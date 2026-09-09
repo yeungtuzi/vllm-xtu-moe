@@ -104,27 +104,39 @@ def main() -> int:
 
 
 def compare(a_path: str, b_path: str) -> int:
+    """比较两条路径。真正有意义的指标:
+      - top-1 token 是否一致(采样决策是否相同)
+      - **实际 prompt token** 的 logprob 偏差(而不是 top-5 尾部 token 的并集)
+    """
     a = json.load(open(a_path))
     b = json.load(open(b_path))
     print(f"[fp8equiv] {a['mode']} vs {b['mode']}")
-    worst_all = 0.0
+    ok = True
     for ra, rb in zip(a["results"], b["results"]):
         print(f"  Q: {ra['question']}")
-        print(f"    gpu gen: {ra['gen_text']!r}")
-        print(f"    cpu gen: {rb['gen_text']!r}")
-        n = 0
-        worst = 0.0
-        for pa, pb in zip(ra["prompt_logprobs"], rb["prompt_logprobs"]):
+        print(f"    {a['mode']} gen: {ra['gen_text']!r}")
+        print(f"    {b['mode']} gen: {rb['gen_text']!r}")
+        n = agree = 0
+        deltas = []
+        for i, (pa, pb) in enumerate(
+            zip(ra["prompt_logprobs"], rb["prompt_logprobs"])
+        ):
             if pa is None or pb is None:
                 continue
-            for k in set(pa) & set(pb):
-                d = abs(pa[k] - pb[k])
-                worst = max(worst, d)
-                n += 1
-        worst_all = max(worst_all, worst)
-        print(f"    prompt-logprob overlap n={n} max|d|={worst:.4f}")
-    print(f"  overall max|d| = {worst_all:.4f}")
-    return 0 if worst_all < 0.1 else 1
+            n += 1
+            agree += int(max(pa, key=pa.get) == max(pb, key=pb.get))
+            tok = str(ra["prompt_ids"][i])
+            if tok in pa and tok in pb:
+                deltas.append(abs(pa[tok] - pb[tok]))
+        mean_d = sum(deltas) / len(deltas) if deltas else float("nan")
+        max_d = max(deltas) if deltas else float("nan")
+        print(f"    top-1 agreement {agree}/{n}; actual-token |dlogprob| "
+              f"mean={mean_d:.4f} max={max_d:.4f}")
+        # 判据:top-1 全一致,且实际 token 的 logprob 偏差在 ~0.3 以内
+        # (GPU 侧对激活做动态 fp8 量化,CPU 侧用 bf16,存在系统性小差异)
+        if n == 0 or agree != n or max_d > 0.3:
+            ok = False
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

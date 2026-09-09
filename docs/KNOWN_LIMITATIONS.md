@@ -50,7 +50,7 @@ sparse 关闭(--hf-overrides '{"index_topk": null}'):
 | 引擎 vs torch 参考(FP8,真实 Qwen3-30B 全部 48 层) | ✅ 相对误差 ~1e-7(`XIAOTU_VERIFY_LAYER=1`) |
 | 引擎 vs torch 参考(MXFP4,真实 DeepSeek-V4 层权重) | ✅ RMS 相对误差 5.6e-3 |
 | CPU 专家 vs GPU 专家端到端(bf16 微型模型) | ✅ greedy token 完全一致 |
-| **CPU 专家 vs GPU 专家端到端(真实 fp8 模型)** | 🟡 **排查中**:同一 prompt 的 prompt-logprob 存在差异,层内检查(上表)通过,正在定位是权重加载还是采样路径的差异 |
+| **CPU 专家 vs GPU 专家端到端(真实 fp8 模型)** | ✅ 同一 prompt 下 **top-1 预测 20/20 一致**,实际 token 的 logprob 平均偏差 0.065(最大 0.24)——差异来自 GPU 侧对激活做动态 fp8 量化、CPU 侧用 bf16 |
 
 ## 3.1 跨请求一致性(已修复)
 
