@@ -14,7 +14,10 @@ import sys
 import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NPZ = "/home/user/lvllm/xiaotu-moe/scripts/real_layer1_model.npz"
+NPZ = os.environ.get(
+    "XIAOTU_LAYER1_NPZ",
+    "/home/user/lvllm/xiaotu-moe/scripts/real_layer1_model.npz",  # 私有引擎仓库里的 fixture
+)
 K = 6
 
 

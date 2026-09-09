@@ -18,16 +18,30 @@
 5. 本文件不替代 `docs/ROADMAP_GENERALITY.md`(通用化方案细节)与
    `docs/EXPERIMENT_REPORT.md`(论文式报告);它是这两者的**索引 + 待办状态**。
 
+## 0b. 项目关系(务必先读,别把两个项目搞混)
+
+| 项目 | 是什么 | 状态 |
+|---|---|---|
+| **`vllm-xtu-moe`**(本仓库) | **vLLM 主线插件**:混合推理(专家权重放 CPU、注意力/长 prefill 留 GPU),按量化格式把 CPU 计算后端挂到主线 `FusedMoEFactory` | 对外发布 |
+| **`xiaotu-moe`**(独立仓库) | 独立 **CPU MoE 引擎项目**:闭源 `lk_moe` 的开源重实现、在 `Lvllm`/`Lvllmds4-x` fork 里做 drop-in 替换 | **已转私有、仅作参考**;其引擎源码作为本仓库内置内核(`xiaotu_moe/` + `csrc/`) |
+| **`Lvllmds4-x`**(第三方 fork) | 别人的 vLLM fork | 仅 PR2/PR3 的代码来源(Apache-2.0 署名);不是运行依赖 |
+
+- 本仓库里 `integration/`、`docs/XIAOTU_MOE_REPORT_*.md`、`docs/THREAD_GEOMETRY.md`、
+  `docs/compute_perf_compare.md`、`docs/TODO_LONGTERM.md` 等是 **xiaotu-moe 时期历史材料**,
+  已加醒目标记,只作参考。
+- 一句话:**引擎来自 xiaotu-moe,项目本身是 vllm-xtu-moe,运行环境是 vLLM 主线(不是 fork)。**
+
 ### 快速状态看板(截至 2026-09-09 夜)
 
 | 主题 | 状态 | 一句话 |
 |---|---|---|
-| 通用 CPU experts 后端(格式无关) | 🟢 主干已通 | `mixed_experts.py` 走主线 router;fp8/mxfp4/int4 三种格式被 oracle 选中 |
-| 混合模式 oracle 前置(主线补丁) | 🟡 只做了 fp8 | `oracle/fp8.py` 已改;mxfp4/int4/nvfp4 未改(PR1 只含 mxfp4) |
+| 通用 CPU experts 后端(格式无关) | 🟢 主干已通 | `mixed_experts.py` 走主线 router;**BF16/FP8/MXFP4/INT4 四种格式**都被 oracle 选中 |
+| 混合模式 oracle 前置(主线补丁) | 🟢 已完成 | `oracle/{fp8,int_wna16,unquantized}.py` 都已改(+跳过 AMX prepack);mxfp4 由 PR1 覆盖;nvfp4/mxfp8 主线无 CPU 后端 |
 | 引擎 clamped SwiGLU(`swiglu_limit`) | 🟢 已完成并验证 | `activation_type=1`;BF16/MXFP4/真实 GLM fp8 三路数值验证通过 |
 | 引擎 e4m3 subnormal 解码 bug | 🟢 已修 | `2^-7 → 2^-6`,与 `torch.float8_e4m3fn` 逐字节一致 |
 | GLM-5.3-Flash 端到端 | 🔴 阻塞(硬件) | A100/SM80 无任何支持其 MLA 维度(256/0/256)的 attention 后端 |
-| 通用路径端到端(能跑的模型) | 🟡 待做 | 需要 Qwen3-30B-A3B-FP8 之类可在 A100 跑、格式匹配的模型 |
+| 通用路径端到端(真实模型) | 🟢 BF16 已过 / 🟡 FP8 在跑 | bf16 tiny-Mixtral:greedy token 48/48 与 GPU 一致;Qwen3-30B-A3B-FP8 加载成功(oracle→CPU FP8) |
+| **目标模型 Qwen3.8-Flash-Next-FP8** | 🟡 下载中 | 用户确认的精确目标(185 GB,512 专家 top-10,fp8 block-128);预检:主线支持该架构、无 SM90 硬门槛 |
 | 上游 PR(PR1/2/3) | 🧊 **已冻结(D9=A)** | 三个 draft 全部不动,等通用 CPU 后端完成后再统一重排(见 §3 D9) |
 | RFC(layerwise GPU prefill / 通用 CPU 后端) | 🔴 未发 | 草稿在 `patches/rfc_layerwise_gpu_prefill.md` |
 
@@ -37,8 +51,8 @@
 
 | ID | 事项 | 状态 | 备注 |
 |---|---|---|---|
-| T01 | 把混合模式 oracle 前置推广到全部格式 | 🟡 进行中 | fp8 已改;`int_wna16.py`/`mxfp4.py`/`nvfp4.py`/`mxfp8` 待改,并抽成统一 helper |
-| T02 | 通用路径端到端验证(真实模型) | 🟡 进行中 | 目标模型见下;GLM 在 A100 被 attention 挡住 |
+| T02 | 通用路径端到端验证(真实模型) | 🟡 进行中 | ①bf16 等价性测试已过(见 T30);②Qwen3-30B-A3B-FP8 已加载成功;③目标模型 Qwen3.8-Flash-Next-FP8 下载中 |
+| T31 | 目标模型 Qwen3.8-Flash-Next-FP8 的端到端(下载 185 GB) | 🟡 下载中 | 预计 ~1–2 h;下载完立刻跑 `scripts/fp8_moe_smoke.py`(SMOKE_MODEL=...) |
 
 ---
 
@@ -48,22 +62,29 @@
 
 | ID | 待办 | 为什么 | 优先级 |
 |---|---|---|---|
-| **T01** | 混合模式下把 CPU 后端前置的改动推广到 `oracle/{mxfp4,int_wna16,nvfp4,mxfp8}.py`,抽成 `oracle/_common.py` 的 `prefer_cpu_backend()` | 现在只有 fp8 生效;PR1 只含 mxfp4。任意格式的模型都要能被选中。fp8 的 6 行改动已快照为 `patches/mainline_fp8_oracle_mixed_mode.patch`(冻结期不入 PR) | **P0** |
+| ~~T01~~ | ~~混合模式 oracle 前置推广~~ | ✅ **已完成**:`oracle/{fp8,int_wna16,unquantized}.py` 都加了混合模式分支,**并且**跳过后端的 AMX prepack(`prepare_*_for_cpu`);nvfp4/mxfp8 主线无 CPU 后端,无需改。补丁快照:`patches/mainline_mixed_mode_generic.patch` | 冻结期不入 PR |
 | **T02** | 用**能在 A100 跑通**的模型做通用路径端到端(load → 连贯输出 → TTFT/吞吐) | 通用路径至今没在真实模型上端到端跑过(DS-V4 一直走 OOT 覆盖) | **P0** |
-| **T03** | 新增 BF16/FP16(无量化)CPU 后端(`CPUUnquantizedExperts` → 引擎 `MOE_BF16`) | 覆盖 Mixtral / Qwen2-MoE / Qwen3-MoE bf16 等大量模型;实现成本极低 | P1 |
-| **T04** | 收紧 `_supports_activation`:只允许 `MoEActivation.SILU`;对 `SWIGLUOAI`(gpt-oss 的**交错** gate/up 布局)必须拒绝而不是静默算错 | 主线 `CPUExpertsMxfp4` 声称支持 SWIGLUOAI,但我们的引擎假设 packed 布局 → 会给出错误结果 | **P0(正确性)** |
+| ~~T03~~ | ~~BF16(无量化)CPU 后端~~ | ✅ **已完成**:`XiaotuCPUExpertsBF16(CPUUnquantizedExperts)` + `oracle/unquantized.py` 前置;tiny-Mixtral 端到端验证通过 | – |
+| ~~T04~~ | ~~激活守卫~~ | ✅ **已完成**:`_supports_activation` 只允许 `SILU` + `SWIGLUOAI_UNINTERLEAVE`(都是 packed 布局),**拒绝 `SWIGLUOAI`**(gpt-oss 交错布局);4 个后端类全部验证 | – |
 | **T05** | 支持专家并行(expert_map / EP) | 现在直接 `raise NotImplementedError`;TP=2 EP 是我们已测过的主力配置 | P1 |
 | **T06** | monolithic `apply` 拿不到 `input_ids`(hash routing / DS-V4 部分层需要) | 要么上游加参数,要么改走 modular 路径;当前会报错而不是算错 | P2 |
 | **T07** | INT4(WNA16)按 `quant_config` 取真实 group size(32/128)与零点 | 现在 `_group_n/_group_k` 硬编码 128/128 | P1 |
 | **T08** | INT8 W8A8 格式(主线 CPU 已有,引擎缺) | 对齐主线 CPU 格式集 | P2 |
 | **T09** | 长尾格式:MXFP8 / MXFP6 / FP8 e5m2 / GGUF k-quants / Marlin 布局 | 按用户需求增量 | P3 |
 | **T10** | 引擎侧:`apply_router_weight_on_input` 支持(现在 raise) | 少数模型会用 | P3 |
+| ~~T28~~ | ~~FP8 块缩放 dtype 归一化~~ | ✅ **已完成**:Qwen3 的 `weight_scale_inv` 是 **bf16**、GLM 是 fp32;`mixed_experts` 现在按格式转成引擎读的 dtype(fp32),MXFP4 保持 uint8 e8m0 | – |
+| ~~T33~~ | ~~文档去混淆~~ | ✅ **已完成**:README 重写 + 新增「项目关系」;BACKLOG §0b;6 个 engine-era 文档加历史标记;ref/ 两篇加决策状态;fork 参考代码加头注释;pyproject/`__init__` 描述校正 | – |
+| ~~T34~~ | ~~第三方署名文件~~ | ✅ **已完成**:仓库根目录已有 `THIRD_PARTY_NOTICES.md`(vLLM / Lvllmds4-x / ktransformers / lk_moe / 模型数据 5 节),本轮更新了引擎引用路径 | – |
+| ~~T35~~ | ~~仓库根目录去混淆~~ | ✅ **已完成**:①`xiaotu-moe/` 目录从本仓库 **untrack**(64 文件,本地保留 + gitignore);②根 `README.md`/`README_CN.md` 重写为「vLLM 主线插件」首页(删掉"一个项目,两个部件"与"lk_moe 开源重实现"的项目定位);③`THIRD_PARTY_NOTICES.md` 引用改为内置引擎路径 | – |
+| **T36** | 仓库根目录剩余 legacy 文件处置(见 D13) | 根目录还有 `LK_MOE_*.md`(4)、`HANDOFF.md`、`serve_*/bench_*/silent_*`、`analysis/` 等 xiaotu-moe/fork 时期文件;是否一并 untrack 待用户定 | P1 |
+| **T37** | git 历史里仍含 `xiaotu-moe` 内容(见 D13) | untrack 只影响未来提交;要真正从公开仓库消失需 filter-repo + force push | 待定 |
+| **T29** | 上游贡献点:主线 fp8/wna16 的 `process_weights_after_loading` **不调用** experts 的钩子(只有 unquantized 调) | 我们在本地补丁里补上了调用(见 L8);冻结解除后可作为 PR1 的配套小改动 | P1 |
 
 ### B. 引擎 / 内核
 
 | ID | 待办 | 为什么 | 优先级 |
 |---|---|---|---|
-| **T11** | 打包全部 ISA 变体(scalar/avx2/avx512_base/vnni/bf16)+ `xiaotu_moe.self_check()` | 现在插件只带 avx512_bf16 一个 `.so`;AVX2-only 机器用不了 | P1 |
+| **T11** | 打包全部 ISA 变体 + `xiaotu_moe.self_check()` | 🟡 **部分完成**:`scripts/build_engine_variants.sh` 已内置(5 个变体实测构建成功,~90 s,不依赖外部引擎仓库);还差:把 5 个 `.so` 纳入 wheel + 自检 | P1 |
 | **T12** | 格式 × ISA 测试矩阵(用 `scripts/_run_one_variant.py` 驱动) | 保证多 ISA 打包后不回归 | P1 |
 | **T13** | AMX 接线(`csrc/moe/amx_gemm.cpp` 3054 行已存在,未接入;需 SPR/EMR 机器) | 性能上限最高,但已实测瓶颈不在算力;需硬件 | P2 |
 | **T14** | 决定性实验:同款 batched MXFP4 内核的 "skip-decode" 版本,量化反量化占比 | 目前**反量化占比未测**(见 §4 已证伪结论) | P2 |
@@ -77,6 +98,9 @@
 | **T17** | 把今天的新结论写进 `EXPERIMENT_REPORT.md`(通用后端一节 + GLM 阻塞) | 报告是主交付物,目前缺这一段 | **P0(文档)** |
 | **T18** | `results.txt` 追加今天全部实测与命令 | 审计/复现 | P1 |
 | **T19** | PR3 的 A100 运行时验证(分支 rebase 后未跑) | PR3 描述里已注明待补 | P1 |
+| ~~T30~~ | ~~CPU 专家 vs GPU 专家的端到端数值等价性~~ | ✅ **已完成**(`scripts/tiny_moe_equiv.py` + `scripts/make_tiny_mixtral.py`):bf16 tiny-Mixtral,greedy token **48/48 与 GPU 一致**,prompt-logprob max\|Δ\|=0.053 / median 0.016(峰化权重),Δ 始终小于 top1-top2 间距 | – |
+| **T31** | 目标模型 `Qwen/Qwen3.8-Flash-Next-FP8` 端到端(185 GB) | 🟡 下载中(~25 MB/s,约 2 h);下载完跑 `SMOKE_MODEL=... scripts/fp8_moe_smoke.py` | **P0** |
+| **T32** | Qwen3.8-Flash-Next 的 attention 在 A100 的实测可行性 | 预检:主线支持 `Qwen4ExpForConditionalGeneration`,QSA 是 Triton 稀疏注意力、GDN 是 Triton,未发现 SM90 硬门槛 —— 但**必须实测** | **P0** |
 
 ### D. 上游 PR / RFC
 
@@ -112,6 +136,10 @@
 | D7a | 删除全部 `XIAOTU_DEBUG_*` / `XIAOTU_TIMING`,保留内部名前缀 | 2026-09-09 | 用户 |
 | D8 | 我们的部分 Apache-2.0,作者「大河马(BigHippo) dahema@me.com」;第三方按其许可 | 2026-09-09 | 用户 |
 | **D9** | **A:三个 draft PR(#56118/#56119/#56120)全部冻结**,等通用 CPU experts 后端完成后再统一重排 | 2026-09-09 | 用户拍板 |
+| **D10** | 端到端**目标模型** = `Qwen/Qwen3.8-Flash-Next-FP8`(185 GB,fp8 block-128,512 专家 top-10);线上没有叫 `Qwen/Qwen3.8-Flash` 的仓库(HF-mirror + ModelScope 都查过) | 2026-09-09 | 用户确认 |
+| **D11** | 误下的 `Qwen/Qwen3-30B-A3B-Instruct-2507-FP8`(30 GB)**保留**,作为额外的 fp8 端到端验证 | 2026-09-09 | 用户选择 |
+| **D12** | `xiaotu-moe` **转私有**(不再发布,仅作参考);`vllm-xtu-moe` 是**唯一对外项目**,定位=vLLM 主线插件 | 2026-09-09 | 用户决定 |
+| **D13** | **待定**:①是否重写 git 历史以彻底移除 `xiaotu-moe` 内容;②根目录其它 legacy 文件是否一并 untrack;③是否把仓库根目录改成插件本身(现在根目录是 `/home/user/lvllm`,插件在 `vllm-xiaotu-moe/` 子目录) | 2026-09-09 | 用户提问(见下) |
 | X1 | ~~"CPU 引擎瓶颈是反量化 ALU"~~ **已证伪**:预反量化 BF16 更慢(14×),真实路由下 1.73–2.0 TFLOP/s ≈ 峰值 15–18% | 2026-09-09 | `EXPERIMENT_REPORT.md` §7.2b |
 | X2 | ~~"CPU MoE 是带宽敏感型"~~ **已证伪**:权重流量 ~10 GB/s,机器可做 740 GB/s | 2026-09-09 | 同上 |
 | X3 | ~~"交叉点 2.5K token"~~ **已更正为 249/550 token**(单/双份权重) | 2026-09-09 | 报告 §5.6d |
@@ -158,7 +186,9 @@
 | **L4** | 主线 CPU FP8 后端的 quant key 是 `(kFp8Static128BlockSym, kFp8Dynamic128Sym)`(A8),但计算实际是 A16 | `cpu_moe.py:CPUExpertsFp8._supports_quant_scheme` | 我们靠子类继承通过;上游若要支持"任意 fp8 模型"需要重新表述 |
 | **L5** | monolithic `apply()` 无 `input_ids` 形参 | `modular_kernel.py:FusedMoEExpertsMonolithic` | hash routing 模型(DS-V4 部分层)无法走通用路径(T06) |
 | **L6** | 本机硬件:2×A100-PCIE-40GB(SM80,无 NVLink)、AMD EPYC 9654(**无 AMX**)、1.5 TB DDR5-4800 | 报告 §1 | AMX 路线无法在本机验证;SM90 特性不可用 |
-| **L7** | hf-mirror 直连可用(不要走代理),实测 ~8.1 MB/s | 200 MB / 25.7 s(2026-09-09) | 31 GB 模型约需 1 小时下载(T02 的成本估算) |
+| **L7** | hf-mirror 直连可用(不要走代理),速率**波动大**:8–60 MB/s | 200 MB/25.7 s = 8.1 MB/s;Qwen3-30B(30 GB)实测 ~60 MB/s;Qwen3.8(185 GB)前 20 min ~25 MB/s | 大模型下载时间估计要按 ~25 MB/s 保守算(185 GB ≈ 2 h) |
+| **L8** | 主线 fp8/wna16 量化方法的 `process_weights_after_loading` **不调用** experts 的 `process_weights_after_loading`(unquantized 会调) | `quantization/fp8.py:775` 与 `unquantized_fused_moe_method.py:171` 对比 | 依赖该钩子捕获 layer 的 OOT 后端会崩(`apply called before process_weights_after_loading`);已本地补调用(→ T29) |
+| **L9** | 模型名要先核实再下载:用户说的「qwen3.8-flash」线上实际只有 `Qwen3.8-Flash-Next(-FP8)` | `Qwen/Qwen3.8-Flash` 在 HF-mirror 与 ModelScope 均 404 | 已按用户确认改下载 `-FP8`(D10);以后下载前先跑 `scripts/probe_oracle.py` 式的"先查后下" |
 
 ---
 
@@ -178,6 +208,9 @@
 | **真实 GLM-5.3 fp8 专家层验证** | `scripts/test_glm53_fp8_layer.py`(layer 3,8 专家,rms_rel **9.3e-5**) |
 | GLM 端到端失败日志 | `logs/glm53_smoke.log`、`logs/glm53_smoke2.log`(`*.log` 被 gitignore,已把关键报错摘录到 `docs/evidence/glm53_a100_blocker.txt`) |
 | GLM 端到端脚本 | `scripts/glm53_smoke.py`(支持 `GLM_HF_OVERRIDES`) |
+| **CPU/GPU 端到端等价性** | `scripts/tiny_moe_equiv.py` + `scripts/make_tiny_mixtral.py`(生成 vLLM 命名兼容的微型 Mixtral) |
+| fp8 真实模型端到端 | `scripts/fp8_moe_smoke.py`(`SMOKE_MODEL` 指定模型) |
+| 混合模式主线补丁快照 | `patches/mainline_mixed_mode_generic.patch`(3 个 oracle + fp8 experts 钩子) |
 
 ### 引擎重建命令(本机,必须记牢)
 
@@ -194,7 +227,9 @@ g++ -std=c++17 -shared -fPIC -O3 -ffast-math -fno-finite-math-only \
   -L"$CUD/lib" -Wl,--no-as-needed -lcudart -Wl,--as-needed -Wl,-rpath,"$CUD/lib" -lcudart \
   "$ROOT/csrc/python_binding/binding.cpp" \
   -o "$ROOT/build/_xiaotu_moe_C_avx512_bf16.cpython-312-x86_64-linux-gnu.so"
-# 约 18 s;改完 csrc 要同步一份到 /home/user/lvllm/xiaotu-moe/csrc/(两处都在 git 里)
+# 约 18 s。
+# 全部 ISA 变体:PYTHON=<env>/bin/python bash scripts/build_engine_variants.sh
+# (引擎源码只在本仓库 xiaotu_moe/csrc;外部 xiaotu-moe 目录已转私有、不再被跟踪)
 ```
 
 ### ⚠️ 主线工作树是"活的",不要 reset
@@ -228,6 +263,14 @@ g++ -std=c++17 -shared -fPIC -O3 -ffast-math -fno-finite-math-only \
 
 ## 7. 修订记录
 
+- **2026-09-09(第 6 版)** — 仓库根目录去混淆(用户指出):①`xiaotu-moe/` 目录 untrack(本地保留、
+  gitignore),本仓库不再包含独立引擎项目;②根 `README.md`/`README_CN.md` 重写为插件首页;
+  ③`THIRD_PARTY_NOTICES.md` 引用更新;④新增 T35(已完成)、T36/T37(待定)、D13(待用户拍板);
+  ⑤T11 记录 `scripts/build_engine_variants.sh` 已内置。依据:用户 2026-09-09 提问 + 仓库检查。
+- **2026-09-09(第 5 版)** — **项目边界澄清(用户指出)**:新增 §0b「项目关系」,记录 D12
+  (`xiaotu-moe` 转私有、`vllm-xtu-moe` 为唯一对外项目);新增 T33(文档去混淆,已完成)、
+  T34(第三方署名文件,待做)。依据:用户 2026-09-09 澄清。
+- **2026-09-09(第 4 版)** — ①T01/T03/T04/T28 **完成**,新增 T29(主线 experts 钩子)、T30(CPU/GPU 端到端等价性,已过)、T31(目标模型端到端)、T32(A100 可行性实测);②新增 D10(目标模型 = `Qwen/Qwen3.8-Flash-Next-FP8`,用户确认)、D11(保留误下的 30 GB 模型作额外验证);③新增 L8(主线 fp8 不调 experts 钩子)、L9(模型名先核实再下载);④看板与 §5 证据索引同步。依据:本轮实测(`scripts/tiny_moe_equiv.py`、`logs/qwen3_fp8_smoke.log`)+ 用户 2026-09-09 澄清。
 - **2026-09-09(第 3 版)** — ①T01 补 fp8 oracle 快照指针(`patches/mainline_fp8_oracle_mixed_mode.patch`);
   ②§5 新增「主线工作树是活的,不要 reset」的风险提示。依据:检查 mainline checkout 的 `git status`。
 - **2026-09-09(第 2 版)** — **D9 拍板为方案 A**:三个 draft PR 全部冻结,等通用 CPU experts 后端完成

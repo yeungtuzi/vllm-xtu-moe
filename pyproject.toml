@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-xtu-moe"
 version = "0.1.0"
-description = "XTU (X Transformers Unity) — mainline vLLM hybrid MoE plugin carrying the xiaotu-moe CPU engine (AVX512-VNNI/BF16 fp4 MXFP4-MXFP8), enabling no-AMX x86 (AMD EPYC) hybrid inference on FusedMoEFactory."
+description = "XTU (X Transformers Unity) — a mainline-vLLM hybrid MoE plugin (CPU experts + GPU attention/long prefill). Bundles the xiaotu CPU MoE engine (AVX512-VNNI/BF16: MXFP4/FP8/INT4/BF16) so no-AMX x86 hosts (AMD EPYC) get usable CPU MoE backends through FusedMoEFactory."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }

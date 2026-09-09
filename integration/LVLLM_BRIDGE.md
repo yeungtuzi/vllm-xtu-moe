@@ -1,5 +1,11 @@
 # xiaotu-moe ↔ Lvllmds4-x 集成（drop-in 替换 lk_moe）
 
+
+> ⚠️ **历史材料(来自 `xiaotu-moe` 时期)** — 本文描述的是独立引擎项目 **xiaotu-moe**
+> (闭源 `lk_moe` 的开源重实现、在 `Lvllm`/`Lvllmds4-x` fork 里做 drop-in 替换),
+> 该项目**已转私有、仅作参考**。本项目 **`vllm-xtu-moe`** 是 **vLLM 主线插件**,
+> 只把该引擎源码作为内置计算内核使用;本文的 fork / `lk_moe` 路线**不代表本项目路线**。
+> 项目边界与当前待办见 `docs/BACKLOG.md`。
 作者：agent（DeepSeek-V4-Flash-0731）· 阶段：Phase 4 集成设计（已核实，**落地与全量层回归留给"测试最后统一做"**）
 
 ## 目标

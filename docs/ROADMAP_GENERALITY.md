@@ -23,8 +23,11 @@
 ### 1.1 已经具备的
 
 - `xiaotu_moe/loader.py`:按 `/proc/cpuinfo` 的 flags 选最高可用变体,5 级阶梯;
-- `xiaotu-moe/scripts/build_variants.sh`:同一份 `binding.cpp` 编译 5 次,
-  每级一个 `_xiaotu_moe_C_<suffix>.so`;AMX 一行被显式跳过(本机无 AMX);
+- `scripts/build_engine_variants.sh`(本仓库自带,构建内置引擎):同一份
+  `xiaotu_moe/csrc/python_binding/binding.cpp` 编译 5 次,每级一个
+  `_xiaotu_moe_C_<suffix>.so`;AMX 一行被显式跳过(本机无 AMX)。
+  (引擎源码来自独立项目 `xiaotu-moe`,该项目已转私有;构建脚本已内置到本仓库,
+  不再依赖外部目录。)
 - 内核头文件已按编译期宏分级:
   `moe_v2_packed4.hpp` 里 `#if defined(__AVX512F__) … #elif defined(__AVX2__) … #else`,
   `kernels/bf16_gemm.hpp` 有 `XIAOTU_MOE_HAVE_AVX512_BF16 / _AVX512 / _AVX2` 三级回退。

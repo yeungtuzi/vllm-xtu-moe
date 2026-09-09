@@ -1,3 +1,6 @@
+# ⚠️ 历史材料(xiaotu-moe 时期):这是当年把 Lvllmds4-x fork 里的闭源 lk_moe
+# 换成 xiaotu_moe 引擎的参考补丁,**不是 vllm-xtu-moe 的代码路径**。
+# 本项目(vllm-xtu-moe)走 vLLM 主线插件路线,见 docs/BACKLOG.md。
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 

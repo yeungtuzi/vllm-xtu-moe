@@ -2,9 +2,14 @@
 
 **作者 Author:** 大河马 (dahema@me.com)，由 DeepSeek Harness 辅助 / with DeepSeek Harness assistance
 
-> **本文件只覆盖"引擎性能对齐 lk-moe"这一条子线。**
-> 全项目的待办/决策总账在 [`BACKLOG.md`](BACKLOG.md)(进行中项、上游 PR 策略、
-> 已知阻塞、证据索引)。新会话请先读 BACKLOG,再按需读本文件。
+
+> ⚠️ **历史材料(来自 `xiaotu-moe` 时期)** — 本文描述的是独立引擎项目 **xiaotu-moe**
+> (闭源 `lk_moe` 的开源重实现、在 `Lvllm`/`Lvllmds4-x` fork 里做 drop-in 替换),
+> 该项目**已转私有、仅作参考**。本项目 **`vllm-xtu-moe`** 是 **vLLM 主线插件**,
+> 只把该引擎源码作为内置计算内核使用;本文的 fork / `lk_moe` 路线**不代表本项目路线**。
+> 项目边界与当前待办见 `docs/BACKLOG.md`。
+> **本文件只覆盖"引擎性能对齐 lk-moe"这一条子线(engine-era,已不再是项目主线)。**
+> 全项目的待办/决策总账在 [`BACKLOG.md`](BACKLOG.md)。新会话请先读 BACKLOG,再按需读本文件。
 
 This file records the long-running optimization goal tracked as a ToDo, so
 progress is persistent and auditable across sessions/rounds. Target is the

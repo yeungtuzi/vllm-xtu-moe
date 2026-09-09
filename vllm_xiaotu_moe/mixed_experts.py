@@ -11,6 +11,7 @@
 `patches/mainline_sm80_mixed_mode.patch`(PR1),FP8 的对称改动在同一补丁里。
 
 支持格式(引擎 → 基线类):
+  bf16   MOE_BF16   CPUUnquantizedExperts 无缩放        权重 bf16 [E,2I,H]/[E,H,I]
   mxfp4  MOE_MXFP4  CPUExpertsMxfp4  groupN=1    groupK=32   权重 u8 nibble + e8m0
   fp8    MOE_FP8    CPUExpertsFp8    groupN=128  groupK=128  权重 e4m3 + fp32 块缩放
   int4   MOE_WNA16  CPUExpertsInt4   groupN=32/128 groupK=32/128 (按 quant_config 取)
@@ -21,9 +22,11 @@ router_logits,所以本模块**复用主线的 router 对象**(`create_fused_moe
 而不是像主线 cpu_moe 那样硬编码 softmax —— 后者对 GLM(sigmoid+noaux_tc)和
 DS-V4(sqrtsoftplus)都会选错专家。
 
-激活:引擎做 `up * silu(gate)`;GLM/DS-V4/MiniMax 的 `swiglu_limit` 由引擎的
-`activation_type=1 + swiglu_limit/alpha/beta` 实现(与主线
-`silu_and_mul_with_clamp` 同语义)。
+激活:引擎实现**packed 布局**的 gated 激活 `out = clamp(gate,max=L) * sigmoid(alpha*clamp(gate,max=L))
+* (clamp(up,±L)+beta)`(与主线 `silu_and_mul_with_clamp` 同语义),因此支持主线的
+`SILU` 与 `SWIGLUOAI_UNINTERLEAVE`(两者都是 packed);**不支持 `SWIGLUOAI`**
+(gpt-oss 把 gate/up 交错存在 w13 里,我们按 packed 取数会静默算错)—— 由
+`_supports_activation` 显式拒绝,让 oracle 去选别的后端。
 
 在 AMD(无 AMX)上,这是唯一能跑的 CPU MoE 内核;主线 CPUExperts* 要 Intel AMX。
 """
@@ -37,13 +40,21 @@ from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
     CPUExpertsFp8,
     CPUExpertsInt4,
     CPUExpertsMxfp4,
+    CPUUnquantizedExperts,
     select_experts,
 )
 
 
 def mixed_mode_enabled() -> bool:
-    """True when experts are configured to live/compute on CPU on a GPU run."""
-    return envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu"
+    """True when experts are configured to live/compute on CPU on a GPU run.
+
+    Delegates to `mainline_shims.mixed_mode_enabled`, which reads the env var
+    directly so the plugin also works on a **stock** vLLM (whose `vllm.envs`
+    has no `VLLM_EXPERTS_LOAD_DEVICE`).
+    """
+    from .mainline_shims import mixed_mode_enabled as _m
+
+    return _m()
 
 
 def _supports_mixed_device() -> bool:
@@ -91,6 +102,13 @@ class _XiaotuExpertsMixin:
     _group_k = 32
     # weight element width in bytes (u8 for mxfp4/int4-packed, 1 for fp8)
     _w_bytes = 1
+    # expected dtype of the layer's w13_weight (None = unchecked)
+    _expect_dtype = None
+    # dtype the engine reads block scales as; None = pass the layer's tensor
+    # through unchanged (MXFP4 uses uint8 e8m0 bytes). Checkpoints disagree on
+    # this (GLM-5.3 ships fp32 scale_inv, Qwen3 ships bf16), so we normalize to
+    # fp32 for the formats whose engine kernel reads `const float*`.
+    _scale_dtype = None
 
     def __init__(self, moe_config, quant_config):
         super().__init__(moe_config, quant_config)
@@ -125,6 +143,17 @@ class _XiaotuExpertsMixin:
         # grouped top-k and custom routing functions.
         return True
 
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        # The engine consumes the *packed* w13 layout (gate rows first, then up)
+        # and applies an optional clamp; that is exactly mainline's SILU and
+        # SWIGLUOAI_UNINTERLEAVE. SWIGLUOAI (gpt-oss) interleaves gate/up inside
+        # w13, so accepting it here would produce silently wrong results.
+        return activation in (
+            MoEActivation.SILU,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Do NOT AMX-prepack; remember the layer so the engine can use the raw
         CPU parameters (the checkpoint layout the engine consumes directly)."""
@@ -140,6 +169,18 @@ class _XiaotuExpertsMixin:
             for name in _ROUTER_EXTRA_ATTRS
             if getattr(layer, name, None) is not None
         }
+        # Resolve block scales once (converted to the dtype the engine reads).
+        # We keep our own tensors instead of mutating vLLM's parameters so the
+        # GPU path (if used for the same layer elsewhere) is unaffected.
+        self._scales: tuple = (None, None)
+        if self._scale_dtype is not None:
+            resolved = []
+            for name in self._scale_attrs:
+                t = self._find_scale(layer, (name,))
+                if t is not None and t.dtype != self._scale_dtype:
+                    t = t.to(self._scale_dtype).contiguous()
+                resolved.append(t)
+            self._scales = tuple(resolved)
         self._router = None
 
     # ---- routing -------------------------------------------------------
@@ -204,6 +245,8 @@ class _XiaotuExpertsMixin:
     # ---- engine construction ------------------------------------------
     def _find_scale(self, layer, names):
         for n in names:
+            if not n:  # unquantized backends have no scale tensors
+                continue
             t = getattr(layer, n, None)
             if t is not None:
                 return t
@@ -216,17 +259,26 @@ class _XiaotuExpertsMixin:
 
         ex_w13 = layer.w13_weight
         ex_w2 = layer.w2_weight
-        s13 = self._find_scale(layer, (self._scale_attrs[0],))
-        s2 = self._find_scale(layer, (self._scale_attrs[1],))
+        if self._expect_dtype is not None and ex_w13.dtype != self._expect_dtype:
+            raise NotImplementedError(
+                f"xiaotu {self._engine_attr} backend expects "
+                f"{self._expect_dtype} weights, got {ex_w13.dtype}"
+            )
+        s13, s2 = self._scales
+        if s13 is None and self._scale_dtype is None:
+            # unquantized / e8m0 formats: use the layer tensors as-is
+            s13 = self._find_scale(layer, (self._scale_attrs[0],))
+            s2 = self._find_scale(layer, (self._scale_attrs[1],))
         num_local_experts = int(ex_w13.shape[0])
         if num_local_experts != int(self.moe_config.num_experts):
             raise NotImplementedError(
                 "xiaotu CPU experts backend does not support expert parallelism "
                 f"yet (local={num_local_experts}, global={self.moe_config.num_experts})"
             )
-        if self.moe_config.activation != MoEActivation.SILU:
+        if not self._supports_activation(self.moe_config.activation):
             raise NotImplementedError(
-                f"xiaotu CPU experts backend implements SwiGLU only, got "
+                f"xiaotu CPU experts backend implements the packed gated "
+                f"activation only (SILU / SWIGLUOAI_UNINTERLEAVE), got "
                 f"{self.moe_config.activation}"
             )
 
@@ -333,12 +385,22 @@ class _XiaotuExpertsMixin:
         return out.to(hidden_states.dtype)
 
 
+class XiaotuCPUExpertsBF16(_XiaotuExpertsMixin, CPUUnquantizedExperts):
+    """无量化(BF16)专家:引擎 MOE_BF16。覆盖 Mixtral / Qwen2-MoE / Qwen3-MoE(bf16)等。"""
+
+    _engine_attr = "MOE_BF16"
+    _scale_attrs = ("", "")
+    _group_n, _group_k = 1, 1
+    _expect_dtype = torch.bfloat16
+
+
 class XiaotuCPUExpertsMxfp4(_XiaotuExpertsMixin, CPUExpertsMxfp4):
     """MXFP4 W4A16 专家:权重在 CPU,计算用 xiaotu AVX512-VNNI 引擎(无需 AMX)。"""
 
     _engine_attr = "MOE_MXFP4"
     _scale_attrs = ("w13_weight_scale", "w2_weight_scale")
     _group_n, _group_k = 1, 32
+    _expect_dtype = torch.uint8
 
 
 class XiaotuCPUExpertsFp8(_XiaotuExpertsMixin, CPUExpertsFp8):
@@ -347,6 +409,8 @@ class XiaotuCPUExpertsFp8(_XiaotuExpertsMixin, CPUExpertsFp8):
     _engine_attr = "MOE_FP8"
     _scale_attrs = ("w13_weight_scale_inv", "w2_weight_scale_inv")
     _group_n, _group_k = 128, 128
+    _expect_dtype = torch.float8_e4m3fn
+    _scale_dtype = torch.float32
 
 
 class XiaotuCPUExpertsInt4(_XiaotuExpertsMixin, CPUExpertsInt4):
@@ -355,10 +419,12 @@ class XiaotuCPUExpertsInt4(_XiaotuExpertsMixin, CPUExpertsInt4):
     _engine_attr = "MOE_WNA16"
     _scale_attrs = ("w13_weight_scale", "w2_weight_scale")
     _group_n, _group_k = 128, 128
+    _scale_dtype = torch.float32
 
 
 # 格式 → 需要替换的主线 CPU 后端类
 _BACKENDS = (
+    ("CPUUnquantizedExperts", XiaotuCPUExpertsBF16, "BF16"),
     ("CPUExpertsMxfp4", XiaotuCPUExpertsMxfp4, "MXFP4"),
     ("CPUExpertsFp8", XiaotuCPUExpertsFp8, "FP8"),
     ("CPUExpertsInt4", XiaotuCPUExpertsInt4, "INT4"),
@@ -395,6 +461,7 @@ def register_mixed_cpu_backend() -> None:
 __all__ = [
     "mixed_mode_enabled",
     "register_mixed_cpu_backend",
+    "XiaotuCPUExpertsBF16",
     "XiaotuCPUExpertsMxfp4",
     "XiaotuCPUExpertsFp8",
     "XiaotuCPUExpertsInt4",

@@ -2,7 +2,12 @@
 import numpy as np, torch, sys
 sys.path.insert(0, "/home/user/lvllm/vllm-xiaotu-moe")
 import xiaotu_moe
-d = np.load('/home/user/lvllm/xiaotu-moe/scripts/real_layer1_model.npz')
+import os
+NPZ = os.environ.get(
+    "XIAOTU_LAYER1_NPZ",
+    "/home/user/lvllm/xiaotu-moe/scripts/real_layer1_model.npz",  # 私有引擎仓库里的 fixture
+)
+d = np.load(NPZ)
 w13,w2,g13,g2 = d['w13'],d['w2'],d['g13'],d['g2']
 E,I,H = int(d['E']),int(d['I']),int(d['H']); K=6
 def f2e(s): return np.clip(np.round(np.log2(np.maximum(s,1e-30))).astype(np.int32)+127,0,255).astype(np.uint8)

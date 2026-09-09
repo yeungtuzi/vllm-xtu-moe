@@ -4,6 +4,14 @@
 状态:决策分析(为下一步「走哪条路」提供证据;本机待办的三步=文档化+搭主线环境+调研 NUMA 控制权)
 相关文档:ref/xiaotu_cpu_expert_mainline.md · ref/gpupre_design_xiaotu.md · results.txt
 
+
+## 状态(2026-09-09 更新)
+
+> 本文是 **2026-09-08 的路线决策记录**。结论已执行:走 **vLLM 主线插件**路线
+> (`vllm-xtu-moe`),**放弃** fork(`Lvllm`/`Lvllmds4-x`)方案。文中的 "xiaotu"
+> 指内置 CPU 引擎(源码来自独立项目 `xiaotu-moe`,该项目已转私有)。
+> 项目边界与当前待办见 `docs/BACKLOG.md`。
+
 ## 0. 问题
 在并发 decode ~100 tok/s、支持 2 路 1M 上下文、平台 = 2×A100 + EPYC 9654 + 24 通道 DDR5-4800、
 跑 DeepSeek-V4-Flash / GLM-5.3-Flash 等的前提下,该继续走 lk/lvllm fork(做其开源替代 xiaotu),

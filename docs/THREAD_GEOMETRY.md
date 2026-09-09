@@ -1,5 +1,12 @@
 # Thread Geometry on the Dual-Socket EPYC 9654
 
+
+> ⚠️ **历史材料(来自 `xiaotu-moe` 时期)** — 本文描述的是独立引擎项目 **xiaotu-moe**
+> (闭源 `lk_moe` 的开源重实现、在 `Lvllm`/`Lvllmds4-x` fork 里做 drop-in 替换),
+> 该项目**已转私有、仅作参考**。本项目 **`vllm-xtu-moe`** 是 **vLLM 主线插件**,
+> 只把该引擎源码作为内置计算内核使用;本文的 fork / `lk_moe` 路线**不代表本项目路线**。
+> 项目边界与当前待办见 `docs/BACKLOG.md`。
+
 **xiaotu-moe v0.12 · hardware calibration notes**
 
 ## 1. The real CPU (verified from `/proc/cpuinfo` + `/sys/.../topology`, not assumed)

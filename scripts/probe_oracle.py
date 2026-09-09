@@ -31,6 +31,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 CASES = {
+    "bf16": (
+        "无量化 BF16 (Mixtral/Qwen2-MoE/Qwen3-MoE bf16)",
+        4096, 14336, 8, 2, RoutingMethodType.Renormalize,
+        None, None, None,
+    ),
     # (label, hidden, inter, experts, topk, routing, weight_key, act_key, swiglu_limit)
     "fp8-glm53": (
         "GLM-5.3-Flash (fp8 e4m3 128x128, sigmoid+noaux_tc)",
@@ -80,6 +85,41 @@ def make_config(hidden, inter, experts, topk, routing, swiglu_limit):
     )
 
 
+def check_activation_guard() -> int:
+    """T04:引擎只做 packed 布局的 gated 激活;SWIGLUOAI(交错)必须被拒绝。"""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts import cpu_moe
+
+    expect = {
+        MoEActivation.SILU: True,
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE: True,
+        MoEActivation.SWIGLUOAI: False,   # gpt-oss: w13 内 gate/up 交错
+        MoEActivation.GELU: False,
+        MoEActivation.GELU_TANH: False,
+        MoEActivation.RELU2: False,
+    }
+    rc = 0
+    for cls in (
+        cpu_moe.CPUUnquantizedExperts,
+        cpu_moe.CPUExpertsMxfp4,
+        cpu_moe.CPUExpertsFp8,
+        cpu_moe.CPUExpertsInt4,
+    ):
+        bad = [
+            a.name
+            for a, want in expect.items()
+            if bool(cls._supports_activation(a)) != want
+        ]
+        ok = not bad
+        rc |= 0 if ok else 1
+        print(
+            f"[{'OK ' if ok else 'BAD'}] activation guard {cls.__name__:26s} "
+            f"{'packed-only (SILU + SWIGLUOAI_UNINTERLEAVE)' if ok else 'mismatch: ' + ','.join(bad)}",
+            flush=True,
+        )
+    return rc
+
+
 def main() -> int:
     only = sys.argv[1] if len(sys.argv) > 1 else None
     import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -88,8 +128,11 @@ def main() -> int:
     from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
         select_mxfp4_moe_backend,
     )
+    from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+        select_unquantized_moe_backend,
+    )
 
-    rc = 0
+    rc = check_activation_guard()
     for key, (
         label, hidden, inter, experts, topk, routing, wkey, akey, swiglu,
     ) in CASES.items():
@@ -101,6 +144,8 @@ def main() -> int:
                 backend, cls = select_fp8_moe_backend(cfg, wkey, akey)
             elif "mxfp4" in key:
                 backend, cls = select_mxfp4_moe_backend(cfg, akey)
+            elif key == "bf16":
+                backend, cls = select_unquantized_moe_backend(cfg)
             else:
                 # WNA16 的 oracle 需要 quant_config 对象,这里直接问 CPU 后端
                 # 自己的能力检查(等价于 oracle 里的那一步)。

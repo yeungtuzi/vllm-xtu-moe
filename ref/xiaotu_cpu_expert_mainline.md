@@ -3,6 +3,13 @@
 日期:2026-09-08(策略研判;依据当日抓取的 vLLM main 源码)
 状态:研判结论,为「gpu_prefill 落地」与「只写计算层」两条路的取舍提供事实依据。
 相关文档:ref/gpupre_design_xiaotu.md · ref/gpupre_implementation_plan.md ·
+
+## 状态(2026-09-09 更新)
+
+> 本文是 **2026-09-08 的路线决策记录**。结论已执行:走 **vLLM 主线插件**路线
+> (`vllm-xtu-moe`),**放弃** fork(`Lvllm`/`Lvllmds4-x`)方案。文中的 "xiaotu"
+> 指内置 CPU 引擎(源码来自独立项目 `xiaotu-moe`,该项目已转私有)。
+> 项目边界与当前待办见 `docs/BACKLOG.md`。
          ref/vllm_gpupre_kernel_reference.md · README.md
 
 ## 0. 一句话结论
