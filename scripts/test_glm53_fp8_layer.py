@@ -44,18 +44,8 @@ def bf16_bits_to_f32(b):
     return (b.astype(np.uint32) << 16).view(np.float32)
 
 
-def dequant_fp8(w_i8: np.ndarray, scale_inv: np.ndarray, block: int = 128):
-    """[N,K] int8(e4m3 位模式) + [N/block,K/block] fp32 -> [N,K] fp32。"""
-    # e4m3 -> float32
-    f = w_i8.view(np.uint8).astype(np.uint32).view(np.float32)  # 占位,下面用查表替换
-    return f, scale_inv
-
-
-E4M3_LUT = None
-
-
-# 引擎当前(fp8_dequant.hpp)的次正规解码用的是 2^-7 而不是正确的 2^-6,
-# 置 GLM_FP8_ENGINE_DECODE=1 可复现引擎语义,用来定位差异来源。
+# 引擎的 e4m3 次正规解码采用与 torch.float8_e4m3fn 一致的 2^-6;
+# 置 GLM_FP8_ENGINE_DECODE=1 可复现旧版(2^-7)的语义,用于差异定位。
 _ENGINE_DECODE = os.environ.get("GLM_FP8_ENGINE_DECODE") == "1"
 
 
