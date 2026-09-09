@@ -1,472 +1,0 @@
-WARNING: CPU IP/backtrace sampling not supported, disabling.
-Try the 'nsys status --environment' command to learn more.
-
-WARNING: CPU context switch tracing not supported, disabling.
-Try the 'nsys status --environment' command to learn more.
-
-[xiaotu] GPU/CPU Mixed: MXFP4 CPU backend -> XiaotuCPUExperts (AVX512-VNNI, no AMX)
-[vllm-xtu-moe] registered OOT override of DeepseekV4ForCausalLM (DeepseekV4MoE -> CpuXiaotuMoE)
-INFO 09-09 16:39:58 [api_utils.py:286] non-default args: {'max_model_len': 16384, 'enable_prefix_caching': False, 'gpu_memory_utilization': 0.85, 'max_num_batched_tokens': 16384, 'max_num_seqs': 16, 'disable_log_stats': True, 'enforce_eager': True, 'kernel_config': KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=[], fused_add_rms_norm=[]), enable_flashinfer_autotune=None, enable_cutedsl_warmup=True, enable_jit_warmup=False, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto'), 'model': '/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master'}
-WARNING 09-09 16:39:58 [envs.py:2326] Unknown vLLM environment variable detected: VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS
-WARNING 09-09 16:39:58 [arg_utils.py:1779] The global random seed is set to 0. Since VLLM_ENABLE_V1_MULTIPROCESSING is set to False, this may affect the random state of the Python process that launched vLLM.
-INFO 09-09 16:39:58 [config.py:803] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
-INFO 09-09 16:40:05 [model.py:691] Resolved architecture: DeepseekV4ForCausalLM
-INFO 09-09 16:40:05 [model.py:712] Defaulting to tokenizer_mode='deepseek_v4' for DeepseekV4ForCausalLM
-INFO 09-09 16:40:05 [model.py:2031] Using max model len 16384
-INFO 09-09 16:40:05 [scheduler.py:288] Chunked prefill is enabled with max_num_batched_tokens=16384.
-WARNING 09-09 16:40:05 [vllm.py:1382] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
-INFO 09-09 16:40:05 [vllm.py:727] Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out.
-INFO 09-09 16:40:05 [kernel.py:372] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
-INFO 09-09 16:40:05 [vllm.py:1596] Cudagraph is disabled under eager mode
-INFO 09-09 16:40:05 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
-INFO 09-09 16:40:06 [core.py:123] Initializing a V1 LLM engine (v0.1.dev1+g6c73b08de) with config: model='/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master', speculative_config=None, tokenizer='/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master', skip_tokenizer_init=False, tokenizer_mode=deepseek_v4, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=16384, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=deepseek_v4_fp8, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['+quant_fp8', 'all', '+quant_fp8'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [16384], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=False, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
-INFO 09-09 16:40:06 [parallel_state.py:1798] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_5a1bd12ebfd94839858eca63fe3c350c backend=nccl
-INFO 09-09 16:40:07 [parallel_state.py:2142] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
-INFO 09-09 16:40:07 [gpu_worker.py:438] Using V2 Model Runner
-INFO 09-09 16:40:07 [model_runner.py:390] Loading model from scratch...
-INFO 09-09 16:40:07 [quant_config.py:75] DeepSeek V4 expert_dtype resolved to 'fp4'
-INFO 09-09 16:40:07 [__init__.py:698] Selected MarlinFP8ScaledMMLinearKernel for Fp8LinearMethod
-INFO 09-09 16:40:07 [attention.py:120] Using DeepSeek's fp8_ds_mla KV cache format.
-INFO 09-09 16:40:08 [attention.py:928] Using FP8 indexer cache for Lightning Indexer.
-INFO 09-09 16:40:16 [weight_utils.py:895] Filesystem type for checkpoints: EXT4. Checkpoint size: 155.43 GiB. Available RAM: 1348.50 GiB.
-INFO 09-09 16:40:16 [weight_utils.py:918] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
-Loading safetensors checkpoint shards:   0% Completed | 0/48 [00:00<?, ?it/s]
-Loading safetensors checkpoint shards:   2% Completed | 1/48 [00:00<00:05,  8.93it/s]
-Loading safetensors checkpoint shards:   4% Completed | 2/48 [00:00<00:22,  2.02it/s]
-Loading safetensors checkpoint shards:   6% Completed | 3/48 [00:02<00:45,  1.00s/it]
-Loading safetensors checkpoint shards:   8% Completed | 4/48 [00:03<00:48,  1.10s/it]
-Loading safetensors checkpoint shards:  10% Completed | 5/48 [00:05<01:01,  1.43s/it]
-Loading safetensors checkpoint shards:  12% Completed | 6/48 [00:07<01:04,  1.54s/it]
-Loading safetensors checkpoint shards:  15% Completed | 7/48 [00:09<01:06,  1.61s/it]
-Loading safetensors checkpoint shards:  17% Completed | 8/48 [00:10<01:00,  1.51s/it]
-Loading safetensors checkpoint shards:  19% Completed | 9/48 [00:11<00:46,  1.19s/it]
-Loading safetensors checkpoint shards:  21% Completed | 10/48 [00:11<00:40,  1.07s/it]
-Loading safetensors checkpoint shards:  23% Completed | 11/48 [00:13<00:44,  1.19s/it]
-Loading safetensors checkpoint shards:  25% Completed | 12/48 [00:14<00:40,  1.13s/it]
-Loading safetensors checkpoint shards:  27% Completed | 13/48 [00:15<00:41,  1.19s/it]
-Loading safetensors checkpoint shards:  29% Completed | 14/48 [00:16<00:40,  1.18s/it]
-Loading safetensors checkpoint shards:  31% Completed | 15/48 [00:18<00:39,  1.20s/it]
-Loading safetensors checkpoint shards:  33% Completed | 16/48 [00:19<00:39,  1.23s/it]
-Loading safetensors checkpoint shards:  35% Completed | 17/48 [00:20<00:36,  1.17s/it]
-Loading safetensors checkpoint shards:  38% Completed | 18/48 [00:21<00:37,  1.26s/it]
-Loading safetensors checkpoint shards:  40% Completed | 19/48 [00:23<00:43,  1.50s/it]
-Loading safetensors checkpoint shards:  42% Completed | 20/48 [00:31<01:33,  3.36s/it]
-Loading safetensors checkpoint shards:  44% Completed | 21/48 [00:32<01:08,  2.53s/it]
-Loading safetensors checkpoint shards:  46% Completed | 22/48 [00:34<01:02,  2.39s/it]
-Loading safetensors checkpoint shards:  48% Completed | 23/48 [00:36<00:57,  2.31s/it]
-Loading safetensors checkpoint shards:  50% Completed | 24/48 [00:37<00:46,  1.95s/it]
-Loading safetensors checkpoint shards:  52% Completed | 25/48 [00:38<00:35,  1.52s/it]
-Loading safetensors checkpoint shards:  54% Completed | 26/48 [00:39<00:31,  1.43s/it]
-Loading safetensors checkpoint shards:  56% Completed | 27/48 [00:40<00:28,  1.35s/it]
-Loading safetensors checkpoint shards:  58% Completed | 28/48 [00:42<00:30,  1.53s/it]
-Loading safetensors checkpoint shards:  60% Completed | 29/48 [00:43<00:24,  1.29s/it]
-Loading safetensors checkpoint shards:  62% Completed | 30/48 [00:46<00:33,  1.86s/it]
-Loading safetensors checkpoint shards:  65% Completed | 31/48 [00:51<00:47,  2.81s/it]
-Loading safetensors checkpoint shards:  67% Completed | 32/48 [00:53<00:40,  2.51s/it]
-Loading safetensors checkpoint shards:  69% Completed | 33/48 [00:54<00:32,  2.18s/it]
-Loading safetensors checkpoint shards:  71% Completed | 34/48 [00:56<00:29,  2.08s/it]
-Loading safetensors checkpoint shards:  73% Completed | 35/48 [01:01<00:37,  2.89s/it]
-Loading safetensors checkpoint shards:  75% Completed | 36/48 [01:04<00:38,  3.17s/it]
-Loading safetensors checkpoint shards:  77% Completed | 37/48 [01:09<00:38,  3.54s/it]
-Loading safetensors checkpoint shards:  79% Completed | 38/48 [01:10<00:28,  2.87s/it]
-Loading safetensors checkpoint shards:  81% Completed | 39/48 [01:12<00:21,  2.44s/it]
-Loading safetensors checkpoint shards:  83% Completed | 40/48 [01:13<00:17,  2.21s/it]
-Loading safetensors checkpoint shards:  85% Completed | 41/48 [01:14<00:12,  1.83s/it]
-Loading safetensors checkpoint shards:  88% Completed | 42/48 [01:15<00:09,  1.56s/it]
-Loading safetensors checkpoint shards:  90% Completed | 43/48 [01:17<00:07,  1.54s/it]
-Loading safetensors checkpoint shards:  92% Completed | 44/48 [01:18<00:05,  1.40s/it]
-Loading safetensors checkpoint shards:  94% Completed | 45/48 [01:18<00:03,  1.06s/it]
-Loading safetensors checkpoint shards: 100% Completed | 48/48 [01:18<00:00,  2.07it/s]
-Loading safetensors checkpoint shards: 100% Completed | 48/48 [01:18<00:00,  1.64s/it]
-
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.0.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.1.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.2.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.3.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.4.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.5.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.6.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.7.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.8.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.9.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.10.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.11.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.12.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.13.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.14.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.15.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.16.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.17.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.18.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.19.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.20.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.21.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.22.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.23.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.24.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.25.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.26.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.27.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.28.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.29.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.30.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.31.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.32.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.33.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.34.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.35.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.36.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.37.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.38.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.39.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.40.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.41.ffn E=256 topk=6
-[xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
-[xiaotu] engine built model.layers.42.ffn E=256 topk=6
-INFO 09-09 16:43:46 [default_loader.py:430] Loading weights took 209.94 seconds
-WARNING 09-09 16:43:46 [marlin_utils_fp8.py:112] Your GPU does not have native support for FP8 computation but FP8 quantization is being used. Weight-only FP8 compression will be used leveraging the Marlin kernel. This may degrade performance for compute-heavy workloads.
-INFO 09-09 16:43:47 [model_runner.py:422] Model loading took 10.22 GiB memory and 219.950596 seconds
-INFO 09-09 16:43:47 [topk_topp_sampler.py:46] FlashInfer top-p/top-k sampling disabled via VLLM_USE_FLASHINFER_SAMPLER=0.
-INFO 09-09 16:43:47 [interface.py:635] Setting kv cache block size to 256 for DEEPSEEK_SPARSE_SWA backend.
-INFO 09-09 16:43:47 [utils.py:306] Using BLHNC KV cache layout.
-INFO 09-09 16:43:48 [marlin_utils.py:625] Marlin kernel can achieve better performance for small size_n with experimental use_atomic_add feature. You can consider set environment variable VLLM_MARLIN_USE_ATOMIC_ADD to 1 if possible.
-INFO 09-09 16:44:28 [gpu_worker.py:637] Available KV cache memory: 9.9 GiB
-INFO 09-09 16:44:29 [kv_cache_utils.py:2312] GPU KV cache size: 25,840 tokens, Maximum concurrency for 16,384 tokens per request: 1.58x
-INFO 09-09 16:44:29 [indexer.py:759] DSA indexer decode path: use_flattening=False supports_varlen=False (next_n=1, use_fp4_cache=False)
-INFO 09-09 16:44:33 [gpu_worker.py:876] Free memory on device (39.07/39.49 GiB) on startup. Desired GPU memory utilization is (0.85, 33.57 GiB). Actual usage is 19.54 GiB for consumed memory (weights + non-torch), 4.13 GiB for peak activation, and 0.0 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=10472460698` (9.75 GiB) to fit into requested memory, or `--kv-cache-memory=16375085056` (15.25 GiB) to fully utilize gpu memory. Current kv cache memory in use is 9.9 GiB.
-INFO 09-09 16:44:33 [jit_monitor.py:85] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
-WARNING 09-09 16:44:34 [torch_utils.py:268] OMP_NUM_THREADS=48 is set; leaving Torch threads at 48 for serving. Multi-threaded torch CPU ops during serving can degrade performance through spin-wait contention and cgroup CPU-quota throttling.
-INFO 09-09 16:44:34 [core.py:379] init engine (profile, create kv cache, warmup model) took 46.50 s
-Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 35.29it/s]
-Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]WARNING 09-09 16:44:34 [jit_monitor.py:141] Triton kernel JIT compilation during inference: ComputePrefillMetadataKernel.kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-WARNING 09-09 16:44:34 [jit_monitor.py:141] Triton kernel JIT compilation during inference: BuildPrefillChunkMetadataKernel.kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-WARNING 09-09 16:44:34 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _deepseek_v4_sm12x_fp8_einsum_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-WARNING 09-09 16:44:35 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _dequantize_and_gather_k_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-WARNING 09-09 16:44:35 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _indexed_d512_split_score_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-WARNING 09-09 16:44:35 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _indexed_d512_split_stats_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-WARNING 09-09 16:44:35 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _indexed_d512_split_value_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-Processed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.87s/it, est. speed input: 897.41 toks/s, output: 0.06 toks/s]Processed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.87s/it, est. speed input: 897.41 toks/s, output: 0.06 toks/s]Processed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.87s/it, est. speed input: 897.41 toks/s, output: 0.06 toks/s]
-[prof] warmup 17.9s tokens=16039
-Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 42.95it/s]
-Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.92s/it, est. speed input: 895.14 toks/s, output: 0.06 toks/s]Processed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.92s/it, est. speed input: 895.14 toks/s, output: 0.06 toks/s]Processed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.92s/it, est. speed input: 895.14 toks/s, output: 0.06 toks/s]
-[prof] measured 17.94s tokens=16039
-[rank0]:[W909 16:45:10.220352032 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
-Generating '/tmp/nsys-report-dbdd.qdstrm'
-[1/1] [0%                          ] prof16k3.nsys-rep[1/1] [0%                          ] prof16k3.nsys-rep[1/1] [9%                          ] prof16k3.nsys-rep[1/1] [7%                          ] prof16k3.nsys-rep[1/1] [8%                          ] prof16k3.nsys-rep[1/1] [9%                          ] prof16k3.nsys-rep[1/1] [7%                          ] prof16k3.nsys-rep[1/1] [8%                          ] prof16k3.nsys-rep[1/1] [9%                          ] prof16k3.nsys-rep[1/1] [10%                         ] prof16k3.nsys-rep[1/1] [11%                         ] prof16k3.nsys-rep[1/1] [12%                         ] prof16k3.nsys-rep[1/1] [13%                         ] prof16k3.nsys-rep[1/1] [14%                         ] prof16k3.nsys-rep[1/1] [=15%                        ] prof16k3.nsys-rep[1/1] [=16%                        ] prof16k3.nsys-rep[1/1] [=17%                        ] prof16k3.nsys-rep[1/1] [==18%                       ] prof16k3.nsys-rep[1/1] [==19%                       ] prof16k3.nsys-rep[1/1] [==20%                       ] prof16k3.nsys-rep[1/1] [==21%                       ] prof16k3.nsys-rep[1/1] [===22%                      ] prof16k3.nsys-rep[1/1] [===23%                      ] prof16k3.nsys-rep[1/1] [===24%                      ] prof16k3.nsys-rep[1/1] [====25%                     ] prof16k3.nsys-rep[1/1] [====26%                     ] prof16k3.nsys-rep[1/1] [====27%                     ] prof16k3.nsys-rep[1/1] [====28%                     ] prof16k3.nsys-rep[1/1] [=====29%                    ] prof16k3.nsys-rep[1/1] [=====30%                    ] prof16k3.nsys-rep[1/1] [=====31%                    ] prof16k3.nsys-rep[1/1] [=====32%                    ] prof16k3.nsys-rep[1/1] [======33%                   ] prof16k3.nsys-rep[1/1] [======34%                   ] prof16k3.nsys-rep[1/1] [======35%                   ] prof16k3.nsys-rep[1/1] [=======36%                  ] prof16k3.nsys-rep[1/1] [=======37%                  ] prof16k3.nsys-rep[1/1] [=======38%                  ] prof16k3.nsys-rep[1/1] [=======39%                  ] prof16k3.nsys-rep[1/1] [======33%                   ] prof16k3.nsys-rep[1/1] [======34%                   ] prof16k3.nsys-rep[1/1] [======35%                   ] prof16k3.nsys-rep[1/1] [=======36%                  ] prof16k3.nsys-rep[1/1] [=======37%                  ] prof16k3.nsys-rep[1/1] [=======38%                  ] prof16k3.nsys-rep[1/1] [=======39%                  ] prof16k3.nsys-rep[1/1] [========40%                 ] prof16k3.nsys-rep[1/1] [========41%                 ] prof16k3.nsys-rep[1/1] [========42%                 ] prof16k3.nsys-rep[1/1] [=========43%                ] prof16k3.nsys-rep[1/1] [=======38%                  ] prof16k3.nsys-rep[1/1] [======34%                   ] prof16k3.nsys-rep[1/1] [=====30%                    ] prof16k3.nsys-rep[1/1] [====28%                     ] prof16k3.nsys-rep[1/1] [====25%                     ] prof16k3.nsys-rep[1/1] [===23%                      ] prof16k3.nsys-rep[1/1] [===22%                      ] prof16k3.nsys-rep[1/1] [==20%                       ] prof16k3.nsys-rep[1/1] [==19%                       ] prof16k3.nsys-rep[1/1] [==18%                       ] prof16k3.nsys-rep[1/1] [========================100%] prof16k3.nsys-rep
-Importer error status: Importation succeeded with non-fatal errors.
-**** Analysis failed with:
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/TraceProcessEvent.cpp(45): Throw in function const string& {anonymous}::GetCudaCallbackName(bool, uint32_t, const QuadDAnalysis::MoreInjection&)\nDynamic exception type: boost::wrapexcept<QuadDCommon::InvalidArgumentException>\nstd::exception::what: InvalidArgumentException\n[QuadDCommon::tag_message*] = Unknown driver API function index: 719\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/TraceProcessEvent.cpp(45): Throw in function const string& {anonymous}::GetCudaCallbackName(bool, uint32_t, const QuadDAnalysis::MoreInjection&)\nDynamic exception type: boost::wrapexcept<QuadDCommon::InvalidArgumentException>\nstd::exception::what: InvalidArgumentException\n[QuadDCommon::tag_message*] = Unknown driver API function index: 719\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/StringStorage.cpp(155): Throw in function QuadDCommon::StringId QuadDAnalysis::StringStorage::GetKeyForExteriorId(QuadDAnalysis::GlobalProcess, QuadDAnalysis::StringStorage::ExteriorId) const\nDynamic exception type: boost::wrapexcept<QuadDCommon::LogicException>\nstd::exception::what: LogicException\n[QuadDCommon::tag_message*] = Cannot find string for an exterior index\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/StringStorage.cpp(155): Throw in function QuadDCommon::StringId QuadDAnalysis::StringStorage::GetKeyForExteriorId(QuadDAnalysis::GlobalProcess, QuadDAnalysis::StringStorage::ExteriorId) const\nDynamic exception type: boost::wrapexcept<QuadDCommon::LogicException>\nstd::exception::what: LogicException\n[QuadDCommon::tag_message*] = Cannot find string for an exterior index\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/TraceProcessEvent.cpp(45): Throw in function const string& {anonymous}::GetCudaCallbackName(bool, uint32_t, const QuadDAnalysis::MoreInjection&)\nDynamic exception type: boost::wrapexcept<QuadDCommon::InvalidArgumentException>\nstd::exception::what: InvalidArgumentException\n[QuadDCommon::tag_message*] = Unknown driver API function index: 719\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/TraceProcessEvent.cpp(45): Throw in function const string& {anonymous}::GetCudaCallbackName(bool, uint32_t, const QuadDAnalysis::MoreInjection&)\nDynamic exception type: boost::wrapexcept<QuadDCommon::InvalidArgumentException>\nstd::exception::what: InvalidArgumentException\n[QuadDCommon::tag_message*] = Unknown driver API function index: 719\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/TraceProcessEvent.cpp(45): Throw in function const string& {anonymous}::GetCudaCallbackName(bool, uint32_t, const QuadDAnalysis::MoreInjection&)\nDynamic exception type: boost::wrapexcept<QuadDCommon::InvalidArgumentException>\nstd::exception::what: InvalidArgumentException\n[QuadDCommon::tag_message*] = Unknown driver API function index: 719\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/TraceProcessEvent.cpp(45): Throw in function const string& {anonymous}::GetCudaCallbackName(bool, uint32_t, const QuadDAnalysis::MoreInjection&)\nDynamic exception type: boost::wrapexcept<QuadDCommon::InvalidArgumentException>\nstd::exception::what: InvalidArgumentException\n[QuadDCommon::tag_message*] = Unknown driver API function index: 719\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/TraceProcessEvent.cpp(45): Throw in function const string& {anonymous}::GetCudaCallbackName(bool, uint32_t, const QuadDAnalysis::MoreInjection&)\nDynamic exception type: boost::wrapexcept<QuadDCommon::InvalidArgumentException>\nstd::exception::what: InvalidArgumentException\n[QuadDCommon::tag_message*] = Unknown driver API function index: 719\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/TraceProcessEvent.cpp(45): Throw in function const string& {anonymous}::GetCudaCallbackName(bool, uint32_t, const QuadDAnalysis::MoreInjection&)\nDynamic exception type: boost::wrapexcept<QuadDCommon::InvalidArgumentException>\nstd::exception::what: InvalidArgumentException\n[QuadDCommon::tag_message*] = Unknown driver API function index: 719\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/StringStorage.cpp(155): Throw in function QuadDCommon::StringId QuadDAnalysis::StringStorage::GetKeyForExteriorId(QuadDAnalysis::GlobalProcess, QuadDAnalysis::StringStorage::ExteriorId) const\nDynamic exception type: boost::wrapexcept<QuadDCommon::LogicException>\nstd::exception::what: LogicException\n[QuadDCommon::tag_message*] = Cannot find string for an exterior index\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/StringStorage.cpp(155): Throw in function QuadDCommon::StringId QuadDAnalysis::StringStorage::GetKeyForExteriorId(QuadDAnalysis::GlobalProcess, QuadDAnalysis::StringStorage::ExteriorId) const\nDynamic exception type: boost::wrapexcept<QuadDCommon::LogicException>\nstd::exception::what: LogicException\n[QuadDCommon::tag_message*] = Cannot find string for an exterior index\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/StringStorage.cpp(155): Throw in function QuadDCommon::StringId QuadDAnalysis::StringStorage::GetKeyForExteriorId(QuadDAnalysis::GlobalProcess, QuadDAnalysis::StringStorage::ExteriorId) const\nDynamic exception type: boost::wrapexcept<QuadDCommon::LogicException>\nstd::exception::what: LogicException\n[QuadDCommon::tag_message*] = Cannot find string for an exterior index\n"
-      }
-    }
-  }
-}
-Status: TargetProfilingFailed
-Props {
-  Items {
-    Type: DeviceId
-    Value: "Local (CLI)"
-  }
-}
-Error {
-  Type: RuntimeError
-  SubError {
-    Type: ProcessEventsError
-    Props {
-      Items {
-        Type: ErrorText
-        Value: "/dvs/p4/build/sw/devtools/Agora/Rel/DTC_F/QuadD/Host/Analysis/Modules/StringStorage.cpp(155): Throw in function QuadDCommon::StringId QuadDAnalysis::StringStorage::GetKeyForExteriorId(QuadDAnalysis::GlobalProcess, QuadDAnalysis::StringStorage::ExteriorId) const\nDynamic exception type: boost::wrapexcept<QuadDCommon::LogicException>\nstd::exception::what: LogicException\n[QuadDCommon::tag_message*] = Cannot find string for an exterior index\n"
-      }
-    }
-  }
-}
-
-
-**** Errors occurred while processing the raw events. ****
-**** Please see the Diagnostics Summary page after opening the report file in GUI. ****
-Generated:
-    /home/user/lvllm/report/prof16k3.qdstrm
-    /home/user/lvllm/report/prof16k3.nsys-rep

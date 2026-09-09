@@ -229,7 +229,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
 #if defined(__AVX512F__)
     // ----------------------------------------------------------------------
     // FAST FP4 (E2M1) gather-free AVX512 path, matching the approach used by
-    // lk-moe's `_avx512_*` engine (decompile: PSHUFB nibble decode -> vpmovzx
+    // the reference engine's AVX-512 path (PSHUFB nibble decode -> vpmovzx
     // zero-extend -> vcvtdq2ps -> vfmadd231ps, FP32 accumulate on the 512-bit
     // datapath -- no BF16 materialization, no int8). Keeps weights FP4 (packed
     // 2 values/byte) and dequantizes to FP32 in-kernel; on Zen4 the 512-bit

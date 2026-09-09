@@ -3,7 +3,7 @@
 path, unlike the offline LLM API which steps before all prompts are queued).
 
 Fires C requests of L tokens at once and reports wall time + aggregate prefill
-throughput. Env: PORT (8071), LEN (2048), CONC (1,2,4,8), MODEL name, OUT jsonl.
+throughput. Env: PORT (8000), LEN (2048), CONC (1,2,4,8), MODEL name, OUT jsonl.
 """
 import concurrent.futures as cf
 import json
@@ -11,7 +11,7 @@ import os
 import time
 import urllib.request
 
-PORT = int(os.environ.get("PORT", "8071"))
+PORT = int(os.environ.get("PORT", "8000"))
 LEN = int(os.environ.get("LEN", "2048"))
 CONC = [int(v) for v in os.environ.get("CONC", "1,2,4,8").split(",")]
 MODEL = os.environ.get("MODEL", "DeepSeek-V4-Flash-xiaotu")

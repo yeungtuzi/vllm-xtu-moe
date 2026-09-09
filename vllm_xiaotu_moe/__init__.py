@@ -2,9 +2,9 @@
 
 项目边界:本包属于 **vllm-xtu-moe**(vLLM 主线插件),不是 xiaotu-moe 项目。
 内置的 xiaotu 引擎(CPU AVX512-VNNI/BF16, MXFP4/FP8/INT4/BF16)源码来自独立项目
-`xiaotu-moe`(闭源 lk_moe 的开源重实现,现已转私有),作为**计算内核**被本插件使用。
+xiaotu 引擎(闭源 lk_moe 引擎的开源重实现),作为**计算内核**被本插件使用。
 本插件把该引擎挂到主线的 `FusedMoEFactory`(通用 CPU experts 后端)并实现混合推理。
-用法与项目关系见 README / docs/BACKLOG.md。
+用法见 README 与 docs/RUNBOOK.md。
 """
 from . import adapter  # noqa: F401
 from . import hybrid_model  # noqa: F401

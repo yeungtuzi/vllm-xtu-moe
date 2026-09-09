@@ -14,7 +14,7 @@ set -uo pipefail
 BASE="${BASE:-6c73b08dec2af5052288169663549687ba61f330}"
 UPSTREAM="${UPSTREAM:-https://github.com/vllm-project/vllm.git}"
 PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
-REPO="${REPO:-/home/user/lvllm/process_data/ref/repos/vllm-mainline}"
+REPO="${REPO:-$PWD/../vllm-mainline}"   # path to a vLLM mainline checkout
 WORK="${WORK:-/tmp/xtu-drift}"
 UP_REF=refs/remotes/up/main
 BRANCHES=(xtu/pr1-experts-load-device xtu/pr2-fp8-sm80-o-proj xtu/pr3-sm80-port)

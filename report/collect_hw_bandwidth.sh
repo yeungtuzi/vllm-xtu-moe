@@ -12,8 +12,6 @@ SOCK=$(numactl --cpunodebind=0-3 --membind=0-3 ./stream 400000000 48 | tail -1)
 ALL=$(numactl --interleave=all ./stream 400000000 192 | tail -1)
 run "$NODE"; run "$SOCK"; run "$ALL"
 
-source /home/user/anaconda3/etc/profile.d/conda.sh
-conda activate vllm-xiaotu-moe
 PCI=$(python pcie_bw.py)
 echo "$PCI" | tee -a hw_bandwidth.txt
 

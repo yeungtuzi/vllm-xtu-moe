@@ -93,4 +93,4 @@ gh issue create --repo vllm-project/vllm \
 ## 修订记录
 
 - **2026-09-09(第 1 版)** — 按 D4a 决策产出 RFC 草稿(不直接提 PR)。
-  依据:`docs/EXPERIMENT_REPORT.md` §5.3/§5.9 实测 + §4 的 PR 拆分。
+  依据:`docs/BENCHMARKS.md` 与 `docs/GPU_PREFILL.md` 的实测数据。

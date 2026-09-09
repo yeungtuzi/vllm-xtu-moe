@@ -1,13 +1,13 @@
 """让**原生(未打补丁)**的 vLLM 主线也能跑混合模式:4 处薄壳 monkey-patch。
 
-背景:混合模式需要主线的 4 处配合(见 `docs/BACKLOG.md` L8/T29):
+背景:混合模式需要主线的 4 处配合(见 `docs/ARCHITECTURE.md` §5):
   1. routed-expert 权重必须建在 CPU(否则 100+ GB 专家在构造时就 OOM);
   2. oracle 必须优先选 CPU 后端(GPU 平台默认不选);
   3. CPU 后端的 AMX 重打包必须跳过(它会破坏原始权重布局,且依赖可能未编译的
      `torch.ops._C.convert_weight_packed`);
   4. 量化方法的 `process_weights_after_loading` 必须通知 experts 后端(fp8/wna16 主线不调)。
 
-这 4 处目前都只在我们的主线补丁里(上游 PR 已按 D9 冻结)。为了让用户
+这 4 处目前尚未合并进上游。为了让用户
 **只装插件就能用**,这里用 monkey-patch 提供等价行为:
 
   shim 1  给每个 `FusedMoEMethodBase` 子类的 `create_weights` 套一层
@@ -20,7 +20,7 @@
   shim 4  包住 `process_weights_after_loading`,调用 experts 后端的同名钩子
           (若源码里已经调过则跳过,避免重复)。
 
-全部是**幂等**的:在已经打过补丁的主线上重复应用等于 no-op。
+全部是**幂等**的:在已合并相应改动的 vLLM 上重复应用等于 no-op。
 关闭:`XIAOTU_MAINLINE_SHIMS=0`。自检:`python -m vllm_xiaotu_moe.mainline_shims`。
 """
 from __future__ import annotations

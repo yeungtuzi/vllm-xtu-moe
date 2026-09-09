@@ -14,10 +14,13 @@ import sys
 import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NPZ = os.environ.get(
-    "XIAOTU_LAYER1_NPZ",
-    "/home/user/lvllm/xiaotu-moe/scripts/real_layer1_model.npz",  # 私有引擎仓库里的 fixture
-)
+NPZ = os.environ.get("XIAOTU_LAYER1_NPZ", "")
+if not NPZ or not os.path.exists(NPZ):
+    raise SystemExit(
+        "set XIAOTU_LAYER1_NPZ=<npz with w13/w2/gol13/gol2/g13/g2/E/I/H of one real "
+        "MXFP4 expert layer>; the self-contained numeric test is "
+        "scripts/test_swiglu_clamp.py"
+    )
 K = 6
 
 

@@ -16,8 +16,9 @@ from safetensors import safe_open
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-MODEL = ("/home/user/.cache/modelscope/models/deepseek-ai--"
-         "DeepSeek-V4-Flash-0731/snapshots/master")
+MODEL = os.environ.get("XIAOTU_LAYER1_NPZ", "")
+if not MODEL:
+    raise SystemExit("set XIAOTU_LAYER1_NPZ=<real layer-1 npz fixture> (see docs/BENCHMARKS.md)")
 H, I, GK, E, K = 4096, 2048, 32, 256, 6
 N_LAYERS = 43
 E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,

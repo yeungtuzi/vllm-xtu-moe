@@ -1,152 +1,0 @@
-[longprefill] GPU threshold env = 2048
-[xiaotu] GPU/CPU Mixed: MXFP4 CPU backend -> XiaotuCPUExperts (AVX512-VNNI, no AMX)
-[vllm-xiaotu-moe] registered OOT override of DeepseekV4ForCausalLM (DeepseekV4MoE -> CpuXiaotuMoE)
-INFO 09-09 10:41:16 [api_utils.py:286] non-default args: {'max_model_len': 4096, 'enable_prefix_caching': False, 'gpu_memory_utilization': 0.85, 'max_num_batched_tokens': 4096, 'max_num_seqs': 16, 'disable_log_stats': True, 'enforce_eager': True, 'kernel_config': KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=[], fused_add_rms_norm=[]), enable_flashinfer_autotune=None, enable_cutedsl_warmup=True, enable_jit_warmup=False, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto'), 'model': '/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master'}
-WARNING 09-09 10:41:16 [envs.py:2326] Unknown vLLM environment variable detected: VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS
-INFO 09-09 10:41:16 [config.py:803] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
-INFO 09-09 10:41:16 [model.py:691] Resolved architecture: DeepseekV4ForCausalLM
-INFO 09-09 10:41:16 [model.py:712] Defaulting to tokenizer_mode='deepseek_v4' for DeepseekV4ForCausalLM
-INFO 09-09 10:41:16 [model.py:2031] Using max model len 4096
-INFO 09-09 10:41:16 [scheduler.py:288] Chunked prefill is enabled with max_num_batched_tokens=4096.
-WARNING 09-09 10:41:16 [vllm.py:1382] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
-INFO 09-09 10:41:16 [vllm.py:727] Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out.
-INFO 09-09 10:41:16 [kernel.py:372] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
-INFO 09-09 10:41:16 [vllm.py:1596] Cudagraph is disabled under eager mode
-INFO 09-09 10:41:16 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
-(EngineCore pid=479931) INFO 09-09 10:41:17 [core.py:123] Initializing a V1 LLM engine (v0.1.dev1+g6c73b08de) with config: model='/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master', speculative_config=None, tokenizer='/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master', skip_tokenizer_init=False, tokenizer_mode=deepseek_v4, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=4096, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=deepseek_v4_fp8, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['+quant_fp8', 'all', '+quant_fp8'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [4096], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=False, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
-(EngineCore pid=479931) INFO 09-09 10:41:17 [parallel_state.py:1798] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_02138edd625e46d6ba277d66fb1b64b2 backend=nccl
-(EngineCore pid=479931) INFO 09-09 10:41:17 [parallel_state.py:2142] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
-(EngineCore pid=479931) INFO 09-09 10:41:17 [gpu_worker.py:438] Using V2 Model Runner
-(EngineCore pid=479931) INFO 09-09 10:41:18 [model_runner.py:390] Loading model from scratch...
-(EngineCore pid=479931) INFO 09-09 10:41:18 [quant_config.py:75] DeepSeek V4 expert_dtype resolved to 'fp4'
-(EngineCore pid=479931) INFO 09-09 10:41:18 [__init__.py:698] Selected MarlinFP8ScaledMMLinearKernel for Fp8LinearMethod
-(EngineCore pid=479931) INFO 09-09 10:41:18 [attention.py:120] Using DeepSeek's fp8_ds_mla KV cache format.
-(EngineCore pid=479931) INFO 09-09 10:41:18 [attention.py:928] Using FP8 indexer cache for Lightning Indexer.
-(EngineCore pid=479931) INFO 09-09 10:41:24 [weight_utils.py:895] Filesystem type for checkpoints: EXT4. Checkpoint size: 155.43 GiB. Available RAM: 1183.70 GiB.
-(EngineCore pid=479931) INFO 09-09 10:41:24 [weight_utils.py:918] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
-(EngineCore pid=479931) Loading safetensors checkpoint shards:   0% Completed | 0/48 [00:00<?, ?it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:   2% Completed | 1/48 [00:00<00:06,  7.46it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:   4% Completed | 2/48 [00:00<00:13,  3.35it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:   6% Completed | 3/48 [00:01<00:19,  2.35it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:   8% Completed | 4/48 [00:01<00:20,  2.13it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  10% Completed | 5/48 [00:02<00:21,  1.98it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  12% Completed | 6/48 [00:02<00:21,  1.95it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  15% Completed | 7/48 [00:03<00:21,  1.91it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  17% Completed | 8/48 [00:03<00:21,  1.89it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  19% Completed | 9/48 [00:04<00:20,  1.86it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  21% Completed | 10/48 [00:04<00:21,  1.80it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  23% Completed | 11/48 [00:05<00:22,  1.65it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  25% Completed | 12/48 [00:06<00:26,  1.34it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  27% Completed | 13/48 [00:07<00:29,  1.18it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  29% Completed | 14/48 [00:08<00:29,  1.16it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  31% Completed | 15/48 [00:09<00:25,  1.31it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  33% Completed | 16/48 [00:09<00:22,  1.42it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  35% Completed | 17/48 [00:10<00:20,  1.49it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  38% Completed | 18/48 [00:11<00:19,  1.55it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  40% Completed | 19/48 [00:11<00:17,  1.63it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  42% Completed | 20/48 [00:12<00:16,  1.69it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  44% Completed | 21/48 [00:12<00:15,  1.74it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  46% Completed | 22/48 [00:13<00:14,  1.76it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  48% Completed | 23/48 [00:13<00:14,  1.78it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  50% Completed | 24/48 [00:14<00:13,  1.76it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  52% Completed | 25/48 [00:14<00:13,  1.75it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  54% Completed | 26/48 [00:15<00:12,  1.74it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  56% Completed | 27/48 [00:16<00:11,  1.75it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  58% Completed | 28/48 [00:16<00:11,  1.76it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  60% Completed | 29/48 [00:17<00:10,  1.77it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  62% Completed | 30/48 [00:17<00:10,  1.76it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  65% Completed | 31/48 [00:18<00:09,  1.75it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  67% Completed | 32/48 [00:18<00:08,  1.79it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  69% Completed | 33/48 [00:19<00:08,  1.81it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  71% Completed | 34/48 [00:19<00:07,  1.77it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  73% Completed | 35/48 [00:20<00:07,  1.77it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  75% Completed | 36/48 [00:21<00:06,  1.76it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  77% Completed | 37/48 [00:21<00:06,  1.76it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  79% Completed | 38/48 [00:22<00:05,  1.75it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  81% Completed | 39/48 [00:22<00:05,  1.75it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  83% Completed | 40/48 [00:23<00:04,  1.73it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  85% Completed | 41/48 [00:24<00:04,  1.73it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  88% Completed | 42/48 [00:24<00:03,  1.76it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  90% Completed | 43/48 [00:25<00:02,  1.80it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  92% Completed | 44/48 [00:25<00:02,  1.76it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards:  94% Completed | 45/48 [00:26<00:01,  2.02it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards: 100% Completed | 48/48 [00:26<00:00,  4.21it/s]
-(EngineCore pid=479931) Loading safetensors checkpoint shards: 100% Completed | 48/48 [00:26<00:00,  1.84it/s]
-(EngineCore pid=479931) 
-(EngineCore pid=479931) [xiaotu] engine built model.layers.0.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.1.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.2.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.3.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.4.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.5.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.6.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.7.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.8.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.9.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.10.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.11.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.12.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.13.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.14.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.15.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.16.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.17.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.18.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.19.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.20.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.21.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.22.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.23.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.24.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.25.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.26.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.27.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.28.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.29.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.30.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.31.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.32.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.33.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.34.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.35.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.36.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.37.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.38.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.39.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.40.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.41.ffn E=256 topk=6
-(EngineCore pid=479931) [xiaotu] engine built model.layers.42.ffn E=256 topk=6
-(EngineCore pid=479931) INFO 09-09 10:42:54 [default_loader.py:430] Loading weights took 89.28 seconds
-(EngineCore pid=479931) WARNING 09-09 10:42:54 [marlin_utils_fp8.py:112] Your GPU does not have native support for FP8 computation but FP8 quantization is being used. Weight-only FP8 compression will be used leveraging the Marlin kernel. This may degrade performance for compute-heavy workloads.
-(EngineCore pid=479931) INFO 09-09 10:42:55 [model_runner.py:422] Model loading took 10.19 GiB memory and 96.985685 seconds
-(EngineCore pid=479931) INFO 09-09 10:42:55 [topk_topp_sampler.py:46] FlashInfer top-p/top-k sampling disabled via VLLM_USE_FLASHINFER_SAMPLER=0.
-(EngineCore pid=479931) INFO 09-09 10:42:55 [interface.py:635] Setting kv cache block size to 256 for DEEPSEEK_SPARSE_SWA backend.
-(EngineCore pid=479931) INFO 09-09 10:42:55 [utils.py:306] Using BLHNC KV cache layout.
-(EngineCore pid=479931) INFO 09-09 10:42:56 [marlin_utils.py:625] Marlin kernel can achieve better performance for small size_n with experimental use_atomic_add feature. You can consider set environment variable VLLM_MARLIN_USE_ATOMIC_ADD to 1 if possible.
-(EngineCore pid=479931) INFO 09-09 10:43:23 [gpu_worker.py:637] Available KV cache memory: 16.0 GiB
-(EngineCore pid=479931) INFO 09-09 10:43:24 [kv_cache_utils.py:2312] GPU KV cache size: 41,679 tokens, Maximum concurrency for 4,096 tokens per request: 10.18x
-(EngineCore pid=479931) INFO 09-09 10:43:24 [indexer.py:759] DSA indexer decode path: use_flattening=False supports_varlen=False (next_n=1, use_fp4_cache=False)
-(EngineCore pid=479931) INFO 09-09 10:43:26 [gpu_worker.py:876] Free memory on device (39.08/39.49 GiB) on startup. Desired GPU memory utilization is (0.85, 33.57 GiB). Actual usage is 10.6 GiB for consumed memory (weights + non-torch), 6.97 GiB for peak activation, and 0.0 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=17017472410` (15.85 GiB) to fit into requested memory, or `--kv-cache-memory=22932679680` (21.36 GiB) to fully utilize gpu memory. Current kv cache memory in use is 16.0 GiB.
-(EngineCore pid=479931) INFO 09-09 10:43:26 [jit_monitor.py:85] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
-(EngineCore pid=479931) WARNING 09-09 10:43:26 [torch_utils.py:268] OMP_NUM_THREADS=96 is set; leaving Torch threads at 96 for serving. Multi-threaded torch CPU ops during serving can degrade performance through spin-wait contention and cgroup CPU-quota throttling.
-(EngineCore pid=479931) INFO 09-09 10:43:26 [core.py:379] init engine (profile, create kv cache, warmup model) took 31.57 s
-(EngineCore pid=479931) INFO 09-09 10:43:26 [kernel.py:372] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
-Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 60.40it/s]
-Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=479931) WARNING 09-09 10:43:26 [jit_monitor.py:141] Triton kernel JIT compilation during inference: ComputePrefillMetadataKernel.kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-(EngineCore pid=479931) WARNING 09-09 10:43:26 [jit_monitor.py:141] Triton kernel JIT compilation during inference: BuildPrefillChunkMetadataKernel.kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-(EngineCore pid=479931) WARNING 09-09 10:43:26 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _deepseek_v4_sm12x_fp8_einsum_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-(EngineCore pid=479931) WARNING 09-09 10:43:27 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _gate_up_bf16_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-(EngineCore pid=479931) WARNING 09-09 10:43:27 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _down_bf16_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-(EngineCore pid=479931) WARNING 09-09 10:43:30 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _dequantize_and_gather_k_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-Processed prompts: 100%|██████████| 1/1 [00:32<00:00, 32.26s/it, est. speed input: 109.15 toks/s, output: 0.03 toks/s]Processed prompts: 100%|██████████| 1/1 [00:32<00:00, 32.26s/it, est. speed input: 109.15 toks/s, output: 0.03 toks/s]Processed prompts: 100%|██████████| 1/1 [00:32<00:00, 32.26s/it, est. speed input: 109.15 toks/s, output: 0.03 toks/s]
-Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 136.72it/s]
-Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:29<00:00, 29.54s/it, est. speed input: 124.63 toks/s, output: 0.03 toks/s]Processed prompts: 100%|██████████| 1/1 [00:29<00:00, 29.54s/it, est. speed input: 124.63 toks/s, output: 0.03 toks/s]Processed prompts: 100%|██████████| 1/1 [00:29<00:00, 29.54s/it, est. speed input: 124.63 toks/s, output: 0.03 toks/s]
-[longprefill] CPU  TTFT=32.28s text=' Marie'
-[longprefill] GPU  TTFT=29.54s text=' The'
-INFO 09-09 10:44:28 [utils.py:620] [shutdown] Process manager: send sigterm to process EngineCore
-(EngineCore pid=479931) INFO 09-09 10:44:28 [core.py:1361] [shutdown] EngineCore: trigger received signal=SIGTERM
-(EngineCore pid=479931) INFO 09-09 10:44:28 [core.py:1512] [shutdown] EngineCore: start mode=abort timeout=0s
-(EngineCore pid=479931) INFO 09-09 10:44:28 [core.py:1543] [shutdown] EngineCore: request processing complete; starting resource teardown
-(EngineCore pid=479931) INFO 09-09 10:44:28 [core.py:1374] [shutdown] EngineCore: exiting busy loop
-WARNING 09-09 10:44:33 [utils.py:640] [shutdown] Process manager: force killing remaining processes count=1
-WARNING 09-09 10:44:33 [utils.py:645] [shutdown] Process manager: force killing remaining process EngineCore pid 479931

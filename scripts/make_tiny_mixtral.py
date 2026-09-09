@@ -19,11 +19,14 @@ import sys
 import torch
 from safetensors.torch import save_file
 
-SRC = (
-    "/home/user/.cache/huggingface/hub/models--hf-internal-testing--"
-    "tiny-random-MixtralForCausalLM/snapshots/ccb12fe2fc142cb752085506c3db22572290e90c"
-)
-OUT = sys.argv[1] if len(sys.argv) > 1 else "/home/user/lvllm/tiny-mixtral-vllm"
+# Source of the tokenizer/config template (a public tiny Mixtral checkpoint).
+SRC = os.environ.get("TINY_SRC", "")
+if not SRC:
+    raise SystemExit(
+        "set TINY_SRC to a local snapshot of "
+        "hf-internal-testing/tiny-random-MixtralForCausalLM (tokenizer/config only)"
+    )
+OUT = sys.argv[1] if len(sys.argv) > 1 else "./tiny-mixtral-vllm"
 
 H, I, V = 64, 128, 32000
 E, TOPK, L = 4, 2, 2

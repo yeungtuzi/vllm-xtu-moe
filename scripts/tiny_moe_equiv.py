@@ -30,11 +30,9 @@ else:
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
-MODEL = os.environ.get(
-    "TINY_MODEL",
-    "/home/user/.cache/huggingface/hub/models--hf-internal-testing--tiny-random-MixtralForCausalLM"
-    "/snapshots/ccb12fe2fc142cb752085506c3db22572290e90c",
-)
+MODEL = os.environ.get("TINY_MODEL", "")
+if not MODEL:
+    raise SystemExit("set TINY_MODEL to the checkpoint produced by scripts/make_tiny_mixtral.py")
 PROMPTS = [
     [100, 200, 300, 400, 500],
     [42] * 16,

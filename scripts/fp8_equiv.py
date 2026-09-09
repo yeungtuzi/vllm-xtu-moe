@@ -24,11 +24,9 @@ else:
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
-MODEL = os.environ.get(
-    "SMOKE_MODEL",
-    "/home/user/.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507-FP8"
-    "/snapshots/5a5a776300a41aaa681dd7ff0106608ef2bc90db",
-)
+MODEL = os.environ.get("SMOKE_MODEL", "")
+if not MODEL:
+    raise SystemExit("set SMOKE_MODEL=<path or HF repo id of an fp8 MoE model>")
 QUESTIONS = [
     "中国的首都是哪座城市?只回答城市名。",
     "1+1 等于几?只回答数字。",

@@ -1,8 +1,7 @@
 // xiaotu-moe Python binding (pybind11)
 //
-// Exposes the MOE_V2 family plus MOEConfigV2, mirroring the public surface of
-// lk_moe's own pybind11 module (see LK_MOE_ABI_SPEC.md) but written fresh and
-// self-contained. Constructors follow the real ABI: every engine takes
+// Exposes the MOE_V2 family plus MOEConfigV2 with a stable constructor ABI:
+// every engine takes
 // (cfg, w13_weight, w2_weight, w13_scale=0, w2_scale=0, w13_global_scale=0,
 //  w2_global_scale=0) where the weight/scale args are integer data pointers
 // (numpy arrays are also accepted for convenience; their data() is used).

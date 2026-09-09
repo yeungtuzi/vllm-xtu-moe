@@ -24,11 +24,9 @@ os.environ.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "7200")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
-MODEL = os.environ.get(
-    "SMOKE_MODEL",
-    "/home/user/.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507-FP8"
-    "/snapshots/5a5a776300a41aaa681dd7ff0106608ef2bc90db",
-)
+MODEL = os.environ.get("SMOKE_MODEL", "")
+if not MODEL:
+    raise SystemExit("set SMOKE_MODEL=<path or HF repo id of an fp8 MoE model>")
 MAXLEN = int(os.environ.get("SMOKE_MAXLEN", "4096"))
 LONG_TOKENS = int(os.environ.get("SMOKE_LONG_TOKENS", "2000"))
 

@@ -25,9 +25,9 @@ import sys
 
 import numpy as np
 
-MODEL = os.environ.get(
-    "GLM_MODEL", "/home/user/.cache/modelscope/models/zai-org/GLM-5.3-Flash"
-)
+MODEL = os.environ.get("GLM_MODEL", "")
+if not MODEL:
+    raise SystemExit("set GLM_MODEL=<local path of the GLM-5.3-Flash checkpoint>")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 

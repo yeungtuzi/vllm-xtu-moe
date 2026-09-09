@@ -41,8 +41,8 @@
 
 namespace xiaotu_moe {
 
-// Minimal config matching lk_moe.MOEConfigV2 field semantics (field order and
-// names follow the ABI spec; see LK_MOE_ABI_SPEC.md).
+// Minimal engine configuration (field order and names follow the reference
+// engine's config semantics).
 struct MOEConfigV2 {
     int   num_processes = 1;
     int   process_id = 0;

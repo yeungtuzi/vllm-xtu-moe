@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build the bundled xiaotu engine in all ISA variants (one .so per ISA level).
 #
-# 本脚本构建的是 **本仓库内置的引擎**(`xiaotu_moe/csrc`),不依赖外部
-# xiaotu-moe 仓库。同一份 `csrc/python_binding/binding.cpp` 编译多次,每次用不同的
+# 本脚本构建的是 **本仓库内置的引擎**(`xiaotu_moe/csrc`),不依赖外部仓库。
+# 同一份 `python_binding/binding.cpp` 编译多次,每次用不同的
 # ISA 宏和一个独立的 pybind 模块名 `_xiaotu_moe_C_<suffix>`;`xiaotu_moe/loader.py`
 # 在导入时按 /proc/cpuinfo 选最高可用变体。
 #
@@ -11,11 +11,11 @@
 #   avx2            -mavx2 -mfma
 #   avx512_base     -mavx512f -mavx512bw -mavx512vl -mavx512dq
 #   avx512_vnni     base + -mavx512vnni
-#   avx512_bf16     base + -mavx512bf16(本机 EPYC 9654 有)
-#   avx512_amx      本机无 AMX,loader 不会选,故不构建
+#   avx512_bf16     base + -mavx512bf16
+#   avx512_amx      AMX(未接线,不构建)
 #
 # 用法:
-#   PYTHON=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python scripts/build_engine_variants.sh
+#   PYTHON=/path/to/venv/bin/python scripts/build_engine_variants.sh
 #   PYBIND11_INC=... CUDART_ROOT=... 可覆盖自动探测
 #
 # License: Apache-2.0
@@ -34,7 +34,7 @@ PY_EXT="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SU
 if [[ -z "${PYBIND11_INC:-}" ]]; then
   for cand in \
       "$("$PYTHON" -c 'import pybind11, os; print(os.path.join(pybind11.get_include()))' 2>/dev/null)" \
-      /home/user/lvllm/.search-venv/lib/python3.10/site-packages/pybind11/include ; do
+      /usr/include/pybind11 /usr/local/include/pybind11 ; do
     [[ -n "$cand" && -d "$cand" ]] && PYBIND11_INC="$cand" && break
   done
 fi

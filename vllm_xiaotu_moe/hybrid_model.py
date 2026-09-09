@@ -1,6 +1,6 @@
 """vllm-xtu-moe: 主线 DS-V4 的 OOT hybrid 模型覆盖(把 MoE 层挪 CPU 走 xiaotu).
 
-机制(已源码 + GPU2 实测实证,见 docs/hybrid_adapter_design.md §5、results.txt M2/M2-2/M1):
+机制(已源码实证,见 docs/ARCHITECTURE.md):
   - vLLM 主线原生支持 DeepSeek-V4(vllm.models.deepseek_v4,nvidia 平台)。
   - ModelRegistry.register_model("DeepseekV4ForCausalLM", "<module>:<class>") 直接覆盖主线该
     arch(registry.py overwrite 明确);main 里 entry-points 把 register() 挂到 vllm.general_plugins。

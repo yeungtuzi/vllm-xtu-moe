@@ -1,8 +1,8 @@
 # vllm-xtu-moe: xiaotu 引擎挂进 vLLM 主线的 FusedMoEExperts 计算模块。
 #
-# 设计目标(详见 ref/fork_vs_mainline_plugin_decision.md §9 / README.md):
+# 设计目标(详见 docs/ARCHITECTURE.md / README.md):
 #   - 复用主线战育:serving/KV/scheduling/TP 全部用主线;
-#   - 提供主线在本机【没有】的 CPU 量化内核:无 AMX 的 x86 上跑 MXFP4/FP8(AMX-only 之外)。
+#   - 提供主线未覆盖的 CPU 量化内核:在无 AMX 的 x86 上运行 MXFP4/FP8。
 # 本文件是适配层占位/骨架:以主线 cpu_moe.py 的 CPUExpertsMxfp4/FP8 为蓝本,把计算内核
 # 换成 xiaotu 引擎。尚未能运行(依赖 xiaotu csrc 被识别为 vLLM CPU 内核,见表单,见 DOC 文档)。
 # 实现状态:WIP。
@@ -39,7 +39,7 @@ class XiaotuMxfp4CPUExperts(FusedMoEExpertsMonolithic):
     """在无 AMX 的 x86 上,用 xiaotu 引擎计算 MXFP4 MoE 的模块(替代主线 CPUExpertsMxfp4)。
 
     与主线 CPUExpertsMxfp4 的唯一关键差异:_supports_current_device 不要求 AMX
-    (本机 AMD EPYC 9654 无 AMX,主线因此在本机无 MXFP4 CPU 内核;本类补上)。
+    (主线自带的 CPU 内核要求 Intel AMX;本类补上无 AMX 的 x86 路径)。
     """
 
     def __init__(self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig):
@@ -175,7 +175,7 @@ class XiaotuMxfp4CPUExperts(FusedMoEExpertsMonolithic):
 
 
 # ---- 注册:让主线分发器在 CPU+x86 上选中本类 ----
-# 分两条(见 ref/fork_vs_mainline_plugin_decision.md §3):
+# 分两条(见 docs/ARCHITECTURE.md):
 #  A. CustomOp 覆盖:"modular_fused_moe" 已被主线注册;外部包需用 vLLM 的插件注册机制覆盖。
 #  B. 作为子类进注册表:需接入主线 FusedMoEExperts 的 class 发现/枚举清单。
 # 两者都需要主线开放"如何发现额外 CPU expert 类"的挂点 —— 这正是下一步要在实测里确认的

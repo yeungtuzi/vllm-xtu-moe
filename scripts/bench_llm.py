@@ -3,7 +3,6 @@
 
 用法:MODEL=...  CONCURRENCY=N  python scripts/bench_llm.py
 给 N 条短 prompt、每条生成 O 个 token,测 decode 阶段 tok/s(近似=批处理吞吐)。
-注意:性能测量前按"静默原则"停掉对 prod 8070 的调用(用户负责),否则 CPU/GPU 被 prod 占用。
 """
 import os
 import sys
