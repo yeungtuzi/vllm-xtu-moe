@@ -366,23 +366,33 @@ routed MoE 放 CPU、注意力放 GPU)增加一条**逐层流式 GPU prefill** �
 异步预取",**要求权重放得进 VRAM**;DS-V4 的 137 GiB 放不进 40 GB,所以本方案改成
 "每层算完即释放"。PR4 应复用 `PrefetchOffloader` 的 stream/event 骨架而不是另造一套。
 
-### 4.1 需要用户确认的决策点
+### 4.1 决策点(D1–D8,已由项目所有者拍板 2026-09-09)
 
-以下是**只有项目所有者能拍板**、我无法从代码或数据推断的选项:
-
-| # | 决策点 | 选项 | 影响 / 我的建议 |
+| # | 决策点 | 决定 | 执行状态 |
 |---|---|---|---|
-| D1 | **是否真的提 upstream,还是先只发仓库** | (a) 只开源 `vllm-xtu-moe` 仓库;(b) 向 vLLM 提 PR | 建议先 (a) 攒外部反馈,再决定 PR —— PR3 体量大(7000 行),贸然提容易被要求重写 |
-| D2 | **PR3(SM80 移植)的代码来源与署名** | (a) 逐字节用 fork `Lvllmds4-x` 的实现并保留其作者署名/许可;(b) 自己重写成更小的补丁 | 纪律 #2 是"凡 fork 已有的直接用",所以建议 (a);但需要你确认 fork 作者的署名/许可条款是否满足你对外发布的要求 |
-| D3 | **PR2(fp8 `is_bmm` 修复)要不要拆出来单独提** | (a) 单独一个小 PR;(b) 并进 PR1 | 建议 (a):这是一个独立的正确性 bug,主线 SM80 用户都会踩,单独提更容易被接受 |
-| D4 | **PR4(通用逐层 GPU prefill 钩子)的形态** | (a) 提一个新的 vLLM 公共 API(`VLLM_GPU_PREFILL_MIN_TOKENS` + `stream_layer_weights()/release()` 契约);(b) 只作为插件留在我们仓库 | (a) 需要 vLLM maintainer 先认可"CPU-offload MoE 的逐层 prefill"这个方向(建议先发 RFC issue);(b) 无风险但收益只在自己项目 |
-| D5 | **MXFP4 Triton 内核要不要一起上游** | (a) 作为 vLLM 的"MXFP4 grouped MoE backend"提(主线 Marlin 不支持 block-32,是真实空白);(b) 只留在插件 | 建议 (a) 单独讨论 —— 但它目前只到 7% MFU,可能先做 §7.2 的优化再提 |
-| D6 | **PR 的提交者与分支** | (a) 你提(用你的 GitHub 身份);(b) 我准备 patch + PR 描述,你来点提交 | 我这边可以产出 `patches/*.patch` + PR 描述草稿;最终提交动作建议由你执行 |
-| D7 | **调试脚手架与内部命名的清理范围** | (a) 上游前删除全部 `XIAOTU_DEBUG_*`/`XIAOTU_TIMING`;(b) 保留但 env-gated | 建议 (a):§3.4 列了位置。另外上游版本里插件包名/环境变量是否也要改成 `XTU_*` 前缀,需要你定(改前缀会打断现有配置,所以我目前只改了对外显示名) |
-| D8 | **许可证与仓库归属** | 当前 Apache-2.0、作者"大河马";引擎部分继承 xiaotu-moe 的许可 | 需要你确认对外发布的 LICENSE / NOTICE / 第三方声明(fork 代码、ktransformers 衍生部分) |
+| D1 | 先发仓库还是直接提 PR | **先发仓库攒反馈** | ✅ 仓库已转 public:<https://github.com/yeungtuzi/vllm-xtu-moe>(内网地址已脱敏) |
+| D2 | PR3 的代码来源与署名 | **逐字节采用 fork `Lvllmds4-x`,保留署名** | ✅ 分支已推;文件保留 SPDX 头,提交信息里写明来源 |
+| D3 | PR2 单独提 | **单独小 PR** | ✅ `xtu/pr2-fp8-sm80-o-proj`(4 文件 +424/−12) |
+| D4 | PR4 形态 | **先发 RFC issue** | ✅ 草稿 `patches/rfc_layerwise_gpu_prefill.md`(待你发) |
+| D5 | MXFP4 内核是否上游 | **暂留插件** | ✅ 未纳入任何 PR |
+| D6 | 谁提交 PR | **我准备分支+描述,你点提交** | ✅ 3 个分支已在 `yeungtuzi/vllm`,标题/描述/测试说明见 `patches/UPSTREAM_PRS.md` |
+| D7 | 清理范围 | **删掉全部 `XIAOTU_DEBUG_*`/`XIAOTU_TIMING` 埋点;内部命名前缀不改** | ✅ PR3 里用 AST 精确删除(共 38 处/122 行),`grep XIAOTU` = 0;插件侧包名/env 前缀保持不变 |
+| D8 | 许可证与署名 | **我方 Apache-2.0,署名"大河马(BigHippo) dahema@me.com";第三方按其 license 要求署名** | ✅ 新增 `NOTICE`、`THIRD_PARTY_NOTICES.md`;`pyproject` 作者更新 |
 
-> 除 D1–D8 之外的部分(改哪些文件、每个 PR 的范围、验证方式)我已经在 §3/§4 里定好,
-> 不需要额外确认。
+### 4.2 上游分支现状(D6b:等你点提交)
+
+| PR | 分支(`yeungtuzi/vllm`) | 规模 | 依赖 |
+|---|---|---|---|
+| PR1 | `xtu/pr1-experts-load-device` | 3 文件 +53/−2 | 无 |
+| PR2 | `xtu/pr2-fp8-sm80-o-proj` | 4 文件 +424/−12 | 无 |
+| PR3 | `xtu/pr3-sm80-port` | 21 文件 +6346/−119 | 建议在 PR2 之后 |
+| RFC | — | issue 草稿 | 建议等 PR1 有回应 |
+
+- 标题、完整描述(含测试说明)与一键 compare 链接:`patches/UPSTREAM_PRS.md`
+- PR1 与 PR3 都会改 `vllm/envs.py`(互不重叠的两组变量),合入时可能有一次
+  trivial 冲突,已在 PR 说明里注明。
+- PR3 的代码来自 fork `Lvllmds4-x`(Apache-2.0),只做了主线 API 适配
+  (如 `combine_topk_swa_indices` 改为返回 `(idx, lens)`)。
 
 ---
 
@@ -832,6 +842,10 @@ python report/make_figs.py
 
 ## 修订记录
 
+- **2026-09-09(第 9 版)** — §4.1 换成 D1–D8 的**决策与执行状态表**;新增 §4.2
+  上游分支现状(PR1/PR2/PR3 已推送到 `yeungtuzi/vllm`);新增 `NOTICE`、
+  `THIRD_PARTY_NOTICES.md`;`pyproject` 作者改为"大河马 (BigHippo)"。
+  依据:用户 2026-09-09 对 D1–D8 的回复。
 - **2026-09-09(第 8 版)** — 优化项 ⑤ 落地一项:`_down_kernel` 输出累加改
   `sem="relaxed"`(T=16K 198.7→191.4 ms,32K 1994→2066 tok/s),并记录 5 项被证伪的
   变体与下一档(per-slot 缓冲 + 归约,可再 +6.3%)。
