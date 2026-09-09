@@ -31,6 +31,9 @@ QUESTIONS = [
     "中国的首都是哪座城市?只回答城市名。",
     "1+1 等于几?只回答数字。",
 ]
+# 可用 QUESTIONS_INDEX=0,1 只跑其中一条(用于定位"跨请求状态污染")
+if os.environ.get("QUESTIONS_INDEX"):
+    QUESTIONS = [QUESTIONS[int(i)] for i in os.environ["QUESTIONS_INDEX"].split(",")]
 
 
 def main() -> int:
@@ -46,7 +49,7 @@ def main() -> int:
         tensor_parallel_size=1,
         gpu_memory_utilization=0.85,
         max_model_len=4096,
-        max_num_seqs=2,
+        max_num_seqs=int(os.environ.get("MAX_SEQS", "2")),
         enforce_eager=True,
         trust_remote_code=False,
         dtype="bfloat16",

@@ -108,6 +108,7 @@ xiaotu_moe variant = _avx512_bf16
 | `XIAOTU_VERIFY_LAYER=1` | 层内数值自校验:每层首次调用时用 torch 参考实现复算并打印 `rel_rms` |
 | `XIAOTU_MOE_THREADS=<n>` | 引擎线程数(默认使用共享 NUMA 池的全部核心) |
 | `XIAOTU_MOE_NOSHARD=1` | 关闭权重 NUMA 分片(调试用) |
+| `XIAOTU_SYNC_DECODE` | 默认 `1`:引擎调用前后与设备同步(保证多请求结果正确);`0` 关闭(仅性能实验) |
 | `XIAOTU_NVTX=1` / `XIAOTU_TORCH_PROFILE=<dir>` | NVTX / torch profiler 埋点 |
 
 ### 3.4 常用命令行参数

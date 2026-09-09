@@ -48,6 +48,9 @@ from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
 
 
 _VERIFY_LAYER = os.environ.get("XIAOTU_VERIFY_LAYER", "") == "1"
+_VERIFY_MAX = int(os.environ.get("XIAOTU_VERIFY_MAX", "1"))
+_DUMP_LAYER = os.environ.get("XIAOTU_DUMP_LAYER", "")
+_HID_LAYER = os.environ.get("XIAOTU_HID_LAYER", "")
 
 
 def mixed_mode_enabled() -> bool:
@@ -388,7 +391,7 @@ class _XiaotuExpertsMixin:
             rel = float(torch.sqrt(torch.mean((got - ref) ** 2)) / (rms + 1e-12))
             print(
                 f"[vllm-xtu-moe/verify] {self._engine_attr} "
-                f"layer={getattr(layer, 'layer_name', '?')} ids0={ids_row} "
+                f"layer={getattr(layer, 'layer_name', '?')} M={hidden_states.shape[0]} ids0={ids_row} "
                 f"w0={[round(float(v), 4) for v in topk_weights[0]]} "
                 f"ref_rms={rms:.4f} rel_rms={rel:.4e} "
                 f"max_abs={float((got - ref).abs().max()):.4e}",
@@ -400,6 +403,76 @@ class _XiaotuExpertsMixin:
             print(f"[vllm-xtu-moe/verify] failed: {type(exc).__name__}: {exc}",
                   flush=True)
             traceback.print_exc()
+
+    # ---- optional one-shot dump/compare against the checkpoint -----------
+    def _dump_layer(self, layer):
+        """XIAOTU_DUMP_LAYER=<layer_name 子串> 时,打印已加载张量的形状/样例值;
+        若 XIAOTU_CKPT_DIR 指向 checkpoint 目录,再与原始 per-expert 张量逐项比对。
+        用途:判断"引擎与 torch 参考一致但模型输出不对"是否来自权重加载布局。"""
+        import json
+        import re
+
+        import numpy as np
+
+        name = getattr(layer, "layer_name", "")
+        w13, w2 = layer.w13_weight, layer.w2_weight
+        s13, s2 = self._scales
+        print(
+            f"[dump] layer={name} w13={tuple(w13.shape)}{w13.dtype} "
+            f"w2={tuple(w2.shape)}{w2.dtype} "
+            f"s13={None if s13 is None else tuple(s13.shape)} "
+            f"s2={None if s2 is None else tuple(s2.shape)} "
+            f"attrs_scale=({getattr(layer, 'w13_weight_scale_inv', None) is not None},"
+            f"{getattr(layer, 'w2_weight_scale_inv', None) is not None})",
+            flush=True,
+        )
+        ckpt = os.environ.get("XIAOTU_CKPT_DIR")
+        m = re.search(r"layers\.(\d+)", name)
+        if not ckpt or not m:
+            return
+        li = m.group(1)
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            return
+        idx_path = os.path.join(ckpt, "model.safetensors.index.json")
+        if not os.path.exists(idx_path):
+            return
+        wm = json.load(open(idx_path))["weight_map"]
+
+        def load(key, dtype_cast=None):
+            with safe_open(os.path.join(ckpt, wm[key]), framework="pt") as f:
+                t = f.get_tensor(key)
+            return t
+
+        import torch as _t
+
+        pre = f"model.layers.{li}.mlp.experts.0."
+        pairs = [
+            ("w13[:I] vs gate", w13[0][: w13.shape[1] // 2],
+             load(pre + "gate_proj.weight")),
+            ("w13[I:] vs up", w13[0][w13.shape[1] // 2:],
+             load(pre + "up_proj.weight")),
+            ("w2 vs down", w2[0], load(pre + "down_proj.weight")),
+        ]
+        for label, got, want in pairs:
+            g = got.view(_t.uint8).numpy() if got.dtype == _t.float8_e4m3fn else got.numpy()
+            w = want.view(_t.uint8).numpy() if want.dtype == _t.float8_e4m3fn else want.numpy()
+            same = g.shape == w.shape
+            diff = float(np.abs(g.astype(np.int16) - w.astype(np.int16)).max()) if same else -1
+            print(f"[dump]   {label}: shape got={g.shape} ckpt={w.shape} "
+                  f"byte_max_diff={diff}", flush=True)
+        if s13 is not None:
+            gs = s13[0].float().numpy()
+            gs_ck = load(pre + "gate_proj.weight_scale_inv").float().numpy()
+            us_ck = load(pre + "up_proj.weight_scale_inv").float().numpy()
+            d2 = s2[0].float().numpy()
+            ds_ck = load(pre + "down_proj.weight_scale_inv").float().numpy()
+            print(f"[dump]   s13 got={gs.shape} ckpt_cat={np.concatenate([gs_ck, us_ck], 0).shape} "
+                  f"gate_diff={float(np.abs(gs[:gs_ck.shape[0]] - gs_ck).max()):.3e} "
+                  f"up_diff={float(np.abs(gs[gs_ck.shape[0]:] - us_ck).max()):.3e} "
+                  f"s2 got={d2.shape} ckpt={ds_ck.shape} "
+                  f"diff={float(np.abs(d2 - ds_ck).max()):.3e}", flush=True)
 
     # ---- compute ------------------------------------------------------
     def apply(
@@ -444,20 +517,57 @@ class _XiaotuExpertsMixin:
         out = torch.empty(qlen, hidden_size, dtype=torch.float32,
                           device=hidden_states.device)
         stream = torch.cuda.current_stream()
+        if os.environ.get("XIAOTU_STREAM_TRACE") and not getattr(self, "_st_traced", False):
+            self._st_traced = True
+            print(f"[stream] cur={stream.cuda_stream:#x} "
+                  f"default={torch.cuda.default_stream().cuda_stream:#x} "
+                  f"cur_device={stream.device} layer={getattr(layer,'layer_name','?')}",
+                  flush=True)
         # The binding's pointer extractor accepts numpy arrays or integer
         # data_ptr() values (NOT torch tensors -> nullptr), so pass data_ptr().
         h_bf16 = hidden_states.to(torch.bfloat16)
         ids_i32 = topk_ids.to(torch.int32)
         wts_f32 = topk_weights.to(torch.float32)
+        # 传裸指针给引擎做异步 D2H/H2D:必须保证这些张量在拷贝完成前不被释放或复用。
+        # ① 保留上一代的强引用(同一层下一次调用在流序上晚于本次拷贝);
+        # ② record_stream 告知分配器这些块仍被当前流使用。
+        self._keepalive = (h_bf16, ids_i32, wts_f32, out)
+        for t in (h_bf16, ids_i32, wts_f32, out):
+            if t.is_cuda:
+                t.record_stream(stream)
+        # 正确性优先:引擎用 cudaMemcpyAsync + host 回调读写设备张量,而 vLLM 的
+        # 异步输出拷贝运行在独立的 non-blocking stream 上。实测(真实 fp8 模型)
+        # 若不在此处与设备同步,第二个请求可能读到上一个请求的数据。
+        # 默认开启;追求极致吞吐时可设 XIAOTU_SYNC_DECODE=0(自担风险)。
+        _sync = os.environ.get("XIAOTU_SYNC_DECODE", "1")
+        _is_first = ".0." in getattr(layer, "layer_name", "")
+        if _sync == "1" or (_sync == "pre") or (_sync == "first" and _is_first):
+            torch.cuda.synchronize()
         engine.cpu_decode(
             stream.cuda_stream, qlen, self.moe_config.experts_per_token,
             h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
             out.data_ptr(),
         )
-        if _VERIFY_LAYER and not getattr(self, "_verified", False):
+        if _sync == "post":
+            torch.cuda.synchronize()
+        if _HID_LAYER and _HID_LAYER in getattr(layer, "layer_name", ""):
+            hs = h_bf16
+            rows = [0] if hs.shape[0] < 5 else [0, 4]
+            bits = hs.view(torch.uint16)  # bf16 原始位模式
+            fp = " ".join(
+                f"r{r}:[" + ",".join(f"{int(v):04x}" for v in bits[r, :4].tolist()) + "]"
+                for r in rows
+            )
+            print(f"[hid] layer={getattr(layer, 'layer_name', '?')} M={hs.shape[0]} {fp}",
+                  flush=True)
+        if _DUMP_LAYER and _DUMP_LAYER in getattr(layer, "layer_name", "") \
+                and not getattr(self, "_dumped", False):
+            self._dumped = True
+            self._dump_layer(layer)
+        if _VERIFY_LAYER and getattr(self, "_verified_n", 0) < _VERIFY_MAX:
             # 跳过 profile/warmup 等路由 id 无效的调用(此时 topk_ids 为 -1 哨兵)
             if bool((ids_i32 >= 0).all()):
-                self._verified = True
+                self._verified_n = getattr(self, "_verified_n", 0) + 1
                 self._verify_once(layer, h_bf16, ids_i32, wts_f32, out)
         return out.to(hidden_states.dtype)
 

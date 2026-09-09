@@ -259,6 +259,18 @@ static void bind_moe_class(py::module& m, const char* name) {
             st->host_fn = [](void* arg) {
                 auto* d = static_cast<CpuDecodeState*>(arg);
                 auto* e = static_cast<MOE*>(const_cast<void*>(d->engine));
+                static int traced = 0;
+                if (std::getenv("XIAOTU_CD_TRACE") && traced < 4000) {
+                    ++traced;
+                    fprintf(stderr, "[cd] stream=%p eng=%p qlen=%d k=%d ids=[%u,%u,%u,%u] "
+                                    "hid=[%04x,%04x]\n",
+                            (void*)d->stream, (void*)d->engine, d->qlen, d->k,
+                            d->qlen > 0 && d->ids ? d->ids[0] : 0u,
+                            d->qlen > 0 && d->ids && d->k > 1 ? d->ids[1] : 0u,
+                            d->qlen > 0 && d->ids && d->k > 2 ? d->ids[2] : 0u,
+                            d->qlen > 0 && d->ids && d->k > 3 ? d->ids[3] : 0u,
+                            d->hid ? d->hid[0] : 0, d->hid ? d->hid[1] : 0);
+                }
                 e->forward_many(d->qlen, d->k, d->ids, d->wts,
                                 d->hid, d->out);
             };
