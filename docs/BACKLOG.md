@@ -99,7 +99,9 @@
 | **T18** | `results.txt` 追加今天全部实测与命令 | 审计/复现 | P1 |
 | **T19** | PR3 的 A100 运行时验证(分支 rebase 后未跑) | PR3 描述里已注明待补 | P1 |
 | ~~T30~~ | ~~CPU 专家 vs GPU 专家的端到端数值等价性~~ | ✅ **已完成**(`scripts/tiny_moe_equiv.py` + `scripts/make_tiny_mixtral.py`):bf16 tiny-Mixtral,greedy token **48/48 与 GPU 一致**,prompt-logprob max\|Δ\|=0.053 / median 0.016(峰化权重),Δ 始终小于 top1-top2 间距 | – |
-| **T31** | 目标模型 `Qwen/Qwen3.8-Flash-Next-FP8` 端到端(185 GB) | 🟡 下载中(~25 MB/s,约 2 h);下载完跑 `SMOKE_MODEL=... scripts/fp8_moe_smoke.py` | **P0** |
+| **T31** | 目标模型 `Qwen/Qwen3.8-Flash-Next-FP8` 端到端(185 GB) | 🟡 下载中;下载完跑 `SMOKE_MODEL=... scripts/fp8_moe_smoke.py` | **P0** |
+| **T39** | **真实 fp8 模型(Qwen3-30B-A3B-FP8)数值不一致**:同一 prompt 的 CPU vs GPU prompt-logprob `max|d|=34.5`;层内自校验显示 `topk_ids[0,0] == -1`(待查) | 引擎对真实 GLM 权重层内 rms_rel 9.3e-5 是对的,说明差异来自**集成/路由**而非 kernel;这是"支持 GLM/Qwen"的核心阻塞 | **P0(正确性)** |
+| ~~T38~~ | ~~运行手册~~ | ✅ **已完成**:`docs/RUNBOOK.md`(装 vLLM/装插件/env 与参数表/DS-V4 与 Qwen3.8 的参考命令/自检与排错) | – |
 | **T32** | Qwen3.8-Flash-Next 的 attention 在 A100 的实测可行性 | 预检:主线支持 `Qwen4ExpForConditionalGeneration`,QSA 是 Triton 稀疏注意力、GDN 是 Triton,未发现 SM90 硬门槛 —— 但**必须实测** | **P0** |
 
 ### D. 上游 PR / RFC
@@ -263,6 +265,12 @@ g++ -std=c++17 -shared -fPIC -O3 -ffast-math -fno-finite-math-only \
 
 ## 7. 修订记录
 
+- **2026-09-09(第 7 版)** — ①**仓库重定位**:项目根目录改为 `vllm-xiaotu-moe/` 本身
+  (用 `git subtree split` 重建历史,27 个提交保留),工作区 `/home/user/lvllm` 不再跟踪本项目;
+  项目自带 LICENSE/NOTICE/THIRD_PARTY_NOTICES/README_EN/`.gitignore`,并把报告引用的
+  `results.txt` + `report/` 一并纳入仓库(D13 第③问已解决;force-push 与工作区 `.git` 处置仍待定);
+  ②新增 `docs/RUNBOOK.md`(T38);③新增 **T39**:真实 fp8 模型数值不一致(层内自校验发现
+  `topk_ids=-1`),已列为 P0。依据:用户 2026-09-09 指示 + 本轮实测。
 - **2026-09-09(第 6 版)** — 仓库根目录去混淆(用户指出):①`xiaotu-moe/` 目录 untrack(本地保留、
   gitignore),本仓库不再包含独立引擎项目;②根 `README.md`/`README_CN.md` 重写为插件首页;
   ③`THIRD_PARTY_NOTICES.md` 引用更新;④新增 T35(已完成)、T36/T37(待定)、D13(待用户拍板);

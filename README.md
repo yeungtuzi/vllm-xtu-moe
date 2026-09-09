@@ -88,6 +88,7 @@ GPU 平台 + 混合模式的完整说明见 `docs/gpu_cpu_mixed_mode.md`;
 | [`docs/BACKLOG.md`](docs/BACKLOG.md) | **待办与决策总账(先读这个)**;含项目关系、D1–D12、L1–L9、证据索引 |
 | [`docs/EXPERIMENT_REPORT.md`](docs/EXPERIMENT_REPORT.md) | 论文式实测报告(硬件、开发摘要、主线改动、上游策略、全部测量) |
 | [`docs/ROADMAP_GENERALITY.md`](docs/ROADMAP_GENERALITY.md) | 通用化路线图(ISA 阶梯、格式矩阵、通用后端计划) |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | **运行手册**:装主线 vLLM + 装插件 + 环境变量/参数 + 跑 DS-V4 / Qwen3.8-Flash-Next 的参考命令 + 排错 |
 | [`docs/GPU_PREFILL.md`](docs/GPU_PREFILL.md) | 长 prefill GPU 流式的设计与实测 |
 | [`docs/gpu_cpu_mixed_mode.md`](docs/gpu_cpu_mixed_mode.md) | 混合模式设计稿 |
 | [`docs/MAINLINE_CHANGES.md`](docs/MAINLINE_CHANGES.md) | 主线改动清单(SM80 支持 + 混合模式) |
