@@ -139,6 +139,10 @@ out = clamp(gate, max=L) * sigmoid(alpha * clamp(gate, max=L)) * (clamp(up, ±L)
 
 - 引擎自带线程池(按 NUMA 节点分组),不依赖 OpenMP;
   `XIAOTU_MOE_THREADS` 可限制线程数;
+- **小批量(decode)按 N 行切片**:一个 token 的 GEMV 会被切成若干行块铺满线程池,
+  并把参与的 worker 数收敛到与工作量匹配的规模(池屏障约 1.8 µs/worker,而 B=1
+  的有效算术只有几十微秒),其余 worker 停靠而非自旋;`XIAOTU_MOE_NSLICE_SMALL=0`
+  可退回旧的逐 token 路径(用于 A/B,两条路径结果逐位一致);
 - 权重在构造期按 NUMA 节点分片(`XIAOTU_MOE_NOSHARD=1` 可关闭),
   减少跨节点流量;
 - 主线 `VLLM_CPU_OMP_THREADS_BIND` 只影响主线自带的 CPU 内核,不影响本引擎。

@@ -107,6 +107,7 @@ xiaotu_moe variant = _avx512_bf16
 | `XIAOTU_MOE_PROFILE=1` | 引擎相位计时(gate/up、down、组合),周期性打印 |
 | `XIAOTU_VERIFY_LAYER=1` | 层内数值自校验:每层首次调用时用 torch 参考实现复算并打印 `rel_rms` |
 | `XIAOTU_MOE_THREADS=<n>` | 引擎线程数(默认使用共享 NUMA 池的全部核心) |
+| `XIAOTU_MOE_NSLICE_SMALL=0` | 关闭小批量 N-切片(退回逐 token 路径,用于 A/B 对比;两条路径结果逐位一致) |
 | `XIAOTU_MOE_NOSHARD=1` | 关闭权重 NUMA 分片(调试用) |
 | `XIAOTU_SYNC_DECODE` | 默认 `0`;设 `1` 时在引擎调用前后与设备同步(排查时序问题用,会降低吞吐) |
 | `XIAOTU_NVTX=1` / `XIAOTU_TORCH_PROFILE=<dir>` | NVTX / torch profiler 埋点 |

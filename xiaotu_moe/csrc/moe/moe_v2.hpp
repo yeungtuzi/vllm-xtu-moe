@@ -143,6 +143,13 @@ struct WeightTraitsBase {
     // forward_many can split the (N-rows of the) GEMV across all worker threads
     // (ktransformers `split_range_n` technique). BF16/FP8 stay single-chunk.
     static constexpr bool kNParallel = false;
+    // Small-batch N-slicing: when a batch has only a few (token, rank)
+    // assignments the per-token loop leaves all but a handful of workers idle,
+    // and a single token's GEMV is compute-bound rather than bandwidth-bound, so
+    // it dominates decode latency. Traits that can slice their N rows (FP8) set
+    // this so forward_many also routes small batches through the N-sliced
+    // kernel; large batches keep their grouped/bandwidth-optimal path.
+    static constexpr bool kNSliceSmallM = false;
     // N-sliced variants used by the N-parallel dispatch. `both` is [2*inter]:
     //   gate in [0, inter), up in [inter, 2*inter).
     // `down` is [hidden], sliced over hidden. Slice is [n0, n1) over `inter`
@@ -474,6 +481,24 @@ public:
             forward_many_nsliced(M, k, expert_ids, weights, input, output);
             return;
         }
+        // Small-batch N-slicing (decode): with few assignments the grouped and
+        // per-token paths both leave most workers idle. Route them through the
+        // N-sliced kernel, and cap the worker count at the point where the pool
+        // barrier (~1.8us/worker, the caller waits for the slowest one) stops
+        // being cheaper than the extra parallelism. The 4x slack keeps a few
+        // tokens per thread on the N-sliced path instead of dropping to the
+        // per-token loop.
+        if constexpr (wt::kNSliceSmallM) {
+            static const bool nslice_small = [] {
+                const char* e = std::getenv("XIAOTU_MOE_NSLICE_SMALL");
+                return !(e && std::atoi(e) == 0);   // =0 forces the legacy path
+            }();
+            if (nslice_small && NASS <= 4 * (size_t)pool_.nthreads()) {
+                forward_many_nsliced(M, k, expert_ids, weights, input, output, -1,
+                                     small_batch_workers(NASS, inter, hidden));
+                return;
+            }
+        }
 
         // Zero the whole output once, up front (was per-token before).
         std::fill(output, output + (size_t)M * (size_t)hidden, 0.f);
@@ -645,9 +670,24 @@ public:
     // GEMV over chunks of `hidden`, so one token's big GEMV fans out across the
     // whole NUMA pool instead of a single worker thread (ktransformers
     // `split_range_n` technique). Race-free: every job writes disjoint N-slices.
+    // Worker count for a small batch: single-thread work is ~NASS*3*I*H MACs at
+    // ~8 MAC/cycle (fp8 decode arithmetic), and a pool call costs ~40us +
+    // ~1.8us/participating worker, so minimise W/T + overhead(T).
+    size_t small_batch_workers(size_t NASS, int inter, int hidden) const {
+        const size_t nt = pool_.nthreads();
+        const double macs = (double)NASS * 3.0 * (double)inter * (double)hidden;
+        const double single_us = macs / (8.0 * 3.0e3);          // us at 3GHz, 8 MAC/cycle
+        double t = std::sqrt(single_us / 1.8);
+        size_t lim = (size_t)(t + 0.5);
+        if (lim < 4) lim = 4;
+        if (lim > nt) lim = nt;
+        return lim;
+    }
+
     void forward_many_nsliced(int M, int k,
                               const uint32_t* expert_ids, const float* weights,
-                              const uint16_t* input, float* output) {
+                              const uint16_t* input, float* output,
+                              int chunk_hint = 0, size_t wlimit = 0) {
         const int hidden = cfg_.hidden_size;
         const int inter = cfg_.intermediate_size;
         const int nel = cfg_.expert_num;
@@ -656,6 +696,18 @@ public:
         const size_t NASS = (size_t)M * (size_t)k;
         if (M <= 0 || k <= 0 || inter <= 0 || hidden <= 0) return;
         prof_init();
+
+        // Every phase goes through these: wlimit>0 restricts the call to a worker
+        // subset (small-batch decode, where the barrier tail would otherwise cost
+        // more than the arithmetic it parallelises).
+        auto pfor = [&](size_t n, auto&& fn) {
+            if (wlimit) pool_.parallel_for_limited(n, wlimit, fn);
+            else        pool_.parallel_for(n, fn);
+        };
+        auto pfor_sharded = [&](int nn, const size_t* jc, auto&& fn) {
+            if (wlimit) pool_.parallel_for_sharded_limited(nn, jc, wlimit, fn);
+            else        pool_.parallel_for_sharded(nn, jc, fn);
+        };
 
         std::fill(output, output + (size_t)M * (size_t)hidden, 0.f);
 
@@ -703,12 +755,21 @@ public:
         const size_t na = active_.size();
 
         // Number of N-chunks per active expert (~4x jobs/thread, coarse ~128 rows).
+        // chunk_hint > 0 forces that many chunks; chunk_hint < 0 selects the
+        // small-batch mode (jobs ~= 2x threads, finer ~64-row chunks) used for
+        // decode, where a single token's GEMV must span the whole pool.
+        const bool small_m = chunk_hint < 0;
+        const int hint = chunk_hint > 0 ? chunk_hint : 0;
+        // Chunk counts are sized against the EFFECTIVE worker count (the subset
+        // when limited), so every participating worker gets ~2-4 tickets.
+        const size_t nt_eff = wlimit ? wlimit : pool_.nthreads();
         int nc_gu = 1;
         {   const char* eov = std::getenv("XIAOTU_MOE_NCGU");
-            if (eov && std::atoi(eov) > 0) nc_gu = std::atoi(eov);
-            else if (pool_.nthreads() > 1) {
-                size_t need = (pool_.nthreads() * 4) / std::max<size_t>(1, na);
-                size_t maxc = (size_t)(inter / 128);
+            if (hint > 0) nc_gu = hint;
+            else if (eov && std::atoi(eov) > 0) nc_gu = std::atoi(eov);
+            else if (nt_eff > 1) {
+                size_t need = (nt_eff * (small_m ? 2 : 4)) / std::max<size_t>(1, na);
+                size_t maxc = (size_t)(inter / (small_m ? 64 : 128));
                 if (maxc < 1) maxc = 1;
                 if (need > maxc) need = maxc;
                 if (need < 1) need = 1;
@@ -717,10 +778,11 @@ public:
         }
         int nc_d = 1;
         {   const char* eov = std::getenv("XIAOTU_MOE_NCD");
-            if (eov && std::atoi(eov) > 0) nc_d = std::atoi(eov);
-            else if (pool_.nthreads() > 1) {
-                size_t need = (pool_.nthreads() * 4) / std::max<size_t>(1, na);
-                size_t maxc = (size_t)(hidden / 128);
+            if (hint > 0) nc_d = hint;
+            else if (eov && std::atoi(eov) > 0) nc_d = std::atoi(eov);
+            else if (nt_eff > 1) {
+                size_t need = (nt_eff * (small_m ? 2 : 4)) / std::max<size_t>(1, na);
+                size_t maxc = (size_t)(hidden / (small_m ? 64 : 128));
                 if (maxc < 1) maxc = 1;
                 if (need > maxc) need = maxc;
                 if (need < 1) need = 1;
@@ -769,7 +831,7 @@ public:
         if (nshard_ >= 2) {
             const size_t NS = (size_t)nshard_;
             std::vector<size_t> jc(NS, (size_t)active_.size() * (size_t)subA);
-            pool_.parallel_for_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
+            pfor_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
                 size_t e_idx = job / (size_t)subA;
                 size_t s = job % (size_t)subA;
                 if (e_idx >= active_.size()) return;
@@ -811,7 +873,7 @@ public:
                 }
             });
         } else {
-            pool_.parallel_for(active_.size() * (size_t)nc_gu, [&](size_t ji) {
+            pfor(active_.size() * (size_t)nc_gu, [&](size_t ji) {
                 size_t e_idx = ji / (size_t)nc_gu;
                 int c = (int)(ji % (size_t)nc_gu);
                 int eid = active_[e_idx];
@@ -852,7 +914,7 @@ public:
         if (nshard_ >= 2) {
             const size_t NS = (size_t)nshard_;
             std::vector<size_t> jc(NS, (size_t)active_.size() * (size_t)subB);
-            pool_.parallel_for_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
+            pfor_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
                 size_t e_idx = job / (size_t)subB;
                 size_t s = job % (size_t)subB;
                 if (e_idx >= active_.size()) return;
@@ -874,7 +936,7 @@ public:
                                        g.down.data(), hidden, inter, (size_t)eid, groupN, groupK, n0, n1);
             });
         } else {
-            pool_.parallel_for(active_.size() * (size_t)nc_d, [&](size_t ji) {
+            pfor(active_.size() * (size_t)nc_d, [&](size_t ji) {
                 size_t e_idx = ji / (size_t)nc_d;
                 int c = (int)(ji % (size_t)nc_d);
                 int eid = active_[e_idx];
@@ -891,7 +953,7 @@ public:
         auto pB1 = clk::now();
 
         // Phase C: weighted reduce per token (rank order) - no output contention.
-        pool_.parallel_for((size_t)M, [&](size_t t) {
+        pfor((size_t)M, [&](size_t t) {
             float* out_t = output + t * (size_t)hidden;
             for (int r = 0; r < k; ++r) {
                 size_t ai = t * (size_t)k + r;

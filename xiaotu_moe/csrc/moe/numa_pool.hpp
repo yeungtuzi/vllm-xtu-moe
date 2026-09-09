@@ -407,6 +407,21 @@ public:
     // run fn(i) for i in [0, n). Persistent workers; dynamic index scheduling.
     template <typename F>
     void parallel_for(size_t n, const F& fn) {
+        parallel_for_impl(n, 0, fn);
+    }
+
+    // Same, but only ~`limit` workers may claim tickets. The completion barrier
+    // waits only for claimed tickets, so non-participants cost nothing; this caps
+    // the tail latency (the caller waits for the LAST worker, and a descheduled
+    // worker on a busy 192-thread pool costs ~100us) that otherwise dominates
+    // small-batch decode, where the useful work per call is a few microseconds.
+    template <typename F>
+    void parallel_for_limited(size_t n, size_t limit, const F& fn) {
+        parallel_for_impl(n, limit, fn);
+    }
+
+    template <typename F>
+    void parallel_for_impl(size_t n, size_t limit, const F& fn) {
         // Serialize access to the shared generation/counter state. When the pool
         // is shared process-wide (one pool for all MoE layers, mirroring lk_moe's
         // single Backend_NUMA), different layers could otherwise race on
@@ -423,6 +438,7 @@ public:
             std::lock_guard<std::mutex> lk(work_mtx_);
             task_ = std::function<void(size_t)>(fn);  // type-erased copy
             n_ = n;
+            worker_limit_.store(limit >= nt_ ? 0 : limit, std::memory_order_relaxed);
             sharded_call_ = 0;   // this is a flat call: task_ is valid, so reset
                                  // any stale sharded marker so late workers anchor flat.
             // MONOTONIC ticket counter (never reset). Each call occupies the
@@ -443,7 +459,12 @@ public:
             // diagnostic processed-bitset for this call (only when debug/trace on)
             if (diag_active()) proc_vec_.assign(n, 0);
         }
-        cv_.notify_all();
+        // Unlimited calls wake everybody (prefill needs the whole pool). Limited
+        // calls rely on their participants already spinning, so the fast path
+        // issues no syscall at all; the wait loop below falls back to notify_all
+        // if nobody claims a ticket (participants parked during an idle gap).
+        const bool limited = (limit > 0 && limit < nt_);
+        if (!limited) cv_.notify_all();
         {
             std::unique_lock<std::mutex> lk(done_mtx_);
             auto t0 = std::chrono::steady_clock::now();
@@ -499,14 +520,27 @@ public:
                 if (idle_us > 0) {
                     auto dl = std::chrono::steady_clock::now()
                             + std::chrono::microseconds(idle_us);
+                    bool woke = false;
                     while (std::chrono::steady_clock::now() < dl) {
                         if (remaining_.load(std::memory_order_acquire) == 0) {
                             spun_done = true; break;
+                        }
+                        // Limited call whose participants are ALL parked (idle
+                        // gap): remaining_ is still n, so nobody claimed a ticket.
+                        // Wake the pool once and keep spinning. Dynamic ticket
+                        // pulling means one awake participant drains every ticket,
+                        // so a partial countdown never needs a wake (and a clock
+                        // check in this loop would cost more than it saves).
+                        if (limited && !woke &&
+                            remaining_.load(std::memory_order_acquire) == n) {
+                            woke = true;
+                            cv_.notify_all();
                         }
                         _mm_pause();
                     }
                 }
                 if (!spun_done) {
+                    if (limited) cv_.notify_all();
                     late = !done_cv_.wait_until(lk, deadline, [&] {
                         if (stop_) return true;
                         return remaining_.load(std::memory_order_acquire) == 0;
@@ -571,6 +605,19 @@ public:
     // -----------------------------------------------------------------------
     template <typename F>
     void parallel_for_sharded(int nnodes, const size_t* job_counts, const F& fn) {
+        parallel_for_sharded_impl(nnodes, job_counts, 0, fn);
+    }
+
+    // Same, with the worker-subset gate (see parallel_for_limited).
+    template <typename F>
+    void parallel_for_sharded_limited(int nnodes, const size_t* job_counts, size_t limit,
+                                      const F& fn) {
+        parallel_for_sharded_impl(nnodes, job_counts, limit, fn);
+    }
+
+    template <typename F>
+    void parallel_for_sharded_impl(int nnodes, const size_t* job_counts, size_t limit,
+                                   const F& fn) {
         std::lock_guard<std::mutex> call_lock(call_mtx_);
         if (nnodes <= 0) return;
         if (nt_ <= 1) {
@@ -606,6 +653,7 @@ public:
                 total += job_counts[n];
             }
             n_ = total;
+            worker_limit_.store(limit >= nt_ ? 0 : limit, std::memory_order_relaxed);
             uint64_t gen = ++current_gen_;   // publish first (workers anchor under lock)
             sharded_call_ = nnodes;          // visible to workers at anchor
             start_ = 0;
@@ -749,6 +797,20 @@ private:
             if (current_gen_.load(std::memory_order_acquire) != my_last_gen) {
                 goto have_work;   // generation already pending: skip all sync
             }
+            // Only workers that may claim tickets in a LIMITED call spin. Idle
+            // spinners cost real throughput: with 192 spinning threads (2 per
+            // physical core) the ~30 participants of a small decode call run at
+            // half speed, and the caller's spin-wait competes for a core too.
+            // Non-participants park on the condvar instead and are woken by the
+            // caller only for unlimited (prefill) calls.
+            {
+                const size_t wl = worker_limit_.load(std::memory_order_relaxed);
+                if (wl > 0 && wl < nt_) {
+                    size_t stride = nt_ / wl;
+                    if (stride < 1) stride = 1;
+                    if (w % stride != 0) goto park;
+                }
+            }
             if (spin_idle_us_.load(std::memory_order_relaxed) > 0) {
                 const uint64_t idle_us = spin_idle_us_.load(std::memory_order_relaxed);
                 auto dl = std::chrono::steady_clock::now()
@@ -759,6 +821,7 @@ private:
                     _mm_pause();
                 }
             }
+        park:
             {
                 std::unique_lock<std::mutex> lk(work_mtx_);
                 cv_.wait(lk, [&] { return stop_ || current_gen_.load() != my_last_gen; });
@@ -775,6 +838,15 @@ private:
                 n = n_;
                 start = start_;       // this call's first ticket
                 sharded = (sharded_call_ > 0);
+            }
+            // Worker-subset gate: a limited call lets only ~limit workers claim
+            // tickets (stride selection keeps them spread across NUMA nodes). The
+            // others claim nothing and simply re-arm, so they are not waited on.
+            const size_t wlim = worker_limit_.load(std::memory_order_relaxed);
+            if (wlim > 0 && wlim < nt_) {
+                size_t stride = nt_ / wlim;
+                if (stride < 1) stride = 1;
+                if (w % stride != 0) continue;
             }
             if (sharded) {
                 // ---- node-scoped single-copy sharded path: pull only from my node.
@@ -932,6 +1004,8 @@ private:
     // futex/condvar wake-storm on every phase -> layer. 0 disables spin entirely
     // (legacy behavior). Mirrors lktransformers' lock-free status spin.
     std::atomic<uint64_t> spin_idle_us_{5000};
+    // >0: only ~this many workers may claim tickets in the current call (0 = all).
+    std::atomic<size_t> worker_limit_{0};
     std::atomic<size_t> dropped_{0};  // diagnostic: tickets dropped (future-gap)
     std::vector<unsigned char> proc_vec_;  // diagnostic processed-bitset
     // per-worker completion slots: worker[w] writes only worker_gen_[w].

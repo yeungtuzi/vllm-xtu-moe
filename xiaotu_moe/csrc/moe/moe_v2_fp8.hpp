@@ -70,16 +70,22 @@ inline float vhsum(Vec v) {
 }
 #endif
 
-inline void matmul_fp8_quant(const uint16_t* A, const uint8_t* W, const float* S,
-                             float* C, int M, int N, int K,
-                             int groupN, int groupK) {
+// Row-range variant: computes C[i][j] only for j in [n0, n1), indexing W/S by the
+// GLOBAL row j so a caller can hand out disjoint row slices to different threads
+// (N-sliced decode). C keeps its full [M][N] row stride.
+inline void matmul_fp8_quant_range(const uint16_t* A, const uint8_t* W, const float* S,
+                                   float* C, int M, int N, int K,
+                                   int groupN, int groupK, int n0, int n1) {
     const int gn = groupN > 0 ? groupN : 1;
     const int gk = groupK > 0 ? groupK : 1;
+    if (n0 < 0) n0 = 0;
+    if (n1 > N) n1 = N;
+    if (n1 <= n0) return;
 #if defined(__AVX2__)
     for (int i = 0; i < M; ++i) {
         const uint16_t* Arow = A + (size_t)i * K;
         float* Crow = C + (size_t)i * N;
-        for (int j = 0; j < N; ++j) {
+        for (int j = n0; j < n1; ++j) {
             const uint8_t* Wrow = W + (size_t)j * K;
             const float* Srow = S + (size_t)(j / gn) * ((K + gk - 1) / gk);
             Vec total = vzero();
@@ -105,7 +111,7 @@ inline void matmul_fp8_quant(const uint16_t* A, const uint8_t* W, const float* S
     for (int i = 0; i < M; ++i) {
         const uint16_t* Arow = A + (size_t)i * K;
         float* Crow = C + (size_t)i * N;
-        for (int j = 0; j < N; ++j) {
+        for (int j = n0; j < n1; ++j) {
             const uint8_t* Wrow = W + (size_t)j * K;
             const float* Srow = S + (size_t)(j / gn) * ((K + gk - 1) / gk);
             float acc = 0.f;
@@ -118,10 +124,19 @@ inline void matmul_fp8_quant(const uint16_t* A, const uint8_t* W, const float* S
 #endif
 }
 
+inline void matmul_fp8_quant(const uint16_t* A, const uint8_t* W, const float* S,
+                             float* C, int M, int N, int K,
+                             int groupN, int groupK) {
+    matmul_fp8_quant_range(A, W, S, C, M, N, K, groupN, groupK, 0, N);
+}
+
 }  // namespace fp8_detail
 
 // FP8 WeightTraits. Base class dispatches to *_impl via CRTP (see moe_v2.hpp).
 struct FP8WeightTraits : WeightTraitsBase<FP8WeightTraits> {
+    // Decode is compute-bound (a single token's GEMV re-decodes every weight row
+    // on one thread), so small batches are fanned out over N slices as well.
+    static constexpr bool kNSliceSmallM = true;
     static constexpr size_t w13_bytes_impl(size_t E, size_t n2, size_t H) {
         return E * n2 * H * sizeof(uint8_t);  // [E][2I][H] fp8
     }
@@ -176,6 +191,56 @@ struct FP8WeightTraits : WeightTraitsBase<FP8WeightTraits> {
             std::vector<float> ones(nb * kb, 1.0f);
             fp8_detail::matmul_fp8_quant(act, base, ones.data(), down, 1, hidden, inter, groupN, groupK);
         }
+    }
+
+    // ---- N-sliced variants (small-batch decode) ----------------------------
+    // Same kernels restricted to the N-row range [n0, n1): gate rows [n0, n1) and
+    // up rows [inter+n0, inter+n1) of the [2*inter] block are written into
+    // `both` (row stride 2*inter); down rows [n0, n1) of the [hidden] block into
+    // `down`. Disjoint slices are race-free, which lets forward_many fan a single
+    // token's GEMV over every worker thread.
+    static void gate_up_slice_impl(const uint16_t* x, const void* w13, const void* w13_g,
+                                   const float* w13_gs, float* both, int inter, int hidden,
+                                   size_t eid, int groupN, int groupK, int n0, int n1) {
+        (void)w13_gs;
+        if (n0 < 0) n0 = 0;
+        if (n1 > inter) n1 = inter;
+        if (n1 <= n0) return;
+        const int n2 = 2 * inter;
+        const uint8_t* base = static_cast<const uint8_t*>(w13) + eid * (size_t)n2 * hidden;
+        const float* sbase = fp8_scale_base(w13_g, eid, n2, hidden, groupN, groupK);
+        fp8_detail::matmul_fp8_quant_range(x, base, sbase, both, 1, n2, hidden, groupN, groupK,
+                                           n0, n1);
+        fp8_detail::matmul_fp8_quant_range(x, base, sbase, both, 1, n2, hidden, groupN, groupK,
+                                           inter + n0, inter + n1);
+    }
+
+    static void down_slice_impl(const uint16_t* act, const void* w2, const void* w2_g,
+                                const float* w2_gs, float* down, int hidden, int inter,
+                                size_t eid, int groupN, int groupK, int n0, int n1) {
+        (void)w2_gs;
+        if (n0 < 0) n0 = 0;
+        if (n1 > hidden) n1 = hidden;
+        if (n1 <= n0) return;
+        const uint8_t* base = static_cast<const uint8_t*>(w2) + eid * (size_t)hidden * inter;
+        const float* sbase = fp8_scale_base(w2_g, eid, hidden, inter, groupN, groupK);
+        fp8_detail::matmul_fp8_quant_range(act, base, sbase, down, 1, hidden, inter, groupN, groupK,
+                                           n0, n1);
+    }
+
+    // Per-expert scale table base; a degenerate all-ones table (thread-local, so
+    // the sliced decode path allocates nothing per job) stands in when the model
+    // ships no per-expert scales.
+    static const float* fp8_scale_base(const void* s, size_t eid, int N, int K,
+                                       int groupN, int groupK) {
+        const int gn = groupN > 0 ? groupN : 1;
+        const int gk = groupK > 0 ? groupK : 1;
+        const size_t nb = ((size_t)N + gn - 1) / gn;
+        const size_t kb = ((size_t)K + gk - 1) / gk;
+        if (s) return static_cast<const float*>(s) + eid * (nb * kb);
+        thread_local std::vector<float> ones;
+        if (ones.size() < nb * kb) ones.assign(nb * kb, 1.0f);
+        return ones.data();
     }
 };
 
