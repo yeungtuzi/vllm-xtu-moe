@@ -338,53 +338,58 @@ class _XiaotuExpertsMixin:
     def _verify_once(self, layer, hidden_states, topk_ids, topk_weights, out):
         """对比引擎输出与 torch 参考(同一批已加载权重),定位数值差异。
 
-        XIAOTU_VERIFY_LAYER=1 打开;每个层实例只跑一次。参考实现:
+        XIAOTU_VERIFY_LAYER=1 打开;每层只跑一次(跳过路由 id 无效的 profile 调用)。
+        参考实现(对 token 0 的全部 top-k 专家求和):
           gate/up = dequant(w13[e]) @ x ; act = silu / clamped swiglu
           out += w * (dequant(w2[e]) @ bf16(act))
-        只取 batch 内第一个 token 的第一个专家,开销很小。
         """
         try:
             w13 = layer.w13_weight
             w2w = layer.w2_weight
             s13, s2 = self._scales
             unquant = (self._scale_dtype is None) and (s13 is None)
-            e = int(topk_ids[0, 0])
             gn = self._group_n
             I = int(w13.shape[1] // 2)
             H = int(w2w.shape[1])
             x = hidden_states[0].float().cpu()
-            w13_e = w13[e].float()
-            if unquant:
-                deq13 = w13_e
-            else:
-                s13_full = s13[e].float().repeat_interleave(gn, 0).repeat_interleave(gn, 1)
-                deq13 = w13_e * s13_full[: 2 * I, :H]
-            gate = deq13[:I] @ x
-            up = deq13[I:] @ x
-            if self.swiglu_limit or self.swiglu_alpha or self.swiglu_beta:
-                limit = float(self.swiglu_limit or 0.0)
-                alpha = float(self.swiglu_alpha or 1.0)
-                beta = float(self.swiglu_beta or 0.0)
-                if limit > 0:
-                    gate = torch.clamp(gate, max=limit)
-                    up = torch.clamp(up, -limit, limit)
-                act = (gate / (1 + torch.exp(-alpha * gate))) * (up + beta)
-            else:
-                act = (gate / (1 + torch.exp(-gate))) * up
-            act = act.to(torch.bfloat16).float()
-            if unquant:
-                down = w2w[e].float() @ act
-            else:
-                s2_full = s2[e].float().repeat_interleave(gn, 0).repeat_interleave(gn, 1)
-                down = (w2w[e].float() * s2_full[:H, :I]) @ act
-            ref = float(topk_weights[0, 0]) * down
+            ref = torch.zeros(H, dtype=torch.float32)
+            ids_row = [int(v) for v in topk_ids[0]]
+            for r, e in enumerate(ids_row):
+                w = float(topk_weights[0, r])
+                if w == 0.0:
+                    continue
+                w13_e = w13[e].float()
+                if unquant:
+                    deq13 = w13_e
+                else:
+                    s13_full = s13[e].float().repeat_interleave(gn, 0).repeat_interleave(gn, 1)
+                    deq13 = w13_e * s13_full[: 2 * I, :H]
+                gate = deq13[:I] @ x
+                up = deq13[I:] @ x
+                if self.swiglu_limit or self.swiglu_alpha or self.swiglu_beta:
+                    limit = float(self.swiglu_limit or 0.0)
+                    alpha = float(self.swiglu_alpha or 1.0)
+                    beta = float(self.swiglu_beta or 0.0)
+                    if limit > 0:
+                        gate = torch.clamp(gate, max=limit)
+                        up = torch.clamp(up, -limit, limit)
+                    act = (gate / (1 + torch.exp(-alpha * gate))) * (up + beta)
+                else:
+                    act = (gate / (1 + torch.exp(-gate))) * up
+                act = act.to(torch.bfloat16).float()
+                if unquant:
+                    down = w2w[e].float() @ act
+                else:
+                    s2_full = s2[e].float().repeat_interleave(gn, 0).repeat_interleave(gn, 1)
+                    down = (w2w[e].float() * s2_full[:H, :I]) @ act
+                ref += w * down
             got = out[0].float().cpu()
             rms = float(torch.sqrt(torch.mean(ref * ref)))
             rel = float(torch.sqrt(torch.mean((got - ref) ** 2)) / (rms + 1e-12))
             print(
                 f"[vllm-xtu-moe/verify] {self._engine_attr} "
-                f"layer={getattr(layer, 'layer_name', '?')} expert={e} "
-                f"n_neg={int((topk_ids < 0).sum())} ids0={topk_ids[0].tolist()} "
+                f"layer={getattr(layer, 'layer_name', '?')} ids0={ids_row} "
+                f"w0={[round(float(v), 4) for v in topk_weights[0]]} "
                 f"ref_rms={rms:.4f} rel_rms={rel:.4e} "
                 f"max_abs={float((got - ref).abs().max()):.4e}",
                 flush=True,
@@ -450,8 +455,10 @@ class _XiaotuExpertsMixin:
             out.data_ptr(),
         )
         if _VERIFY_LAYER and not getattr(self, "_verified", False):
-            self._verified = True
-            self._verify_once(layer, h_bf16, ids_i32, wts_f32, out)
+            # 跳过 profile/warmup 等路由 id 无效的调用(此时 topk_ids 为 -1 哨兵)
+            if bool((ids_i32 >= 0).all()):
+                self._verified = True
+                self._verify_once(layer, h_bf16, ids_i32, wts_f32, out)
         return out.to(hidden_states.dtype)
 
 
