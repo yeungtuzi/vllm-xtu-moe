@@ -1,6 +1,6 @@
 # RFC 草稿:CPU-offload MoE 的逐层 GPU prefill
 
-> D4a 决策:先发 issue 征求方向,不直接提 PR。
+> 先发 issue 征求方向,不直接提 PR。
 > 目标仓库: `vllm-project/vllm`(issue,不是 PR)
 > 建议标题: **[RFC] Layerwise GPU prefill for CPU-offloaded MoE (stream one layer's weights per step)**
 
@@ -92,5 +92,5 @@ gh issue create --repo vllm-project/vllm \
 ---
 ## 修订记录
 
-- **2026-09-09(第 1 版)** — 按 D4a 决策产出 RFC 草稿(不直接提 PR)。
+- **2026-09-09(第 1 版)** — RFC 草稿(先发 issue 征求方向,不直接提 PR)。
   依据:`docs/BENCHMARKS.md` 与 `docs/GPU_PREFILL.md` 的实测数据。

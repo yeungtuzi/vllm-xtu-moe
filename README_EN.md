@@ -35,7 +35,7 @@ into those slots, so:
 | Weight format | Engine kernel | Status |
 |---|---|---|
 | **BF16 / FP16** (unquantized) | `MOE_BF16` / `MOE_FP16` | ✅ |
-| **FP8 e4m3 + 128×128 blocks** (vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | ✅ numerically verified; kernel speed still being optimized |
+| **FP8 e4m3 + 128×128 blocks** (vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | 🟡 layer-level numerics verified (engine vs torch reference on real weights); end-to-end consistency on real models under investigation; kernel speed still being optimized |
 | **MXFP4** (e2m1 + e8m0 block 32) | `MOE_MXFP4` | ✅ |
 | **NVFP4** | `MOE_NVFP4` | ✅ engine side |
 | **INT4 / WNA16** (GPTQ / AWQ group quantization) | `MOE_WNA16` | 🟡 engine side works; group-size / zero-point plumbing in progress |

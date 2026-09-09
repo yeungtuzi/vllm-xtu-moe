@@ -41,7 +41,18 @@ sparse 关闭(--hf-overrides '{"index_topk": null}'):
 | **INT8 W8A8 未实现** | 引擎暂无该格式内核 |
 | **monolithic `apply()` 拿不到 `input_ids`** | 依赖 `input_ids` 的路由(哈希路由)无法走该路径,插件会报错而非静默算错 |
 
-## 3. 性能现状
+## 3. 验证状态(诚实记录)
+
+| 项 | 状态 |
+|---|---|
+| 引擎 vs torch 参考(BF16 路径) | ✅ 相对误差 ~1e-7 |
+| 引擎 vs numpy 参考(FP8 block-128,真实 GLM-5.3 专家权重) | ✅ RMS 相对误差 9.3e-5 |
+| 引擎 vs torch 参考(FP8,真实 Qwen3-30B 全部 48 层) | ✅ 相对误差 ~1e-7(`XIAOTU_VERIFY_LAYER=1`) |
+| 引擎 vs torch 参考(MXFP4,真实 DeepSeek-V4 层权重) | ✅ RMS 相对误差 5.6e-3 |
+| CPU 专家 vs GPU 专家端到端(bf16 微型模型) | ✅ greedy token 完全一致 |
+| **CPU 专家 vs GPU 专家端到端(真实 fp8 模型)** | 🟡 **排查中**:同一 prompt 的 prompt-logprob 存在差异,层内检查(上表)通过,正在定位是权重加载还是采样路径的差异 |
+
+## 4. 性能现状
 
 | 项 | 现状 |
 |---|---|
@@ -50,7 +61,7 @@ sparse 关闭(--hf-overrides '{"index_topk": null}'):
 | **AMX** | 未接线;Intel AMX 机器目前会使用主线自带 CPU 内核(需自行验证) |
 | **多 ISA 打包** | `scripts/build_engine_variants.sh` 可编出 5 个变体,但发布 wheel 目前默认只带单一变体 |
 
-## 4. 运行注意事项
+## 5. 运行注意事项
 
 - 首次加载超大模型(数百 GB 专家权重)需要数分钟,请放大
   `VLLM_ENGINE_READY_TIMEOUT_S`;
@@ -59,7 +70,7 @@ sparse 关闭(--hf-overrides '{"index_topk": null}'):
 - CPU 引擎自带线程池,`OMP_NUM_THREADS` / `VLLM_CPU_OMP_THREADS_BIND`
   只影响主线自带的 CPU 内核。
 
-## 5. 数值验证工具
+## 6. 数值验证工具
 
 出现"输出不连贯"时,依次使用:
 

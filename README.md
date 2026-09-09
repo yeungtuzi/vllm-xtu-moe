@@ -31,7 +31,7 @@ CPU 后端槽位,于是:
 | 权重格式 | 引擎内核 | 状态 |
 |---|---|---|
 | **BF16 / FP16**(无量化) | `MOE_BF16` / `MOE_FP16` | ✅ |
-| **FP8 e4m3 + block 128×128**(vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | ✅ 数值已验证;内核性能待优化 |
+| **FP8 e4m3 + block 128×128**(vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | 🟡 层内数值已验证(引擎 vs torch 参考,真实权重);真实模型端到端一致性排查中;内核性能待优化 |
 | **MXFP4**(e2m1 + e8m0 block 32) | `MOE_MXFP4` | ✅ |
 | **NVFP4** | `MOE_NVFP4` | ✅ 引擎侧 |
 | **INT4 / WNA16**(GPTQ / AWQ 组量化) | `MOE_WNA16` | 🟡 引擎侧可用,组大小/零点适配进行中 |
