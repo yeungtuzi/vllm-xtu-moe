@@ -1,0 +1,6 @@
+{"kind": "load", "tp": 1, "maxlen": 16384, "mnbt": 16384, "load_s": 333.2, "ts": "2026-09-09T14:35:48"}
+{"kind": "warmup", "tp": 1, "wall_s": 5.7, "ts": "2026-09-09T14:35:53"}
+{"kind": "ttft", "tp": 1, "mode": "cpu", "target_len": 2048, "tokens": 2091, "ttft_s": 112.931, "tok_per_s": 18.5, "text": "2", "ts": "2026-09-09T14:37:46"}
+{"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 2048, "tokens": 2091, "ttft_s": 5.673, "tok_per_s": 368.6, "text": "2", "ts": "2026-09-09T14:37:52"}
+{"kind": "ttft", "tp": 1, "mode": "cpu", "target_len": 4096, "tokens": 4137, "ttft_s": 439.383, "tok_per_s": 9.4, "text": "1", "ts": "2026-09-09T14:45:11"}
+{"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 4096, "tokens": 4137, "ttft_s": 5.783, "tok_per_s": 715.4, "text": "2", "ts": "2026-09-09T14:45:17"}

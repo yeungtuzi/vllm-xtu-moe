@@ -1,0 +1,31 @@
+# ---- build artifacts -------------------------------------------------------
+**/build/
+dist/
+*.egg-info/
+
+# ---- python ---------------------------------------------------------------
+**/__pycache__/
+*.pyc
+*.pyo
+
+# ---- scratch / logs -------------------------------------------------------
+*.log
+*.tmp
+logs/
+
+# ---- measurement scratch (raw profiler traces are large; keep JSON/figures) --
+report/*.nsys-rep
+report/*.qdstrm
+report/*.sqlite
+report/st_native
+report/st_nt
+report/st_nt2
+report/rd1
+
+# ---- locally generated test checkpoints (scripts/make_tiny_mixtral.py) -----
+/tiny-mixtral-vllm*/
+
+# ---- model weights / datasets (never committed) ---------------------------
+*.npz
+*.safetensors
+*.gguf

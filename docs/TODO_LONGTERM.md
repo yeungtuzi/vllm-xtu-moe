@@ -23,7 +23,7 @@ open-source **ktransformers / lktransformers** (Apache-2.0). We study lk-moe's
 持续对齐优化 xiaotu-moe 的 CPU MoE 计算内核，使同机(168核 + A100/GPU2)
 50-prompts / conc-4 ShareGPT 基准性能追上原版 lk-moe，以
 ktransformers/lktransformers (Apache-2.0) 为参考逐项对标优化，并持续在
-`/home/user/lvllm/results.txt` / `xiaotu_vs_lkmoe.md` 更新对比结果。
+`results.txt`(仓库根)/ `xiaotu_vs_lkmoe.md` 更新对比结果。
 
 [on] Keep aligning/optimizing xiaotu-moe's CPU MoE compute kernel so the
 same-machine (168-core + A100/GPU2) 50-prompts/conc-4 ShareGPT benchmark

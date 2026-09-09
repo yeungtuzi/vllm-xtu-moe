@@ -1,5 +1,7 @@
 # vllm-xtu-moe
 
+> 本仓库的根目录就是 **插件项目本身**(`vllm-xtu-moe`)。英文简版见 [`README_EN.md`](README_EN.md)。
+>
 > **XTU = X Transformers Unity**(读音:汉语「小兔」)。本项目是 **vLLM 主线的混合推理加速插件**:
 > CPU 专家 + GPU 注意力/长 prefill。内部标识符(`vllm_xiaotu_moe` / `xiaotu_moe` 包名、
 > `XIAOTU_*` 环境变量、目录名)保持不变,以免破坏既有配置与调用方。

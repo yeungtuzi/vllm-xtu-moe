@@ -14,7 +14,7 @@
 2. 状态词表:`待办` / `进行中` / `已完成` / `阻塞` / `已决断` / `已放弃`。
    - 已完成、已放弃的条目**保留在表里**(带日期和结论),避免重复讨论。
 3. 每次改动本文件:①改条目状态;②在 §7 修订记录追加一行(日期 + 改了什么 + 依据)。
-4. 实测数字一律落到 `/home/user/lvllm/results.txt` 和 `report/`,本文件只放结论 + 指针。
+4. 实测数字一律落到 `results.txt` 和 `report/`(均在仓库根目录,随仓库发布),本文件只放结论 + 指针。
 5. 本文件不替代 `docs/ROADMAP_GENERALITY.md`(通用化方案细节)与
    `docs/EXPERIMENT_REPORT.md`(论文式报告);它是这两者的**索引 + 待办状态**。
 
@@ -245,8 +245,8 @@ g++ -std=c++17 -shared -fPIC -O3 -ffast-math -fno-finite-math-only \
 - 第 2 轮优化:`docs/OPTIMIZATION_ROUND2.md`
 - 通用化路线图:`docs/ROADMAP_GENERALITY.md`
 - 上游 PR 计划与快照:`patches/UPSTREAM_PRS.md`、`patches/upstream/pr{1,2,3}_body.md`
-- 全量测量日志:`/home/user/lvllm/results.txt`
-- 图表/JSON:`/home/user/lvllm/report/`
+- 全量测量日志:`results.txt`(仓库根)
+- 图表/JSON:`report/`(仓库根)
 - 引擎性能长跑 TODO:`docs/TODO_LONGTERM.md`(与 lk-moe 对齐,另一条线)
 
 ---

@@ -1,0 +1,322 @@
+[curve] model=/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master tp=1 maxlen=16384 mnbt=16384 modes=['cpu', 'gpu'] lens=[128, 256, 384, 512, 768, 1024, 2048, 4096, 8192, 16000] conc=[1, 4, 8]
+[xiaotu] GPU/CPU Mixed: MXFP4 CPU backend -> XiaotuCPUExperts (AVX512-VNNI, no AMX)
+[vllm-xiaotu-moe] registered OOT override of DeepseekV4ForCausalLM (DeepseekV4MoE -> CpuXiaotuMoE)
+INFO 09-09 16:07:09 [api_utils.py:286] non-default args: {'max_model_len': 16384, 'enable_prefix_caching': False, 'gpu_memory_utilization': 0.85, 'max_num_batched_tokens': 16384, 'max_num_seqs': 16, 'disable_log_stats': True, 'enforce_eager': True, 'kernel_config': KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=[], fused_add_rms_norm=[]), enable_flashinfer_autotune=None, enable_cutedsl_warmup=True, enable_jit_warmup=False, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto'), 'model': '/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master'}
+WARNING 09-09 16:07:09 [envs.py:2326] Unknown vLLM environment variable detected: VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS
+INFO 09-09 16:07:09 [config.py:803] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+INFO 09-09 16:07:16 [model.py:691] Resolved architecture: DeepseekV4ForCausalLM
+INFO 09-09 16:07:16 [model.py:712] Defaulting to tokenizer_mode='deepseek_v4' for DeepseekV4ForCausalLM
+INFO 09-09 16:07:16 [model.py:2031] Using max model len 16384
+INFO 09-09 16:07:16 [scheduler.py:288] Chunked prefill is enabled with max_num_batched_tokens=16384.
+WARNING 09-09 16:07:16 [vllm.py:1382] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+INFO 09-09 16:07:16 [vllm.py:727] Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out.
+INFO 09-09 16:07:16 [kernel.py:372] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 09-09 16:07:16 [vllm.py:1596] Cudagraph is disabled under eager mode
+INFO 09-09 16:07:16 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+(EngineCore pid=534338) INFO 09-09 16:07:17 [core.py:123] Initializing a V1 LLM engine (v0.1.dev1+g6c73b08de) with config: model='/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master', speculative_config=None, tokenizer='/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master', skip_tokenizer_init=False, tokenizer_mode=deepseek_v4, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=16384, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=deepseek_v4_fp8, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['+quant_fp8', 'all', '+quant_fp8'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [16384], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=False, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=534338) INFO 09-09 16:07:17 [parallel_state.py:1798] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_1c297a2238884a95b16d398eefa76680 backend=nccl
+(EngineCore pid=534338) INFO 09-09 16:07:17 [parallel_state.py:2142] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+(EngineCore pid=534338) INFO 09-09 16:07:17 [gpu_worker.py:438] Using V2 Model Runner
+(EngineCore pid=534338) INFO 09-09 16:07:18 [model_runner.py:390] Loading model from scratch...
+(EngineCore pid=534338) INFO 09-09 16:07:18 [quant_config.py:75] DeepSeek V4 expert_dtype resolved to 'fp4'
+(EngineCore pid=534338) INFO 09-09 16:07:18 [__init__.py:698] Selected MarlinFP8ScaledMMLinearKernel for Fp8LinearMethod
+(EngineCore pid=534338) INFO 09-09 16:07:18 [attention.py:120] Using DeepSeek's fp8_ds_mla KV cache format.
+(EngineCore pid=534338) INFO 09-09 16:07:18 [attention.py:928] Using FP8 indexer cache for Lightning Indexer.
+(EngineCore pid=534338) INFO 09-09 16:07:27 [weight_utils.py:895] Filesystem type for checkpoints: EXT4. Checkpoint size: 155.43 GiB. Available RAM: 1350.57 GiB.
+(EngineCore pid=534338) INFO 09-09 16:07:27 [weight_utils.py:918] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+(EngineCore pid=534338) Loading safetensors checkpoint shards:   0% Completed | 0/48 [00:00<?, ?it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:   2% Completed | 1/48 [00:00<00:05,  9.11it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:   4% Completed | 2/48 [00:00<00:10,  4.31it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:   6% Completed | 3/48 [00:00<00:13,  3.23it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:   8% Completed | 4/48 [00:01<00:15,  2.83it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  10% Completed | 5/48 [00:01<00:16,  2.68it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  12% Completed | 6/48 [00:02<00:16,  2.58it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  15% Completed | 7/48 [00:02<00:16,  2.52it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  17% Completed | 8/48 [00:02<00:16,  2.47it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  19% Completed | 9/48 [00:03<00:15,  2.47it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  21% Completed | 10/48 [00:03<00:15,  2.47it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  23% Completed | 11/48 [00:04<00:14,  2.50it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  25% Completed | 12/48 [00:04<00:15,  2.34it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  27% Completed | 13/48 [00:05<00:20,  1.72it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  29% Completed | 14/48 [00:06<00:23,  1.46it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  31% Completed | 15/48 [00:07<00:25,  1.31it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  33% Completed | 16/48 [00:07<00:21,  1.52it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  35% Completed | 17/48 [00:08<00:18,  1.72it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  38% Completed | 18/48 [00:08<00:15,  1.89it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  40% Completed | 19/48 [00:09<00:14,  2.03it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  42% Completed | 20/48 [00:09<00:13,  2.15it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  44% Completed | 21/48 [00:09<00:12,  2.23it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  46% Completed | 22/48 [00:10<00:11,  2.27it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  48% Completed | 23/48 [00:10<00:10,  2.31it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  50% Completed | 24/48 [00:11<00:10,  2.34it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  52% Completed | 25/48 [00:11<00:09,  2.36it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  54% Completed | 26/48 [00:11<00:09,  2.37it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  56% Completed | 27/48 [00:12<00:08,  2.38it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  58% Completed | 28/48 [00:12<00:08,  2.38it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  60% Completed | 29/48 [00:13<00:07,  2.39it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  62% Completed | 30/48 [00:13<00:07,  2.38it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  65% Completed | 31/48 [00:14<00:07,  2.38it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  67% Completed | 32/48 [00:14<00:06,  2.38it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  69% Completed | 33/48 [00:14<00:06,  2.38it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  71% Completed | 34/48 [00:15<00:05,  2.39it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  73% Completed | 35/48 [00:15<00:05,  2.38it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  75% Completed | 36/48 [00:16<00:05,  2.38it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  77% Completed | 37/48 [00:16<00:04,  2.39it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  79% Completed | 38/48 [00:16<00:04,  2.39it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  81% Completed | 39/48 [00:17<00:03,  2.40it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  83% Completed | 40/48 [00:17<00:03,  2.42it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  85% Completed | 41/48 [00:18<00:02,  2.41it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  88% Completed | 42/48 [00:18<00:02,  2.41it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  90% Completed | 43/48 [00:19<00:02,  2.40it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  92% Completed | 44/48 [00:19<00:01,  2.40it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards:  94% Completed | 45/48 [00:19<00:01,  2.73it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards: 100% Completed | 48/48 [00:19<00:00,  5.53it/s]
+(EngineCore pid=534338) Loading safetensors checkpoint shards: 100% Completed | 48/48 [00:19<00:00,  2.42it/s]
+(EngineCore pid=534338) 
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.0.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.1.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.2.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.3.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.4.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.5.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.6.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.7.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.8.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.9.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.10.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.11.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.12.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.13.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.14.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.15.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.16.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.17.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.18.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.19.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.20.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.21.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.22.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.23.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.24.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.25.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.26.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.27.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.28.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.29.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.30.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.31.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.32.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.33.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.34.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.35.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.36.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.37.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.38.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.39.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.40.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.41.ffn E=256 topk=6
+(EngineCore pid=534338) [xiaotu] WARNING: max_num_batched_tokens=16384 > group_max_len=4224; the engine's per-token buffers would overflow. Set --max-num-batched-tokens <= 4096.
+(EngineCore pid=534338) [xiaotu] engine built model.layers.42.ffn E=256 topk=6
+(EngineCore pid=534338) INFO 09-09 16:09:45 [default_loader.py:430] Loading weights took 137.64 seconds
+(EngineCore pid=534338) WARNING 09-09 16:09:45 [marlin_utils_fp8.py:112] Your GPU does not have native support for FP8 computation but FP8 quantization is being used. Weight-only FP8 compression will be used leveraging the Marlin kernel. This may degrade performance for compute-heavy workloads.
+(EngineCore pid=534338) INFO 09-09 16:09:45 [model_runner.py:422] Model loading took 10.22 GiB memory and 147.762231 seconds
+(EngineCore pid=534338) INFO 09-09 16:09:45 [topk_topp_sampler.py:46] FlashInfer top-p/top-k sampling disabled via VLLM_USE_FLASHINFER_SAMPLER=0.
+(EngineCore pid=534338) INFO 09-09 16:09:45 [interface.py:635] Setting kv cache block size to 256 for DEEPSEEK_SPARSE_SWA backend.
+(EngineCore pid=534338) INFO 09-09 16:09:45 [utils.py:306] Using BLHNC KV cache layout.
+(EngineCore pid=534338) INFO 09-09 16:09:46 [marlin_utils.py:625] Marlin kernel can achieve better performance for small size_n with experimental use_atomic_add feature. You can consider set environment variable VLLM_MARLIN_USE_ATOMIC_ADD to 1 if possible.
+(EngineCore pid=534338) [qlen] pass#1 qlen=[16384] layers=43
+(EngineCore pid=534338) INFO 09-09 16:10:22 [gpu_worker.py:637] Available KV cache memory: 9.9 GiB
+(EngineCore pid=534338) INFO 09-09 16:10:23 [kv_cache_utils.py:2312] GPU KV cache size: 25,840 tokens, Maximum concurrency for 16,384 tokens per request: 1.58x
+(EngineCore pid=534338) INFO 09-09 16:10:23 [indexer.py:759] DSA indexer decode path: use_flattening=False supports_varlen=False (next_n=1, use_fp4_cache=False)
+(EngineCore pid=534338) INFO 09-09 16:10:26 [gpu_worker.py:876] Free memory on device (39.08/39.49 GiB) on startup. Desired GPU memory utilization is (0.85, 33.57 GiB). Actual usage is 19.54 GiB for consumed memory (weights + non-torch), 4.13 GiB for peak activation, and 0.0 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=10472460698` (9.75 GiB) to fit into requested memory, or `--kv-cache-memory=16387667968` (15.26 GiB) to fully utilize gpu memory. Current kv cache memory in use is 9.9 GiB.
+(EngineCore pid=534338) INFO 09-09 16:10:26 [jit_monitor.py:85] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(EngineCore pid=534338) WARNING 09-09 16:10:27 [torch_utils.py:268] OMP_NUM_THREADS=48 is set; leaving Torch threads at 48 for serving. Multi-threaded torch CPU ops during serving can degrade performance through spin-wait contention and cgroup CPU-quota throttling.
+(EngineCore pid=534338) INFO 09-09 16:10:27 [core.py:379] init engine (profile, create kv cache, warmup model) took 41.51 s
+(EngineCore pid=534338) INFO 09-09 16:10:27 [kernel.py:372] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+JSON {"kind": "load", "tp": 1, "maxlen": 16384, "mnbt": 16384, "load_s": 198.5, "ts": "2026-09-09T16:10:27"}
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 70.30it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=534338) WARNING 09-09 16:10:27 [jit_monitor.py:141] Triton kernel JIT compilation during inference: ComputePrefillMetadataKernel.kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=534338) WARNING 09-09 16:10:27 [jit_monitor.py:141] Triton kernel JIT compilation during inference: BuildPrefillChunkMetadataKernel.kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=534338) WARNING 09-09 16:10:27 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _deepseek_v4_sm12x_fp8_einsum_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=534338) WARNING 09-09 16:10:28 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _dequantize_and_gather_k_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=534338) [qlen] pass#2 qlen=[2091] layers=43
+Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.74s/it, est. speed input: 364.02 toks/s, output: 0.17 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.74s/it, est. speed input: 364.02 toks/s, output: 0.17 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.74s/it, est. speed input: 364.02 toks/s, output: 0.17 toks/s]
+[curve] warmup (pinned cache + JIT) = 5.8s
+JSON {"kind": "warmup", "tp": 1, "wall_s": 5.8, "ts": "2026-09-09T16:10:33"}
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1565.62it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=534338) WARNING 09-09 16:10:33 [jit_monitor.py:141] TileLang JIT compilation during inference: hc_prenorm_gemm_tilelang. This causes a latency spike; consider extending warmup to cover this shape/config.
+Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.69s/it, est. speed input: 24.44 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.69s/it, est. speed input: 24.44 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.69s/it, est. speed input: 24.44 toks/s, output: 0.18 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "cpu", "target_len": 128, "tokens": 139, "ttft_s": 5.689, "tok_per_s": 24.4, "text": "\",\n", "ts": "2026-09-09T16:10:39"}
+[curve] L=128(139 tok) cpu: 5.69s (24 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1371.58it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:02<00:00,  2.41s/it, est. speed input: 57.67 toks/s, output: 0.41 toks/s]Processed prompts: 100%|██████████| 1/1 [00:02<00:00,  2.41s/it, est. speed input: 57.67 toks/s, output: 0.41 toks/s]Processed prompts: 100%|██████████| 1/1 [00:02<00:00,  2.41s/it, est. speed input: 57.67 toks/s, output: 0.41 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 128, "tokens": 139, "ttft_s": 2.412, "tok_per_s": 57.6, "text": "\",\n", "ts": "2026-09-09T16:10:41"}
+[curve] L=128(139 tok) gpu: 2.41s (58 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1247.56it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:06<00:00,  6.53s/it, est. speed input: 42.14 toks/s, output: 0.15 toks/s]Processed prompts: 100%|██████████| 1/1 [00:06<00:00,  6.53s/it, est. speed input: 42.14 toks/s, output: 0.15 toks/s]Processed prompts: 100%|██████████| 1/1 [00:06<00:00,  6.53s/it, est. speed input: 42.14 toks/s, output: 0.15 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "cpu", "target_len": 256, "tokens": 275, "ttft_s": 6.528, "tok_per_s": 42.1, "text": " research", "ts": "2026-09-09T16:10:47"}
+[curve] L=256(275 tok) cpu: 6.53s (42 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1031.05it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:04<00:00,  4.95s/it, est. speed input: 55.51 toks/s, output: 0.20 toks/s]Processed prompts: 100%|██████████| 1/1 [00:04<00:00,  4.95s/it, est. speed input: 55.51 toks/s, output: 0.20 toks/s]Processed prompts: 100%|██████████| 1/1 [00:04<00:00,  4.95s/it, est. speed input: 55.51 toks/s, output: 0.20 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 256, "tokens": 275, "ttft_s": 4.956, "tok_per_s": 55.5, "text": " research", "ts": "2026-09-09T16:10:52"}
+[curve] L=256(275 tok) gpu: 4.96s (55 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 950.23it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:09<00:00,  9.85s/it, est. speed input: 41.72 toks/s, output: 0.10 toks/s]Processed prompts: 100%|██████████| 1/1 [00:09<00:00,  9.85s/it, est. speed input: 41.72 toks/s, output: 0.10 toks/s]Processed prompts: 100%|██████████| 1/1 [00:09<00:00,  9.85s/it, est. speed input: 41.72 toks/s, output: 0.10 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "cpu", "target_len": 384, "tokens": 411, "ttft_s": 9.852, "tok_per_s": 41.7, "text": "\"\n", "ts": "2026-09-09T16:11:02"}
+[curve] L=384(411 tok) cpu: 9.85s (42 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 826.95it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:08<00:00,  8.02s/it, est. speed input: 51.28 toks/s, output: 0.12 toks/s]Processed prompts: 100%|██████████| 1/1 [00:08<00:00,  8.02s/it, est. speed input: 51.28 toks/s, output: 0.12 toks/s]Processed prompts: 100%|██████████| 1/1 [00:08<00:00,  8.02s/it, est. speed input: 51.28 toks/s, output: 0.12 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 384, "tokens": 411, "ttft_s": 8.017, "tok_per_s": 51.3, "text": "\"\n", "ts": "2026-09-09T16:11:10"}
+[curve] L=384(411 tok) gpu: 8.02s (51 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 793.32it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:12<00:00, 12.25s/it, est. speed input: 44.75 toks/s, output: 0.08 toks/s]Processed prompts: 100%|██████████| 1/1 [00:12<00:00, 12.25s/it, est. speed input: 44.75 toks/s, output: 0.08 toks/s]Processed prompts: 100%|██████████| 1/1 [00:12<00:00, 12.25s/it, est. speed input: 44.75 toks/s, output: 0.08 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "cpu", "target_len": 512, "tokens": 548, "ttft_s": 12.247, "tok_per_s": 44.7, "text": "ium", "ts": "2026-09-09T16:11:23"}
+[curve] L=512(548 tok) cpu: 12.25s (45 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 673.89it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=534338) [qlen] pass#3 qlen=[548] layers=43
+Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.65s/it, est. speed input: 96.91 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.65s/it, est. speed input: 96.91 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.65s/it, est. speed input: 96.91 toks/s, output: 0.18 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 512, "tokens": 548, "ttft_s": 5.656, "tok_per_s": 96.9, "text": "ium", "ts": "2026-09-09T16:11:28"}
+[curve] L=512(548 tok) gpu: 5.66s (97 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 594.60it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:18<00:00, 18.05s/it, est. speed input: 43.93 toks/s, output: 0.06 toks/s]Processed prompts: 100%|██████████| 1/1 [00:18<00:00, 18.05s/it, est. speed input: 43.93 toks/s, output: 0.06 toks/s]Processed prompts: 100%|██████████| 1/1 [00:18<00:00, 18.05s/it, est. speed input: 43.93 toks/s, output: 0.06 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "cpu", "target_len": 768, "tokens": 793, "ttft_s": 18.052, "tok_per_s": 43.9, "text": "2", "ts": "2026-09-09T16:11:46"}
+[curve] L=768(793 tok) cpu: 18.05s (44 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 504.61it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=534338) [qlen] pass#4 qlen=[793] layers=43
+Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.67s/it, est. speed input: 139.83 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.67s/it, est. speed input: 139.83 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.67s/it, est. speed input: 139.83 toks/s, output: 0.18 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 768, "tokens": 793, "ttft_s": 5.674, "tok_per_s": 139.8, "text": "2", "ts": "2026-09-09T16:11:52"}
+[curve] L=768(793 tok) gpu: 5.67s (140 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 489.53it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:23<00:00, 23.51s/it, est. speed input: 44.95 toks/s, output: 0.04 toks/s]Processed prompts: 100%|██████████| 1/1 [00:23<00:00, 23.51s/it, est. speed input: 44.95 toks/s, output: 0.04 toks/s]Processed prompts: 100%|██████████| 1/1 [00:23<00:00, 23.51s/it, est. speed input: 44.95 toks/s, output: 0.04 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "cpu", "target_len": 1024, "tokens": 1057, "ttft_s": 23.516, "tok_per_s": 44.9, "text": "2", "ts": "2026-09-09T16:12:15"}
+[curve] L=1024(1057 tok) cpu: 23.52s (45 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 337.19it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=534338) [qlen] pass#5 qlen=[1057] layers=43
+Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.65s/it, est. speed input: 187.10 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.65s/it, est. speed input: 187.10 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.65s/it, est. speed input: 187.10 toks/s, output: 0.18 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 1024, "tokens": 1057, "ttft_s": 5.653, "tok_per_s": 187.0, "text": "2", "ts": "2026-09-09T16:12:21"}
+[curve] L=1024(1057 tok) gpu: 5.65s (187 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 275.98it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s][pool] SLOW parallel_for: elapsed=2584ms gen=1683 n=346 counter=700554 remaining=0 current_gen=1683
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2723ms gen=1686 n=380 counter=703659 remaining=0 current_gen=1686
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2840ms gen=1692 n=282 counter=709679 remaining=0 current_gen=1692
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2348ms gen=1695 n=342 counter=712682 remaining=0 current_gen=1695
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2170ms gen=1698 n=362 counter=715765 remaining=0 current_gen=1698
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=4104ms gen=1713 n=199 counter=730199 remaining=0 current_gen=1713
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=4275ms gen=1719 n=209 counter=735765 remaining=0 current_gen=1719
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=4624ms gen=1722 n=194 counter=738547 remaining=0 current_gen=1722
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2088ms gen=1731 n=374 counter=747384 remaining=0 current_gen=1731
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2093ms gen=1737 n=364 counter=753648 remaining=0 current_gen=1737
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2088ms gen=1740 n=352 counter=756743 remaining=0 current_gen=1740
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2271ms gen=1743 n=350 counter=759824 remaining=0 current_gen=1743
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2726ms gen=1746 n=298 counter=762851 remaining=0 current_gen=1746
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2873ms gen=1749 n=322 counter=765850 remaining=0 current_gen=1749
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2550ms gen=1755 n=345 counter=771887 remaining=0 current_gen=1755
+  laggards=0/96 remaining=0
+[pool] SLOW parallel_for: elapsed=2570ms gen=1758 n=345 counter=774956 remaining=0 current_gen=1758
+  laggards=0/96 remaining=0
+Processed prompts: 100%|██████████| 1/1 [01:32<00:00, 92.59s/it, est. speed input: 22.58 toks/s, output: 0.01 toks/s]Processed prompts: 100%|██████████| 1/1 [01:32<00:00, 92.59s/it, est. speed input: 22.58 toks/s, output: 0.01 toks/s]Processed prompts: 100%|██████████| 1/1 [01:32<00:00, 92.59s/it, est. speed input: 22.58 toks/s, output: 0.01 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "cpu", "target_len": 2048, "tokens": 2091, "ttft_s": 92.598, "tok_per_s": 22.6, "text": "2", "ts": "2026-09-09T16:13:54"}
+[curve] L=2048(2091 tok) cpu: 92.60s (23 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 262.95it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=534338) [qlen] pass#6 qlen=[2091] layers=43
+Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.71s/it, est. speed input: 366.37 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.71s/it, est. speed input: 366.37 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.71s/it, est. speed input: 366.37 toks/s, output: 0.18 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 2048, "tokens": 2091, "ttft_s": 5.712, "tok_per_s": 366.1, "text": "2", "ts": "2026-09-09T16:13:59"}
+[curve] L=2048(2091 tok) gpu: 5.71s (366 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 151.93it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=534338) [qlen] pass#7 qlen=[4137] layers=43
+Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.76s/it, est. speed input: 718.71 toks/s, output: 0.17 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.76s/it, est. speed input: 718.71 toks/s, output: 0.17 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.76s/it, est. speed input: 718.71 toks/s, output: 0.17 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 4096, "tokens": 4137, "ttft_s": 5.763, "tok_per_s": 717.8, "text": "1", "ts": "2026-09-09T16:14:05"}
+[curve] L=4096(4137 tok) gpu: 5.76s (718 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 81.20it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=534338) WARNING 09-09 16:14:06 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _indexed_d512_split_score_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=534338) WARNING 09-09 16:14:06 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _indexed_d512_split_stats_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=534338) WARNING 09-09 16:14:06 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _indexed_d512_split_value_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=534338) [qlen] pass#8 qlen=[8229] layers=43
+Processed prompts: 100%|██████████| 1/1 [00:08<00:00,  8.60s/it, est. speed input: 957.02 toks/s, output: 0.12 toks/s]Processed prompts: 100%|██████████| 1/1 [00:08<00:00,  8.60s/it, est. speed input: 957.02 toks/s, output: 0.12 toks/s]Processed prompts: 100%|██████████| 1/1 [00:08<00:00,  8.60s/it, est. speed input: 957.02 toks/s, output: 0.12 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 8192, "tokens": 8229, "ttft_s": 8.611, "tok_per_s": 955.6, "text": "2", "ts": "2026-09-09T16:14:14"}
+[curve] L=8192(8229 tok) gpu: 8.61s (956 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 43.61it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=534338) [qlen] pass#9 qlen=[16039] layers=43
+Processed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.72s/it, est. speed input: 905.21 toks/s, output: 0.06 toks/s]Processed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.72s/it, est. speed input: 905.21 toks/s, output: 0.06 toks/s]Processed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.72s/it, est. speed input: 905.21 toks/s, output: 0.06 toks/s]
+JSON {"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 16000, "tokens": 16039, "ttft_s": 17.742, "tok_per_s": 904.0, "text": "1", "ts": "2026-09-09T16:14:32"}
+[curve] L=16000(16039 tok) gpu: 17.74s (904 tok/s)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 297.93it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.63s/it, est. speed input: 371.10 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.63s/it, est. speed input: 371.10 toks/s, output: 0.18 toks/s]Processed prompts: 100%|██████████| 1/1 [00:05<00:00,  5.63s/it, est. speed input: 371.10 toks/s, output: 0.18 toks/s]
+JSON {"kind": "concurrency", "tp": 1, "conc": 1, "tokens": 2091, "total_tokens": 2091, "wall_s": 5.639, "tok_per_s": 370.8, "per_req_ttft_s": 5.639, "n_out": 1, "ts": "2026-09-09T16:14:37"}
+[curve] conc=1 x 2091 tok: 5.64s (371 tok/s aggregate)
+Rendering prompts:   0%|          | 0/4 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 4/4 [00:00<00:00, 301.39it/s]
+Processed prompts:   0%|          | 0/4 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts:  25%|██▌       | 1/4 [00:13<00:40, 13.35s/it, est. speed input: 156.61 toks/s, output: 0.07 toks/s]Processed prompts: 100%|██████████| 4/4 [00:13<00:00, 13.35s/it, est. speed input: 622.07 toks/s, output: 0.30 toks/s]Processed prompts: 100%|██████████| 4/4 [00:13<00:00,  3.36s/it, est. speed input: 622.07 toks/s, output: 0.30 toks/s]
+JSON {"kind": "concurrency", "tp": 1, "conc": 4, "tokens": 2091, "total_tokens": 8364, "wall_s": 13.459, "tok_per_s": 621.4, "per_req_ttft_s": 13.459, "n_out": 4, "ts": "2026-09-09T16:14:51"}
+[curve] conc=4 x 2091 tok: 13.46s (621 tok/s aggregate)
+Rendering prompts:   0%|          | 0/8 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 8/8 [00:00<00:00, 309.82it/s]
+Processed prompts:   0%|          | 0/8 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts:  12%|█▎        | 1/8 [00:24<02:49, 24.15s/it, est. speed input: 86.60 toks/s, output: 0.04 toks/s]Processed prompts:  25%|██▌       | 2/8 [00:24<01:00, 10.07s/it, est. speed input: 171.68 toks/s, output: 0.08 toks/s]Processed prompts: 100%|██████████| 8/8 [00:24<00:00, 10.07s/it, est. speed input: 686.73 toks/s, output: 0.33 toks/s]Processed prompts: 100%|██████████| 8/8 [00:24<00:00,  3.04s/it, est. speed input: 686.73 toks/s, output: 0.33 toks/s]
+JSON {"kind": "concurrency", "tp": 1, "conc": 8, "tokens": 2091, "total_tokens": 16728, "wall_s": 24.385, "tok_per_s": 686.0, "per_req_ttft_s": 24.385, "n_out": 8, "ts": "2026-09-09T16:15:15"}
+[curve] conc=8 x 2091 tok: 24.39s (686 tok/s aggregate)
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1105.22it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:12<00:00, 12.10s/it, est. speed input: 22.73 toks/s, output: 5.29 toks/s]Processed prompts: 100%|██████████| 1/1 [00:12<00:00, 12.10s/it, est. speed input: 22.73 toks/s, output: 5.29 toks/s]Processed prompts: 100%|██████████| 1/1 [00:12<00:00, 12.10s/it, est. speed input: 22.73 toks/s, output: 5.29 toks/s]
+JSON {"kind": "decode", "tp": 1, "out_tokens": 64, "wall_s": 12.102, "decode_tok_per_s": 5.29, "ts": "2026-09-09T16:15:27"}
+[curve] decode 64 tok in 12.10s (5.3 tok/s)
+[curve] DONE
+INFO 09-09 16:15:27 [utils.py:620] [shutdown] Process manager: send sigterm to process EngineCore
+(EngineCore pid=534338) INFO 09-09 16:15:27 [core.py:1361] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=534338) INFO 09-09 16:15:27 [core.py:1512] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=534338) INFO 09-09 16:15:27 [core.py:1543] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=534338) INFO 09-09 16:15:27 [core.py:1374] [shutdown] EngineCore: exiting busy loop
+WARNING 09-09 16:15:32 [utils.py:640] [shutdown] Process manager: force killing remaining processes count=1
+WARNING 09-09 16:15:32 [utils.py:645] [shutdown] Process manager: force killing remaining process EngineCore pid 534338

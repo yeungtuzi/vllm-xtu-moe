@@ -1,0 +1,4 @@
+{"kind": "server_concurrency", "conc": 1, "tokens": 2048, "total_tokens": 2048, "wall_s": 5.745, "tok_per_s": 356.5, "max_lat_s": 5.744, "min_lat_s": 5.744}
+{"kind": "server_concurrency", "conc": 2, "tokens": 2048, "total_tokens": 4096, "wall_s": 3.154, "tok_per_s": 1298.5, "max_lat_s": 3.153, "min_lat_s": 2.828}
+{"kind": "server_concurrency", "conc": 4, "tokens": 2048, "total_tokens": 8192, "wall_s": 4.099, "tok_per_s": 1998.4, "max_lat_s": 4.098, "min_lat_s": 4.05}
+{"kind": "server_concurrency", "conc": 8, "tokens": 2048, "total_tokens": 16384, "wall_s": 8.18, "tok_per_s": 2002.9, "max_lat_s": 8.179, "min_lat_s": 8.082}

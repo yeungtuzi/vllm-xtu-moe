@@ -1,0 +1,5 @@
+{"kind": "load", "tp": 1, "maxlen": 16384, "mnbt": 16384, "load_s": 321.4, "ts": "2026-09-09T14:51:49"}
+{"kind": "warmup", "tp": 1, "wall_s": 5.8, "ts": "2026-09-09T14:51:55"}
+{"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 2048, "tokens": 2091, "ttft_s": 5.638, "tok_per_s": 370.9, "text": "2", "ts": "2026-09-09T14:52:01"}
+{"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 4096, "tokens": 4137, "ttft_s": 5.763, "tok_per_s": 717.9, "text": "1", "ts": "2026-09-09T14:52:06"}
+{"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 8192, "tokens": 8229, "ttft_s": 8.639, "tok_per_s": 952.5, "text": "2", "ts": "2026-09-09T14:52:15"}

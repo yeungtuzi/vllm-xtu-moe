@@ -1,0 +1,8 @@
+loadavg_before=77.43 59.88 51.51 4/4294 518492
+threads=24 N=200000000  Copy 30.4 GB/s  Scale 60.5 GB/s  Triad 68.1 GB/s
+threads=48 N=400000000  Copy 109.4 GB/s  Scale 217.4 GB/s  Triad 241.0 GB/s
+threads=192 N=400000000  Copy 133.1 GB/s  Scale 246.3 GB/s  Triad 291.2 GB/s
+pinned H2D     22.71 GB/s
+pinned D2H     22.41 GB/s
+pageable H2D   25.03 GB/s
+HBM D2D copy  1372.37 GB/s (r+w)

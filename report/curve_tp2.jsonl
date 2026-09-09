@@ -1,0 +1,9 @@
+{"kind": "load", "tp": 2, "maxlen": 16384, "mnbt": 16384, "load_s": 942.5, "ts": "2026-09-09T15:18:26"}
+{"kind": "warmup", "tp": 2, "wall_s": 3.5, "ts": "2026-09-09T15:18:29"}
+{"kind": "ttft", "tp": 2, "mode": "gpu", "target_len": 4096, "tokens": 4137, "ttft_s": 3.993, "tok_per_s": 1036.2, "text": "13", "ts": "2026-09-09T15:18:33"}
+{"kind": "ttft", "tp": 2, "mode": "gpu", "target_len": 16000, "tokens": 16039, "ttft_s": 13.956, "tok_per_s": 1149.3, "text": "8", "ts": "2026-09-09T15:18:47"}
+{"kind": "concurrency", "tp": 2, "conc": 1, "tokens": 2091, "total_tokens": 2091, "wall_s": 2.921, "tok_per_s": 715.9, "per_req_ttft_s": 2.921, "n_out": 1, "ts": "2026-09-09T15:18:50"}
+{"kind": "concurrency", "tp": 2, "conc": 2, "tokens": 2091, "total_tokens": 4182, "wall_s": 5.828, "tok_per_s": 717.6, "per_req_ttft_s": 5.828, "n_out": 2, "ts": "2026-09-09T15:18:56"}
+{"kind": "concurrency", "tp": 2, "conc": 4, "tokens": 2091, "total_tokens": 8364, "wall_s": 8.547, "tok_per_s": 978.6, "per_req_ttft_s": 8.547, "n_out": 4, "ts": "2026-09-09T15:19:04"}
+{"kind": "concurrency", "tp": 2, "conc": 8, "tokens": 2091, "total_tokens": 16728, "wall_s": 16.468, "tok_per_s": 1015.8, "per_req_ttft_s": 16.468, "n_out": 8, "ts": "2026-09-09T15:19:21"}
+{"kind": "decode", "tp": 2, "out_tokens": 64, "wall_s": 37.493, "decode_tok_per_s": 1.71, "ts": "2026-09-09T15:19:58"}

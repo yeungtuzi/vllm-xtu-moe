@@ -1,0 +1,8 @@
+{"kind": "load", "tp": 1, "maxlen": 16384, "mnbt": 16384, "load_s": 317.1, "ts": "2026-09-09T15:00:10"}
+{"kind": "warmup", "tp": 1, "wall_s": 5.8, "ts": "2026-09-09T15:00:16"}
+{"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 16000, "tokens": 16039, "ttft_s": 18.237, "tok_per_s": 879.5, "text": " Marie", "ts": "2026-09-09T15:00:34"}
+{"kind": "concurrency", "tp": 1, "conc": 1, "tokens": 2091, "total_tokens": 2091, "wall_s": 5.637, "tok_per_s": 370.9, "per_req_ttft_s": 5.637, "n_out": 1, "ts": "2026-09-09T15:00:40"}
+{"kind": "concurrency", "tp": 1, "conc": 2, "tokens": 2091, "total_tokens": 4182, "wall_s": 11.247, "tok_per_s": 371.8, "per_req_ttft_s": 11.247, "n_out": 2, "ts": "2026-09-09T15:00:51"}
+{"kind": "concurrency", "tp": 1, "conc": 4, "tokens": 2091, "total_tokens": 8364, "wall_s": 13.81, "tok_per_s": 605.7, "per_req_ttft_s": 13.81, "n_out": 4, "ts": "2026-09-09T15:01:05"}
+{"kind": "concurrency", "tp": 1, "conc": 8, "tokens": 2091, "total_tokens": 16728, "wall_s": 24.702, "tok_per_s": 677.2, "per_req_ttft_s": 24.702, "n_out": 8, "ts": "2026-09-09T15:01:29"}
+{"kind": "decode", "tp": 1, "out_tokens": 64, "wall_s": 14.258, "decode_tok_per_s": 4.49, "ts": "2026-09-09T15:01:44"}

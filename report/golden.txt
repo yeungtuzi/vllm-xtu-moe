@@ -1,0 +1,7 @@
+device: NVIDIA A100-PCIE-40GB
+[golden] small dims:
+  H=256 I=128 E=8 T=32 K=3: max_abs=16.00000 max_rel=1499.99988 rms_rel=4.12e-03 out_absmean=163.0000
+  H=256 I=128 E=8 T=7 K=2: max_abs=8.00000 max_rel=999.99994 rms_rel=3.60e-03 out_absmean=127.0000
+[golden] full DS-V4 dims (T=4):
+  H=4096 I=2048 E=256 T=4 K=6: max_abs=1024.00000 max_rel=191999.98438 rms_rel=5.59e-03 out_absmean=16640.0000
+[golden] ALL PASS

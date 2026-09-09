@@ -1,0 +1,319 @@
+[xiaotu] GPU/CPU Mixed: MXFP4 CPU backend -> XiaotuCPUExperts (AVX512-VNNI, no AMX)
+[vllm-xiaotu-moe] registered OOT override of DeepseekV4ForCausalLM (DeepseekV4MoE -> CpuXiaotuMoE)
+INFO 09-09 06:13:00 [api_utils.py:286] non-default args: {'max_model_len': 256, 'gpu_memory_utilization': 0.85, 'max_num_seqs': 256, 'disable_log_stats': True, 'enforce_eager': True, 'kernel_config': KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=[], fused_add_rms_norm=[]), enable_flashinfer_autotune=None, enable_cutedsl_warmup=True, enable_jit_warmup=False, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto'), 'model': '/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master'}
+INFO 09-09 06:13:00 [config.py:803] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+INFO 09-09 06:13:07 [model.py:691] Resolved architecture: DeepseekV4ForCausalLM
+INFO 09-09 06:13:07 [model.py:712] Defaulting to tokenizer_mode='deepseek_v4' for DeepseekV4ForCausalLM
+INFO 09-09 06:13:07 [model.py:2031] Using max model len 256
+INFO 09-09 06:13:07 [scheduler.py:288] Chunked prefill is enabled with max_num_batched_tokens=8192.
+WARNING 09-09 06:13:07 [vllm.py:1382] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+INFO 09-09 06:13:07 [vllm.py:727] Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out.
+INFO 09-09 06:13:07 [kernel.py:372] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 09-09 06:13:07 [vllm.py:1596] Cudagraph is disabled under eager mode
+INFO 09-09 06:13:07 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+(EngineCore pid=445703) INFO 09-09 06:13:08 [core.py:123] Initializing a V1 LLM engine (v0.1.dev1+g6c73b08de) with config: model='/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master', speculative_config=None, tokenizer='/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master', skip_tokenizer_init=False, tokenizer_mode=deepseek_v4, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=256, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=deepseek_v4_fp8, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['+quant_fp8', 'all', '+quant_fp8'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=False, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=445703) INFO 09-09 06:13:08 [parallel_state.py:1798] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_7b743192e4a54970971365a37e229f1f backend=nccl
+(EngineCore pid=445703) INFO 09-09 06:13:08 [parallel_state.py:2142] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+(EngineCore pid=445703) INFO 09-09 06:13:08 [gpu_worker.py:438] Using V2 Model Runner
+(EngineCore pid=445703) INFO 09-09 06:13:09 [model_runner.py:390] Loading model from scratch...
+(EngineCore pid=445703) INFO 09-09 06:13:09 [quant_config.py:75] DeepSeek V4 expert_dtype resolved to 'fp4'
+(EngineCore pid=445703) INFO 09-09 06:13:09 [__init__.py:698] Selected MarlinFP8ScaledMMLinearKernel for Fp8LinearMethod
+(EngineCore pid=445703) INFO 09-09 06:13:09 [attention.py:120] Using DeepSeek's fp8_ds_mla KV cache format.
+(EngineCore pid=445703) INFO 09-09 06:13:09 [attention.py:928] Using FP8 indexer cache for Lightning Indexer.
+(EngineCore pid=445703) INFO 09-09 06:13:15 [weight_utils.py:895] Filesystem type for checkpoints: EXT4. Checkpoint size: 155.43 GiB. Available RAM: 1189.62 GiB.
+(EngineCore pid=445703) INFO 09-09 06:13:15 [weight_utils.py:918] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+(EngineCore pid=445703) Loading safetensors checkpoint shards:   0% Completed | 0/48 [00:00<?, ?it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:   2% Completed | 1/48 [00:00<00:05,  8.08it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:   4% Completed | 2/48 [00:00<00:15,  3.03it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:   6% Completed | 3/48 [00:01<00:20,  2.22it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:   8% Completed | 4/48 [00:01<00:21,  2.01it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  10% Completed | 5/48 [00:02<00:22,  1.90it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  12% Completed | 6/48 [00:02<00:22,  1.85it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  15% Completed | 7/48 [00:03<00:22,  1.85it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  17% Completed | 8/48 [00:04<00:21,  1.82it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  19% Completed | 9/48 [00:04<00:21,  1.79it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  21% Completed | 10/48 [00:05<00:21,  1.76it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  23% Completed | 11/48 [00:05<00:21,  1.75it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  25% Completed | 12/48 [00:06<00:21,  1.67it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  27% Completed | 13/48 [00:07<00:26,  1.32it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  29% Completed | 14/48 [00:08<00:29,  1.16it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  31% Completed | 15/48 [00:09<00:30,  1.07it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  33% Completed | 16/48 [00:10<00:29,  1.08it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  35% Completed | 17/48 [00:11<00:25,  1.20it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  38% Completed | 18/48 [00:11<00:22,  1.33it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  40% Completed | 19/48 [00:12<00:20,  1.44it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  42% Completed | 20/48 [00:12<00:18,  1.53it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  44% Completed | 21/48 [00:13<00:16,  1.61it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  46% Completed | 22/48 [00:14<00:15,  1.68it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  48% Completed | 23/48 [00:14<00:14,  1.72it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  50% Completed | 24/48 [00:15<00:13,  1.74it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  52% Completed | 25/48 [00:15<00:13,  1.72it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  54% Completed | 26/48 [00:16<00:12,  1.71it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  56% Completed | 27/48 [00:16<00:12,  1.71it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  58% Completed | 28/48 [00:17<00:11,  1.71it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  60% Completed | 29/48 [00:18<00:11,  1.72it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  62% Completed | 30/48 [00:18<00:10,  1.73it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  65% Completed | 31/48 [00:19<00:09,  1.73it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  67% Completed | 32/48 [00:19<00:09,  1.73it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  69% Completed | 33/48 [00:20<00:08,  1.74it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  71% Completed | 34/48 [00:20<00:08,  1.72it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  73% Completed | 35/48 [00:21<00:07,  1.71it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  75% Completed | 36/48 [00:22<00:07,  1.70it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  77% Completed | 37/48 [00:22<00:06,  1.70it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  79% Completed | 38/48 [00:23<00:05,  1.69it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  81% Completed | 39/48 [00:23<00:05,  1.69it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  83% Completed | 40/48 [00:24<00:04,  1.69it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  85% Completed | 41/48 [00:25<00:04,  1.68it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  88% Completed | 42/48 [00:25<00:03,  1.68it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  90% Completed | 43/48 [00:26<00:02,  1.69it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  92% Completed | 44/48 [00:26<00:02,  1.65it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards:  94% Completed | 45/48 [00:27<00:01,  1.91it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards: 100% Completed | 48/48 [00:27<00:00,  3.98it/s]
+(EngineCore pid=445703) Loading safetensors checkpoint shards: 100% Completed | 48/48 [00:27<00:00,  1.75it/s]
+(EngineCore pid=445703) 
+(EngineCore pid=445703) [xiaotu] engine built model.layers.0.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.1.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.2.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.3.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.4.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.5.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.6.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.7.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.8.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.9.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.10.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.11.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.12.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.13.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.14.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.15.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.16.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.17.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.18.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.19.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.20.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.21.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.22.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.23.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.24.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.25.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.26.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.27.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.28.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.29.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.30.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.31.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.32.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.33.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.34.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.35.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.36.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.37.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.38.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.39.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.40.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.41.ffn E=256 topk=6
+(EngineCore pid=445703) [xiaotu] engine built model.layers.42.ffn E=256 topk=6
+(EngineCore pid=445703) INFO 09-09 06:14:44 [default_loader.py:430] Loading weights took 88.65 seconds
+(EngineCore pid=445703) WARNING 09-09 06:14:44 [marlin_utils_fp8.py:112] Your GPU does not have native support for FP8 computation but FP8 quantization is being used. Weight-only FP8 compression will be used leveraging the Marlin kernel. This may degrade performance for compute-heavy workloads.
+(EngineCore pid=445703) INFO 09-09 06:14:45 [model_runner.py:422] Model loading took 10.2 GiB memory and 96.082546 seconds
+(EngineCore pid=445703) INFO 09-09 06:14:45 [topk_topp_sampler.py:46] FlashInfer top-p/top-k sampling disabled via VLLM_USE_FLASHINFER_SAMPLER=0.
+(EngineCore pid=445703) INFO 09-09 06:14:45 [interface.py:635] Setting kv cache block size to 256 for DEEPSEEK_SPARSE_SWA backend.
+(EngineCore pid=445703) INFO 09-09 06:14:45 [utils.py:306] Using BLHNC KV cache layout.
+(EngineCore pid=445703) INFO 09-09 06:14:46 [marlin_utils.py:625] Marlin kernel can achieve better performance for small size_n with experimental use_atomic_add feature. You can consider set environment variable VLLM_MARLIN_USE_ATOMIC_ADD to 1 if possible.
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.950s ntok=8192
+(EngineCore pid=445703) [xiaotu-timing] engine=5.012s step_wall=27.953s other=22.941s qlen=8192 engine_frac=0.18
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=29.396s ntok=8192
+(EngineCore pid=445703) INFO 09-09 06:17:23 [gpu_worker.py:637] Available KV cache memory: 20.61 GiB
+(EngineCore pid=445703) INFO 09-09 06:17:24 [kv_cache_utils.py:2312] GPU KV cache size: 51,864 tokens, Maximum concurrency for 256 tokens per request: 202.60x
+(EngineCore pid=445703) INFO 09-09 06:17:24 [indexer.py:759] DSA indexer decode path: use_flattening=False supports_varlen=False (next_n=1, use_fp4_cache=False)
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.657s ntok=512
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=132.483s other=132.481s qlen=512 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=2.534s ntok=512
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.346s ntok=256
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=4.504s other=4.503s qlen=256 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.557s ntok=256
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.087s ntok=2
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=3.225s other=3.224s qlen=2 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.245s ntok=2
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.074s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.171s other=0.170s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.143s ntok=1
+(EngineCore pid=445703) INFO 09-09 06:17:35 [gpu_worker.py:876] Free memory on device (39.08/39.49 GiB) on startup. Desired GPU memory utilization is (0.85, 33.57 GiB). Actual usage is 10.64 GiB for consumed memory (weights + non-torch), 2.32 GiB for peak activation, and 0.0 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=21976122266` (20.47 GiB) to fit into requested memory, or `--kv-cache-memory=27891329536` (25.98 GiB) to fully utilize gpu memory. Current kv cache memory in use is 20.61 GiB.
+(EngineCore pid=445703) INFO 09-09 06:17:35 [jit_monitor.py:85] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(EngineCore pid=445703) WARNING 09-09 06:17:35 [torch_utils.py:268] OMP_NUM_THREADS=96 is set; leaving Torch threads at 96 for serving. Multi-threaded torch CPU ops during serving can degrade performance through spin-wait contention and cgroup CPU-quota throttling.
+(EngineCore pid=445703) INFO 09-09 06:17:35 [core.py:379] init engine (profile, create kv cache, warmup model) took 170.37 s
+(EngineCore pid=445703) INFO 09-09 06:17:35 [kernel.py:372] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+[sweep] constructed 275.6s maxlen=256
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 118.39it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=445703) WARNING 09-09 06:17:35 [jit_monitor.py:141] Triton kernel JIT compilation during inference: ComputePrefillMetadataKernel.kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=445703) WARNING 09-09 06:17:35 [jit_monitor.py:141] Triton kernel JIT compilation during inference: BuildPrefillChunkMetadataKernel.kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=445703) WARNING 09-09 06:17:35 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _deepseek_v4_sm12x_fp8_einsum_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=445703) WARNING 09-09 06:17:35 [jit_monitor.py:141] Triton kernel JIT compilation during inference: _dequantize_and_gather_k_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.086s ntok=5
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.591s other=0.590s qlen=5 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.149s ntok=5
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.077s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.157s other=0.155s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.143s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.061s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.151s other=0.150s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.131s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.067s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.136s other=0.135s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.128s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.061s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=0.147s other=0.144s qlen=1 engine_frac=0.02
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.138s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.071s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.133s other=0.132s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.124s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.075s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.138s other=0.137s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.129s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.055s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.144s other=0.143s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.135s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.073s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.150s other=0.149s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.140s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.064s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.145s other=0.144s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.137s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.061s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.142s other=0.141s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.134s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.070s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.143s other=0.142s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.134s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.066s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.139s other=0.138s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.131s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.066s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.137s other=0.136s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.129s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.072s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.151s other=0.149s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.142s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.066s ntok=1
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.134s other=0.133s qlen=1 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.126s ntok=1
+Processed prompts: 100%|██████████| 1/1 [00:02<00:00,  2.31s/it, est. speed input: 2.16 toks/s, output: 6.92 toks/s]Processed prompts: 100%|██████████| 1/1 [00:02<00:00,  2.31s/it, est. speed input: 2.16 toks/s, output: 6.92 toks/s]Processed prompts: 100%|██████████| 1/1 [00:02<00:00,  2.31s/it, est. speed input: 2.16 toks/s, output: 6.92 toks/s]
+[sweep] B=1 sanity token_ids=[11111, 16, 455, 6102, 294, 16603, 344, 29168, 16, 455, 6102, 294, 14251, 344, 16235, 16] text=' Paris. The capital of Spain is Madrid. The capital of Italy is Rome.'
+Rendering prompts:   0%|          | 0/64 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 64/64 [00:00<00:00, 7268.17it/s]
+Processed prompts:   0%|          | 0/64 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.103s ntok=5
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.176s other=0.174s qlen=5 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.164s ntok=5
+(EngineCore pid=445703) WARNING 09-09 06:17:38 [jit_monitor.py:141] Triton kernel JIT compilation during inference: CombineTopkSwaIndicesKernel.kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=2.193s ntok=316
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=2.257s other=2.255s qlen=316 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=2.240s ntok=316
+(EngineCore pid=445703) WARNING 09-09 06:17:42 [jit_monitor.py:141] TileLang JIT compilation during inference: hc_prenorm_gemm_tilelang. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=2.134s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=2.429s other=2.428s qlen=64 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=2.206s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.084s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=0.636s other=0.633s qlen=64 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.613s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.093s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=0.701s other=0.698s qlen=64 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.649s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.093s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=0.666s other=0.664s qlen=64 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.618s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.087s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=0.633s other=0.631s qlen=64 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.587s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.078s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.004s step_wall=0.652s other=0.648s qlen=64 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.604s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.093s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=0.684s other=0.682s qlen=64 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.635s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.085s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=0.650s other=0.648s qlen=64 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.603s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.074s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=0.676s other=0.672s qlen=64 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.622s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.070s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=0.637s other=0.635s qlen=64 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.592s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.113s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=0.658s other=0.654s qlen=64 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.605s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.083s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=0.645s other=0.643s qlen=64 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.601s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.084s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=0.653s other=0.650s qlen=64 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.612s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.078s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=0.688s other=0.685s qlen=64 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.639s ntok=64
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.619s ntok=63
+(EngineCore pid=445703) [xiaotu-timing] engine=0.001s step_wall=0.751s other=0.750s qlen=63 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.699s ntok=63
+Processed prompts:   2%|▏         | 1/64 [00:14<14:53, 14.18s/it, est. speed input: 0.35 toks/s, output: 1.13 toks/s]Processed prompts:   3%|▎         | 2/64 [00:14<06:19,  6.12s/it, est. speed input: 0.68 toks/s, output: 2.18 toks/s]Processed prompts: 100%|██████████| 64/64 [00:14<00:00,  6.12s/it, est. speed input: 21.83 toks/s, output: 69.86 toks/s]Processed prompts: 100%|██████████| 64/64 [00:14<00:00,  4.37it/s, est. speed input: 21.83 toks/s, output: 69.86 toks/s]
+[sweep] B=  64   1024 tok in   14.67s ->   69.82 tok/s
+Rendering prompts:   0%|          | 0/128 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 128/128 [00:00<00:00, 5913.13it/s]
+Processed prompts:   0%|          | 0/128 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.096s ntok=5
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=0.658s other=0.656s qlen=5 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=0.171s ntok=5
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=4.264s ntok=636
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=4.346s other=4.344s qlen=636 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=4.323s ntok=636
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=3.105s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.004s step_wall=3.629s other=3.624s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=3.254s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.094s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=1.271s other=1.269s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.180s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.131s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=1.273s other=1.271s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.179s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.117s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=1.214s other=1.211s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.130s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.125s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.009s step_wall=1.189s other=1.181s qlen=128 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.106s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.095s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=1.181s other=1.178s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.090s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.127s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.006s step_wall=1.251s other=1.245s qlen=128 engine_frac=0.01
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.162s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.117s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=1.218s other=1.215s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.129s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.120s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=1.253s other=1.251s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.165s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.097s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=1.215s other=1.212s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.129s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.128s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.004s step_wall=1.217s other=1.213s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.128s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.120s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=1.208s other=1.205s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.125s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.109s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.003s step_wall=1.244s other=1.241s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.153s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=0.108s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] engine=0.004s step_wall=1.308s other=1.305s qlen=128 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.209s ntok=128
+(EngineCore pid=445703) [xiaotu-timing] attn_43layers=1.336s ntok=127
+(EngineCore pid=445703) [xiaotu-timing] engine=0.002s step_wall=1.505s other=1.503s qlen=127 engine_frac=0.00
+(EngineCore pid=445703) [xiaotu-timing] layer_43x=1.413s ntok=127
+Processed prompts:   1%|          | 1/128 [00:25<54:24, 25.71s/it, est. speed input: 0.19 toks/s, output: 0.62 toks/s]Processed prompts:   2%|▏         | 2/128 [00:26<23:13, 11.06s/it, est. speed input: 0.38 toks/s, output: 1.21 toks/s]Processed prompts: 100%|██████████| 128/128 [00:26<00:00, 11.06s/it, est. speed input: 24.14 toks/s, output: 77.24 toks/s]Processed prompts: 100%|██████████| 128/128 [00:26<00:00,  4.83it/s, est. speed input: 24.14 toks/s, output: 77.24 toks/s]
+[sweep] B= 128   2048 tok in   26.54s ->   77.17 tok/s
+INFO 09-09 06:18:19 [utils.py:620] [shutdown] Process manager: send sigterm to process EngineCore
+(EngineCore pid=445703) INFO 09-09 06:18:19 [core.py:1361] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=445703) INFO 09-09 06:18:19 [core.py:1512] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=445703) INFO 09-09 06:18:19 [core.py:1543] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=445703) INFO 09-09 06:18:19 [core.py:1374] [shutdown] EngineCore: exiting busy loop
+WARNING 09-09 06:18:24 [utils.py:640] [shutdown] Process manager: force killing remaining processes count=1
+WARNING 09-09 06:18:24 [utils.py:645] [shutdown] Process manager: force killing remaining process EngineCore pid 445703

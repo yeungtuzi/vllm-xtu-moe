@@ -1,0 +1,11 @@
+{"kind": "load", "tp": 1, "maxlen": 16384, "mnbt": 16384, "load_s": 197.7, "ts": "2026-09-09T16:20:09"}
+{"kind": "warmup", "tp": 1, "wall_s": 5.8, "ts": "2026-09-09T16:20:15"}
+{"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 128, "tokens": 139, "ttft_s": 5.567, "tok_per_s": 25.0, "text": "\",\n", "ts": "2026-09-09T16:20:20"}
+{"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 256, "tokens": 275, "ttft_s": 5.568, "tok_per_s": 49.4, "text": " research", "ts": "2026-09-09T16:20:26"}
+{"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 384, "tokens": 411, "ttft_s": 5.584, "tok_per_s": 73.6, "text": " discovered", "ts": "2026-09-09T16:20:31"}
+{"kind": "ttft", "tp": 1, "mode": "gpu", "target_len": 512, "tokens": 548, "ttft_s": 5.587, "tok_per_s": 98.1, "text": "ium", "ts": "2026-09-09T16:20:37"}
+{"kind": "concurrency", "tp": 1, "conc": 1, "tokens": 2091, "total_tokens": 2091, "wall_s": 5.646, "tok_per_s": 370.3, "per_req_ttft_s": 5.646, "n_out": 1, "ts": "2026-09-09T16:20:43"}
+{"kind": "concurrency", "tp": 1, "conc": 2, "tokens": 2091, "total_tokens": 4182, "wall_s": 11.261, "tok_per_s": 371.4, "per_req_ttft_s": 11.261, "n_out": 2, "ts": "2026-09-09T16:20:54"}
+{"kind": "concurrency", "tp": 1, "conc": 4, "tokens": 2091, "total_tokens": 8364, "wall_s": 13.464, "tok_per_s": 621.2, "per_req_ttft_s": 13.464, "n_out": 4, "ts": "2026-09-09T16:21:07"}
+{"kind": "concurrency", "tp": 1, "conc": 8, "tokens": 2091, "total_tokens": 16728, "wall_s": 24.408, "tok_per_s": 685.3, "per_req_ttft_s": 24.408, "n_out": 8, "ts": "2026-09-09T16:21:32"}
+{"kind": "decode", "tp": 1, "out_tokens": 32, "wall_s": 11.656, "decode_tok_per_s": 2.75, "ts": "2026-09-09T16:21:43"}

@@ -1,0 +1,251 @@
+[glm] construct: load_format=dummy experts_device=cpu max_len=2048
+[xiaotu] GPU/CPU Mixed: MXFP4 CPU backend -> XiaotuCPUExperts (AVX512-VNNI, no AMX)
+[vllm-xiaotu-moe] registered OOT override of DeepseekV4ForCausalLM (DeepseekV4MoE -> CpuXiaotuMoE)
+INFO 09-08 16:21:06 [api_utils.py:286] non-default args: {'skip_tokenizer_init': True, 'load_format': 'dummy', 'max_model_len': 2048, 'gpu_memory_utilization': 0.85, 'max_num_seqs': 8, 'disable_log_stats': True, 'enforce_eager': True, 'limit_mm_per_prompt': {'image': 0, 'video': 0}, 'model': '/home/user/.cache/modelscope/models/zai-org/GLM-5.3-Flash'}
+INFO 09-08 16:21:06 [model.py:691] Resolved architecture: Glm5NextForConditionalGeneration
+INFO 09-08 16:21:06 [model.py:2031] Using max model len 2048
+WARNING 09-08 16:21:06 [model.py:991] Model does not support mm_device_do_normalize, forcing mm_device_do_normalize = False.
+INFO 09-08 16:21:07 [registry.py:146] All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+INFO 09-08 16:21:07 [model.py:897] Disabled mm_prefix attention mode because multimodal inputs are configuration-disabled. Attention backends without mm_prefix support may now be selected.
+INFO 09-08 16:21:07 [scheduler.py:288] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 09-08 16:21:07 [config.py:625] Mamba cache mode is set to 'align' for Glm5NextForConditionalGeneration by default when prefix caching is enabled
+WARNING 09-08 16:21:07 [vllm.py:1382] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+INFO 09-08 16:21:07 [vllm.py:727] Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out.
+INFO 09-08 16:21:07 [kernel.py:372] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 09-08 16:21:07 [vllm.py:1596] Cudagraph is disabled under eager mode
+INFO 09-08 16:21:07 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+[transformers] The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+WARNING 09-08 16:21:07 [system_utils.py:157] We must use the `spawn` multiprocessing start method. Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. See https://docs.vllm.ai/en/latest/usage/troubleshooting.html#python-multiprocessing for more information. Reasons: CUDA is initialized
+(EngineCore pid=365830) [xiaotu] GPU/CPU Mixed: MXFP4 CPU backend -> XiaotuCPUExperts (AVX512-VNNI, no AMX)
+(EngineCore pid=365830) [vllm-xiaotu-moe] registered OOT override of DeepseekV4ForCausalLM (DeepseekV4MoE -> CpuXiaotuMoE)
+(EngineCore pid=365830) INFO 09-08 16:21:14 [core.py:123] Initializing a V1 LLM engine (v0.1.dev1+g6c73b08de) with config: model='/home/user/.cache/modelscope/models/zai-org/GLM-5.3-Flash', speculative_config=None, tokenizer='/home/user/.cache/modelscope/models/zai-org/GLM-5.3-Flash', skip_tokenizer_init=True, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=2048, download_dir=None, load_format=dummy, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=fp8, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/home/user/.cache/modelscope/models/zai-org/GLM-5.3-Flash, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['+quant_fp8', 'all', '+quant_fp8'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=365830) INFO 09-08 16:21:14 [registry.py:146] All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+(EngineCore pid=365830) INFO 09-08 16:21:14 [parallel_state.py:1798] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_47694a3655cb46f08ab8ec2dc912c2ab backend=nccl
+(EngineCore pid=365830) INFO 09-08 16:21:15 [parallel_state.py:2142] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+(EngineCore pid=365830) INFO 09-08 16:21:15 [gpu_worker.py:438] Using V2 Model Runner
+(EngineCore pid=365830) INFO 09-08 16:21:15 [model_runner.py:390] Loading model from scratch...
+(EngineCore pid=365830) INFO 09-08 16:21:15 [cuda.py:581] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention
+(EngineCore pid=365830) INFO 09-08 16:21:15 [mm_encoder_attention.py:372] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.
+(EngineCore pid=365830) WARNING 09-08 16:21:15 [vllm.py:1382] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+(EngineCore pid=365830) INFO 09-08 16:21:15 [kernel.py:372] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+(EngineCore pid=365830) INFO 09-08 16:21:15 [vllm.py:1596] Cudagraph is disabled under eager mode
+(EngineCore pid=365830) INFO 09-08 16:21:15 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+(EngineCore pid=365830) INFO 09-08 16:21:15 [__init__.py:698] Selected MarlinFP8ScaledMMLinearKernel for Fp8LinearMethod
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385] EngineCore failed to start.
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385] Traceback (most recent call last):
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/core.py", line 1347, in run_engine_core
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     return func(*args, **kwargs)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/core.py", line 1104, in __init__
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     super().__init__(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/core.py", line 134, in __init__
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self.model_executor = executor_class(vllm_config)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     return func(*args, **kwargs)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/executor/abstract.py", line 110, in __init__
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self._init_executor()
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/executor/uniproc_executor.py", line 74, in _init_executor
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self.driver_worker.load_model()
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/worker/gpu_worker.py", line 504, in load_model
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/worker/gpu/model_runner.py", line 394, in load_model
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self.model = model_loader.load_model(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]                  ^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     return func(*args, **kwargs)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/model_loader/base_loader.py", line 55, in load_model
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     model = initialize_model(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]             ^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     return func(*args, **kwargs)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/model_loader/utils.py", line 60, in initialize_model
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     model = model_class(vllm_config=vllm_config, prefix=prefix)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/model.py", line 1054, in __init__
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self.language_model = init_vllm_registered_model(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/models/utils.py", line 609, in init_vllm_registered_model
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     return initialize_model(vllm_config=vllm_config, prefix=prefix)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     return func(*args, **kwargs)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/model_loader/utils.py", line 60, in initialize_model
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     model = model_class(vllm_config=vllm_config, prefix=prefix)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/model.py", line 899, in __init__
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self.model = Glm5NextModel(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]                  ^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/model.py", line 630, in __init__
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self.start_layer, self.end_layer, self.layers = make_layers(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]                                                     ^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/models/utils.py", line 880, in make_layers
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     + get_offloader().wrap_modules(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/offloader/base.py", line 119, in wrap_modules
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     return list(modules_generator)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]            ^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/models/utils.py", line 881, in <genexpr>
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     layer_fn(prefix=f"{prefix}.{idx}") for idx in range(start_layer, end_layer)
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/model.py", line 622, in get_layer
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     return Glm5NextDecoderLayer(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/model.py", line 318, in __init__
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self.self_attn = Glm5NextMLAAttention(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]                      ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/attention.py", line 569, in __init__
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self.mla_attn = MultiHeadLatentAttentionWrapper(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/layers/mla.py", line 115, in __init__
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self.mla_attn = MLAAttention(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]                     ^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/layers/attention/mla_attention.py", line 486, in __init__
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     self.attn_backend = get_attn_backend(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]                         ^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/attention/selector.py", line 187, in get_attn_backend
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     return _cached_get_attn_backend(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/attention/selector.py", line 202, in _cached_get_attn_backend
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     attention_cls = current_platform.get_attn_backend_cls(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/platforms/cuda.py", line 486, in get_attn_backend_cls
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385]     raise ValueError(
+(EngineCore pid=365830) ERROR 09-08 16:21:24 [core.py:1385] ValueError: No valid attention backend found for cuda with AttentionSelectorConfig(head_size=512, dtype=torch.bfloat16, kv_cache_dtype=auto, block_size=None, use_mla=True, has_sink=False, use_sparse=True, use_mm_prefix=False, use_per_head_quant_scales=False, attn_type=AttentionType.DECODER, has_sliding_window=False, use_non_causal=False, use_batch_invariant=False, use_kv_connector=False, use_adaptive_verification=False, use_pcp=False, use_dcp=False). Reasons: {FLASH_ATTN_MLA: [sparse not supported, compute capability not supported, FlashAttention MLA not supported on this device], FLASHMLA: [sparse not supported, compute capability not supported, FlashMLA Sparse is only supported on Hopper and Blackwell DC devices.], FLASHINFER_MLA: [sparse not supported, compute capability not supported, FlashInfer MLA kernel requires qk_nope_head_dim in [64, 128, 192], but got 256], TRITON_MLA: [sparse not supported], FLASHINFER_MLA_SPARSE_SM90: [compute capability not supported], FLASH_ATTN_MLA_SPARSE: [compute capability not supported, FlashAttention MLA not supported on this device], FLASHMLA_SPARSE: [head_size not supported, compute capability not supported]}.
+(EngineCore pid=365830) Process EngineCore:
+(EngineCore pid=365830) Traceback (most recent call last):
+(EngineCore pid=365830)   File "/home/user/anaconda3/envs/vllm-xiaotu-moe/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore pid=365830)     self.run()
+(EngineCore pid=365830)   File "/home/user/anaconda3/envs/vllm-xiaotu-moe/lib/python3.12/multiprocessing/process.py", line 108, in run
+(EngineCore pid=365830)     self._target(*self._args, **self._kwargs)
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/core.py", line 1389, in run_engine_core
+(EngineCore pid=365830)     raise e
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/core.py", line 1347, in run_engine_core
+(EngineCore pid=365830)     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=365830)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=365830)     return func(*args, **kwargs)
+(EngineCore pid=365830)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/core.py", line 1104, in __init__
+(EngineCore pid=365830)     super().__init__(
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/core.py", line 134, in __init__
+(EngineCore pid=365830)     self.model_executor = executor_class(vllm_config)
+(EngineCore pid=365830)                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=365830)     return func(*args, **kwargs)
+(EngineCore pid=365830)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/executor/abstract.py", line 110, in __init__
+(EngineCore pid=365830)     self._init_executor()
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/executor/uniproc_executor.py", line 74, in _init_executor
+(EngineCore pid=365830)     self.driver_worker.load_model()
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/worker/gpu_worker.py", line 504, in load_model
+(EngineCore pid=365830)     self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/worker/gpu/model_runner.py", line 394, in load_model
+(EngineCore pid=365830)     self.model = model_loader.load_model(
+(EngineCore pid=365830)                  ^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=365830)     return func(*args, **kwargs)
+(EngineCore pid=365830)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/model_loader/base_loader.py", line 55, in load_model
+(EngineCore pid=365830)     model = initialize_model(
+(EngineCore pid=365830)             ^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=365830)     return func(*args, **kwargs)
+(EngineCore pid=365830)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/model_loader/utils.py", line 60, in initialize_model
+(EngineCore pid=365830)     model = model_class(vllm_config=vllm_config, prefix=prefix)
+(EngineCore pid=365830)             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/model.py", line 1054, in __init__
+(EngineCore pid=365830)     self.language_model = init_vllm_registered_model(
+(EngineCore pid=365830)                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/models/utils.py", line 609, in init_vllm_registered_model
+(EngineCore pid=365830)     return initialize_model(vllm_config=vllm_config, prefix=prefix)
+(EngineCore pid=365830)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=365830)     return func(*args, **kwargs)
+(EngineCore pid=365830)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/model_loader/utils.py", line 60, in initialize_model
+(EngineCore pid=365830)     model = model_class(vllm_config=vllm_config, prefix=prefix)
+(EngineCore pid=365830)             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/model.py", line 899, in __init__
+(EngineCore pid=365830)     self.model = Glm5NextModel(
+(EngineCore pid=365830)                  ^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/model.py", line 630, in __init__
+(EngineCore pid=365830)     self.start_layer, self.end_layer, self.layers = make_layers(
+(EngineCore pid=365830)                                                     ^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/models/utils.py", line 880, in make_layers
+(EngineCore pid=365830)     + get_offloader().wrap_modules(
+(EngineCore pid=365830)       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/offloader/base.py", line 119, in wrap_modules
+(EngineCore pid=365830)     return list(modules_generator)
+(EngineCore pid=365830)            ^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/models/utils.py", line 881, in <genexpr>
+(EngineCore pid=365830)     layer_fn(prefix=f"{prefix}.{idx}") for idx in range(start_layer, end_layer)
+(EngineCore pid=365830)     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/model.py", line 622, in get_layer
+(EngineCore pid=365830)     return Glm5NextDecoderLayer(
+(EngineCore pid=365830)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/model.py", line 318, in __init__
+(EngineCore pid=365830)     self.self_attn = Glm5NextMLAAttention(
+(EngineCore pid=365830)                      ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/glm5next/nvidia/attention.py", line 569, in __init__
+(EngineCore pid=365830)     self.mla_attn = MultiHeadLatentAttentionWrapper(
+(EngineCore pid=365830)                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/layers/mla.py", line 115, in __init__
+(EngineCore pid=365830)     self.mla_attn = MLAAttention(
+(EngineCore pid=365830)                     ^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/layers/attention/mla_attention.py", line 486, in __init__
+(EngineCore pid=365830)     self.attn_backend = get_attn_backend(
+(EngineCore pid=365830)                         ^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/attention/selector.py", line 187, in get_attn_backend
+(EngineCore pid=365830)     return _cached_get_attn_backend(
+(EngineCore pid=365830)            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/attention/selector.py", line 202, in _cached_get_attn_backend
+(EngineCore pid=365830)     attention_cls = current_platform.get_attn_backend_cls(
+(EngineCore pid=365830)                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=365830)   File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/platforms/cuda.py", line 486, in get_attn_backend_cls
+(EngineCore pid=365830)     raise ValueError(
+(EngineCore pid=365830) ValueError: No valid attention backend found for cuda with AttentionSelectorConfig(head_size=512, dtype=torch.bfloat16, kv_cache_dtype=auto, block_size=None, use_mla=True, has_sink=False, use_sparse=True, use_mm_prefix=False, use_per_head_quant_scales=False, attn_type=AttentionType.DECODER, has_sliding_window=False, use_non_causal=False, use_batch_invariant=False, use_kv_connector=False, use_adaptive_verification=False, use_pcp=False, use_dcp=False). Reasons: {FLASH_ATTN_MLA: [sparse not supported, compute capability not supported, FlashAttention MLA not supported on this device], FLASHMLA: [sparse not supported, compute capability not supported, FlashMLA Sparse is only supported on Hopper and Blackwell DC devices.], FLASHINFER_MLA: [sparse not supported, compute capability not supported, FlashInfer MLA kernel requires qk_nope_head_dim in [64, 128, 192], but got 256], TRITON_MLA: [sparse not supported], FLASHINFER_MLA_SPARSE_SM90: [compute capability not supported], FLASH_ATTN_MLA_SPARSE: [compute capability not supported, FlashAttention MLA not supported on this device], FLASHMLA_SPARSE: [head_size not supported, compute capability not supported]}.
+[rank0]:[W908 16:21:25.703654167 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+INFO 09-08 16:21:33 [utils.py:620] [shutdown] Process manager: send sigterm to process EngineCore
+Traceback (most recent call last):
+  File "/home/user/lvllm/vllm-xiaotu-moe/scripts/glm_mixed_test.py", line 59, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/user/lvllm/vllm-xiaotu-moe/scripts/glm_mixed_test.py", line 31, in main
+    llm = LLM(
+          ^^^^
+  File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/entrypoints/llm.py", line 343, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/llm_engine.py", line 184, in from_engine_args
+    return cls(
+           ^^^^
+  File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/llm_engine.py", line 109, in __init__
+    self.engine_core = EngineCoreClient.make_client(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/core_client.py", line 122, in make_client
+    return SyncMPClient(
+           ^^^^^^^^^^^^^
+  File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/tracing/otel.py", line 178, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/core_client.py", line 880, in __init__
+    super().__init__(
+  File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/core_client.py", line 656, in __init__
+    with launch_core_engines(
+         ^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/anaconda3/envs/vllm-xiaotu-moe/lib/python3.12/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/utils.py", line 1240, in launch_core_engines
+    wait_for_engine_startup(
+  File "/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/engine/utils.py", line 1320, in wait_for_engine_startup
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
