@@ -66,6 +66,21 @@
 
 复现:`python scripts/bench_cpu_engine.py` / `python scripts/bench_fp8_engine.py`。
 
+## 4.1 Qwen3.8-Flash-Next-FP8 端到端(目标模型,2×A100-40GB)
+
+| 项 | 数值 |
+|---|---|
+| 配置 | `VLLM_EXPERTS_LOAD_DEVICE=cpu` + TP=2 + `--enable-expert-parallel` + `--cpu-offload-gb 12` |
+| 后端选择 | `Using CPU Fp8 MoE backend`;每 rank `local=256 / global=512` 专家 |
+| 权重加载 | **1583.8 s**(185 GB,2 rank 各自读全部 shard) |
+| GPU 侧 | 每 rank 非专家权重 6.25 GiB;KV cache 20.27 GiB |
+| 短问答 | 3 个问题 38.6 s,答案正确(北京 / 2 / MoE 解释) |
+| 长 prefill | 531 token:TTFT **12.21 s**(44 tok/s) |
+| decode | ≈**1.3 tok/s**(512 专家 top-10,FP8 内核尚未优化) |
+
+> 该模型非专家权重约 65 GB(其中 51 GB 是一张 PLE n-gram 嵌入表),
+> 单卡 40 GB 放不下,必须 TP=2 + 部分权重 offload 到 CPU。
+
 ## 5. 服务端吞吐与时延(DeepSeek-V4-Flash,单卡)
 
 | 指标 | 数值 |

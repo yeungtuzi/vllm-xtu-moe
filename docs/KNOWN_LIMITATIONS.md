@@ -34,7 +34,7 @@ sparse 关闭(--hf-overrides '{"index_topk": null}'):
 
 | 限制 | 说明 |
 |---|---|
-| **专家并行(expert_map / EP)** | ✅ 已支持:按 `expert_map` 把全局 expert id 映射为本地 id(不在本 rank 的置 0)。**端到端验证待补**:本机 vLLM TP=2 会卡住(用 GPU 专家后端同样卡住,属环境问题) |
+| **专家并行(expert_map / EP)** | ✅ 已支持并在真实模型上验证(TP=2 + EP:Qwen3-30B-A3B-FP8 与 Qwen3.8-Flash-Next-FP8 均正常) |
 | **不支持 `apply_router_weight_on_input`** | 少数模型使用该选项 |
 | **不支持交错 gate/up 布局** | `SWIGLUOAI`(gpt-oss 系)把 gate/up 交错存在 `w13` 中;引擎按 packed 布局取数,因此该情形由 `_supports_activation` 拒绝 |
 | **INT4(WNA16)组大小固定 128** | 组大小/零点的完整适配进行中 |
@@ -51,6 +51,7 @@ sparse 关闭(--hf-overrides '{"index_topk": null}'):
 | 引擎 vs torch 参考(MXFP4,真实 DeepSeek-V4 层权重) | ✅ RMS 相对误差 5.6e-3 |
 | CPU 专家 vs GPU 专家端到端(bf16 微型模型) | ✅ greedy token 完全一致 |
 | **CPU 专家 vs GPU 专家端到端(真实 fp8 模型)** | ✅ 同一 prompt 下 **top-1 预测 20/20 一致**,实际 token 的 logprob 平均偏差 0.065(最大 0.24)——差异来自 GPU 侧对激活做动态 fp8 量化、CPU 侧用 bf16 |
+| **目标模型端到端**(Qwen3.8-Flash-Next-FP8,185 GB) | ✅ 2×A100 + TP=2 + EP + `--cpu-offload-gb 12`:三个问答答案正确,长 prompt 摘要正确 |
 
 ## 3.1 跨请求一致性(已从根因修复)
 
