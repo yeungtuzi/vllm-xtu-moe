@@ -264,6 +264,15 @@ class _XiaotuExpertsMixin:
         return em
 
     # ---- engine construction ------------------------------------------
+    def _validate_weights(self, layer, ex_w13, ex_w2) -> None:
+        """Per-format layout guard, run before the engine is built.
+
+        The engine consumes the *checkpoint* layout directly (it never calls
+        mainline's `prepare_*_for_cpu` AMX repack), so a format whose checkpoint
+        layout differs from the engine's must be rejected here instead of
+        silently computing garbage.
+        """
+
     def _find_scale(self, layer, names):
         for n in names:
             if not n:  # unquantized backends have no scale tensors
@@ -280,6 +289,7 @@ class _XiaotuExpertsMixin:
 
         ex_w13 = layer.w13_weight
         ex_w2 = layer.w2_weight
+        self._validate_weights(layer, ex_w13, ex_w2)
         if self._expect_dtype is not None and ex_w13.dtype != self._expect_dtype:
             raise NotImplementedError(
                 f"xiaotu {self._engine_attr} backend expects "
@@ -623,12 +633,45 @@ class XiaotuCPUExpertsFp8(_XiaotuExpertsMixin, CPUExpertsFp8):
 
 
 class XiaotuCPUExpertsInt4(_XiaotuExpertsMixin, CPUExpertsInt4):
-    """INT4 W4A16 组量化专家:引擎 MOE_WNA16。组大小由 quant_config 决定。"""
+    """INT4 W4A16 组量化专家:引擎 MOE_WNA16。
+
+    组大小/零点与检查点布局的完整适配尚未完成,见 docs/KNOWN_LIMITATIONS.md:
+    主线的 int4 检查点是 `w13 [E, K/8, 2I] int32`(nibble 沿 K 打包)并带 `qzeros`,
+    而引擎期望 `[E, 2I, K/2]` 字节打包的"中心 8"布局。`_validate_weights` 会在
+    不匹配时显式报错,而不是静默算错。
+    """
 
     _engine_attr = "MOE_WNA16"
     _scale_attrs = ("w13_weight_scale", "w2_weight_scale")
     _group_n, _group_k = 128, 128
     _scale_dtype = torch.float32
+
+    def _validate_weights(self, layer, ex_w13, ex_w2) -> None:
+        # Engine layout: w13 [E, 2I, H/2] u8, w2 [E, H, I/2] u8 (nibbles along K).
+        # A WNA16 checkpoint is int32 with K packed 8-per-word and N last.
+        qzeros = [
+            n for n in ("w13_qzeros", "w2_qzeros", "w13_zeros", "w2_zeros")
+            if getattr(layer, n, None) is not None
+        ]
+        layout_ok = (
+            ex_w13.dtype == torch.uint8
+            and ex_w13.dim() == 3
+            and ex_w2.dim() == 3
+            and ex_w13.shape[2] * 2 == ex_w2.shape[1]
+            and ex_w2.shape[2] * 2 == ex_w13.shape[1] // 2
+        )
+        if not layout_ok or qzeros:
+            raise NotImplementedError(
+                "xiaotu INT4/WNA16 backend cannot consume this checkpoint yet: "
+                f"w13 shape={tuple(ex_w13.shape)} dtype={ex_w13.dtype}, "
+                f"w2 shape={tuple(ex_w2.shape)} dtype={ex_w2.dtype}, "
+                f"zero-point tensors={qzeros or 'none'}. "
+                "The engine expects the byte-packed [E, 2I, K/2] / [E, H, I/2] "
+                "'center-8' layout; mainline int4 checkpoints pack nibbles along "
+                "K as int32 and carry qzeros, which needs a repack plus "
+                "zero-point support in the kernel. "
+                "See docs/KNOWN_LIMITATIONS.md (INT4/WNA16) and docs/ROADMAP.md."
+            )
 
 
 # 格式 → 需要替换的主线 CPU 后端类

@@ -37,7 +37,7 @@ sparse 关闭(--hf-overrides '{"index_topk": null}'):
 | **专家并行(expert_map / EP)** | ✅ 已支持并在真实模型上验证(TP=2 + EP:Qwen3-30B-A3B-FP8 与 Qwen3.8-Flash-Next-FP8 均正常) |
 | **不支持 `apply_router_weight_on_input`** | 少数模型使用该选项 |
 | **不支持交错 gate/up 布局** | `SWIGLUOAI`(gpt-oss 系)把 gate/up 交错存在 `w13` 中;引擎按 packed 布局取数,因此该情形由 `_supports_activation` 拒绝 |
-| **INT4(WNA16)组大小固定 128** | 组大小/零点的完整适配进行中 |
+| **INT4(WNA16)暂不接受真实 4-bit 检查点** | 主线的 int4 检查点布局是 `w13 [E, K/8, 2I] int32`(nibble 沿 K 打包)、并带 `qzeros`(对称量化时由主线合成 8);引擎期望 `[E, 2I, K/2]` 字节打包的"中心 8"布局。两者需要一次重排,且非对称量化的零点必须进内核。**当前插件会显式报错**(不再静默算错),适配工作见 `ROADMAP.md` |
 | **INT8 W8A8 未实现** | 引擎暂无该格式内核 |
 | **monolithic `apply()` 拿不到 `input_ids`** | 依赖 `input_ids` 的路由(哈希路由)无法走该路径,插件会报错而非静默算错 |
 
