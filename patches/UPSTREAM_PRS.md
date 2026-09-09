@@ -3,12 +3,18 @@
 > 目标仓库: `vllm-project/vllm`,基线已 rebase 到 `main@1454b71`
 > 我们的 fork: `yeungtuzi/vllm`
 > **D6 已改:PR 由我生成(draft),你检查后点 "Ready for review"**。
+>
+> ## 🧊 2026-09-09 冻结(D9=A,用户拍板)
+> 因项目目标改为「通用 CPU experts 后端,支持大部分 MoE 模型(DeepSeek/GLM/Qwen)」,
+> **三个 draft PR 全部冻结**:不点 Ready、不改描述、不关、不主动 rebase,只记录上游漂移。
+> 解冻条件与重排方案见 `docs/BACKLOG.md` §3「D9 已决」。
+> **下表的"你的动作"在冻结解除前不执行。**
 
 | PR | 分支 | 规模(vs 最新 main) | Draft PR | 状态 |
 |---|---|---|---|---|
-| PR1 | `xtu/pr1-experts-load-device` | 3 文件 +59/−2 | [#56118](https://github.com/vllm-project/vllm/pull/56118) | draft,待你 review |
-| PR2 | `xtu/pr2-fp8-sm80-o-proj` | 4 文件 +422/−12 | [#56119](https://github.com/vllm-project/vllm/pull/56119) | draft,待你 review |
-| PR3 | `xtu/pr3-sm80-port` | 21 文件 +6350/−119 | [#56120](https://github.com/vllm-project/vllm/pull/56120) | draft;**A100 运行时验证待补** |
+| PR1 | `xtu/pr1-experts-load-device` | 3 文件 +59/−2 | [#56118](https://github.com/vllm-project/vllm/pull/56118) | draft,**🧊 冻结(D9=A)** |
+| PR2 | `xtu/pr2-fp8-sm80-o-proj` | 4 文件 +422/−12 | [#56119](https://github.com/vllm-project/vllm/pull/56119) | draft,**🧊 冻结(D9=A)** |
+| PR3 | `xtu/pr3-sm80-port` | 21 文件 +6350/−119 | [#56120](https://github.com/vllm-project/vllm/pull/56120) | draft,**🧊 冻结(D9=A)**;A100 运行时验证待补 |
 | RFC | — | issue | — | 草稿见 `rfc_layerwise_gpu_prefill.md`,待你发 |
 
 **你的动作**:逐个点开 → 检查代码/描述 → 点 **"Ready for review"** 即提交给 maintainer。
@@ -178,6 +184,8 @@ gh pr create --repo vllm-project/vllm --base main \
 ---
 ## 修订记录
 
+- **2026-09-09(第 2 版)** — 顶部加 **D9=A 冻结声明**(三个 draft 全部冻结,不点 Ready、
+  不 rebase,只记录漂移);解冻条件见 `docs/BACKLOG.md` §3。依据:用户 2026-09-09 拍板。
 - **2026-09-09(第 1 版)** — 按 D1–D8 决策产出:PR1/PR2/PR3 分支已推送到
   `yeungtuzi/vllm`,标题/描述/测试说明齐备,等用户点提交(D6b)。
   依据:`docs/EXPERIMENT_REPORT.md` §4.1 的 D1–D8 决策 + 用户 2026-09-09 回复。

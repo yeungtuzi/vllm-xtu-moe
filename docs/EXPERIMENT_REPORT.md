@@ -416,7 +416,11 @@ FLASHINFER 仅 Blackwell 且维度是 (128,64,128)。→ GLM-5.3 需要 SM90+;�
 | D7 | 清理范围 | **删掉全部 `XIAOTU_DEBUG_*`/`XIAOTU_TIMING` 埋点;内部命名前缀不改** | ✅ PR3 里用 AST 精确删除(共 38 处/122 行),`grep XIAOTU` = 0;插件侧包名/env 前缀保持不变 |
 | D8 | 许可证与署名 | **我方 Apache-2.0,署名"大河马(BigHippo) dahema@me.com";第三方按其 license 要求署名** | ✅ 新增 `NOTICE`、`THIRD_PARTY_NOTICES.md`;`pyproject` 作者更新 |
 
-### 4.2 上游分支现状(D6b:等你点提交)
+### 4.2 上游分支现状(D9=A:已冻结,等你点提交的动作暂缓)
+
+> **🧊 2026-09-09 冻结**:项目目标改为「通用 CPU experts 后端(支持 DeepSeek/GLM/Qwen)」后,
+> 用户拍板 **三个 draft PR 全部冻结**(不点 Ready、不改描述、不主动 rebase,只记录漂移)。
+> 解冻条件与重排方案见 `docs/BACKLOG.md` §3「D9 已决」。下表为冻结时的状态快照。
 
 | PR | 分支(`yeungtuzi/vllm`) | 规模(vs 最新 main) | Draft PR | 依赖 |
 |---|---|---|---|---|
@@ -970,6 +974,8 @@ python report/make_figs.py
 
 ## 修订记录
 
+- **2026-09-09(第 14 版)** — §4.2 记录 **D9=A:三个 draft PR 全部冻结**(用户拍板),
+  解冻条件见 `docs/BACKLOG.md` §3。依据:用户 2026-09-09 选择。
 - **2026-09-09(第 13 版)** — 新增 §3.6「通用 CPU experts 后端(进行中)」:①
   `mixed_experts.py` 从"只覆盖 DS-V4 的 OOT 覆盖"升级为格式无关后端(MXFP4/FP8/INT4),
   路由改用主线 router(修掉主线 `cpu_moe.select_experts` 硬编码 softmax 的 bug 影响);
