@@ -35,10 +35,10 @@ into those slots, so:
 | Weight format | Engine kernel | Status |
 |---|---|---|
 | **BF16 / FP16** (unquantized) | `MOE_BF16` / `MOE_FP16` | ✅ |
-| **FP8 e4m3 + 128×128 blocks** (vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | 🟡 layer-level numerics verified (engine vs torch reference on real weights); end-to-end consistency on real models under investigation; kernel speed still being optimized |
+| **FP8 e4m3 + 128×128 blocks** (vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | ✅ layer-level numerics verified (48-layer self-check ≤1.4e-4) plus real end-to-end runs (Qwen3-30B-A3B-FP8 on one GPU, Qwen3.8-Flash-Next-FP8 on 2×A100 TP=2+EP) |
 | **MXFP4** (e2m1 + e8m0 block 32) | `MOE_MXFP4` | ✅ |
 | **NVFP4** | `MOE_NVFP4` | ✅ engine side |
-| **INT4 / WNA16** (GPTQ / AWQ group quantization) | `MOE_WNA16` | 🟡 engine side works; group-size / zero-point plumbing in progress |
+| **INT4 / WNA16** (GPTQ / AWQ group quantization) | `MOE_WNA16` | 🔴 real 4-bit checkpoints are not accepted yet: upstream packs `w13 [E, K/8, 2I] int32` plus `qzeros`, while the engine expects a byte-packed "center-8" layout, so the plugin raises an explicit error instead of computing silently wrong results (see `docs/ROADMAP.md`) |
 | INT8 W8A8 | — | ❌ not implemented in the engine |
 
 **Routing**: the plugin reuses upstream vLLM's router objects (softmax,

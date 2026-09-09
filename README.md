@@ -31,10 +31,10 @@ CPU 后端槽位,于是:
 | 权重格式 | 引擎内核 | 状态 |
 |---|---|---|
 | **BF16 / FP16**(无量化) | `MOE_BF16` / `MOE_FP16` | ✅ |
-| **FP8 e4m3 + block 128×128**(vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | 🟡 层内数值已验证(引擎 vs torch 参考,真实权重);真实模型端到端一致性排查中;内核性能待优化 |
+| **FP8 e4m3 + block 128×128**(vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | ✅ 层内数值已验证(48 层自校验 ≤1.4e-4)+ 真实模型端到端(Qwen3-30B-A3B-FP8 单卡、Qwen3.8-Flash-Next-FP8 2×A100 TP=2+EP) |
 | **MXFP4**(e2m1 + e8m0 block 32) | `MOE_MXFP4` | ✅ |
 | **NVFP4** | `MOE_NVFP4` | ✅ 引擎侧 |
-| **INT4 / WNA16**(GPTQ / AWQ 组量化) | `MOE_WNA16` | 🟡 引擎侧可用,组大小/零点适配进行中 |
+| **INT4 / WNA16**(GPTQ / AWQ 组量化) | `MOE_WNA16` | 🔴 暂不接受真实 4-bit 检查点:主线的 `w13 [E, K/8, 2I] int32` + `qzeros` 布局与引擎的字节打包"中心 8"布局不同,插件**显式报错**而非静默算错(适配计划见 `docs/ROADMAP.md`) |
 | INT8 W8A8 | — | ❌ 引擎尚未实现 |
 
 **路由**:直接复用主线 router(softmax、sigmoid + `noaux_tc`、
