@@ -394,6 +394,53 @@ routed MoE 放 CPU、注意力放 GPU)增加一条**逐层流式 GPU prefill** �
 - PR3 的代码来自 fork `Lvllmds4-x`(Apache-2.0),只做了主线 API 适配
   (如 `combine_topk_swa_indices` 改为返回 `(idx, lens)`)。
 
+### 4.3 上游漂移与维护成本(实测,2026-09-09)
+
+上游 vLLM 的更新节奏(实测):**近 90 天 3682 个提交(≈41/天)**;
+我们基线 `6c73b08` 之后 **36 小时内上游走了 85–86 个提交、涉及 300 个文件**,
+而且在我做这几次检查的十几分钟里 `main` 又前进了一次。
+
+**我们的三个 PR 对当天上游 main 的可应用性**(脚本 `scripts/check_upstream_drift.sh`):
+
+| PR | 结果 | 需要人工 rebase 的文件 |
+|---|---|---|
+| PR1 | ⚠️ 1 文件 / **1 处冲突标记** | `fused_moe/routed_experts.py`(上游在同一位置加了 `intermediate_size_full` 的 hunk) |
+| PR2 | ✅ **干净应用** | — |
+| PR3 | ⚠️ 3 文件 / **6 处冲突标记** | `common/ops/{cache_utils,fused_indexer_q,fused_inv_rope_fp8_quant}.py` |
+
+**插件侧(我们自己的代码)受上游影响很小**:
+
+- 插件只从上游导入 **15 个模块**(见脚本 §2 的清单),`grep` 全部仍存在;
+- 上游近 90 天对这些 API 文件有 9–16 次提交,但**近 1 天内没有任何一次改动
+  `def`/`class` 签名**(实测 `cpu_moe.py` / `modular_kernel.py` / `config.py` /
+  `gate_linear.py` / `fused_topk_bias_router.py` 的签名改动数 = 0)。
+- 风险形态是"改名/删函数"这类破坏性变更 —— 一旦发生,插件在 **import 时立刻报错**,
+  不会静默算错。
+
+**会被上游高频繁改动的"高危文件"**(近 90 天提交数):
+
+| 提交数 | 文件 |
+|---:|---|
+| 79 | `vllm/envs.py` |
+| 28 | `models/deepseek_v4/attention.py` |
+| 26 | `models/deepseek_v4/nvidia/model.py` |
+| 26 | `fused_moe/oracle/mxfp4.py` |
+| 25 | `fused_moe/routed_experts.py` |
+| 22 | `quantization/fp8.py` |
+| 17 | `v1/attention/backends/mla/indexer.py` |
+
+**结论与维护建议:**
+
+1. **不是"基本不受影响",而是"要按天跟"** —— 但冲突量很小(PR1 一行、PR3 六处),
+   因为我们的改动 ~90% 是**新增**(新文件、新分支、新函数),不是重写既有逻辑。
+2. 提 PR 前**必须**先跑 `scripts/check_upstream_drift.sh`,必要时 rebase;
+   建议每周至少跑一次,或在上游合并高峰后跑。
+3. **能上游的就尽快上游**:补丁被主线吸收后,本地维护成本直接归零
+   (插件只剩 ~1200 行 Python)。
+4. 插件侧建议加**版本守卫**:导入失败时给出"当前支持的 vLLM 版本区间"而不是裸 import 错误。
+5. 若上游重构 `FusedMoE` 的模块化接口(`modular_kernel`/`config`)或重写 DS-V4 的
+   attention 路径,那就是"大改",届时插件与 PR3 都要跟着改 —— 这是唯一的系统性风险点。
+
 ---
 
 ## 5. 本机实测报告
@@ -842,6 +889,9 @@ python report/make_figs.py
 
 ## 修订记录
 
+- **2026-09-09(第 10 版)** — 新增 §4.3 上游漂移与维护成本(实测:上游 41 提交/天、
+  36h 走 85 个提交;PR2 干净、PR1 1 处冲突、PR3 6 处冲突;插件 15 个导入模块全在、
+  近 1 天无签名变更),并给出维护建议。新增 `scripts/check_upstream_drift.sh`。
 - **2026-09-09(第 9 版)** — §4.1 换成 D1–D8 的**决策与执行状态表**;新增 §4.2
   上游分支现状(PR1/PR2/PR3 已推送到 `yeungtuzi/vllm`);新增 `NOTICE`、
   `THIRD_PARTY_NOTICES.md`;`pyproject` 作者改为"大河马 (BigHippo)"。

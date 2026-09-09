@@ -1,0 +1,116 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index a3ef86d..e3d267c 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -88,6 +88,7 @@ if TYPE_CHECKING:
+     VLLM_MEDIA_CONNECTOR: str = "http"
+     VLLM_MM_HASHER_ALGORITHM: str = "blake3"
+     VLLM_TARGET_DEVICE: str = "cuda"
++    VLLM_EXPERTS_LOAD_DEVICE: Literal["gpu", "cpu"] = "gpu"
+     VLLM_MAIN_CUDA_VERSION: str = "13.0"
+     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
+     VLLM_BATCH_INVARIANT: bool = False
+@@ -614,6 +615,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Target device of vLLM, supporting [cuda (by default),
+     # rocm, cpu]
+     "VLLM_TARGET_DEVICE": lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda").lower(),
++    # Device that holds the routed-expert weights. "cpu" enables the
++    # GPU/CPU mixed mode: attention and every other layer stay on the
++    # compute device while expert weights are constructed and kept on the
++    # host, so a MoE whose experts exceed device memory no longer OOMs at
++    # model construction. Orthogonal to VLLM_TARGET_DEVICE.
++    "VLLM_EXPERTS_LOAD_DEVICE": env_with_choices(
++        "VLLM_EXPERTS_LOAD_DEVICE", "gpu", ["gpu", "cpu"], case_sensitive=False
++    ),
+     # Main CUDA version of vLLM. This follows PyTorch but can be overridden.
+     "VLLM_MAIN_CUDA_VERSION": lambda: (
+         os.getenv("VLLM_MAIN_CUDA_VERSION", "").lower() or "13.0"
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+index 1fa2f63..17d126d 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+@@ -577,6 +577,19 @@ def select_mxfp4_moe_backend(
+         assert last_error is not None
+         raise last_error
+ 
++    # GPU/CPU mixed mode: expert weights live on the host (see
++    # VLLM_EXPERTS_LOAD_DEVICE), so a GPU expert kernel cannot consume them.
++    # Select the CPU backend unconditionally rather than preferring the GPU
++    # kernels (Marlin WNA16 etc.), which would only fail with "not on GPU".
++    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++        return _return_or_raise(
++            Mxfp4MoeBackend.CPU,
++            config,
++            kMxfp4Static,
++            None,
++            activation_format,
++        )
++
+     if _requires_qwen38_tep8_emulation(config, requested_activation_key):
+         backend = Mxfp4MoeBackend.EMULATION
+         logger.warning_once(
+@@ -627,7 +640,10 @@ def select_mxfp4_moe_backend(
+             activation_format,
+         )
+ 
+-    if current_platform.is_cpu():
++    # CPU/GPU mixed mode: the expert weights live on the host while the rest of
++    # the model runs on the GPU, so the CPU backend is a valid fallback even
++    # though the platform is not CPU-only.
++    if current_platform.is_cpu() or envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
+         backend = Mxfp4MoeBackend.CPU
+         logger.info_once(_make_log_backend(backend))
+         return _return_or_raise(
+@@ -1303,6 +1319,19 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
+             prepare_mxfp4_moe_layer_for_cpu,
+         )
+ 
++        if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++            # GPU/CPU mixed mode: the CPU backend is an out-of-tree engine that
++            # consumes the raw [E, 2I, H//2] / [E, H, I//2] uint8 weights and
++            # raw e8m0 scales directly, so skip the AMX prepack.
++            return (
++                w13_weight.data,
++                w2_weight.data,
++                w13_weight_scale.data,
++                w2_weight_scale.data,
++                w13_bias,
++                w2_bias,
++            )
++
+         packed_w13, packed_w2, packed_w13_scale, packed_w2_scale = (
+             prepare_mxfp4_moe_layer_for_cpu(
+                 w13_weight.data,
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
+index e9a7fc4..f1c429c 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
+ 
+ import torch
+ 
++from vllm import envs
+ from vllm.distributed.eplb.eplb_state import EplbState
+ from vllm.logger import init_logger
+ from vllm.model_executor.custom_op import PluggableLayer
+@@ -174,7 +175,19 @@ class RoutedExperts(PluggableLayer):
+                 self.moe_config.intermediate_size
+             )
+ 
+-        self.quant_method.create_weights(layer=self, **moe_quant_params)
++        # GPU/CPU mixed mode: construct the expert weights on the host when
++        # VLLM_EXPERTS_LOAD_DEVICE=cpu. create_weights() allocates with no
++        # explicit device, so a scoped default device keeps the parameters on
++        # CPU from construction onward (the weight loaders then copy into them
++        # in place). Everything else the layer owns -- router tables, expert
++        # maps, the shared experts -- keeps its normal device, so only the
++        # expert weights move. This is what lets a MoE whose experts exceed
++        # device memory build without OOM.
++        if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++            with torch.device("cpu"):
++                self.quant_method.create_weights(layer=self, **moe_quant_params)
++        else:
++            self.quant_method.create_weights(layer=self, **moe_quant_params)
+ 
+         self.lora_base_layer_prefix = ""
+ 

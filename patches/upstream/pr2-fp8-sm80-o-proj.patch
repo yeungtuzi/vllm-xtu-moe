@@ -1,0 +1,499 @@
+diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
+index 2cf7168..5522631 100644
+--- a/vllm/model_executor/layers/quantization/fp8.py
++++ b/vllm/model_executor/layers/quantization/fp8.py
+@@ -50,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+     create_fp8_scale_parameter,
+     create_fp8_weight_parameter,
+     process_fp8_input_tensor_strategy_moe,
++    process_fp8_weight_block_strategy,
+     process_fp8_weight_tensor_strategy,
+     process_fp8_weight_tensor_strategy_moe,
+     validate_fp8_block_shape,
+@@ -385,6 +386,28 @@ class Fp8LinearMethod(LinearMethodBase):
+                 self.fp8_linear.marlin_input_dtype = self.marlin_input_dtype
+             return
+ 
++        if self.use_marlin and getattr(layer, "is_bmm", False):
++            # DSv4 o_proj `wo_a` is consumed by a fused per-group einsum that
++            # reads its weight directly (apply_weights is bypassed). Marlin
++            # would repack the weight into its opaque int32 layout and break
++            # that einsum, so pre-dequantize the FP8 block weight to bf16 while
++            # keeping the original [N, K] layout.
++            assert self.block_quant
++            weight, weight_scale_inv = process_fp8_weight_block_strategy(
++                layer.weight, layer.weight_scale_inv
++            )
++            block_m, block_k = self.weight_block_size
++            scale = weight_scale_inv.to(torch.float32)
++            scale = torch.repeat_interleave(scale, block_m, dim=-2)
++            scale = torch.repeat_interleave(scale, block_k, dim=-1)
++            scale = scale[: weight.shape[-2], : weight.shape[-1]]
++            weight = (weight.to(torch.float32) * scale).to(torch.bfloat16)
++            replace_parameter(layer, "weight", weight.data)
++            replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
++            layer.input_scale = None
++            self.use_marlin = False
++            return
++
+         if self.use_marlin:
+             if not self.block_quant:
+                 # Canonicalize to (K, N) for the kernel.
+diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
+index 451ae3a..b18e55e 100644
+--- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
+@@ -1477,3 +1477,61 @@ def process_fp8_input_tensor_strategy_moe(
+         amax_for_moe_activation_quant(w13_input_scale, enable_eplb),
+         amax_for_moe_activation_quant(w2_input_scale, enable_eplb),
+     )
++
++
++@triton.jit
++def _e4m3_uint8_to_f32(u):
++    """Decode an ``e4m3fn`` byte (1-4-3, exp bias 7) to f32 without ever
++    materializing Triton's ``fp8e4nv`` type, which Ampere (SM80/SM86) cannot
++    represent. ``u`` is the raw uint8 bit pattern. NaN (S.1111.111) is not
++    produced by quantized weights and is decoded as a finite value."""
++    ui = u.to(tl.int32)
++    sign = (ui >> 7) & 1
++    exp = (ui >> 3) & 0xF
++    man = ui & 0x7
++    mant = man.to(tl.float32) * 0.125
++    # normal: 2^(exp-7) * (1+mant); subnormal (exp==0): 2^-6 * mant
++    val = tl.where(
++        exp != 0,
++        tl.exp2((exp - 7).to(tl.float32)) * (1.0 + mant),
++        0.015625 * mant,
++    )
++    return tl.where(sign != 0, -val, val)
++@triton.jit
++def _f32_to_e4m3_uint8(x):
++    """Encode f32 -> ``e4m3fn`` (1-4-3, exp bias 7, max 448, no inf) raw uint8
++    bits, for Ampere (SM80/SM86) where Triton lacks the ``fp8e4nv`` type. Inverse
++    of ``_e4m3_uint8_to_f32``. Round-to-nearest; saturates |x| > 448 and NaN/Inf
++    to +/-448. RNE-vs-round-half differences are sub-ulp and below fp8 noise."""
++    x = x.to(tl.float32)
++    sign = tl.where(x < 0, 1, 0).to(tl.int32)
++    a = tl.abs(x)
++    a = tl.where(a != a, 0.0, a)  # NaN -> 0 magnitude
++    a = tl.minimum(a, 448.0)
++    is_zero = a == 0.0
++    a_safe = tl.where(is_zero, 1.0, a)
++    # unbiased exponent, folded to the [-6, 8] e4m3 range (-6 covers subnormals)
++    e = tl.floor(tl.log2(a_safe))
++    e = tl.maximum(tl.minimum(e, 8.0), -6.0)
++    m = a / tl.exp2(e)  # normal: [1, 2); subnormal (a < 2^-6): [0, 1)
++    is_norm = m >= 1.0
++    # normal: expfield = e + 7 in [1, 15], mant = round((m - 1) * 8), carry -> +1 exp
++    mant_n = tl.floor((m - 1.0) * 8.0 + 0.5)
++    expf_n = e + 7.0
++    carry_n = mant_n >= 8.0
++    mant_n = tl.where(carry_n, 0.0, mant_n)
++    expf_n = tl.where(carry_n, expf_n + 1.0, expf_n)
++    # subnormal: expfield = 0, mant = round(m * 8); mant==8 promotes to min normal
++    mant_s = tl.floor(m * 8.0 + 0.5)
++    promote_s = mant_s >= 8.0
++    expf_s = tl.where(promote_s, 1.0, 0.0)
++    mant_s = tl.where(promote_s, 0.0, mant_s)
++    expf = tl.where(is_norm, expf_n, expf_s)
++    mant = tl.where(is_norm, mant_n, mant_s)
++    expf = tl.where(is_zero, 0.0, expf)
++    mant = tl.where(is_zero, 0.0, mant)
++    expf = tl.minimum(expf, 15.0)
++    byte = (sign << 7) | (expf.to(tl.int32) << 3) | mant.to(tl.int32)
++    return byte.to(tl.uint8)
++
++
+diff --git a/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py b/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py
+new file mode 100644
+index 0000000..f61ddf3
+--- /dev/null
++++ b/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py
+@@ -0,0 +1,320 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SM12x Triton FP8 einsum kernels for DeepSeek V4."""
++
++import torch
++
++from vllm.distributed import get_tensor_model_parallel_rank
++from vllm.model_executor.layers.quantization.utils.fp8_utils import (
++    _e4m3_uint8_to_f32,
++    _upcast_e8m0_to_fp32,
++)
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++from vllm.utils.deep_gemm import fp8_einsum
++
++
++@triton.jit
++def _deepseek_v4_sm12x_fp8_einsum_kernel(
++    a_ptr,
++    a_scale_ptr,
++    b_ptr,
++    b_scale_ptr,
++    out_ptr,
++    num_tokens: tl.constexpr,
++    num_groups: tl.constexpr,
++    out_rank: tl.constexpr,
++    hidden_size: tl.constexpr,
++    a_stride_token: tl.constexpr,
++    a_stride_group: tl.constexpr,
++    a_stride_hidden: tl.constexpr,
++    a_scale_stride_token: tl.constexpr,
++    a_scale_stride_group: tl.constexpr,
++    a_scale_stride_hidden: tl.constexpr,
++    b_stride_group: tl.constexpr,
++    b_stride_out: tl.constexpr,
++    b_stride_hidden: tl.constexpr,
++    b_scale_stride_group: tl.constexpr,
++    b_scale_stride_out: tl.constexpr,
++    b_scale_stride_hidden: tl.constexpr,
++    out_stride_token: tl.constexpr,
++    out_stride_group: tl.constexpr,
++    out_stride_rank: tl.constexpr,
++    BLOCK_TOKENS: tl.constexpr,
++    BLOCK_OUT: tl.constexpr,
++    BLOCK_HIDDEN: tl.constexpr,
++    UPCAST_FP8: tl.constexpr,
++    DECODE_E4M3: tl.constexpr,
++    B_BF16: tl.constexpr,
++) -> None:
++    token_block = tl.program_id(0)
++    out_block = tl.program_id(1)
++    group = tl.program_id(2)
++
++    token_offsets = token_block * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
++    out_offsets = out_block * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
++    hidden_offsets = tl.arange(0, BLOCK_HIDDEN)
++    accum = tl.zeros((BLOCK_TOKENS, BLOCK_OUT), dtype=tl.float32)
++
++    for hidden_start in range(0, hidden_size, BLOCK_HIDDEN):
++        hidden = hidden_start + hidden_offsets
++        a_mask = (token_offsets[:, None] < num_tokens) & (hidden[None, :] < hidden_size)
++        b_mask = (out_offsets[None, :] < out_rank) & (hidden[:, None] < hidden_size)
++        a_off = (
++            a_ptr
++            + token_offsets[:, None] * a_stride_token
++            + group * a_stride_group
++            + hidden[None, :] * a_stride_hidden
++        )
++        b_off = (
++            b_ptr
++            + group * b_stride_group
++            + out_offsets[None, :] * b_stride_out
++            + hidden[:, None] * b_stride_hidden
++        )
++        if DECODE_E4M3:
++            # Ampere (SM80/SM86): Triton cannot represent fp8e4nv, so the
++            # FP8 operands arrive bitcast to uint8 and are decoded e4m3 -> bf16.
++            a = _e4m3_uint8_to_f32(tl.load(a_off, mask=a_mask, other=0)).to(
++                tl.bfloat16
++            )
++        else:
++            a = tl.load(a_off, mask=a_mask, other=0.0)
++            if UPCAST_FP8:
++                # SM89/Ada: Triton may not lower an FP8-operand tl.dot on this
++                # arch, so upcast to bf16 before the MMA. SM12x keeps native FP8.
++                a = a.to(tl.bfloat16)
++        if B_BF16:
++            b = tl.load(b_off, mask=b_mask, other=0.0).to(tl.bfloat16)
++        elif DECODE_E4M3:
++            b = _e4m3_uint8_to_f32(tl.load(b_off, mask=b_mask, other=0)).to(
++                tl.bfloat16
++            )
++        else:
++            b = tl.load(b_off, mask=b_mask, other=0.0)
++            if UPCAST_FP8:
++                b = b.to(tl.bfloat16)
++        raw = tl.dot(a, b, out_dtype=tl.float32)
++        hidden_scale_block = hidden_start // BLOCK_HIDDEN
++        a_scale = tl.load(
++            a_scale_ptr
++            + token_offsets * a_scale_stride_token
++            + group * a_scale_stride_group
++            + hidden_scale_block * a_scale_stride_hidden,
++            mask=token_offsets < num_tokens,
++            other=0.0,
++        )
++        if B_BF16:
++            accum += raw * a_scale[:, None]
++        else:
++            b_scale = tl.load(
++                b_scale_ptr
++                + group * b_scale_stride_group
++                + (out_offsets // 128) * b_scale_stride_out
++                + hidden_scale_block * b_scale_stride_hidden,
++                mask=out_offsets < out_rank,
++                other=0.0,
++            )
++            accum += raw * a_scale[:, None] * b_scale[None, :]
++
++    tl.store(
++        out_ptr
++        + token_offsets[:, None] * out_stride_token
++        + group * out_stride_group
++        + out_offsets[None, :] * out_stride_rank,
++        accum,
++        mask=(token_offsets[:, None] < num_tokens) & (out_offsets[None, :] < out_rank),
++    )
++
++
++def deepseek_v4_sm12x_fp8_einsum(
++    a: torch.Tensor,
++    a_scale: torch.Tensor,
++    b: torch.Tensor,
++    b_scale: torch.Tensor,
++    out: torch.Tensor,
++) -> None:
++    """Compute ``bhr,hdr->bhd`` with FP32 block scales on SM12x.
++
++    ``a`` is the transposed output of ``fused_inv_rope_fp8_quant`` with shape
++    ``[tokens, groups, hidden]``. ``b`` is ``wo_a`` reshaped to
++    ``[groups, out_rank, hidden]``.
++    """
++    num_tokens, num_groups, hidden_size = a.shape
++    b_groups, out_rank, b_hidden_size = b.shape
++    assert b_groups == num_groups
++    assert b_hidden_size == hidden_size
++    assert out.shape == (num_tokens, num_groups, out_rank)
++    assert hidden_size % 128 == 0
++    assert out_rank % 128 == 0
++    assert a.dtype == torch.float8_e4m3fn
++    b_bf16 = b.dtype == torch.bfloat16
++    assert b_bf16 or b.dtype == torch.float8_e4m3fn
++    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
++    if a_scale.dtype == e8m0_dtype:
++        a_scale = _upcast_e8m0_to_fp32(a_scale)
++    if b_bf16:
++        b_scale = torch.empty((1, 1, 1), device=b.device, dtype=torch.float32)
++    if not b_bf16 and b_scale.dtype == e8m0_dtype:
++        b_scale = _upcast_e8m0_to_fp32(b_scale)
++    assert a_scale.dtype == torch.float32
++    assert b_bf16 or b_scale.dtype == torch.float32
++
++    if num_tokens == 0:
++        return
++
++    block_tokens = 16
++    block_out = 128
++    block_hidden = 128
++    # SM12x has native FP8 tensor-core dot; SM89/Ada loads FP8 then upcasts to
++    # bf16; Ampere (SM80/SM86) cannot represent fp8e4nv so it decodes from
++    # uint8. Quantized operands are always e4m3 here (asserted above).
++    decode_e4m3 = not current_platform.supports_fp8()
++    upcast_fp8 = (
++        not current_platform.is_device_capability_family(120) and not decode_e4m3
++    )
++    if decode_e4m3:
++        a = a.view(torch.uint8)
++        if not b_bf16:
++            b = b.view(torch.uint8)
++    grid = (
++        triton.cdiv(num_tokens, block_tokens),
++        triton.cdiv(out_rank, block_out),
++        num_groups,
++    )
++    _deepseek_v4_sm12x_fp8_einsum_kernel[grid](
++        a,
++        a_scale,
++        b,
++        b_scale,
++        out,
++        num_tokens,
++        num_groups,
++        out_rank,
++        hidden_size,
++        a.stride(0),
++        a.stride(1),
++        a.stride(2),
++        a_scale.stride(0),
++        a_scale.stride(1),
++        a_scale.stride(2),
++        b.stride(0),
++        b.stride(1),
++        b.stride(2),
++        b_scale.stride(0),
++        b_scale.stride(1),
++        b_scale.stride(2),
++        out.stride(0),
++        out.stride(1),
++        out.stride(2),
++        BLOCK_TOKENS=block_tokens,
++        BLOCK_OUT=block_out,
++        BLOCK_HIDDEN=block_hidden,
++        UPCAST_FP8=upcast_fp8,
++        DECODE_E4M3=decode_e4m3,
++        B_BF16=b_bf16,
++        num_warps=4,
++        num_stages=3,
++    )
++
++
++def deepseek_v4_fp8_einsum_config(
++    capability_major: int,
++) -> tuple[tuple[int, int, int], bool]:
++    if capability_major == 10:
++        return (1, 1, 128), True
++    return (1, 128, 128), False
++
++
++def _use_deepseek_v4_sm12x_triton_fp8_einsum(
++    equation: str,
++    recipe: list[int],
++    b_scale: torch.Tensor,
++) -> bool:
++    capability = current_platform.get_device_capability()
++    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
++    # SM12x (major 12) and SM 8.x (Ampere/Ada) both use the Triton FP8 einsum
++    # here: they lack the SM90/SM100-only DeepGEMM fp8_einsum kernel. Ada (8.9)
++    # loads FP8 then upcasts; Ampere (8.0/8.6) cannot represent fp8e4nv, so the
++    # kernel decodes from uint8 (DECODE_E4M3). See deepseek_v4_sm12x_fp8_einsum.
++    is_supported_arch = capability is not None and capability.major in (8, 12)
++    return (
++        is_supported_arch
++        and equation == "bhr,hdr->bhd"
++        and tuple(recipe) == (1, 128, 128)
++        and b_scale.dtype in (torch.float32, e8m0_dtype)
++    )
++
++
++def deepseek_v4_fp8_einsum(
++    a: torch.Tensor,
++    a_scale: torch.Tensor,
++    b: torch.Tensor,
++    b_scale: torch.Tensor,
++    out: torch.Tensor,
++    equation: str,
++    recipe: list[int],
++) -> None:
++    if equation == "bhr,hdr->bhd" and b.dim() == 2:
++        num_groups = out.shape[1]
++        out_rank = out.shape[2]
++        hidden_size = a.shape[2]
++        if b.shape[0] % out_rank != 0:
++            raise RuntimeError(
++                "DeepSeek V4 fp8 einsum weight rows must be divisible by "
++                f"out_rank={out_rank}, got {b.shape[0]}"
++            )
++        b_groups = b.shape[0] // out_rank
++        group_start = 0
++        if b_groups != num_groups:
++            if b_groups % num_groups != 0:
++                raise RuntimeError(
++                    "DeepSeek V4 fp8 einsum weight groups must match the "
++                    "TP-local output groups or be an integer multiple of "
++                    f"them, got weight_groups={b_groups}, "
++                    f"output_groups={num_groups}"
++                )
++            group_partitions = b_groups // num_groups
++            group_start = (
++                get_tensor_model_parallel_rank() % group_partitions
++            ) * num_groups
++        b = b.view(b_groups, out_rank, hidden_size)
++        if group_start != 0 or b_groups != num_groups:
++            b = b.narrow(0, group_start, num_groups)
++
++        if b_scale.dim() == 2:
++            scale_mn = recipe[1]
++            scale_k_pack = 4 if b_scale.dtype == torch.int32 else 1
++            scale_k = recipe[2] * scale_k_pack
++            scale_out_blocks = (out_rank + scale_mn - 1) // scale_mn
++            scale_hidden_blocks = (hidden_size + scale_k - 1) // scale_k
++            if b_scale.shape[0] % scale_out_blocks != 0:
++                raise RuntimeError(
++                    "DeepSeek V4 fp8 einsum scale rows must be divisible by "
++                    f"scale_out_blocks={scale_out_blocks}, "
++                    f"got {b_scale.shape[0]}"
++                )
++            scale_groups = b_scale.shape[0] // scale_out_blocks
++            if scale_groups not in (num_groups, b_groups):
++                raise RuntimeError(
++                    "DeepSeek V4 fp8 einsum scale groups must match the "
++                    "TP-local output groups or weight groups, got "
++                    f"scale_groups={scale_groups}, output_groups={num_groups}, "
++                    f"weight_groups={b_groups}"
++                )
++            b_scale = b_scale.view(
++                scale_groups,
++                scale_out_blocks,
++                scale_hidden_blocks,
++            )
++            if scale_groups == b_groups and scale_groups != num_groups:
++                b_scale = b_scale.narrow(0, group_start, num_groups)
++        elif b_scale.dim() == 3 and b_scale.shape[0] == b_groups:
++            if b_groups != num_groups:
++                b_scale = b_scale.narrow(0, group_start, num_groups)
++
++        if _use_deepseek_v4_sm12x_triton_fp8_einsum(equation, recipe, b_scale):
++            deepseek_v4_sm12x_fp8_einsum(a, a_scale, b, b_scale, out)
++            return
++
++    fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
+diff --git a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+index b064fbe..04af223 100644
+--- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
++++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+@@ -3,23 +3,30 @@
+ import torch
+ import torch.nn as nn
+ 
+-from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+-    fused_inv_rope_fp8_quant,
++from vllm.models.deepseek_v4.common.ops import fused_inv_rope_fp8_quant
++from vllm.models.deepseek_v4.nvidia.ops.fp8_einsum import (
++    deepseek_v4_fp8_einsum,
++    deepseek_v4_fp8_einsum_config,
+ )
+ from vllm.platforms import current_platform
+-from vllm.utils.deep_gemm import fp8_einsum
+ 
+ 
+ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
+     """fp8_einsum recipe + scale layout for the current GPU arch.
+ 
+     SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128.
+-    SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.
++    SM100/SM110: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.
++    SM12x: RTX PRO / GB10 does not expose the same TMA/TCGEN05 path, so keep
++    the legacy FP32 block-scale layout expected by DeepGEMM.
++    SM 8.x (Ampere/Ada): no DeepGEMM fp8_einsum; the portable Triton kernel in
++    ``fp8_einsum.py`` consumes the legacy [g, r/128, d/128] layout.
+ 
+     Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.
+     """
+     cap = current_platform.get_device_capability()
+     assert cap is not None, "DeepseekV4 attention requires a CUDA device"
++    if cap.major in (8, 12):
++        return deepseek_v4_fp8_einsum_config(cap.major)
+     einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
+     tma_aligned_scales = cap.major >= 10
+     return einsum_recipe, tma_aligned_scales
+@@ -60,14 +67,18 @@ def deep_gemm_fp8_o_proj(
+         device=o.device,
+         dtype=torch.bfloat16,
+     )
+-    weight_scale = (
+-        wo_a.weight_scale if hasattr(wo_a, "weight_scale") else wo_a.weight_scale_inv
+-    )
+-    fp8_einsum(
+-        "bhr,hdr->bhd",
+-        (o_fp8, o_scale),
+-        (wo_a.weight, weight_scale),
++    # MarlinFP8.process_weights_after_loading renames block-FP8 scales to
++    # weight_scale_inv. Non-Marlin kernels keep the on-disk weight_scale name.
++    wo_a_scale = getattr(wo_a, "weight_scale_inv", None)
++    if wo_a_scale is None:
++        wo_a_scale = wo_a.weight_scale
++    deepseek_v4_fp8_einsum(
++        o_fp8,
++        o_scale,
++        wo_a.weight,
++        wo_a_scale,
+         z,
+-        recipe=einsum_recipe,
++        "bhr,hdr->bhd",
++        list(einsum_recipe),
+     )
+     return wo_b(z.flatten(1))
