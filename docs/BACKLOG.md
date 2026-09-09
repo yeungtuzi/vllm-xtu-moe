@@ -48,7 +48,7 @@
 
 | ID | 待办 | 为什么 | 优先级 |
 |---|---|---|---|
-| **T01** | 混合模式下把 CPU 后端前置的改动推广到 `oracle/{mxfp4,int_wna16,nvfp4,mxfp8}.py`,抽成 `oracle/_common.py` 的 `prefer_cpu_backend()` | 现在只有 fp8 生效;PR1 只含 mxfp4。任意格式的模型都要能被选中 | **P0** |
+| **T01** | 混合模式下把 CPU 后端前置的改动推广到 `oracle/{mxfp4,int_wna16,nvfp4,mxfp8}.py`,抽成 `oracle/_common.py` 的 `prefer_cpu_backend()` | 现在只有 fp8 生效;PR1 只含 mxfp4。任意格式的模型都要能被选中。fp8 的 6 行改动已快照为 `patches/mainline_fp8_oracle_mixed_mode.patch`(冻结期不入 PR) | **P0** |
 | **T02** | 用**能在 A100 跑通**的模型做通用路径端到端(load → 连贯输出 → TTFT/吞吐) | 通用路径至今没在真实模型上端到端跑过(DS-V4 一直走 OOT 覆盖) | **P0** |
 | **T03** | 新增 BF16/FP16(无量化)CPU 后端(`CPUUnquantizedExperts` → 引擎 `MOE_BF16`) | 覆盖 Mixtral / Qwen2-MoE / Qwen3-MoE bf16 等大量模型;实现成本极低 | P1 |
 | **T04** | 收紧 `_supports_activation`:只允许 `MoEActivation.SILU`;对 `SWIGLUOAI`(gpt-oss 的**交错** gate/up 布局)必须拒绝而不是静默算错 | 主线 `CPUExpertsMxfp4` 声称支持 SWIGLUOAI,但我们的引擎假设 packed 布局 → 会给出错误结果 | **P0(正确性)** |
@@ -197,6 +197,13 @@ g++ -std=c++17 -shared -fPIC -O3 -ffast-math -fno-finite-math-only \
 # 约 18 s;改完 csrc 要同步一份到 /home/user/lvllm/xiaotu-moe/csrc/(两处都在 git 里)
 ```
 
+### ⚠️ 主线工作树是"活的",不要 reset
+
+`/home/user/lvllm/process_data/ref/repos/vllm-mainline`(HEAD=`6c73b08`,这是**已安装的 vllm**)
+带着一批**未提交**改动:SM80 port + `is_bmm` fp8 修复 + 本轮新增的 `oracle/fp8.py` 混合模式前置。
+其中 fp8 那 6 行已单独快照到 `patches/mainline_fp8_oracle_mixed_mode.patch`;
+其余仍在工作树里。**任何 `git checkout/clean/reset` 都会丢掉它们**(重装 vllm 亦然)。
+
 ### 历史证据(仍在用)
 
 - 论文式报告:`docs/EXPERIMENT_REPORT.md`(rev 12,991 行)
@@ -221,6 +228,8 @@ g++ -std=c++17 -shared -fPIC -O3 -ffast-math -fno-finite-math-only \
 
 ## 7. 修订记录
 
+- **2026-09-09(第 3 版)** — ①T01 补 fp8 oracle 快照指针(`patches/mainline_fp8_oracle_mixed_mode.patch`);
+  ②§5 新增「主线工作树是活的,不要 reset」的风险提示。依据:检查 mainline checkout 的 `git status`。
 - **2026-09-09(第 2 版)** — **D9 拍板为方案 A**:三个 draft PR 全部冻结,等通用 CPU experts 后端完成
   后再统一重排(附冻结动作清单与 4 条解冻触发条件);同步调整看板、T20/T23/T24 的状态。依据:用户 2026-09-09 选择。
 - **2026-09-09(第 1 版)** — 新建。汇总:①今天会话新增(通用 CPU experts 后端重写、

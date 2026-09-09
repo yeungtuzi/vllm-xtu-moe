@@ -1,0 +1,17 @@
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/fp8.py b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+index abe4737..959c449 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/fp8.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+@@ -131,6 +131,12 @@ def _get_priority_backends(
+         # CPU platform uses FP8 W8A16 fused MoE kernel.
+         _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU)
+ 
++    # GPU/CPU mixed mode: expert weights live on the host (see
++    # VLLM_EXPERTS_LOAD_DEVICE), so only the CPU backend can consume them.
++    # Prefer it on a GPU platform as well.
++    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++        _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU)
++
+     return _AVAILABLE_BACKENDS
+ 
+ 
