@@ -36,7 +36,10 @@ inline float e4m3_to_fp32_scalar(uint8_t v) {
     int m = v & 0x7;
     float val;
     if (e == 0) {
-        val = (m == 0) ? 0.0f : std::ldexp(m / 8.0f, -7);       // subnormal
+        // Subnormal: exponent field 0 has the same weight as e=1, i.e.
+        // 2^(1-7) = 2^-6 (bias 7). The old 2^-7 made every subnormal byte
+        // decode 2x too small (verified against torch.float8_e4m3fn).
+        val = (m == 0) ? 0.0f : std::ldexp(m / 8.0f, -6);       // subnormal
     } else {
         val = std::ldexp(1.0f + m / 8.0f, e - 7);               // normal
     }

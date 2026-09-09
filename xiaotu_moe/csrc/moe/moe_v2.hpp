@@ -59,9 +59,10 @@ struct MOEConfigV2 {
     int   group_max_len = 4096;
     int   groupN = 0;
     int   groupK = 0;
-    float swiglu_alpha = 0.f;   // unused for plain SiLU
-    float swiglu_limit = 0.f;
-    int   activation_type = 0;  // 0=SiLU, 1=SwiGLU(multiply by alpha, clamp by limit)
+    float swiglu_alpha = 1.f;   // sigmoid scale inside the gated activation
+    float swiglu_beta = 0.f;    // additive term on `up` before the multiply
+    float swiglu_limit = 0.f;   // clamp on both gate (max) and up (+-), 0=off
+    int   activation_type = 0;  // 0=plain gated SiLU, 1=clamped SwiGLU
     bool  use_gpu_prefill = false;
 };
 
@@ -82,6 +83,30 @@ inline void silu_gate(const float* gate, const float* up, float* out, int n) {
 inline void silu_single(float* v, int n) {
     for (int i = 0; i < n; ++i)
         v[i] = v[i] / (1.f + std::exp(-v[i]));
+}
+
+// Clamped gated activation, bit-for-bit the semantics of vLLM's
+// `silu_and_mul_with_clamp(out, in, limit, alpha, beta)`:
+//   out = clamp(gate, max=limit) * sigmoid(alpha * clamp(gate, max=limit))
+//         * (clamp(up, +-limit) + beta)
+// `limit <= 0` disables clamping; (limit=0, alpha=1, beta=0) reduces to
+// silu_gate above. Models that need it: GLM-5.x (10.0), DeepSeek-V4 (10.0),
+// MiniMax-M3 (7.0), HY-V4 (10.0) — all trained with the clamp, so ignoring it
+// changes the experts' output.
+__attribute__((always_inline)) inline float silu_gate_one(
+    float g, float u, float limit, float alpha, float beta) {
+    if (limit > 0.f) {
+        if (g > limit) g = limit;
+        if (u > limit) u = limit;
+        else if (u < -limit) u = -limit;
+    }
+    return (g / (1.f + std::exp(-alpha * g))) * (u + beta);
+}
+
+inline void silu_gate_clamped(const float* gate, const float* up, float* out,
+                              int n, float limit, float alpha, float beta) {
+    for (int i = 0; i < n; ++i)
+        out[i] = silu_gate_one(gate[i], up[i], limit, alpha, beta);
 }
 
 } // namespace act
@@ -303,6 +328,17 @@ public:
         if (cfg_.expert_num <= 0 || cfg_.top_k <= 0 ||
             cfg_.hidden_size <= 0 || cfg_.intermediate_size <= 0)
             throw std::runtime_error("MOE_V2: invalid config dims");
+
+        // Resolve the activation once. activation_type: 0 = plain gated SiLU,
+        // 1 = clamped SwiGLU (vLLM `silu_and_mul_with_clamp` semantics, used by
+        // GLM-5.x / DeepSeek-V4 / MiniMax-M3 via `swiglu_limit`).
+        if (cfg_.activation_type != 0 && cfg_.activation_type != 1)
+            throw std::runtime_error("MOE_V2: unsupported activation_type");
+        swiglu_limit_ = cfg_.swiglu_limit > 0.f ? cfg_.swiglu_limit : 0.f;
+        swiglu_alpha_ = cfg_.swiglu_alpha != 0.f ? cfg_.swiglu_alpha : 1.f;
+        swiglu_beta_  = cfg_.swiglu_beta;
+        clamped_ = cfg_.activation_type == 1 &&
+                   (swiglu_limit_ > 0.f || swiglu_alpha_ != 1.f || swiglu_beta_ != 0.f);
 
         // COPY the weight blocks into engine-owned buffers. The fork hands us
         // pointers into the vLLM parameter tensors (self.w13_weight etc.), but
@@ -526,8 +562,14 @@ public:
                     const uint16_t* xt = input + t * (size_t)hidden;
                     wt::gate_up(xt, w13_, w13_g_, w13_gs_, gate_buf.data(), up_buf.data(),
                                 inter, hidden, job.eid, groupN, groupK);
-                    ::xiaotu_moe::act::silu_gate(gate_buf.data(), up_buf.data(),
-                                                 act_base + ai * (size_t)inter, inter);
+                    float* act_dst = act_base + ai * (size_t)inter;
+                    if (clamped_)
+                        ::xiaotu_moe::act::silu_gate_clamped(gate_buf.data(),
+                            up_buf.data(), act_dst, inter,
+                            swiglu_limit_, swiglu_alpha_, swiglu_beta_);
+                    else
+                        ::xiaotu_moe::act::silu_gate(gate_buf.data(), up_buf.data(),
+                                                     act_dst, inter);
                 }
             });
 
@@ -583,8 +625,13 @@ public:
                 if (eid >= (uint32_t)nel || w == 0.f) continue;
                 wt::gate_up(xt, w13_, w13_g_, w13_gs_, gate_out.data(), up_out.data(),
                             inter, hidden, eid, groupN, groupK);
-                ::xiaotu_moe::act::silu_gate(gate_out.data(), up_out.data(),
-                                             act_out.data(), inter);
+                if (clamped_)
+                    ::xiaotu_moe::act::silu_gate_clamped(gate_out.data(),
+                        up_out.data(), act_out.data(), inter,
+                        swiglu_limit_, swiglu_alpha_, swiglu_beta_);
+                else
+                    ::xiaotu_moe::act::silu_gate(gate_out.data(), up_out.data(),
+                                                 act_out.data(), inter);
                 bf16::convert_f32_to_bf16(act_out.data(), act_bf16.data(), (size_t)inter);
                 wt::down(act_bf16.data(), w2_, w2_g_, w2_gs_, down_out.data(),
                          hidden, inter, eid, groupN, groupK);
@@ -750,9 +797,16 @@ public:
                 for (size_t mi = 0; mi < me; ++mi) {
                     const float* bs = bc + mi * (size_t)2 * (size_t)inter;
                     uint16_t* abd = ab + mi * (size_t)inter;
-                    for (int i = n0; i < n1; ++i) {
-                        float gv = bs[i];
-                        abd[i] = bf16::fp32_to_bf16(bs[inter + i] * (gv / (1.f + std::exp(-gv))));
+                    if (clamped_) {
+                        for (int i = n0; i < n1; ++i)
+                            abd[i] = bf16::fp32_to_bf16(::xiaotu_moe::act::silu_gate_one(
+                                bs[i], bs[inter + i], swiglu_limit_, swiglu_alpha_,
+                                swiglu_beta_));
+                    } else {
+                        for (int i = n0; i < n1; ++i) {
+                            float gv = bs[i];
+                            abd[i] = bf16::fp32_to_bf16(bs[inter + i] * (gv / (1.f + std::exp(-gv))));
+                        }
                     }
                 }
             });
@@ -776,9 +830,16 @@ public:
                 for (size_t mi = 0; mi < me; ++mi) {
                     const float* bs = bc + mi * (size_t)2 * (size_t)inter;
                     uint16_t* abd = ab + mi * (size_t)inter;
-                    for (int i = n0; i < n1; ++i) {
-                        float gv = bs[i];
-                        abd[i] = bf16::fp32_to_bf16(bs[inter + i] * (gv / (1.f + std::exp(-gv))));
+                    if (clamped_) {
+                        for (int i = n0; i < n1; ++i)
+                            abd[i] = bf16::fp32_to_bf16(::xiaotu_moe::act::silu_gate_one(
+                                bs[i], bs[inter + i], swiglu_limit_, swiglu_alpha_,
+                                swiglu_beta_));
+                    } else {
+                        for (int i = n0; i < n1; ++i) {
+                            float gv = bs[i];
+                            abd[i] = bf16::fp32_to_bf16(bs[inter + i] * (gv / (1.f + std::exp(-gv))));
+                        }
                     }
                 }
             });
@@ -875,6 +936,12 @@ public:
 
 private:
     MOEConfigV2 cfg_;
+    // Activation parameters, resolved once from cfg_ (see act::silu_gate_one).
+    // clamped_ == false keeps the original hot loop (plain `up * silu(gate)`).
+    bool  clamped_ = false;
+    float swiglu_limit_ = 0.f;
+    float swiglu_alpha_ = 1.f;
+    float swiglu_beta_ = 0.f;
     std::unique_ptr<uint8_t[]> buf_w13_, buf_w2_, buf_w13_g_, buf_w2_g_;
     std::unique_ptr<float[]> buf_w13_gs_, buf_w2_gs_;
     const void* w13_;

@@ -20,6 +20,11 @@ vLLM 主线已把 MoE 模块化 + 按 CPU 架构自动分发;但主线自己的�
 内核。**xiaotu-moe 恰好提供"无 AMX x86 上的 MXFP4/FP8 AVX512 内核"** → 我们不是可有可无,
 而是主线在本机唯一可用的 CPU 量化内核。
 
+> **📌 待办与决策总账:[`docs/BACKLOG.md`](docs/BACKLOG.md)** —— 全项目唯一的 TODO/决策清单
+> (进行中项、上游 PR 策略 D9、已知阻塞 L1–L7、证据索引)。**新会话请先读它。**
+> 论文式实测报告:[`docs/EXPERIMENT_REPORT.md`](docs/EXPERIMENT_REPORT.md);
+> 通用化方案:[`docs/ROADMAP_GENERALITY.md`](docs/ROADMAP_GENERALITY.md)。
+
 ## 布局
 ```
 vllm-xtu-moe/

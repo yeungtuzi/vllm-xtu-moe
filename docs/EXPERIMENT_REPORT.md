@@ -341,8 +341,43 @@ routed MoE 放 CPU、注意力放 GPU)增加一条**逐层流式 GPU prefill** �
 |---|---|
 | `vllm_xiaotu_moe/hybrid_model.py` | OOT 覆盖 `DeepseekV4ForCausalLM`;`CpuXiaotuMoE` 替换 `DeepseekV4MoE`(专家参数在 CPU,gate/共享专家在 GPU) |
 | `vllm_xiaotu_moe/gpu_prefill.py` | 长 prefill 逐层流式 GPU MoE(本报告主角) |
-| `vllm_xiaotu_moe/mixed_experts.py` | `XiaotuCPUExperts(CPUExpertsMxfp4)`,把 `_supports_current_device` 放宽到"x86 无 AMX" |
-| `xiaotu_moe/csrc/` | CPU MoE 引擎(MXFP4/BF16/FP8/NVFP4),header-only,`binding.cpp` 导出 |
+| `vllm_xiaotu_moe/mixed_experts.py` | 通用 CPU experts 后端注册表:MXFP4/FP8/INT4 三个格式,把 `_supports_current_device` 放宽到"x86 无 AMX"(见 §3.6) |
+| `xiaotu_moe/csrc/` | CPU MoE 引擎(MXFP4/BF16/FP8/NVFP4/WNA16),header-only,`binding.cpp` 导出 |
+
+### 3.6 通用 CPU experts 后端(2026-09-09 夜新增,进行中)
+
+把"只覆盖 DS-V4"的 OOT 模型覆盖,升级为**格式无关的 CPU experts 后端**:任何使用主线
+`FusedMoEFactory` 的 MoE 模型,只要权重量化格式在支持列表里,就会在混合模式下自动选中
+xiaotu 引擎(不再需要模型级覆盖)。
+
+| 机制 | 实现 |
+|---|---|
+| 后端注册 | `mixed_experts.register_mixed_cpu_backend()` 把 `cpu_moe.{CPUExpertsMxfp4,CPUExpertsFp8,CPUExpertsInt4}` 替换为 `XiaotuCPUExperts*`(oracle 对这些类是惰性 import,替换模块属性即可) |
+| 设备选择 | `_supports_current_device()` = 混合模式(`VLLM_EXPERTS_LOAD_DEVICE=cpu`)+ x86;主线原版要求 `is_cpu()` + AMX |
+| **路由** | 复用主线 router(`create_fused_moe_router`),覆盖 softmax / sigmoid+noaux_tc / **sqrtsoftplus** / grouped-topk / custom_routing_function。主线 `cpu_moe.select_experts` 硬编码 `scoring_func="softmax"`,对 GLM(sigmoid)、DS-V4(sqrtsoftplus)会**选错专家**(已列为上游 bug) |
+| 激活 | `moe_config.swiglu_limit/alpha/beta` 透传到引擎 `activation_type=1`,语义对齐主线 `silu_and_mul_with_clamp`(GLM/DS-V4=10.0、MiniMax-M3=7.0) |
+| 拒绝而非静默错算 | 非 SILU 激活、EP(`expert_map`)、`apply_router_weight_on_input` 目前显式 `raise NotImplementedError` |
+
+**已验证**:
+
+- oracle 选择(`scripts/probe_oracle.py`,不加载权重):
+  GLM-5.3 fp8 块 128x128 + sigmoid/noaux_tc → `CPU / XiaotuCPUExpertsFp8` ✅(修 `_supports_routing_method` 前是 `MARLIN`);
+  DS-V4 fp8 + sqrtsoftplus → 同上 ✅;INT4(WNA16)→ 支持 ✅;INT8 → 不支持(引擎无 int8,如实报告)。
+- 引擎激活语义(`scripts/test_swiglu_clamp.py`,BF16 路径,5 组 limit/alpha/beta):rel_rms ≤ 1.7e-3;
+  真实 DS-V4 layer-1 MXFP4 权重(`scripts/test_swiglu_clamp_mxfp4.py`):max_rel 6.8e-4;
+  **真实 GLM-5.3-Flash fp8 专家权重**(`scripts/test_glm53_fp8_layer.py`,layer 3 / 8 专家):
+  引擎 vs numpy 参考 **rms_rel = 9.3e-5**(引擎在 act 后转 bf16,这就是下限)。
+- 顺带修掉引擎一个真实 bug:`fp8_dequant.hpp` 的 e4m3 **subnormal 解码**用了 `2^-7`(应为 `2^-6`),
+  导致每个 subnormal 权重小 2 倍。修后与 `torch.float8_e4m3fn` 逐字节一致;
+  GLM 权重里非零 subnormal 占 0.010%(聚合影响小,但语义必须对)。
+
+**阻塞(与插件无关)**:GLM-5.3-Flash 在 A100/SM80 上**完全无法启动** —— 它的 MLA 维度
+(`qk_nope_head_dim=256, qk_rope_head_dim=0, v_head_dim=256`)没有任何可用 attention 后端:
+sparse 打开时所有 MLA 后端以 compute-capability/sparse 拒绝;用 `hf_overrides {"index_topk": null}`
+关掉 sparse 后,MLA prefill 选择器只剩 FLASH_ATTN,而它只支持 (128,64,128)/(192,64,256)/(64,64,128)。
+FLASHINFER 仅 Blackwell 且维度是 (128,64,128)。→ GLM-5.3 需要 SM90+;本报告用**层内真实权重**
+验证代替端到端(见上)。日志:`logs/glm53_smoke.log`、`logs/glm53_smoke2.log`;关键报错摘录已入库:
+`docs/evidence/glm53_a100_blocker.txt`。
 
 ---
 
@@ -935,6 +970,14 @@ python report/make_figs.py
 
 ## 修订记录
 
+- **2026-09-09(第 13 版)** — 新增 §3.6「通用 CPU experts 后端(进行中)」:①
+  `mixed_experts.py` 从"只覆盖 DS-V4 的 OOT 覆盖"升级为格式无关后端(MXFP4/FP8/INT4),
+  路由改用主线 router(修掉主线 `cpu_moe.select_experts` 硬编码 softmax 的 bug 影响);
+  ②引擎实现 `swiglu_limit/alpha/beta`(语义对齐 `silu_and_mul_with_clamp`)并给出三路数值验证
+  (BF16 rel_rms ≤1.7e-3 / 真实 DS-V4 MXFP4 max_rel 6.8e-4 / **真实 GLM-5.3 fp8 专家 rms_rel 9.3e-5**);
+  ③修掉引擎 e4m3 subnormal 解码 bug(`2^-7→2^-6`);④记录 **GLM-5.3-Flash 在 A100 无法启动**
+  的确切原因(MLA 维度 256/0/256 无后端)与替代验证方式。依据:`scripts/probe_oracle.py`、
+  `scripts/test_swiglu_clamp*.py`、`scripts/test_glm53_fp8_layer.py`、`logs/glm53_smoke*.log`。
 - **2026-09-09(第 12 版)** — **更正两个错误结论**(用户指出):①"CPU 引擎瓶颈是
   fp4→bf16 反量化 ALU"不成立;②早期 CPU 微基准用了**固定路由**(所有 token 命中同样
   6 个专家),导致 CPU 数字偏悲观 3×、并得出"每 token 成本随 batch 恶化"的假象。

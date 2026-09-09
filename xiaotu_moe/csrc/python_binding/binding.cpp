@@ -333,6 +333,7 @@ PYBIND11_MODULE(XIAOTU_MOE_MODULE_NAME, m) {
         .def_readwrite("groupN", &MOEConfigV2::groupN)
         .def_readwrite("groupK", &MOEConfigV2::groupK)
         .def_readwrite("swiglu_alpha", &MOEConfigV2::swiglu_alpha)
+        .def_readwrite("swiglu_beta", &MOEConfigV2::swiglu_beta)
         .def_readwrite("swiglu_limit", &MOEConfigV2::swiglu_limit)
         .def_readwrite("activation_type", &MOEConfigV2::activation_type)
         .def_readwrite("use_gpu_prefill", &MOEConfigV2::use_gpu_prefill);

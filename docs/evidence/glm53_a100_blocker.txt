@@ -1,0 +1,17 @@
+# GLM-5.3-Flash 在 A100(SM80)无法启动的确切报错
+# 来源: logs/glm53_smoke.log (sparse 开) / logs/glm53_smoke2.log (sparse 关)
+# 复现: CUDA_VISIBLE_DEVICES=2 VLLM_EXPERTS_LOAD_DEVICE=cpu XIAOTU_MOE_SINGLECOPY=1 \
+#         python scripts/glm53_smoke.py            # 以及 GLM_HF_OVERRIDES='{"index_topk": null}'
+
+=== 1) sparse 打开(默认配置) ===
+ValueError: No valid attention backend found for cuda with AttentionSelectorConfig(head_size=512, dtype=torch.bfloat16, kv_cache_dtype=auto, block_size=None, use_mla=True, has_sink=False, use_sparse=T
+rue, use_mm_prefix=False, use_per_head_quant_scales=False, attn_type=AttentionType.DECODER, has_sliding_window=False, use_non_causal=False, use_batch_invariant=False, use_kv_connector=False, use_adapt
+ive_verification=False, use_pcp=False, use_dcp=False). Reasons: {FLASH_ATTN_MLA: [sparse not supported, compute capability not supported, FlashAttention MLA not supported on this device], FLASHMLA: [s
+parse not supported, compute capability not supported, FlashMLA Sparse is only supported on Hopper and Blackwell DC devices.], FLASHINFER_MLA: [sparse not supported, compute capability not supported, 
+FlashInfer MLA kernel requires qk_nope_head_dim in [64, 128, 192], but got 256], TRITON_MLA: [sparse not supported], FLASHINFER_MLA_SPARSE_SM90: [compute capability not supported], FLASH_ATTN_MLA_SPAR
+SE: [compute capability not supported, FlashAttention MLA not supported on this device], FLASHMLA_SPARSE: [head_size not supported, compute capability not supported]}.
+
+=== 2) sparse 关闭(hf_overrides index_topk=null) ===
+ValueError: No valid MLA prefill backend found with MLAPrefillSelectorConfig(dtype=torch.bfloat16, mla_dimensions=(qk_nope_head_dim=256, qk_rope_head_dim=0, v_head_dim=256)). Reasons: {FLASH_ATTN: [Mo
+del does not have supported MLA dimensions (got (qk_nope_head_dim=256, qk_rope_head_dim=0, v_head_dim=256))]}.
+

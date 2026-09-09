@@ -2,6 +2,10 @@
 
 **作者 Author:** 大河马 (dahema@me.com)，由 DeepSeek Harness 辅助 / with DeepSeek Harness assistance
 
+> **本文件只覆盖"引擎性能对齐 lk-moe"这一条子线。**
+> 全项目的待办/决策总账在 [`BACKLOG.md`](BACKLOG.md)(进行中项、上游 PR 策略、
+> 已知阻塞、证据索引)。新会话请先读 BACKLOG,再按需读本文件。
+
 This file records the long-running optimization goal tracked as a ToDo, so
 progress is persistent and auditable across sessions/rounds. Target is the
 **closed-source lk-moe** CPU MoE engine; reference for implementation is the
