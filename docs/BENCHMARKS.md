@@ -58,13 +58,18 @@
 | 格式 | 形状 | 吞吐 |
 |---|---|---|
 | MXFP4 | 真实路由,每专家约 48 行 | **1.73 / 1.96 / 2.00 TFLOP/s**(B=512/2048/8192)≈ AVX-512 BF16 峰值的 15–18% |
-| FP8 block-128 | E=128,H=2048,I=768,top-8 | **0.35–0.43 TFLOP/s**(待优化) |
+| FP8 block-128 | E=128,H=2048,I=768,top-8 | **0.73 / 0.91 / 0.98 TFLOP/s**(B=512/2048/8192;gather-free 解码后提升 ~2.3×) |
 
 - MXFP4 路径 **99.7% 的时间**在两个 GEMM 相位(gate/up 57%、down 28%);
 - 权重流量约 10 GB/s,远低于机器可提供的 740 GB/s → **不是带宽受限**;
 - 每 token 每层约 0.15–0.17 ms,且随 batch 增大而改善。
 
 复现:`python scripts/bench_cpu_engine.py` / `python scripts/bench_fp8_engine.py`。
+
+> FP8 内核的瓶颈曾是**每 8 字节一次 LUT gather**(微码指令,吞吐极低)。
+> 改为**无 gather 的位运算解码**(AVX-512 16-wide / AVX2 8-wide)后,
+> 引擎吞吐 0.35–0.43 → **0.73–0.98 TFLOP/s**;真实模型(Qwen3-30B-A3B-FP8,单卡)
+> prefill 75 → **113 tok/s**,decode 1.1 → **5.8 tok/s**。
 
 ## 4.1 Qwen3.8-Flash-Next-FP8 端到端(目标模型,2×A100-40GB)
 
@@ -76,7 +81,7 @@
 | GPU 侧 | 每 rank 非专家权重 6.25 GiB;KV cache 20.27 GiB |
 | 短问答 | 3 个问题 38.6 s,答案正确(北京 / 2 / MoE 解释) |
 | 长 prefill | 531 token:TTFT **12.21 s**(44 tok/s) |
-| decode | ≈**1.3 tok/s**(512 专家 top-10,FP8 内核尚未优化) |
+| decode | ≈**1.3 tok/s**(512 专家 top-10;内核已提速 2.3×,仍待继续优化) |
 
 > 该模型非专家权重约 65 GB(其中 51 GB 是一张 PLE n-gram 嵌入表),
 > 单卡 40 GB 放不下,必须 TP=2 + 部分权重 offload 到 CPU。

@@ -35,16 +35,46 @@ namespace fp8_detail {
 
 // C[M,N] fp32 = A[M,K]bf16 x W[N,K]fp8^T, group scale along N (groupN) and K
 // (groupK). S = [N/groupN][K/groupK] fp32. groupN/groupK <= 0 treated as 1.
+// Vector helpers: one instantiation per ISA level, so the kernel body below is
+// written once. Arithmetic (gather-free) FP8 decode is used in the hot loop.
+#if defined(__AVX512F__)
+using Vec = __m512;
+constexpr int kVW = 16;
+inline Vec vzero() { return _mm512_setzero_ps(); }
+inline Vec vbcast(float s) { return _mm512_set1_ps(s); }
+inline Vec vfma(Vec a, Vec b, Vec c) { return _mm512_fmadd_ps(a, b, c); }
+inline Vec load_bf16_as_f32(const uint16_t* p) {
+    __m256i a16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a16), 16));
+}
+inline Vec load_fp8_as_f32(const uint8_t* p) { return fp8::e4m3x16_to_fp32(p); }
+inline float vhsum(Vec v) { return _mm512_reduce_add_ps(v); }
+#elif defined(__AVX2__)
+using Vec = __m256;
+constexpr int kVW = 8;
+inline Vec vzero() { return _mm256_setzero_ps(); }
+inline Vec vbcast(float s) { return _mm256_set1_ps(s); }
+inline Vec vfma(Vec a, Vec b, Vec c) { return _mm256_fmadd_ps(a, b, c); }
+inline Vec load_bf16_as_f32(const uint16_t* p) {
+    __m128i a16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(a16), 16));
+}
+inline Vec load_fp8_as_f32(const uint8_t* p) { return fp8::e4m3x8_to_fp32_arith(p); }
+inline float vhsum(Vec v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+#endif
+
 inline void matmul_fp8_quant(const uint16_t* A, const uint8_t* W, const float* S,
                              float* C, int M, int N, int K,
                              int groupN, int groupK) {
     const int gn = groupN > 0 ? groupN : 1;
     const int gk = groupK > 0 ? groupK : 1;
-#if XIAOTU_MOE_HAVE_AVX2
-    constexpr int Wv = 8;
-#else
-    constexpr int Wv = 8;
-#endif
 #if defined(__AVX2__)
     for (int i = 0; i < M; ++i) {
         const uint16_t* Arow = A + (size_t)i * K;
@@ -52,33 +82,23 @@ inline void matmul_fp8_quant(const uint16_t* A, const uint8_t* W, const float* S
         for (int j = 0; j < N; ++j) {
             const uint8_t* Wrow = W + (size_t)j * K;
             const float* Srow = S + (size_t)(j / gn) * ((K + gk - 1) / gk);
-            __m256 total = _mm256_setzero_ps();
+            Vec total = vzero();
+            float tail = 0.f;   // 标量尾巴(不足一个向量的部分),最后一起加
             int kbase = 0;
             for (; kbase < K; kbase += gk) {
-                __m256 gacc = _mm256_setzero_ps();
+                Vec gacc = vzero();
                 int k = kbase;
                 int kend = (kbase + gk < K) ? (kbase + gk) : K;
-                for (; k + Wv <= kend; k += Wv) {
-                    // A: bf16 -> fp32 (load 8 bf16 = 16 bytes = full __m128i)
-                    __m128i a16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Arow + k));
-                    __m256 av = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(a16), 16));
-                    __m256 wv = fp8::e4m3x8_to_fp32(Wrow + k);
-                    gacc = _mm256_fmadd_ps(av, wv, gacc);
-                }
+                for (; k + kVW <= kend; k += kVW)
+                    gacc = vfma(load_bf16_as_f32(Arow + k), load_fp8_as_f32(Wrow + k), gacc);
                 float gscalar = 0.f;
                 for (; k < kend; ++k)
                     gscalar += bf16::bf16_to_fp32(Arow[k]) * fp8::e4m3_to_fp32_scalar(Wrow[k]);
                 float scale = Srow[kbase / gk];
-                total = _mm256_fmadd_ps(gacc, _mm256_set1_ps(scale), total);
-                if (gscalar != 0.f) {
-                    float t[8]; _mm256_storeu_ps(t, total);
-                    t[0] += gscalar * scale;
-                    total = _mm256_loadu_ps(t);
-                }
+                total = vfma(gacc, vbcast(scale), total);
+                tail += gscalar * scale;
             }
-            float tmp[Wv]; _mm256_storeu_ps(tmp, total);
-            float acc = 0.f; for (int t = 0; t < Wv; ++t) acc += tmp[t];
-            Crow[j] = acc;
+            Crow[j] = vhsum(total) + tail;
         }
     }
 #else
