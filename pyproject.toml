@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-xtu-moe"
+version = "0.1.0"
+description = "XTU (X Transformers Unity) — mainline vLLM hybrid MoE plugin carrying the xiaotu-moe CPU engine (AVX512-VNNI/BF16 fp4 MXFP4-MXFP8), enabling no-AMX x86 (AMD EPYC) hybrid inference on FusedMoEFactory."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "大河马", email = "dahema@me.com" }]
+keywords = ["moe", "llm", "cpu", "quantization", "mxfp4", "nvfp4", "vllm", "hybrid"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.setuptools]
+packages = ["xiaotu_moe", "vllm_xiaotu_moe"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+xiaotu_moe = ["build/*.so"]
+
+[project.entry-points."vllm.general_plugins"]
+vllm_xiaotu_moe = "vllm_xiaotu_moe.hybrid_model:register"
+
