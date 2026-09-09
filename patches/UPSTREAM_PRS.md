@@ -14,6 +14,14 @@
 **你的动作**:逐个点开 → 检查代码/描述 → 点 **"Ready for review"** 即提交给 maintainer。
 若想撤销,点 "Convert to draft" 或 Close 即可。
 
+**PR 描述已按"目标 / 问题 / 设计 / 算法 / 实测性能 / 测试 / 关联"重写并推送到 GitHub**
+(PR1 3910 字符、PR2 3680、PR3 5491)。仓库内保留同一份快照,便于重新生成时直接复用:
+`patches/upstream/pr{1,2,3}_body.md`。更新某条 PR 描述:
+
+```bash
+gh pr edit <PR号> --repo vllm-project/vllm --body-file patches/upstream/pr1_body.md
+```
+
 **重新生成(上游又变了时)**:
 ```bash
 bash scripts/check_upstream_drift.sh          # 先看漂移
