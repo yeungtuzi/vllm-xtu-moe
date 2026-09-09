@@ -1,15 +1,24 @@
 # Upstream PR 计划(D1–D8 决策后的执行状态)
 
-> 目标仓库: `vllm-project/vllm`,基线 `6c73b08dec2af5052288169663549687ba61f330`
+> 目标仓库: `vllm-project/vllm`,基线已 rebase 到 `main@1454b71`
 > 我们的 fork: `yeungtuzi/vllm`
-> 三个分支已经推好,**等你点 Create PR**(D6b)。
+> **D6 已改:PR 由我生成(draft),你检查后点 "Ready for review"**。
 
-| PR | 分支 | 规模 | 依赖 | 状态 |
+| PR | 分支 | 规模(vs 最新 main) | Draft PR | 状态 |
 |---|---|---|---|---|
-| PR1 | `xtu/pr1-experts-load-device` | 3 文件 +53/−2 | 无 | 已推送,待你提交 |
-| PR2 | `xtu/pr2-fp8-sm80-o-proj` | 4 文件 +424/−12 | 无 | 已推送,待你提交 |
-| PR3 | `xtu/pr3-sm80-port` | 21 文件 +6346/−119 | 建议在 PR2 之后 | 已推送,待你提交 |
+| PR1 | `xtu/pr1-experts-load-device` | 3 文件 +59/−2 | [#56118](https://github.com/vllm-project/vllm/pull/56118) | draft,待你 review |
+| PR2 | `xtu/pr2-fp8-sm80-o-proj` | 4 文件 +422/−12 | [#56119](https://github.com/vllm-project/vllm/pull/56119) | draft,待你 review |
+| PR3 | `xtu/pr3-sm80-port` | 21 文件 +6350/−119 | [#56120](https://github.com/vllm-project/vllm/pull/56120) | draft;**A100 运行时验证待补** |
 | RFC | — | issue | — | 草稿见 `rfc_layerwise_gpu_prefill.md`,待你发 |
+
+**你的动作**:逐个点开 → 检查代码/描述 → 点 **"Ready for review"** 即提交给 maintainer。
+若想撤销,点 "Convert to draft" 或 Close 即可。
+
+**重新生成(上游又变了时)**:
+```bash
+bash scripts/check_upstream_drift.sh          # 先看漂移
+# 需要时:重新 rebase 三个分支并强推(步骤见 results.txt「上游推进」段)
+```
 
 **提交顺序建议**: PR2 → PR3(PR3 的 o_proj 正确性依赖 PR2)→ PR1(独立,可随时)。
 三者互不冲突(只有 `vllm/envs.py` 在 PR1 与 PR3 各加了一组互不重叠的变量,

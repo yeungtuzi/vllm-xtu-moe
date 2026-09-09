@@ -375,18 +375,25 @@ routed MoE 放 CPU、注意力放 GPU)增加一条**逐层流式 GPU prefill** �
 | D3 | PR2 单独提 | **单独小 PR** | ✅ `xtu/pr2-fp8-sm80-o-proj`(4 文件 +424/−12) |
 | D4 | PR4 形态 | **先发 RFC issue** | ✅ 草稿 `patches/rfc_layerwise_gpu_prefill.md`(待你发) |
 | D5 | MXFP4 内核是否上游 | **暂留插件** | ✅ 未纳入任何 PR |
-| D6 | 谁提交 PR | **我准备分支+描述,你点提交** | ✅ 3 个分支已在 `yeungtuzi/vllm`,标题/描述/测试说明见 `patches/UPSTREAM_PRS.md` |
+| D6 | 谁提交 PR | **改成:我生成全部 PR(draft),你检查后点 "Ready for review"** | ✅ 三个 draft PR 已开:#56118 / #56119 / #56120 |
 | D7 | 清理范围 | **删掉全部 `XIAOTU_DEBUG_*`/`XIAOTU_TIMING` 埋点;内部命名前缀不改** | ✅ PR3 里用 AST 精确删除(共 38 处/122 行),`grep XIAOTU` = 0;插件侧包名/env 前缀保持不变 |
 | D8 | 许可证与署名 | **我方 Apache-2.0,署名"大河马(BigHippo) dahema@me.com";第三方按其 license 要求署名** | ✅ 新增 `NOTICE`、`THIRD_PARTY_NOTICES.md`;`pyproject` 作者更新 |
 
 ### 4.2 上游分支现状(D6b:等你点提交)
 
-| PR | 分支(`yeungtuzi/vllm`) | 规模 | 依赖 |
-|---|---|---|---|
-| PR1 | `xtu/pr1-experts-load-device` | 3 文件 +53/−2 | 无 |
-| PR2 | `xtu/pr2-fp8-sm80-o-proj` | 4 文件 +424/−12 | 无 |
-| PR3 | `xtu/pr3-sm80-port` | 21 文件 +6346/−119 | 建议在 PR2 之后 |
-| RFC | — | issue 草稿 | 建议等 PR1 有回应 |
+| PR | 分支(`yeungtuzi/vllm`) | 规模(vs 最新 main) | Draft PR | 依赖 |
+|---|---|---|---|---|
+| PR1 | `xtu/pr1-experts-load-device` | 3 文件 +59/−2 | [#56118](https://github.com/vllm-project/vllm/pull/56118) | 无 |
+| PR2 | `xtu/pr2-fp8-sm80-o-proj` | 4 文件 +422/−12 | [#56119](https://github.com/vllm-project/vllm/pull/56119) | 无 |
+| PR3 | `xtu/pr3-sm80-port` | 21 文件 +6350/−119 | [#56120](https://github.com/vllm-project/vllm/pull/56120) | 建议在 PR2 之后 |
+| RFC | — | issue 草稿 | 未发 | 建议等 PR1 有回应 |
+
+**三个分支都已 rebase 到 `main@1454b71`(behind=0)**。PR3 需要额外说明:上游重构了
+`common/ops/{cache_utils,fused_indexer_q,fused_inv_rope_fp8_quant}.py`(新的
+`VllmTritonJitKernel`/`LaunchSpec` 结构),我们的改动**按新结构重新落了一遍**
+(fp8 编解码改用 `_f32_to_e4m3_uint8`/`_e4m3_uint8_to_f32`、`has_cutedsl()` 加
+`not is_ampere_or_ada()` 门、移植的 SM80 内核追加在文件末尾);已验证全部文件可解析、
+无冲突标记,**A100 运行时验证仍待补**(PR 描述里已如实标注)。
 
 - 标题、完整描述(含测试说明)与一键 compare 链接:`patches/UPSTREAM_PRS.md`
 - PR1 与 PR3 都会改 `vllm/envs.py`(互不重叠的两组变量),合入时可能有一次
@@ -889,6 +896,9 @@ python report/make_figs.py
 
 ## 修订记录
 
+- **2026-09-09(第 11 版)** — D6 改为"我生成全部 PR":三个 draft PR 已开
+  (#56118/#56119/#56120),三个分支全部 rebase 到 `main@1454b71`;PR3 因上游重构
+  `common/ops/*` 做了手工移植(细节见 §4.2),运行时验证待补。
 - **2026-09-09(第 10 版)** — 新增 §4.3 上游漂移与维护成本(实测:上游 41 提交/天、
   36h 走 85 个提交;PR2 干净、PR1 1 处冲突、PR3 6 处冲突;插件 15 个导入模块全在、
   近 1 天无签名变更),并给出维护建议。新增 `scripts/check_upstream_drift.sh`。
