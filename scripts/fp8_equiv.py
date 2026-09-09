@@ -46,7 +46,8 @@ def main() -> int:
     t0 = time.time()
     llm = LLM(
         model=MODEL,
-        tensor_parallel_size=1,
+        tensor_parallel_size=int(os.environ.get("TP", "1")),
+        enable_expert_parallel=os.environ.get("EP", "0") == "1",
         gpu_memory_utilization=0.85,
         max_model_len=4096,
         max_num_seqs=int(os.environ.get("MAX_SEQS", "2")),
