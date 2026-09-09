@@ -9,7 +9,7 @@ description = "XTU (X Transformers Unity) — mainline vLLM hybrid MoE plugin ca
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
-authors = [{ name = "大河马", email = "dahema@me.com" }]
+authors = [{ name = "大河马 (BigHippo)", email = "dahema@me.com" }]
 keywords = ["moe", "llm", "cpu", "quantization", "mxfp4", "nvfp4", "vllm", "hybrid"]
 classifiers = [
     "Programming Language :: Python :: 3",
