@@ -120,7 +120,10 @@ def main():
           f"{'MXFP4 TFLOP/s':>14} {'BF16 TFLOP/s':>13}", flush=True)
     for B in bs:
         x = f32_to_bf16_bits(rng.standard_normal((B, H)).astype(np.float32))
-        ids = np.tile(ids1, (B, 1)); wts = np.tile(wts1, (B, 1))
+        # realistic per-token routing (see bench_cpu_engine.py): fixed routing
+        # collapses onto 6 experts and inflates the per-expert row count 40x.
+        ids = rng.integers(0, E, size=(B, K)).astype(np.int32)
+        wts = rng.uniform(-1, 1, size=(B, K)).astype(np.float32)
         d4, f4, o4 = bench(eng4, B, ids, wts, x, rep)
         db, fb, ob = bench(engb, B, ids, wts, x, rep)
         # numerical agreement (different kernels: expect bf16-level differences)

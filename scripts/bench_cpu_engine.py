@@ -84,8 +84,12 @@ def main():
     for B in bs:
         x = f32_to_bf16_bits(rng.standard_normal((B, H)).astype(np.float32))
         out = np.zeros((B, H), dtype=np.float32)
-        ids_b = np.tile(ids, (B, 1))
-        wts_b = np.tile(wts, (B, 1))
+        # Random per-token routing: with identical ids for every token the batch
+        # collapses onto a handful of experts, which is NOT what the real model
+        # does (256 experts x ~48 rows each) and changes the weight working set
+        # from 3.2 GB (DRAM) to a few tens of MB (L3).
+        ids_b = rng.integers(0, E, size=(B, K)).astype(np.int32)
+        wts_b = rng.uniform(-1, 1, size=(B, K)).astype(np.float32)
         engine.cpu_prefill(B, K, ids_b, wts_b, x, out)
         t0 = time.perf_counter()
         for _ in range(rep):
