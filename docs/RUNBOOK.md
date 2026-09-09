@@ -81,7 +81,7 @@ xiaotu_moe variant = _avx512_bf16
 
 | 变量 | 推荐值 | 作用 |
 |---|---|---|
-| `VLLM_EXPERTS_LOAD_DEVICE` | `cpu` | ★ 混合模式开关:routed-expert 权重在 CPU 上构造与计算 |
+| `VLLM_EXPERTS_LOAD_DEVICE` | `cpu` | ★ 混合模式开关:routed-expert 权重在 CPU 上构造与计算。**取值只有 `cpu` / `gpu`**(写 `cuda` 会被 vLLM 直接拒绝);`gpu` 用于同模型对照基线 |
 | `XIAOTU_MOE_SINGLECOPY` | `1` | 权重只保留一份(NUMA 分片);不设时可能按 socket 复制,内存约 2× |
 | `XIAOTU_MAINLINE_SHIMS` | `1`(默认) | 在原生 vLLM 上启用混合模式所需的集成补丁;`0` 关闭 |
 | `CUDA_VISIBLE_DEVICES` | 例如 `0` | 选择使用的 GPU |
