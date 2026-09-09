@@ -535,11 +535,10 @@ class _XiaotuExpertsMixin:
         for t in (h_bf16, ids_i32, wts_f32, out):
             if t.is_cuda:
                 t.record_stream(stream)
-        # 正确性优先:引擎用 cudaMemcpyAsync + host 回调读写设备张量,而 vLLM 的
-        # 异步输出拷贝运行在独立的 non-blocking stream 上。实测(真实 fp8 模型)
-        # 若不在此处与设备同步,第二个请求可能读到上一个请求的数据。
-        # 默认开启;追求极致吞吐时可设 XIAOTU_SYNC_DECODE=0(自担风险)。
-        _sync = os.environ.get("XIAOTU_SYNC_DECODE", "1")
+        # 引擎调用前后可选地与设备同步。跨请求状态污染已在 binding.cpp 中从根上修复
+        # (每次调用使用不可变的参数块,回调不再读 per-engine 的可变字段),因此默认
+        # 关闭;调试或怀疑时序问题时设 XIAOTU_SYNC_DECODE=1 可强制串行化。
+        _sync = os.environ.get("XIAOTU_SYNC_DECODE", "0")
         _is_first = ".0." in getattr(layer, "layer_name", "")
         if _sync == "1" or (_sync == "pre") or (_sync == "first" and _is_first):
             torch.cuda.synchronize()

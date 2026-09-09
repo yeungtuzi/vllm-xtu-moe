@@ -71,27 +71,34 @@ struct CpuDecodeState {
     size_t out_bytes = 0;
     void (*host_fn)(void*) = nullptr;
 
-    void ensure_buffers(size_t nh, size_t ni, size_t nw, size_t no) {
+    // 返回 true 表示发生了重新分配(旧 pinned 指针失效)。
+    bool ensure_buffers(size_t nh, size_t ni, size_t nw, size_t no) {
+        bool realloc = false;
         if (nh > cap_hidden) {
             if (pin_hidden) cudaFreeHost(pin_hidden);
             cudaHostAlloc(&pin_hidden, nh, cudaHostAllocDefault);
             cap_hidden = nh;
+            realloc = true;
         }
         if (ni > cap_ids) {
             if (pin_ids) cudaFreeHost(pin_ids);
             cudaHostAlloc(&pin_ids, ni, cudaHostAllocDefault);
             cap_ids = ni;
+            realloc = true;
         }
         if (nw > cap_weights) {
             if (pin_weights) cudaFreeHost(pin_weights);
             cudaHostAlloc(&pin_weights, nw, cudaHostAllocDefault);
             cap_weights = nw;
+            realloc = true;
         }
         if (no > cap_out) {
             if (pin_out) cudaFreeHost(pin_out);
             cudaHostAlloc(&pin_out, no, cudaHostAllocDefault);
             cap_out = no;
+            realloc = true;
         }
+        return realloc;
     }
 
     ~CpuDecodeState() {
@@ -229,18 +236,18 @@ static void bind_moe_class(py::module& m, const char* name) {
             std::lock_guard<std::mutex> lg(g_cd_mtx);
             auto& st = g_cd_state[&self];
             if (!st) st = std::make_unique<CpuDecodeState>();
-            st->ensure_buffers(nh, ni, nw, no);
+            if (st->ensure_buffers(nh, ni, nw, no)) {
+                // 重新分配了 pinned 缓冲:旧的缓冲可能还有 pending 的回调在读,
+                // 先排空该 stream 再继续(只在缓冲区增长时发生,稳态下不会触发)。
+                cudaError_t es = cudaStreamSynchronize(s);
+                if (es != cudaSuccess)
+                    fprintf(stderr, "[cd] streamSync err=%s\n", cudaGetErrorString(es));
+            }
 
             st->stream = s;
-            st->engine = &self;
-            st->qlen = qlen;
-            st->k = top_k;
             st->out_bytes = no;
-            st->hid = (const uint16_t*)st->pin_hidden;
-            st->ids = (const uint32_t*)st->pin_ids;
-            st->wts = (const float*)st->pin_weights;
-            st->out = (float*)st->pin_out;
-            st->outg = outg_dev;
+            st->out = (float*)st->pin_out;   // pinned 计算输出(H2D 源)
+            st->outg = outg_dev;             // 设备 H2D 目标
 
             // 1) Async D2H copies on the caller stream (graph-capturable).
             cudaMemcpyAsync(st->pin_hidden, hid_dev, nh,
@@ -256,25 +263,50 @@ static void bind_moe_class(py::module& m, const char* name) {
             //    stream node placed AFTER this host node. Stream ordering
             //    guarantees the H2D waits for the callback, i.e. for
             //    forward_many to finish writing st->out.
+            // 每次调用一个不可变的参数块:回调只读它,不再读 per-engine 的
+            // 可变字段。否则当 vLLM 的 async scheduling 让下一 step 的 host 代码
+            // 跑在本 step 的回调之前时,回调会读到新 step 的参数(实测:第二个
+            // 请求会拿到上一个请求的数据)。
+            struct CpuDecodeCall {
+                MOE* engine;
+                int qlen;
+                int k;
+                const uint16_t* hid;
+                const uint32_t* ids;
+                const float* wts;
+                float* out;
+            };
+            auto* call = new CpuDecodeCall{
+                &self, qlen, top_k,
+                (const uint16_t*)st->pin_hidden,
+                (const uint32_t*)st->pin_ids,
+                (const float*)st->pin_weights,
+                (float*)st->pin_out,
+            };
             st->host_fn = [](void* arg) {
-                auto* d = static_cast<CpuDecodeState*>(arg);
-                auto* e = static_cast<MOE*>(const_cast<void*>(d->engine));
+                std::unique_ptr<CpuDecodeCall> c(
+                    static_cast<CpuDecodeCall*>(arg));
                 static int traced = 0;
                 if (std::getenv("XIAOTU_CD_TRACE") && traced < 4000) {
                     ++traced;
-                    fprintf(stderr, "[cd] stream=%p eng=%p qlen=%d k=%d ids=[%u,%u,%u,%u] "
+                    fprintf(stderr, "[cd] eng=%p qlen=%d k=%d ids=[%u,%u,%u,%u] "
                                     "hid=[%04x,%04x]\n",
-                            (void*)d->stream, (void*)d->engine, d->qlen, d->k,
-                            d->qlen > 0 && d->ids ? d->ids[0] : 0u,
-                            d->qlen > 0 && d->ids && d->k > 1 ? d->ids[1] : 0u,
-                            d->qlen > 0 && d->ids && d->k > 2 ? d->ids[2] : 0u,
-                            d->qlen > 0 && d->ids && d->k > 3 ? d->ids[3] : 0u,
-                            d->hid ? d->hid[0] : 0, d->hid ? d->hid[1] : 0);
+                            (void*)c->engine, c->qlen, c->k,
+                            c->ids ? c->ids[0] : 0u,
+                            c->ids && c->k > 1 ? c->ids[1] : 0u,
+                            c->ids && c->k > 2 ? c->ids[2] : 0u,
+                            c->ids && c->k > 3 ? c->ids[3] : 0u,
+                            c->hid ? c->hid[0] : 0, c->hid ? c->hid[1] : 0);
                 }
-                e->forward_many(d->qlen, d->k, d->ids, d->wts,
-                                d->hid, d->out);
+                c->engine->forward_many(c->qlen, c->k, c->ids, c->wts,
+                                        c->hid, c->out);
             };
-            cudaLaunchHostFunc(s, st->host_fn, &*st);
+            cudaLaunchHostFunc(s, st->host_fn, call);
+            if (std::getenv("XIAOTU_CD_ERRCHECK")) {
+                cudaError_t e1 = cudaGetLastError();
+                if (e1 != cudaSuccess)
+                    fprintf(stderr, "[cd] hostfunc err=%s\n", cudaGetErrorString(e1));
+            }
             // 3) Async H2D write-back into the stable out_gpu device buffer.
             //    During capture this is recorded as a normal graph node; at
             //    replay the graph executes D2H -> host(CPU compute) -> H2D.
