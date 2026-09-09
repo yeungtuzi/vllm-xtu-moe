@@ -119,8 +119,7 @@ vllm-xtu-moe/
 │   ├── mixed_experts.py #   通用 CPU experts 后端(BF16/FP8/MXFP4/INT4)
 │   ├── mainline_shims.py#   在原生 vLLM 上启用混合模式的集成补丁
 │   ├── hybrid_model.py  #   DeepSeek-V4 的模型级覆盖(可选路径)
-│   ├── gpu_prefill.py   #   长 prefill 逐层 GPU 流式
-│   └── adapter.py       #   引擎 ↔ vLLM 薄适配
+│   └── gpu_prefill.py   #   长 prefill 逐层 GPU 流式
 ├── xiaotu_moe/          # 内置 CPU 引擎(Python 绑定 + C++ 内核 + 运行时 ISA 选择)
 ├── scripts/             # 构建、基准、数值验证、端到端冒烟
 ├── patches/             # 上游 PR / 补丁 / RFC

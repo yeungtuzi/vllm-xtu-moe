@@ -125,8 +125,7 @@ vllm-xtu-moe/
 │   ├── mixed_experts.py #   generic CPU experts backend (BF16/FP8/MXFP4/INT4)
 │   ├── mainline_shims.py#   integration shims for stock vLLM
 │   ├── hybrid_model.py  #   DeepSeek-V4 model-level override (optional path)
-│   ├── gpu_prefill.py   #   layerwise GPU prefill
-│   └── adapter.py       #   thin engine ↔ vLLM adapter
+│   └── gpu_prefill.py   #   layerwise GPU prefill
 ├── xiaotu_moe/          # bundled CPU engine (Python bindings + C++ kernels + runtime ISA selection)
 ├── scripts/             # build, benchmarks, numeric tests, end-to-end smoke tests
 ├── patches/             # upstream PRs / patches / RFC
