@@ -250,6 +250,19 @@ class _XiaotuExpertsMixin:
             e_score_correction_bias=self.e_score_correction_bias,
         )
 
+    def _local_expert_map(self, expert_map, device):
+        """把 expert_map 缓存在 ids 所在的设备上(EP 下每层一份)。"""
+        cached = getattr(self, "_expert_map_cached", None)
+        if cached is not None and cached[0] == device:
+            return cached[1]
+        em = expert_map
+        if em.device != device:
+            em = em.to(device)
+        if em.dtype not in (torch.int32, torch.int64):
+            em = em.to(torch.long)
+        self._expert_map_cached = (device, em)
+        return em
+
     # ---- engine construction ------------------------------------------
     def _find_scale(self, layer, names):
         for n in names:
@@ -279,9 +292,12 @@ class _XiaotuExpertsMixin:
             s2 = self._find_scale(layer, (self._scale_attrs[1],))
         num_local_experts = int(ex_w13.shape[0])
         if num_local_experts != int(self.moe_config.num_experts):
-            raise NotImplementedError(
-                "xiaotu CPU experts backend does not support expert parallelism "
-                f"yet (local={num_local_experts}, global={self.moe_config.num_experts})"
+            # 专家并行:本 rank 只持有 local_num_experts 个专家,id 已在 apply 里
+            # 按 expert_map 映射成局部 id。
+            print(
+                f"[vllm-xtu-moe] expert parallelism: local={num_local_experts} "
+                f"global={self.moe_config.num_experts}",
+                flush=True,
             )
         if not self._supports_activation(self.moe_config.activation):
             raise NotImplementedError(
@@ -491,12 +507,6 @@ class _XiaotuExpertsMixin:
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
     ) -> torch.Tensor:
-        # 混合模式下权重全在 host,主线不会为 CPU 后端建 expert_map(见
-        # CPUExperts*.supports_expert_map() == False);真出现就是 EP 配置,拒绝。
-        if expert_map is not None:
-            raise NotImplementedError(
-                "xiaotu CPU experts backend does not support expert_map (EP)"
-            )
         if apply_router_weight_on_input:
             raise NotImplementedError(
                 "xiaotu CPU experts backend does not support "
@@ -505,6 +515,19 @@ class _XiaotuExpertsMixin:
         # monolithic apply() 拿不到 input_ids,若模型的路由需要它(hash routing),
         # router 会在这里报错——比静默选错专家好。
         topk_weights, topk_ids = self._select_topk(hidden_states, router_logits)
+
+        # 专家并行(EP):路由给出的是全局 expert id,需要按 expert_map 映射到本
+        # rank 的本地 id;映射为 -1 表示该专家不在本 rank,把权重置 0。
+        if expert_map is not None:
+            em = self._local_expert_map(expert_map, topk_ids.device)
+            local = em[topk_ids.to(torch.long)]
+            miss = local < 0
+            if bool(miss.any()):
+                topk_weights = torch.where(
+                    miss, torch.zeros_like(topk_weights), topk_weights
+                )
+                local = torch.where(miss, torch.zeros_like(local), local)
+            topk_ids = local.to(torch.int32)
 
         layer = self._layer_ref
         if layer is None:

@@ -34,7 +34,7 @@ sparse 关闭(--hf-overrides '{"index_topk": null}'):
 
 | 限制 | 说明 |
 |---|---|
-| **不支持专家并行(expert_map / EP)** | 出现 `expert_map` 时插件直接报错;TP>1 走权重分片 |
+| **专家并行(expert_map / EP)** | ✅ 已支持:按 `expert_map` 把全局 expert id 映射为本地 id(不在本 rank 的置 0)。**端到端验证待补**:本机 vLLM TP=2 会卡住(用 GPU 专家后端同样卡住,属环境问题) |
 | **不支持 `apply_router_weight_on_input`** | 少数模型使用该选项 |
 | **不支持交错 gate/up 布局** | `SWIGLUOAI`(gpt-oss 系)把 gate/up 交错存在 `w13` 中;引擎按 packed 布局取数,因此该情形由 `_supports_activation` 拒绝 |
 | **INT4(WNA16)组大小固定 128** | 组大小/零点的完整适配进行中 |
