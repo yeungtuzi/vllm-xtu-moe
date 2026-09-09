@@ -7,7 +7,7 @@
      `torch.ops._C.convert_weight_packed`);
   4. 量化方法的 `process_weights_after_loading` 必须通知 experts 后端(fp8/wna16 主线不调)。
 
-这 4 处目前尚未合并进上游。为了让用户
+这 4 处目前尚未合并进上游。为了让使用
 **只装插件就能用**,这里用 monkey-patch 提供等价行为:
 
   shim 1  给每个 `FusedMoEMethodBase` 子类的 `create_weights` 套一层

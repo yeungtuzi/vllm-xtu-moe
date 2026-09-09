@@ -86,7 +86,7 @@ def make_config(hidden, inter, experts, topk, routing, swiglu_limit):
 
 
 def check_activation_guard() -> int:
-    """T04:引擎只做 packed 布局的 gated 激活;SWIGLUOAI(交错)必须被拒绝。"""
+    """激活守卫:引擎只做 packed 布局的 gated 激活;SWIGLUOAI(交错)必须被拒绝。"""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.experts import cpu_moe
 
