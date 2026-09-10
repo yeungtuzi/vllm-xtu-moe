@@ -86,6 +86,39 @@ def _maybe_profile() -> None:
         print(f"[xiaotu-profile] chrome trace -> {path}", flush=True)
 
 
+_PROF_DEC: dict = {"prof": None, "calls": 0}
+
+
+def _maybe_profile_decode() -> None:
+    """Env-gated torch profiler for the DECODE path.
+
+    XIAOTU_TORCH_PROFILE_DECODE=<path> dump(默认抓 2×43 层)――decode 的
+    step 由 43 次 D2H→host 回调→H2D + GPU 注意力组成,只有拿到进程内 trace
+    才能看清"每层 6 ms 里有多少是内核、多少是等 CPU"。
+    """
+    path = os.environ.get("XIAOTU_TORCH_PROFILE_DECODE")
+    if not path:
+        return
+    st = _PROF_DEC
+    if st["prof"] is None:
+        import torch.profiler as tp
+
+        st["prof"] = tp.profile(
+            activities=[tp.ProfilerActivity.CPU, tp.ProfilerActivity.CUDA]
+        )
+        st["prof"].__enter__()
+    st["calls"] += 1
+    limit = int(os.environ.get("XIAOTU_TORCH_PROFILE_DECODE_CALLS", "86"))
+    if st["calls"] >= limit:
+        prof = st["prof"]
+        st["prof"] = None
+        prof.__exit__(None, None, None)
+        print("[xiaotu-dec-profile]\n" + prof.key_averages().table(
+            sort_by="cuda_time_total", row_limit=30), flush=True)
+        prof.export_chrome_trace(path)
+        print(f"[xiaotu-dec-profile] chrome trace -> {path}", flush=True)
+
+
 def _start_pinned_prebuild() -> None:
     """Build every layer's K-major pinned host cache in the background (once).
 
@@ -394,14 +427,20 @@ class CpuXiaotuMoE(nn.Module):
             )
             or 4096
         )
+        # V2 引擎(MOE_MXFP4/MOE_FP8/MOE_BF16)的每 token 缓冲是**按调用动态
+        # 分配**的(qlen = 本次 forward 的 token 数),不再依赖 group_max_len;
+        # group_max_len 只对旧 moe.cpp 引擎的静态缓冲有意义。这里仍然把它设成
+        # max_num_batched_tokens,并在两者不一致时给出**信息性**提示(而不是
+        # 让用户以为必须把 --max-num-batched-tokens 压到 4096)。
         cfg.group_max_len = int(
-            os.environ.get("XIAOTU_GROUP_MAX_LEN", str(min(4096, _mnbt) + 128))
+            os.environ.get("XIAOTU_GROUP_MAX_LEN", str(max(4096, _mnbt) + 128))
         )
         if _mnbt > cfg.group_max_len:
             print(
                 f"[xiaotu] WARNING: max_num_batched_tokens={_mnbt} > "
-                f"group_max_len={cfg.group_max_len}; the engine's per-token "
-                "buffers would overflow. Set --max-num-batched-tokens <= 4096.",
+                f"group_max_len={cfg.group_max_len}; the legacy per-token "
+                "buffers would overflow (V2 engine allocates per call, so this "
+                "is informational).",
                 flush=True,
             )
         cfg.activation_type = 0
@@ -551,6 +590,7 @@ class CpuXiaotuMoE(nn.Module):
             wts_f32.data_ptr(),
             out.data_ptr(),
         )
+        _maybe_profile_decode()
         if self._timing:
             _T["eng"] += time.perf_counter() - _t0
             _T["calls"] += 1

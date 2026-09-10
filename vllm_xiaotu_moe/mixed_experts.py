@@ -339,11 +339,14 @@ class _XiaotuExpertsMixin:
         cfg.top_k = self.moe_config.experts_per_token
         cfg.hidden_size = int(ex_w2.shape[1])            # w2: [E, H, I//2] or [E, H, I]
         cfg.intermediate_size = int(ex_w13.shape[1] // 2)  # w13: [E, 2I, ...]
-        cfg.max_batch_size = 8192
-        cfg.max_num_seqs = 256
+        # 每 token 缓冲在 V2 引擎里是按调用分配的,这两个值只影响预分配提示;
+        # 仍按 vLLM 的调度配置设置,避免与真实 batch 规模脱节。
+        sched = getattr(self.moe_config, "scheduler_config", None)
+        cfg.max_batch_size = int(getattr(sched, "max_num_batched_tokens", 0) or 8192)
+        cfg.max_num_seqs = int(getattr(sched, "max_num_seqs", 0) or 256)
         cfg.stride = int(self._group_k)
         cfg.group_min_len = 10
-        cfg.group_max_len = 4096 + 128
+        cfg.group_max_len = int(getattr(sched, "max_num_batched_tokens", 0) or 4096) + 128
         # 激活:0=plain SiLU(gate*up),1=clamped SwiGLU(vLLM silu_and_mul_with_clamp
         # 同语义,GLM/DS-V4/MiniMax 的 swiglu_limit)。
         limit = float(self.swiglu_limit) if self.swiglu_limit else 0.0

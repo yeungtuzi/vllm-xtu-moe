@@ -79,6 +79,11 @@ VLLM_EXPERTS_LOAD_DEVICE=cpu python -m vllm_xiaotu_moe.mainline_shims
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py   # 后端选择探测,秒级
 ```
 
+**Qwen3.8-Flash-Next 可在单张 40 GB 卡上运行**:`XIAOTU_PLE_CPU=1` 把 51 GB 的 PLE
+n-gram 查找表放进主机内存(锁页 + UVA 访问,显存不占),显存只剩 ~14.7 GiB 权重 + KV,
+262K 上下文仍有 2.78× 并发。两个已验证模型的**推荐参数与实测数据**见
+**[`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md)**。
+
 完整安装、环境变量见 **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)**;
 **DeepSeek-V4-Flash 与 Qwen3.8-Flash-Next-FP8 的逐步使用指南 + 初步性能实测**见
 **[`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md)**。
@@ -105,6 +110,7 @@ CPU:  routed experts 的权重与计算(xiaotu 引擎,AVX-512)
 |---|---|
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | 安装、环境变量/参数、各模型运行命令、排错 |
 | [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) | **DeepSeek-V4-Flash / Qwen3.8-Flash-Next-FP8 使用指南与初步性能** |
+| [`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md) | **调参报告:两个模型的推荐运行参数 + 全部实测** |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 混合模式与主线集成设计 |
 | [`docs/GPU_PREFILL.md`](docs/GPU_PREFILL.md) | 长 prefill 逐层 GPU 流式 |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | 实测:硬件、吞吐、时延、消融 |

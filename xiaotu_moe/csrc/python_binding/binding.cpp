@@ -267,6 +267,12 @@ static void bind_moe_class(py::module& m, const char* name) {
             // 可变字段。否则当 vLLM 的 async scheduling 让下一 step 的 host 代码
             // 跑在本 step 的回调之前时,回调会读到新 step 的参数(实测:第二个
             // 请求会拿到上一个请求的数据)。
+            //
+            // CUDA graph 的区别(重要):capture 期间 host function **不会执行**,
+            // 它只是被记录成一个节点,并在**每次 replay** 时用同一个 arg 指针回调。
+            // 因此 graph 捕获的块绝不能由回调释放 —— 否则第二个 replay 就是
+            // use-after-free(实测 SIGSEGV 落在引擎的 forward 里,每个请求只出 2 个
+            // token 引擎就死)。eager 路径下每个块只被调用一次,由回调释放。
             struct CpuDecodeCall {
                 MOE* engine;
                 int qlen;
@@ -275,13 +281,18 @@ static void bind_moe_class(py::module& m, const char* name) {
                 const uint32_t* ids;
                 const float* wts;
                 float* out;
+                bool graph_owned;   // true: 由 graph 节点持有,回调不得释放
             };
+            cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s, &cap_status);
+            const bool capturing = (cap_status != cudaStreamCaptureStatusNone);
             auto* call = new CpuDecodeCall{
                 &self, qlen, top_k,
                 (const uint16_t*)st->pin_hidden,
                 (const uint32_t*)st->pin_ids,
                 (const float*)st->pin_weights,
                 (float*)st->pin_out,
+                capturing,
             };
             st->host_fn = [](void* arg) {
                 std::unique_ptr<CpuDecodeCall> c(
@@ -298,8 +309,14 @@ static void bind_moe_class(py::module& m, const char* name) {
                             c->ids && c->k > 3 ? c->ids[3] : 0u,
                             c->hid ? c->hid[0] : 0, c->hid ? c->hid[1] : 0);
                 }
-                c->engine->forward_many(c->qlen, c->k, c->ids, c->wts,
-                                        c->hid, c->out);
+                MOE* engine = c->engine;
+                const int qlen = c->qlen, k = c->k;
+                const uint16_t* hid = c->hid;
+                const uint32_t* ids = c->ids;
+                const float* wts = c->wts;
+                float* out = c->out;
+                if (c->graph_owned) c.release();   // graph 还会再 replay 它
+                engine->forward_many(qlen, k, ids, wts, hid, out);
             };
             cudaLaunchHostFunc(s, st->host_fn, call);
             if (std::getenv("XIAOTU_CD_ERRCHECK")) {

@@ -29,3 +29,7 @@ report/rd1
 *.npz
 *.safetensors
 *.gguf
+
+# ---- 调参产物(report/tuning)--------------------------------------
+report/tuning/logs/
+report/tuning/nsys/

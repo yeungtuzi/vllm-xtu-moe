@@ -85,6 +85,11 @@ VLLM_EXPERTS_LOAD_DEVICE=cpu python -m vllm_xiaotu_moe.mainline_shims
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py   # backend selection probe
 ```
 
+**Qwen3.8-Flash-Next runs on a single 40 GB card**: `XIAOTU_PLE_CPU=1` keeps its 51 GB
+PLE n-gram lookup table in pinned host memory (accessed over UVA, zero VRAM), leaving
+~14.7 GiB of weights plus KV cache — still 2.78x concurrency at a 262K context.
+Recommended parameters and all measurements: **[`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md)**.
+
 Full install notes and environment variables:
 **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)**.
 Step-by-step guides plus preliminary measurements for **DeepSeek-V4-Flash** and

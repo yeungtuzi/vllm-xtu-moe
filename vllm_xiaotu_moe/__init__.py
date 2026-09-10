@@ -8,6 +8,7 @@
 from . import hybrid_model  # noqa: F401
 from . import mixed_experts  # noqa: F401
 from . import mainline_shims  # noqa: F401
+from . import ple_offload  # noqa: F401
 
 # 混合模式(VLLM_EXPERTS_LOAD_DEVICE=cpu)下,把主线的 CPU experts 后端注册为
 # xiaotu 引擎(无 AMX 依赖)。非混合模式时是 no-op。
@@ -17,3 +18,9 @@ mixed_experts.register_mixed_cpu_backend()
 # 专家权重建在 CPU / oracle 优先选 CPU 后端 / 跳过 AMX 重打包 / 通知 experts 后端。
 # 已合并相应改动的主线上重复应用等于 no-op(XIAOTU_MAINLINE_SHIMS=0 可关闭)。
 mainline_shims.apply_mainline_shims()
+
+# Qwen3.8-Flash-Next 的 PLE n-gram 表(~51 GB)可放到主机内存(UVA 访问),
+# 让单卡 40 GB 也能跑起该模型;默认关闭,设 XIAOTU_PLE_CPU=1 打开。
+_ple_hooks = ple_offload.install()
+if _ple_hooks:
+    print(f"[vllm-xtu-moe/ple] PLE 表走主机内存: {', '.join(_ple_hooks)}", flush=True)
