@@ -221,46 +221,43 @@ CUDA_VISIBLE_DEVICES=0 VLLM_EXPERTS_LOAD_DEVICE=cpu XIAOTU_MOE_SINGLECOPY=1 \
 
 ---
 
-## 4b. 生产服务(8070,1M 上下文,TP=2)—— 2026-09-10 实测版
+## 4b. 生产服务(8070)—— 两种模式,按"能不能交互"选
 
 ```bash
-bash scripts/serve_prod_8070.sh          # GPUS=0,1 TP=2 1M 上下文
+bash scripts/serve_prod_8070.sh                       # MODE=1m :TP=2 + 1M 上下文 + DSpark(默认)
+MODE=fast PORT=8090 bash scripts/serve_prod_8070.sh   # MODE=fast:单卡 + 256K + DSpark
+SPEC_OFF=1 bash scripts/serve_prod_8070.sh            # 关投机:高并发吞吐优先
 ```
 
-| 参数 | 值 | 理由 |
-|---|---|---|
-| `--max-model-len` | **1048576** | 生产要求 1M 上下文 |
-| `--tensor-parallel-size` | 2 | 1M 的 KV 需要 ~32.5 GiB(单卡放不下,含 ~19.6 GB 非专家权重) |
-| `--kv-cache-memory-bytes` | 18 GiB/rank | 实测 KV 容量 **1,876,112 tokens**;给 16 GiB 会被 vLLM 拒绝(要求 16.27 GiB) |
-| `--max-num-seqs` | 64 | CUDA graph 捕获尺寸受它约束(**>128 会崩**) |
-| `--max-num-batched-tokens` | 8192 | 长上下文 prefill 分块;调大可改善 TTFT,但更吃锁页内存 |
-| `XIAOTU_MOE_SINGLECOPY` | **1** | ★ TP=2 必须:分片模式(SINGLECOPY=0)在 TP=2 下会 **node-0 OOM**(实测两次) |
-| `XIAOTU_MOE_EP_SHM` | 1 | EP 的跨 rank 归约走 `/dev/shm`,不再每层一次 NCCL all-reduce |
-| `--enforce-eager` | 关 | CUDA graph |
-| `XIAOTU_MOE_THREADS` | 96/rank | 两个 rank 合计 192 线程 = 整机;单卡时用 192 |
+### 实测对比(2026-09-10,全部本机实跑)
 
-**实测(2026-09-10)**:
+| 口径 | **fast**(单卡 256K + DSpark) | **1m**(TP=2 1M + DSpark) | 单卡 256K 无投机(CG) | lk-moe 生产(双卡+DSpark) |
+|---|---|---|---|---|
+| **C=1 单路 TPOT** | **85 ms(11.8 tok/s/路)** | 266 ms(3.7 tok/s/路) | ~128 ms | — |
+| C=1 TTFT | 0.63 s | 2.2 s | 2.85 s(C=4) | — |
+| C=4 Output / Total | 23.60 / 52.82 | 待测 | 25.91 / 57.84 | **46.67 / 105.74** |
+| C=4 TPOT | 171 ms | — | 128.6 ms | **40.2 ms** |
+| C=64 Output | — | 48 左右(无投机) | 90.60 | — |
+| C=128 Output | — | — | **106.15** | — |
+| 上下文 | 256K | **1M(KV 1,876,112 tokens)** | 256K | — |
 
-| 口径 | 8070(TP=2,1M) | 单卡最优(256K) | lk-moe 生产(双卡+投机) |
-|---|---|---|---|
-| C=4 Output / Total | 8.85 / 20.73 | **25.91 / 57.84** | 46.67 / 105.74 |
-| C=64 Output / Total | 48.01 / 94.89 | **90.60 / 179.07** | — |
-| C=128 Output | —(seqs=64) | **106.15** | — |
-| TTFT(C=64) | 8.5 s | 15.8 s | — |
+**怎么选**:
+- **日常交互**(聊天/写代码):用 `MODE=fast`,单路 85 ms 出词,手感接近可用;
+- **长文本/1M 上下文**:用默认的 1M 模式,但要接受 3.7 tok/s/路(比 fast 慢 3 倍);
+- **批处理/高吞吐**:`SPEC_OFF=1` + 高并发(C≥64),单卡可到 106 tok/s。
 
-> **取用建议**:1M 上下文 + 长文本/Agent 任务用 8070;追求吞吐/低延迟的短上下文任务,
-> 单卡 256K 配置(见 `docs/PERFORMANCE_OPTIMIZATION.md §15.3`)快 2~3 倍。
-> TP=2 目前在低并发下每层有 ~10 ms 的固定开销(两 rank 同步 + 池唤醒),
-> 这是下一步优化项(见 §7 的 CPU-TP 设计)。
+**为什么 1M 一定要 TP=2**:KV = 29.5 KB/token,1M 就是 29.5 GiB;单卡扣掉 ~19.6 GB 非专家
+权重后放不下;FP4 KV(`nvfp4_ds_mla`)在 A100/SM80 被主线拒绝,512K 单卡也会 OOM。
 
-**已知限制**:TP=2 的 decode 慢于单卡(每层一次跨 rank 同步);1M 上下文 KV 只够
-1~1.8 条序列;长上下文 prefill 受 `max_num_batched_tokens` 分块数与 PCIe 流式带宽限制。
+**已知问题**:TP=2 的每层跨 rank 同步使低并发延迟变差(EP=0 时 qlen=1 的每层
+`period 4.63 ms = compute 0.86 + rest 3.77`);解法见 `docs/PERFORMANCE_OPTIMIZATION.md §7`
+(CPU-TP:把合并放进引擎内部,而不是每层一次集合通信)。
 
 **健康检查**:
 
 ```bash
 curl -s http://127.0.0.1:8070/v1/models | head -c 200
-curl -s http://127.0.0.1:8070/metrics | grep -E "num_requests_running|generation_tokens_total"
+curl -s http://127.0.0.1:8070/metrics | grep -E "num_requests_running|spec_decode_num_accepted"
 ```
 
 ---

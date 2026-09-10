@@ -416,6 +416,65 @@ vLLM 的 breakable 捕获仍会在某个尺寸上崩(与上述两个 bug 无关)
 
 ---
 
+---
+
+## 16. 投机解码(DSpark)与"低并发延迟"这个真正的目标(2026-09-10 晚)
+
+### 16.1 先纠正目标:C=64 的"高吞吐"对交互式使用没有意义
+
+C=64/out=256 时 TPOT 是 0.6~1.3 s/路 —— 人机交互上等于卡死。
+**该看的是 C≤4 时单路出词速度**(与 lk-moe 生产基准 C=4 同口径)。
+
+### 16.2 DSpark 跑通(主线 `mtp` 方法不可用,`dspark` 可以)
+
+- `--speculative-config '{"method":"mtp",...}'` 会被主线接受,但**加载草稿权重时崩**
+  (`KeyError: model.layers.43.mtp_block.main_norm.weight` —— 主线把 `mtp.{i}.` 映射成
+  `model.layers.{43+i}.` 后又加了 `.mtp_block.`,而模型参数名里没有它);
+- **`{"method":"dspark", ...}` 可用**:日志 `DSpark draft model loaded: 97 params`,
+  与 lk-moe 生产同款(draft block=5,`num_speculative_tokens=4`);
+- **CUDA graph 与 DSpark 不兼容**:捕获期草稿模型会 `aten::new_empty` 失败 ⇒ 用 `--enforce-eager`。
+
+### 16.3 实测:投机解码在两种并发下方向相反
+
+| 场景 | 无投机 | **+DSpark** | 结论 |
+|---|---|---|---|
+| C=1 单路 | ~128 ms/token | **85 ms/token(11.8 tok/s/路)** | ✅ **+50%** |
+| C=4(生产同形) | 25.91 / 57.84 out/total | 23.60 / 52.82 | ❌ −9% |
+
+接受率实测 **33.9%**,**2.35 token/step**(生产 40.16% / 3.01)。
+原因:验证批次变大 ⇒ pair 数变多 ⇒ CPU MoE 成本上升;只有当"每步固定开销"占主导
+(小 batch)时,多出来的 token 才是净赚。
+
+> **结论:投机解码是低并发延迟优化,不是高并发吞吐优化。交互用开,批处理关。**
+
+### 16.4 1M 上下文为什么必须 TP=2(三条路都试过了)
+
+| 方案 | 结果 |
+|---|---|
+| 单卡 + fp8 KV | KV 29.5 GiB,放不下(非专家权重 ~19.6 GB) |
+| 单卡 + **FP4 KV**(`nvfp4_ds_mla`) | ❌ 主线拒绝:A100/SM80 的 `fp8_ds_mla` 布局只支持 fp8 KV |
+| 单卡 + 512K | ❌ OOM(2 GiB 预取槽) |
+| **TP=2 + 1M + DSpark** | ✅ KV 1,876,112 tokens;C=1 单路 266 ms/token |
+
+### 16.5 最终交付的三档配置
+
+| 用途 | 命令 | 单路延迟 | 上下文 |
+|---|---|---|---|
+| **交互** | `MODE=fast bash scripts/serve_prod_8070.sh` | **85 ms/token** | 256K |
+| **长文本/1M** | `bash scripts/serve_prod_8070.sh`(默认) | 266 ms/token | 1M |
+| **高吞吐** | 上面 + `SPEC_OFF=1`,C≥64 | 646 ms/token(但 90~106 tok/s 聚合) | 256K |
+
+**正确性**:投机 vs 非投机(同一 1M/TP=2 配置)贪心输出 **3/5 逐字一致**,其余前 11~25 字符
+一致后因验证批次不同导致的浮点归约顺序差异分叉;输出内容均正确连贯。
+
+### 16.6 下一步(未做,按价值排序)
+
+1. **把 TP=2 的每层同步干掉**:低并发时 `rest 3.77 ms/层` 全在跨 rank 同步上
+   (EP=0 时 compute 只有 0.86 ms),这是 1M 模式慢 3 倍的根因 → 按 §7 的 CPU-TP 设计,
+   把部分和合并放进引擎内部(共享内存),而不是每层一次集合通信;
+2. **让 DSpark 与 CUDA graph 共存**(修草稿模型的捕获期分配)→ 再拿 +5~7%;
+3. 提高接受率(调 `num_speculative_tokens` / 学习生产用 block=5)。
+
 ## 14. T55:GPU 常驻专家层(把权重流量搬去 HBM)
 
 ### 14.1 为什么这是"绕开 DRAM 上限"的唯一办法

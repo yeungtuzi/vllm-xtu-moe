@@ -1,39 +1,55 @@
 #!/usr/bin/env bash
-# 生产服务启动脚本(8070,1M 上下文,TP=2)—— 供实际使用/测试
+# 生产服务启动脚本 —— 两种模式,按"能不能交互"取舍
 #
-# 为什么是 TP=2:1M 上下文的 KV 需要 1,048,576 × 29.5 KB ≈ 29.5 GiB(单张 40GB 卡
-# 减去 ~19GB 非专家权重后放不下),TP=2 把 KV 按 rank 分片 ⇒ 每 rank 14.75 GiB。
+#   MODE=fast (日常交互推荐):单卡、256K 上下文、DSpark 投机解码
+#       实测 C=1 单路 85 ms/token(11.8 tok/s/路),TTFT 0.63 s;
+#       关投机时吞吐口径 C=128 可达 106 tok/s(见 docs/PERFORMANCE_OPTIMIZATION.md §15)。
+#   MODE=1m  (默认,需要 1M 上下文):TP=2、1M 上下文、DSpark 投机解码
+#       实测 C=1 单路 266 ms/token(3.7 tok/s/路),TTFT 2.2 s;KV 容量 1,876,112 tokens。
 #
-# 与"最优单卡调参配置"的差异:
-#   * TP=2 + `--enable-expert-parallel`:prefill 每 rank 只流一半专家(实测 TTFT 快 1.76×);
-#     decode 目前每层多一次跨 rank all-reduce(实测每层 +4~6.5 ms),所以 decode 比单卡慢
-#     —— 这是当前的主要优化方向(见 docs/PERFORMANCE_OPTIMIZATION.md §6/§7)。
-#   * `XIAOTU_MOE_SINGLECOPY=0`:回到引擎默认的 NUMA 分片(单卡实测 +38%)。
-#   * `EAGER=0`:CUDA graph(--max-num-seqs ≤128 才稳,实测 +5~7%)。
-#   * `MAX_NBT=16384`:KV 上限放宽后允许更大的 prefill 分块(长上下文 TTFT 的关键)。
+# 为什么 1M 必须 TP=2:KV 是 29.5 KB/token ⇒ 1M = 29.5 GiB;单卡扣掉 ~19.6 GB 非专家权重
+# 后放不下,而 `--kv-cache-dtype nvfp4_ds_mla`(FP4 KV)在 A100/SM80 上被主线拒绝
+# (只支持 fp8_ds_mla 布局);512K 单卡也会 OOM(2 GiB 预取槽放不下)。
 #
-# 用法:  bash scripts/serve_prod_8070.sh          # 前台启动(日志同时写文件)
-#        TAG=xxx PORT=8071 bash scripts/serve_prod_8070.sh   # 换端口/标签做灰度
+# 用法:
+#   bash scripts/serve_prod_8070.sh                       # 1M 模式(TP=2,端口 8070)
+#   MODE=fast PORT=8090 bash scripts/serve_prod_8070.sh    # 快速模式(单卡)
+#   SPEC_OFF=1 bash scripts/serve_prod_8070.sh             # 关投机(高并发吞吐优先)
 #
 # License: Apache-2.0
 set -euo pipefail
 
 TAG="${TAG:-dsv4_prod_8070}"
 PORT="${PORT:-8070}"
-GPUS="${GPUS:-0,1}"
-TP="${TP:-2}"
-SEQS="${SEQS:-64}"                 # CUDA graph 捕获尺寸上限受它约束(>128 会崩)
-MAXLEN="${MAXLEN:-1048576}"        # 1M 上下文
-MAX_NBT="${MAX_NBT:-16384}"
-KV_MEM_BYTES="${KV_MEM_BYTES:-17179869184}"   # 16 GiB/rank ⇒ 1M×29.5KB/2 = 14.75 GiB 刚好装下
-THREADS="${THREADS:-96}"           # 每 rank 96 线程(整机 192;96→192 无额外收益)
-OMP="${OMP:-48}"
+MODE="${MODE:-1m}"
+CKPT="${CKPT:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master}"
+
+if [ "${SPEC_OFF:-0}" = "1" ]; then
+  SPEC=""
+else
+  # DSpark(与 lk-moe 生产同款,block=5)。注意:CUDA graph 下草稿模型捕获会崩,
+  # 所以这里强制 eager;换来单路延迟 ~+43%(见 docs/PERFORMANCE_OPTIMIZATION.md §16)。
+  SPEC="{\"method\":\"dspark\",\"model\":\"$CKPT\",\"num_speculative_tokens\":4}"
+fi
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-exec env \
-  GPUS="$GPUS" TP="$TP" EP=1 MODE=dsv4 PORT="$PORT" TAG="$TAG" \
-  MAXLEN="$MAXLEN" SEQS="$SEQS" MAX_NBT="$MAX_NBT" \
-  KV_DTYPE=fp8_ds_mla GPU_UTIL=0.90 KV_MEM_BYTES="$KV_MEM_BYTES" \
-  THREADS="$THREADS" OMP="$OMP" EAGER=0 PREFILL_MIN=384 \
-  XIAOTU_MOE_SINGLECOPY=0 \
-  scripts/tune_serve.sh
+
+if [ "$MODE" = "fast" ]; then
+  exec env \
+    GPUS="${GPUS:-2}" TP=1 EP=0 MODE=dsv4 PORT="$PORT" TAG="$TAG" \
+    MAXLEN=262144 SEQS=128 MAX_NBT=8192 \
+    KV_DTYPE=fp8_ds_mla GPU_UTIL=0.90 KV_MEM_BYTES=12884901888 \
+    THREADS=192 OMP=96 EAGER=1 PREFILL_MIN=384 \
+    XIAOTU_MOE_SINGLECOPY=0 \
+    SPEC="$SPEC" SERVED=DeepSeek-V4-Flash-xiaotu \
+    scripts/tune_serve.sh
+else
+  exec env \
+    GPUS="${GPUS:-0,1}" TP=2 EP=0 MODE=dsv4 PORT="$PORT" TAG="$TAG" \
+    MAXLEN=1048576 SEQS=64 MAX_NBT=8192 \
+    KV_DTYPE=fp8_ds_mla GPU_UTIL=0.90 KV_MEM_BYTES=19327352832 \
+    THREADS=96 OMP=48 EAGER=1 PREFILL_MIN=384 \
+    XIAOTU_MOE_SINGLECOPY=1 ENV_EXTRA="XIAOTU_MOE_EP=0" \
+    SPEC="$SPEC" SERVED=DeepSeek-V4-Flash-xiaotu \
+    scripts/tune_serve.sh
+fi
