@@ -346,19 +346,77 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 C[(size_t)(mi + 2) * N + j] = hsum512(s2) * global_scale;
                 C[(size_t)(mi + 3) * N + j] = hsum512(s3) * global_scale;
             }
+            // ---- 2/3-row blocked path (decode-critical) --------------------
+            // WHY: `gate_up_slice_batch_impl`/`down_slice_batch_impl` call this
+            // kernel with M = me = (instances routed to ONE expert). In a decode
+            // step the 6 tokens of a sequence land on ~12 distinct experts, i.e.
+            // **me ≈ 3** — so the 4-row block above is never taken and every row
+            // went through the single-row remainder below, which re-runs the
+            // whole FP4 nibble decode for each instance.
+            // Measured (scripts/bench_cpu_engine.py, same 12 experts = same
+            // weight bytes): me=4 (blocked) = 31.2 us/assignment vs me=3
+            // (unblocked) = 55.6 us/assignment => 1.78x wasted decode work.
+            // This block shares ONE decode across 2-3 rows, with the same
+            // 4-partial accumulation structure as the 4-row block (identical
+            // association/numerics per row).
+            auto block_23 = [&](auto Rc) {
+                constexpr int R = decltype(Rc)::value;
+                const float* pr[R];
+                for (int r = 0; r < R; ++r) pr[r] = a32 + (size_t)(mi + r) * K;
+                __m512 acc[R][4];
+                for (int r = 0; r < R; ++r)
+                    for (int q = 0; q < 4; ++q) acc[r][q] = _mm512_setzero_ps();
+                for (int g = 0; g < group_count; g++) {
+                    const int base = g * 32;
+                    XIAOTU_DECODE_GROUP_AVX512(b_row, g);
+                    const __m512 sv = _mm512_set1_ps(scale_at(j, g * 32));
+                    const int p = g & 3;
+                    for (int r = 0; r < R; ++r) {
+                        __m512 d = _mm512_mul_ps(wlo_, _mm512_loadu_ps(pr[r] + base));
+                        d = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(pr[r] + base + 16), d);
+                        acc[r][p] = _mm512_fmadd_ps(d, sv, acc[r][p]);
+                    }
+                }
+                for (int r = 0; r < R; ++r) {
+                    const __m512 s = _mm512_add_ps(_mm512_add_ps(acc[r][0], acc[r][1]),
+                                                   _mm512_add_ps(acc[r][2], acc[r][3]));
+                    C[(size_t)(mi + r) * N + j] = hsum512(s) * global_scale;
+                }
+            };
+            if (M - mi == 3) {
+                block_23(std::integral_constant<int, 3>{});
+                mi += 3;
+            } else if (M - mi == 2) {
+                block_23(std::integral_constant<int, 2>{});
+                mi += 2;
+            }
             // Single-row remainder (also the whole path when M == 1).
+            //
+            // ILP: 4 INDEPENDENT partial accumulators instead of one serial
+            // chain. The old loop did `total0 = fmadd(d, sv, total0)` 128 times
+            // per row = a 128-long dependency chain at ~4-cycle FMA latency
+            // (~512 cycles/row) that out-of-order execution cannot hide. Real
+            // routing is dominated by M==1 (in-server measurement: 36
+            // assignments land on ~32 DISTINCT experts => me≈1.1), so this path
+            // IS the decode hot loop. Accumulation structure now matches the
+            // 4-row blocked path: ((t0+t1)+(t2+t3)). Numerics validated by
+            // scripts/test_block23_equiv.py + scripts/test_swiglu_clamp_mxfp4.py.
             for (; mi < M; mi++) {
                 const float* p0 = a32 + (size_t)mi * K;
-                __m512 total0 = _mm512_setzero_ps();
+                __m512 t[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(),
+                               _mm512_setzero_ps(), _mm512_setzero_ps()};
                 for (int g = 0; g < group_count; g++) {
                     const int base = g * 32;
                     XIAOTU_DECODE_GROUP_AVX512(b_row, g);
                     __m512 d = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p0 + base));
                     d = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p0 + base + 16), d);
                     const float scale = scale_at(j, g * 32);
-                    total0 = _mm512_fmadd_ps(d, _mm512_set1_ps(scale), total0);
+                    const int p = g & 3;
+                    t[p] = _mm512_fmadd_ps(d, _mm512_set1_ps(scale), t[p]);
                 }
-                C[(size_t)mi * N + j] = hsum512(total0) * global_scale;
+                const __m512 s = _mm512_add_ps(_mm512_add_ps(t[0], t[1]),
+                                               _mm512_add_ps(t[2], t[3]));
+                C[(size_t)mi * N + j] = hsum512(s) * global_scale;
             }
         }
         if (bp_on) {

@@ -89,7 +89,19 @@ def main():
         # collapses onto a handful of experts, which is NOT what the real model
         # does (256 experts x ~48 rows each) and changes the weight working set
         # from 3.2 GB (DRAM) to a few tens of MB (L3).
-        ids_b = rng.integers(0, E, size=(B, K)).astype(np.int32)
+        #
+        # DEDUP=N 控制"去重后的活跃专家数"(不设 = 全随机,36 个都不同)。
+        # 真实解码步(qlen=6/topk=6、6 个 draft token 属同一段文本)实测去重后只有
+        # ~12 个专家 ⇒ 每个专家平均被 3 个 token 命中(me=3)。内核只有 me>=4 才走
+        # "解码一次喂 4 行"的快路径,me=1..3 走单行路径(每行都把权重重新解码一遍)
+        # ⇒ 不设 DEDUP 就测不到真实情形。
+        dedup = int(os.environ.get("DEDUP", "0"))
+        if dedup > 0:
+            picks = rng.integers(0, E, size=(dedup,)).astype(np.int32)
+            ids_b = np.tile(picks, (B * K) // dedup + 1)[: B * K].reshape(B, K)
+            ids_b = ids_b.reshape(-1)[rng.permutation(B * K)].reshape(B, K)
+        else:
+            ids_b = rng.integers(0, E, size=(B, K)).astype(np.int32)
         wts_b = rng.uniform(-1, 1, size=(B, K)).astype(np.float32)
         engine.cpu_prefill(B, K, ids_b, wts_b, x, out)
         t0 = time.perf_counter()

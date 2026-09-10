@@ -1,0 +1,88 @@
+{
+ "summary": {
+  "ts": "2026-09-10T22:23:25",
+  "tag": "ilp23_L128_c1",
+  "server_tag": "ilp23",
+  "natural_text": 1,
+  "client": "bench_nat_client",
+  "concurrency": 1,
+  "num_prompts": 4,
+  "output_len": 128,
+  "input_len": "nat128",
+  "completed": 4,
+  "failed": 0,
+  "duration_s": 71.79,
+  "total_output_tokens": 512,
+  "out_tok_per_s": 7.13,
+  "per_stream_tok_per_s": 7.13,
+  "mean_ttft_ms": 2919.0,
+  "mean_tpot_ms": 117.4,
+  "mean_step_ms": 336.94,
+  "p95_step_ms": 417.69,
+  "mean_tokens_per_step": 2.818,
+  "per_req_tok_per_s": [
+   7.33,
+   9.62,
+   8.72,
+   8.72
+  ]
+ },
+ "requests": [
+  {
+   "idx": 0,
+   "ttft_ms": 4836.625676602125,
+   "n_out": 128,
+   "n_steps": 48,
+   "tokens_per_step": 2.6666666666666665,
+   "e2e_s": 22.29702647961676,
+   "decode_s": 17.460400803014636,
+   "mean_step_ms": 371.4968298977994,
+   "mean_itl_ms": 136.40938127355184,
+   "p50_step_ms": 357.44440369307995,
+   "p95_step_ms": 489.73705619573593,
+   "tok_per_s": 7.330874098714852
+  },
+  {
+   "idx": 1,
+   "ttft_ms": 2248.0126079171896,
+   "n_out": 128,
+   "n_steps": 43,
+   "tokens_per_step": 2.9767441860465116,
+   "e2e_s": 15.548490999266505,
+   "decode_s": 13.300478391349316,
+   "mean_step_ms": 316.6768631587426,
+   "mean_itl_ms": 103.90998743241653,
+   "p50_step_ms": 300.826970487833,
+   "p95_step_ms": 383.9546348899603,
+   "tok_per_s": 9.62371399236675
+  },
+  {
+   "idx": 2,
+   "ttft_ms": 2171.2065432220697,
+   "n_out": 128,
+   "n_steps": 46,
+   "tokens_per_step": 2.782608695652174,
+   "e2e_s": 16.84671893529594,
+   "decode_s": 14.67551239207387,
+   "mean_step_ms": 326.12152223785716,
+   "mean_itl_ms": 114.6524405630771,
+   "p50_step_ms": 322.53606244921684,
+   "p95_step_ms": 404.2065367102623,
+   "tok_per_s": 8.72201232776934
+  },
+  {
+   "idx": 3,
+   "ttft_ms": 2419.9563805013895,
+   "n_out": 128,
+   "n_steps": 45,
+   "tokens_per_step": 2.8444444444444446,
+   "e2e_s": 17.093001540750265,
+   "decode_s": 14.673045160248876,
+   "mean_step_ms": 333.4773106246509,
+   "mean_itl_ms": 114.63316531444434,
+   "p50_step_ms": 340.3293462470174,
+   "p95_step_ms": 392.8584884852171,
+   "tok_per_s": 8.723478909938075
+  }
+ ]
+}

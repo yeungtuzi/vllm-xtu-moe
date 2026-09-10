@@ -1,0 +1,8 @@
+round=1 kernel=old load=42.66 na=6 M=3 maxme=3  skew(1|2-7|8-31|32-127|128+)=0|12|0|0|0  A=43.3ms A2=0.0ms B0=0.0ms B=25.8ms C=3.6ms ovh=0.0ms (sum 73ms)
+round=1 kernel=new load=39.41 na=6 M=3 maxme=3  skew(1|2-7|8-31|32-127|128+)=0|12|0|0|0  A=26.1ms A2=0.0ms B0=0.0ms B=20.1ms C=3.0ms ovh=0.0ms (sum 49ms)
+round=2 kernel=old load=36.41 na=6 M=3 maxme=3  skew(1|2-7|8-31|32-127|128+)=0|12|0|0|0  A=43.4ms A2=0.0ms B0=0.0ms B=32.7ms C=3.3ms ovh=0.0ms (sum 79ms)
+round=2 kernel=new load=36.41 na=6 M=3 maxme=3  skew(1|2-7|8-31|32-127|128+)=0|12|0|0|0  A=25.1ms A2=0.0ms B0=0.0ms B=18.1ms C=2.8ms ovh=0.0ms (sum 46ms)
+round=3 kernel=old load=33.66 na=6 M=3 maxme=3  skew(1|2-7|8-31|32-127|128+)=0|12|0|0|0  A=42.9ms A2=0.0ms B0=0.0ms B=25.0ms C=3.8ms ovh=0.0ms (sum 72ms)
+round=3 kernel=new load=31.12 na=6 M=3 maxme=3  skew(1|2-7|8-31|32-127|128+)=0|12|0|0|0  A=25.2ms A2=0.0ms B0=0.0ms B=18.2ms C=3.0ms ovh=0.0ms (sum 46ms)
+round=4 kernel=old load=28.79 na=6 M=3 maxme=3  skew(1|2-7|8-31|32-127|128+)=0|12|0|0|0  A=43.6ms A2=0.0ms B0=0.0ms B=24.6ms C=3.5ms ovh=0.0ms (sum 72ms)
+round=4 kernel=new load=28.79 na=6 M=3 maxme=3  skew(1|2-7|8-31|32-127|128+)=0|12|0|0|0  A=25.0ms A2=0.0ms B0=0.0ms B=18.1ms C=3.5ms ovh=0.0ms (sum 47ms)
