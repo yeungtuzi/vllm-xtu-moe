@@ -488,6 +488,11 @@ public:
         // pool, not 1 thread (ktransformers `split_range_n`). BF16/FP8 take the
         // existing single-chunk paths below.
         if constexpr (wt::kNParallel) {
+            // 注意:这里**不要**传 wlimit。实测 `parallel_for_limited(limit == nt_)`
+            // 会在 warmup 阶段让 worker 卡死(shm_broadcast 超时),
+            // 而 `small_batch_workers()` 在 DS-V4 维度上恒等于 nt_ ⇒ 传了也等于没限制,
+            // 只会踩到 limited 等待路径的边界竞态。真正要限制 worker 子集需要
+            // 先把 numa_pool 的 limited 路径修好(见 report/tuning/NOTES.md §33)。
             forward_many_nsliced(M, k, expert_ids, weights, input, output);
             return;
         }

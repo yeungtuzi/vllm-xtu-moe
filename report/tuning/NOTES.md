@@ -644,3 +644,44 @@ decode 期间 `top` 实测:
 2. 修好后重测 TP=1 的 C=1/C=2(现在 15.94 / 9.94),目标是 C=2 时每路不明显下降;
 3. 接受率 2.66 → 3.0(生产水平):调 draft 参数/采样方法;
 4. 每改一项记录到本文档 + `docs/PERFORMANCE_OPTIMIZATION.md`。
+
+## 33. 本轮(fix 尝试)的结论:worker 子集这条路被引擎自身的竞态挡住
+
+### 33.1 关键分辨实验:TP=2 + EP=1,**关掉 shm 合并**(回到 vLLM all-reduce)
+
+| 配置(TP=2,1M,production flag,eager,96 线程/rank,qlen=6) | compute | rest | period | C=1 单路 |
+|---|---|---|---|---|
+| shm 合并开 | 12.25 ms | 0.93 | 13.27 | 3.96 |
+| **shm 合并关** | **6.01–7.61 ms** | 2.93–4.53 | **10.44–10.54** | **4.22** |
+
+⇒ shm barrier 值 ~5–6 ms/层(把 `period` 从 10.5 抬到 13.3);但**即便没有 barrier,
+引擎本体在小批量下仍要 6–7.6 ms/18 pairs ≈ 340–420 µs/pair**,
+而**独立微基准**(`bench_vs_lkmoe`,同一引擎同一形状)只有 ~55 µs/pair ⇒ **6–8× 的差距**。
+
+### 33.2 池诊断证明不是"等 worker"
+
+`XIAOTU_MOE_POOL_SLOW_MS=6` 输出:
+```
+[pool] SLOW parallel_for: elapsed=12ms n=32 counter=568 remaining=0 current_gen=4
+  laggards=0/96 remaining=0
+```
+laggards=0、remaining=0 ⇒ **没有掉队线程,worker 确实在算** —— 即 96 个线程抢一条
+ticket cache line、屏障尾部 + 2 个 rank 争核,把"小活"的成本放大了近一个数量级
+(引擎注释原话:小批量下"屏障尾部比它并行的算术还贵")。
+
+### 33.3 为什么没能用"worker 子集"修
+
+- 引擎里正确的做法是 `small_batch_workers()` + `parallel_for_limited`;
+  **但 packed4/kNParallel 路径绕过了它**(只有 FP8 的 `kNSliceSmallM` 分支用);
+- 我按 FP8 的写法给 packed4 补上 wlimit 后,**两种跑法都挂**:
+  warmup 阶段卡死、EngineCore 报 `shm_broadcast ... 60 seconds`;
+- 读代码后确认根因:`small_batch_workers()` 在 DS-V4 维度上(macs 极大)恒返回 `nt`,
+  于是传进去的是 **`wlimit == nt_`** 这个边界值,而 `parallel_for_limited` 的等待路径
+  ("limited 且 remaining==n 时只 notify 一次")在这个边界上有竞态 ⇒ 死锁。
+- **回退补丁(已重建 .so)**;要真正修得先修 `numa_pool` 的 limited 路径(附带单测),
+  或在创建引擎时把池线程数降下来(但 48 线程实测无改善:13.07 vs 12.25)。
+
+### 33.4 因此当前最优仍是单卡档;1M/TP=2 档需要先修引擎并发
+
+8070 保持:**单卡 256K + DSpark + CUDA graph + 192 线程 + NUMA 分片**
+= C=1 **15.94 tok/s**(TPOT 55 ms)、C=2 19.88。目标(25 / 50)尚差 1.6× / 2.5×。
