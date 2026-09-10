@@ -730,3 +730,10 @@ ticket cache line、屏障尾部 + 2 个 rank 争核,把"小活"的成本放大�
    单次 3.6 ms、每步 2 次就 7 ms,值得单独查。
 2. **提接受率** 2.66 → 3.01(生产水平):调 draft 参数/采样方法,直接换 ~13% 单路速度。
 3. **1M/TP=2**:仍受限于池的自旋/唤醒结构(§33),需要引擎侧认真改 + 单测。
+
+### 34.5 试过但不行的:FlashInfer sampler
+
+`VLLM_USE_FLASHINFER_SAMPLER=1` 直接起不来(与当初在 runbook 里关掉它一致)。
+⇒ 每步那 ~50 ms 的非 MoE 开销暂不能从采样器换实现来解决,得从别处查
+(下一步:用 `XIAOTU_TORCH_PROFILE_DECODE` 在 *eager* 下抓一张 C=2 的 kernel 表,
+看 sampling/logits/调度各占多少)。
