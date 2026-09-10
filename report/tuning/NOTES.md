@@ -473,3 +473,174 @@ lk-moe 生产没有这么明显的下降,原因有二:
 **TP=2 的每层开销(低并发杀手)**:EP=0 时 qlen=1 实测
 `period 4.63 ms = compute 0.86 + rest 3.77`(rest 占 81%)——注意 compute 已经很低,
 瓶颈是**每层的跨 rank 同步(注意力 all-reduce)+ 两 rank 抖动**,而不是我们的 CPU 引擎。
+
+## 26. fast 档(DSpark + eager)的每层构成 —— 下一块肥肉是"eager 的逐 kernel 派发"
+
+单卡 256K + DSpark + 192 线程 + NUMA 分片 + **eager**(C=1 实测 **80 ms/token = 12.3 tok/s/路**,TTFT 0.47 s):
+
+| 项 | 值 | 占比 |
+|---|---|---|
+| period | 3.54–3.83 ms/层 | 100% |
+| compute(CPU MoE,120 pairs) | 1.65–1.88 ms | 43–52% |
+| **rest(GPU + 拷贝 + 派发)** | **1.75–2.18 ms** | 48–57% |
+
+对比:**关投机 + CUDA graph** 时 rest 只有 0.78–0.86 ms ⇒ **为了开 DSpark 而退回 eager,
+每层多付了 ~1 ms 的逐 kernel 派发开销**(43 层 × 1 ms ≈ 43 ms/token,正好是差距的大头)。
+
+⇒ 下一步优先级:
+1. **让 DSpark 与 CUDA graph 共存**。首次尝试(FULL_AND_PIECEWISE)在捕获期崩:
+   `aten::new_empty` 失败,堆栈落在 `vllm/models/deepseek_v4/attention.py:776`
+   的 `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`(该 C++ op 内部会分配 q)。
+   正在试 `{"cudagraph_mode":"PIECEWISE"}`(只捕获注意力/稠密段)。
+2. 接受率 2.35 → 目标 3.0(生产水平):调 `num_speculative_tokens` / draft 配置。
+3. 1M 档的 TP=2 每层同步(rest 3.77 ms/层)仍是低并发杀手。
+
+## 27. 调研:1M 的 KV 到底是什么撑起来的(A100 上还有没有省的路)
+
+| 组成 | 每 token | 依据 |
+|---|---|---|
+| 主 MLA 缓存(已压缩) | ~3 KB | `MLAAttentionSpec(tokens_per_state=compress_ratio)`;0731 是 4/128 交替 ⇒ 4→146 B、128→4.6 B |
+| **Lightning Indexer 缓存** | **~26 KB** | 每个 indexer 层 32 头 × 128 维 fp8 = 4 KB/token;实测总量 29.5 KB/token 反推约 6–7 个 indexer 层 |
+| 合计(实测) | **29.5 KB** | 437,337 tokens / 12 GiB |
+
+**能不能把 indexer 缓存压到 FP4?** 主线有 `indexer_kv_dtype`(`dsa_indexer_uses_fp4`,
+`vllm/v1/attention/backends/mla/indexer.py:54`),但代码里写死:
+
+```
+if use_fp4 and not current_platform.is_device_capability_family(100):
+    raise ValueError("indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs (sm_10x)")
+```
+
+⇒ **A100(SM80)拿不到这条 2× 红利**。同理 `--kv-cache-dtype nvfp4_ds_mla` 也被拒。
+**结论:1M 上下文在本机只能 TP=2(或 TP=3),没有单卡捷径。**
+
+⇒ 因此目标(1M + 单路 25 tok/s)等价于:**把 TP=2 的每层耗时从 4.63 ms 压到 ~2.2–2.8 ms**
+   (compute 0.86 已经很小,要砍的是 rest 3.77 ms 里的 ~2.4 ms TP 额外开销)。下一步:
+   用 `XIAOTU_TORCH_PROFILE_DECODE` 抓 TP=2 decode 的 kernel 表,定位是不是每层集合通信。
+
+## 28. 关于"非专家权重 + KV 复制到每张卡以减少通信"(用户提问的调研)
+
+**方向正确,而且主流部署(Lvllm 生产、DeepSeek 自述的 EPD/DP-attention)就是这么做的:**
+把专家按 EP 切分,而**注意力权重与 KV 在每个 rank 复制**,这样每层就没有集合通信。
+但落到本机 + 1M 上下文,有三个约束:
+
+1. **1M 的 KV 复制不下**:单卡每 token 的 KV 是 29.5 KB(见 §27,大头是 Lightning Indexer
+   缓存)⇒ 1M = 29.5 GiB;复制到两张卡就得每卡 29.5 GiB KV + 19.6 GB 非专家权重 = 49 GB > 40 GB。
+   ⇒ **1M 只能切分 KV(TP=2),因此每层必然有集合通信。**
+2. **通信后端已经是最优的那档**:启动日志
+   `Using ['CUSTOM', 'PYNCCL'] all-reduce backends (in dispatch order) for group 'tp:0'`
+   —— vLLM 走的是自家 custom all-reduce(P2P over PCIe),不是慢路径。
+3. **实测的 TP 额外开销(2.4 ms/层)远大于一次 all-reduce 的理论值(几十 µs)**
+   ⇒ 瓶颈很可能不是"通信量",而是**每层一次 barrier + 两个 rank 的相位漂移**:
+   我们的 CPU MoE 在 host 回调里占住 stream,两个 rank 的完成时刻互相等待,漂移被逐层放大。
+
+⇒ 下一步(优先级):
+   a. 抓 TP=2 decode 的 kernel 表(`XIAOTU_TORCH_PROFILE_DECODE`,服务已在跑)确认
+      每层有几个集合通信 kernel、各占多久;若 kernel 时间很小 ⇒ 帧间等待是主因;
+   b. 若是相位漂移:让两个 rank 的每层起点对齐(例如把 MoE 的 D2H 提前、或让 CPU MoE
+      在两 rank 上严格同拍),而不是让 barrier 去吸收漂移;
+   c. 若是通信本身:考虑 TP=2 时把 o_proj 的 all-reduce 与下一层注意力重叠(vLLM 有
+      `fuse_allreduce_rms` 之类的 pass,但对我们这种 host 回调结构要改插件侧)。
+
+## 29. 复刻生产配置的第一版实测:差距 6×,需要逐层拆解
+
+照抄 `process_data/scripts/dsv4.sh` 的生产参数(TP=2、1M、`--disable-custom-all-reduce`、
+`cudagraph_mode=FULL_DECODE_ONLY`、`max-num-seqs 2`、util 0.80、48 线程/rank、
+DSpark 5 draft + probabilistic):KV 容量 **1,510,891 tokens** ✓,但性能:
+
+| 口径 | 本次(复刻) | 目标(lk-moe 生产) |
+|---|---|---|
+| C=1 单路 output | **3.96 tok/s**(TPOT 242 ms) | 25 tok/s(40 ms) |
+| C=2 聚合 output | 6.39(3.19/路) | 50(25/路) |
+| TTFT | 1.6 s | — |
+| 接受率 / 每步 token | 33.1% / **2.66** | 40.2% / 3.01 |
+
+⇒ 每步 644 ms ÷ 43 层 = **15 ms/层**,而生产是 2.8 ms/层。**差 5 倍,必须逐层拆解**
+(下一轮加 `XIAOTU_CD_TIMING=1` 拿 compute/rest)。
+重点怀疑:(a) `--disable-custom-all-reduce` 后走 PYNCCL,在本机 SYS 拓扑上每次集合通信
+可能走主机内存;(b) 48 线程/rank 下的引擎效率;(c) EP+shm 的每层 barrier。
+
+## 30. 定位:12 ms/层 是"EP 共享内存 barrier 的等待",不是引擎算力
+
+| 配置(TP=2,1M,复刻生产 flag) | compute | rest | period |
+|---|---|---|---|
+| EP=1 + shm,48 线程/rank | 13.07 ms | 0.80 | 13.87 |
+| EP=1 + shm,96 线程/rank | **12.25 ms** | 0.93 | 13.27 |
+| EP=0(冗余专家,**无合并**),96 线程/rank | **0.86 ms** | 3.77 | 4.63 |
+
+- 线程数几乎无影响 ⇒ **12 ms 不是算力**,而是我的 `/dev/shm` barrier 自旋:
+  在跨 NUMA 的共享 cache line 上做 acquire 轮询会形成 ping-pong 风暴,反而拖慢对端 rank;
+- 对比:不做跨 rank 合并(EP=0,两 rank 各算全量)时 compute 只要 0.86 ms,
+  代价是 rest 变成 3.77(vLLM 的注意力集合通信)。
+
+⇒ 两条修法:
+  a. **EP=0**(冗余专家,零 barrier)——配置即可,先验证;
+  b. 修 barrier:自旋加退避(`_mm_pause` → `sleep_for(50µs)`),或改用 futex/eventfd,
+     减少跨 NUMA 轮询对 DRAM 的冲击(需要改 binding 并重编)。
+
+## 31. 真凶:引擎线程池的 5 ms 自旋在两个 rank 共机时把机器烧穿
+
+decode 期间 `top` 实测:
+
+| 进程 | %CPU |
+|---|---|
+| VLLM::Worker_TP0 | **4713%**(≈47 核) |
+| VLLM::Worker_TP1 | **4709%**(≈47 核) |
+| VLLM::EngineCore | 100% |
+
+即 **2 × 96 线程在两 rank 上持续自旋**(`numa_pool.hpp:861`,默认 `spin_idle_us_=5000`:
+每次调用后 worker 用 `_mm_pause()` 轮询 `current_gen_` 最多 5 ms 再 park)。
+后果:(a) 96 核被空转占掉 → 真正干活的线程被抢占;(b) 96 个线程轮询同一条
+`current_gen_` cache line → 跨 8 个 NUMA node 的广播风暴,直接吃 DRAM 带宽。
+
+这解释了为什么同一套引擎在**独立微基准**里 B=6 只要 ~2 ms(`bench_vs_lkmoe`),
+在**两 rank 服务**里却要 10–12 ms;也解释了生产为什么用 `LK_POWER_SAVING=1`
+(作者正是为省 CPU / 降内存温度而做的开关)。
+
+⇒ 立即验证:`XIAOTU_MOE_SPIN_IDLE_US=0`(调用之间立刻 park,靠 condvar 唤醒)。
+
+### 31.1 直接设 `SPIN_IDLE_US=0` 会让 worker 在初始化阶段挂住
+
+现象:EngineCore 反复打印
+`shm_broadcast.py:801 No available shared memory broadcast block found in 60 seconds`
+(有 worker 卡住)。⇒ 引擎池在"永不 spin、立刻 park"这条路径上有丢唤醒/竞态。
+**结论:生产不要用 0,改用小值(200 µs 量级)既能压住自旋风暴,又走原来的唤醒路径。**
+
+## 32. 本轮结论汇总(目标:1M + 单路 25 tok/s + 两路 50)
+
+### 32.1 现在的可用配置与实测(8070 上跑的)
+
+单卡 256K + DSpark(spec=5, probabilistic)+ CUDA graph + 192 线程 + NUMA 分片:
+
+| 口径 | 实测 | 目标 |
+|---|---|---|
+| C=1 单路 output | **15.94 tok/s**(TPOT 55 ms,TTFT 0.52 s) | 25 |
+| C=2 聚合 output | 19.88(9.94/路,TPOT 91 ms) | 50 |
+| C=128(关投机) | 106.15(聚合,每路 0.83) | — |
+| 1M 上下文 | 需要 TP=2,当前仅 ~3.7–4 tok/s/路 | 25 |
+
+### 32.2 四个根因(都有实测证据)
+
+1. **引擎池自旋风暴(最大项)**:`numa_pool.hpp:861` 默认 `spin_idle_us_=5000`;
+   每个层有**独立线程池**,43 池 × 96~192 线程 ⇒ decode 时实测 **两个 worker 各烧 ~47 核**
+   (`top` `%CPU 4713%`)。同一引擎在独立微基准里 B=6 只要 ~2 ms,在两 rank 服务里要 10–13 ms。
+   **TP=2 比 TP=1 慢 5 倍,主因是风暴翻倍(94/192 核被空转),不是集合通信本身。**
+   - 直接设 `SPIN_IDLE_US=0/200` 会让 worker 在初始化挂住(引擎丢唤醒 bug,见 §31.1);
+   - 引擎里本有 `worker_limit_`+park 的正确路径,但**只对 FP8(`kNSliceSmallM`)生效,
+     MXFP4(packed4,kNParallel)绕过了它** —— 这是该修的地方(我打过一版补丁,
+     在 capture 阶段又挂,已回退,需要更仔细地做)。
+2. **`--max-num-seqs`/拓扑相关的口径**:生产 `dsv4.sh` 用 `--max-num-seqs 2` ⇒ 他们标称 C=4
+   的聚合 46.67 实际是 2 路 × ~23。
+3. **1M 的 KV 结构**:主 MLA 已压缩(~3 KB/token),大头是 Lightning Indexer(每层 4 KB/token,
+   约 6–7 层);FP4 indexer 被主线限制在 Blackwell,单卡 1M 不可行(§27)。
+4. **NUMA 单节点打满**:反复重启后 node0 只剩 1 GB(总 193 GB),导致后续启动卡在
+   `shm_broadcast`。清理 + 让页分散后可恢复。
+
+### 32.3 下一步(按收益)
+
+1. **正确实现"小批量只用部分 worker"**(对 packed4 生效,且不能在 capture 期挂):
+   预期把 decode 期的空转从 ~94 核降到 ~30 核量级 ⇒ TP=2 的每层 10–13 ms 有望回到 ~3 ms
+   ⇒ 1M 档单路 3.7 → ~15 tok/s,再叠加其他优化逼近 25;
+2. 修好后重测 TP=1 的 C=1/C=2(现在 15.94 / 9.94),目标是 C=2 时每路不明显下降;
+3. 接受率 2.66 → 3.0(生产水平):调 draft 参数/采样方法;
+4. 每改一项记录到本文档 + `docs/PERFORMANCE_OPTIMIZATION.md`。
