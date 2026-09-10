@@ -79,7 +79,9 @@ VLLM_EXPERTS_LOAD_DEVICE=cpu python -m vllm_xiaotu_moe.mainline_shims
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py   # 后端选择探测,秒级
 ```
 
-完整安装、环境变量与各模型的参考命令见 **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)**。
+完整安装、环境变量见 **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)**;
+**DeepSeek-V4-Flash 与 Qwen3.8-Flash-Next-FP8 的逐步使用指南 + 初步性能实测**见
+**[`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md)**。
 
 ## 工作原理(一句话版)
 
@@ -102,6 +104,7 @@ CPU:  routed experts 的权重与计算(xiaotu 引擎,AVX-512)
 | 文档 | 内容 |
 |---|---|
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | 安装、环境变量/参数、各模型运行命令、排错 |
+| [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) | **DeepSeek-V4-Flash / Qwen3.8-Flash-Next-FP8 使用指南与初步性能** |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 混合模式与主线集成设计 |
 | [`docs/GPU_PREFILL.md`](docs/GPU_PREFILL.md) | 长 prefill 逐层 GPU 流式 |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | 实测:硬件、吞吐、时延、消融 |

@@ -85,8 +85,10 @@ VLLM_EXPERTS_LOAD_DEVICE=cpu python -m vllm_xiaotu_moe.mainline_shims
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py   # backend selection probe
 ```
 
-Full install notes, environment variables and per-model commands:
+Full install notes and environment variables:
 **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)**.
+Step-by-step guides plus preliminary measurements for **DeepSeek-V4-Flash** and
+**Qwen3.8-Flash-Next-FP8**: **[`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md)**.
 
 ## How it works (one paragraph)
 
@@ -108,6 +110,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for details.
 | Document | Contents |
 |---|---|
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | install, env vars / CLI flags, per-model commands, troubleshooting |
+| [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) | **guides and preliminary measurements for DeepSeek-V4-Flash / Qwen3.8-Flash-Next-FP8** |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | mixed-mode and mainline integration design |
 | [`docs/GPU_PREFILL.md`](docs/GPU_PREFILL.md) | layerwise GPU prefill |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | measured hardware, throughput, latency, ablations |

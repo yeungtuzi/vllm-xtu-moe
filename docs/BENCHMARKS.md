@@ -127,6 +127,11 @@ GPTQ 检查点在引擎构造时一次性重排(`w13 [E, K/8, 2I] int32` → `[E
 以及逐层 dense/超连接算子。**对这类"权重放不下、必须 offload"的模型,decode 的瓶颈是 offload 带宽,
 不是 CPU 专家计算**;缓解办法是减少 offload 量(加显存/加卡)而不是优化 MoE 内核。
 
+## 4.2 使用指南与其它模型
+
+DeepSeek-V4-Flash 与 Qwen3.8-Flash-Next-FP8 的**逐步使用指南、完整初步性能表
+(含数据来源与复现命令)**见 [`MODEL_GUIDES.md`](MODEL_GUIDES.md)。
+
 ## 5. 服务端吞吐与时延(DeepSeek-V4-Flash,单卡)
 
 | 指标 | 数值 |

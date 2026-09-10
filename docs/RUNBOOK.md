@@ -125,6 +125,9 @@ xiaotu_moe variant = _avx512_bf16
 
 ---
 
+> **两个已验证模型的逐步指南 + 初步性能数据**见 [`MODEL_GUIDES.md`](MODEL_GUIDES.md)
+> (DeepSeek-V4-Flash 与 Qwen3.8-Flash-Next-FP8);本节只给最简参考命令。
+
 ## 4. 参考启动命令
 
 ### 4.1 DeepSeek-V4-Flash(单卡)
