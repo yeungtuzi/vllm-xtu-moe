@@ -123,6 +123,10 @@ out = clamp(gate, max=L) * sigmoid(alpha * clamp(gate, max=L)) * (clamp(up, ±L)
 
 - 引擎在构造时把权重快照到自己的缓冲(按 NUMA 节点分片),避免后续
   `clean_weights_after_loading` 释放原始参数导致悬空指针;
+- 检查点布局与引擎布局不同的格式(INT4/WNA16)在**引擎构造时一次性重排**:
+  GPTQ 的 `w13 [E, K/8, 2I] int32` → `[E, 2I, K/2]` u8、缩放 `[E, K/g, N]` → `[E, N, K/g]`,
+  并以 `groupN=1 / groupK=group_size` 构建引擎;重排后的张量用显式 `empty+copy_`
+  分配,避免 `.contiguous()` 链留下"存储归属别处"的视图;
 - 每个层一个引擎实例,引擎之间共享同一个 NUMA 线程池;
 - `XIAOTU_MOE_SINGLECOPY=1` 时权重只保留一份并按 NUMA 节点分片,
   每个核心只读本节点数据。

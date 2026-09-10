@@ -184,7 +184,8 @@ class _XiaotuExpertsMixin:
         if self._scale_dtype is not None:
             resolved = []
             for name in self._scale_attrs:
-                t = self._find_scale(layer, (name,))
+                cands = name if isinstance(name, (tuple, list)) else (name,)
+                t = self._find_scale(layer, cands)
                 if t is not None and t.dtype != self._scale_dtype:
                     t = t.to(self._scale_dtype).contiguous()
                 resolved.append(t)
@@ -267,11 +268,23 @@ class _XiaotuExpertsMixin:
     def _validate_weights(self, layer, ex_w13, ex_w2) -> None:
         """Per-format layout guard, run before the engine is built.
 
-        The engine consumes the *checkpoint* layout directly (it never calls
-        mainline's `prepare_*_for_cpu` AMX repack), so a format whose checkpoint
-        layout differs from the engine's must be rejected here instead of
-        silently computing garbage.
+        Called with the tensors the engine will actually consume (i.e. after
+        `_prepare_weights`). The engine reads the checkpoint layout directly (it
+        never calls mainline's `prepare_*_for_cpu` AMX repack), so a format whose
+        layout differs from the engine's must be converted or rejected here
+        instead of silently computing garbage.
         """
+
+    def _prepare_weights(self, layer) -> None:
+        """Resolve the tensors/grouping the engine consumes.
+
+        Default: the layer's own tensors — BF16/FP8/MXFP4/NVFP4 checkpoints
+        already match the engine's layout. Formats that differ override this and
+        set `self._engine_w13/_engine_w2`, `self._scales`,
+        `self._group_n/_group_k` (INT4/WNA16 repacks the GPTQ int32 packing).
+        """
+        self._engine_w13 = None
+        self._engine_w2 = None
 
     def _find_scale(self, layer, names):
         for n in names:
@@ -287,8 +300,9 @@ class _XiaotuExpertsMixin:
             return self._xiaotu_engine
         import xiaotu_moe
 
-        ex_w13 = layer.w13_weight
-        ex_w2 = layer.w2_weight
+        self._prepare_weights(layer)
+        ex_w13 = self._engine_w13 if self._engine_w13 is not None else layer.w13_weight
+        ex_w2 = self._engine_w2 if self._engine_w2 is not None else layer.w2_weight
         self._validate_weights(layer, ex_w13, ex_w2)
         if self._expect_dtype is not None and ex_w13.dtype != self._expect_dtype:
             raise NotImplementedError(
@@ -373,13 +387,23 @@ class _XiaotuExpertsMixin:
           out += w * (dequant(w2[e]) @ bf16(act))
         """
         try:
-            w13 = layer.w13_weight
-            w2w = layer.w2_weight
+            w13 = self._engine_w13 if getattr(self, "_engine_w13", None) is not None \
+                else layer.w13_weight
+            w2w = self._engine_w2 if getattr(self, "_engine_w2", None) is not None \
+                else layer.w2_weight
             s13, s2 = self._scales
             unquant = (self._scale_dtype is None) and (s13 is None)
-            gn = self._group_n
+            gn, gk = int(self._group_n), int(self._group_k)
             I = int(w13.shape[1] // 2)
             H = int(w2w.shape[1])
+            int4 = self._engine_attr == "MOE_WNA16" and w13.dtype == torch.uint8
+
+            def _unpack4(w):   # [N, K/2] u8 -> [N, K] f32 with value = nibble - 8
+                b = w.to(torch.int16)
+                lo = (b & 0x0F) - 8
+                hi = ((b >> 4) & 0x0F) - 8
+                return torch.stack((lo, hi), dim=-1).reshape(w.shape[0], -1).float()
+
             x = hidden_states[0].float().cpu()
             ref = torch.zeros(H, dtype=torch.float32)
             ids_row = [int(v) for v in topk_ids[0]]
@@ -387,11 +411,11 @@ class _XiaotuExpertsMixin:
                 w = float(topk_weights[0, r])
                 if w == 0.0:
                     continue
-                w13_e = w13[e].float()
+                w13_e = _unpack4(w13[e]) if int4 else w13[e].float()
                 if unquant:
                     deq13 = w13_e
                 else:
-                    s13_full = s13[e].float().repeat_interleave(gn, 0).repeat_interleave(gn, 1)
+                    s13_full = s13[e].float().repeat_interleave(gn, 0).repeat_interleave(gk, 1)
                     deq13 = w13_e * s13_full[: 2 * I, :H]
                 gate = deq13[:I] @ x
                 up = deq13[I:] @ x
@@ -406,11 +430,12 @@ class _XiaotuExpertsMixin:
                 else:
                     act = (gate / (1 + torch.exp(-gate))) * up
                 act = act.to(torch.bfloat16).float()
+                w2_e = _unpack4(w2w[e]) if int4 else w2w[e].float()
                 if unquant:
-                    down = w2w[e].float() @ act
+                    down = w2_e @ act
                 else:
-                    s2_full = s2[e].float().repeat_interleave(gn, 0).repeat_interleave(gn, 1)
-                    down = (w2w[e].float() * s2_full[:H, :I]) @ act
+                    s2_full = s2[e].float().repeat_interleave(gn, 0).repeat_interleave(gk, 1)
+                    down = (w2_e * s2_full[:H, :I]) @ act
                 ref += w * down
             got = out[0].float().cpu()
             rms = float(torch.sqrt(torch.mean(ref * ref)))
@@ -546,7 +571,11 @@ class _XiaotuExpertsMixin:
             )
         engine = self._ensure_engine(layer)
         qlen = hidden_states.size(0)
-        hidden_size = int(w2.shape[1])
+        # Use the tensor the ENGINE was built from: for formats whose checkpoint
+        # layout differs (INT4/WNA16), the `w2` argument is the raw packed tensor
+        # ([E, I/8, H]) and its dim 1 is NOT the hidden size.
+        w2_engine = self._engine_w2 if self._engine_w2 is not None else w2
+        hidden_size = int(w2_engine.shape[1])
         out = torch.empty(qlen, hidden_size, dtype=torch.float32,
                           device=hidden_states.device)
         stream = torch.cuda.current_stream()
@@ -635,24 +664,114 @@ class XiaotuCPUExpertsFp8(_XiaotuExpertsMixin, CPUExpertsFp8):
 class XiaotuCPUExpertsInt4(_XiaotuExpertsMixin, CPUExpertsInt4):
     """INT4 W4A16 组量化专家:引擎 MOE_WNA16。
 
-    组大小/零点与检查点布局的完整适配尚未完成,见 docs/KNOWN_LIMITATIONS.md:
-    主线的 int4 检查点是 `w13 [E, K/8, 2I] int32`(nibble 沿 K 打包)并带 `qzeros`,
-    而引擎期望 `[E, 2I, K/2]` 字节打包的"中心 8"布局。`_validate_weights` 会在
-    不匹配时显式报错,而不是静默算错。
+    检查点布局与引擎布局不同,`_prepare_weights` 在**引擎构造时做一次重排**:
+
+      GPTQ / compressed-tensors:`w13 [E, K/8, 2I] int32`(每 int32 沿 K 打包 8 个
+      nibble,小端下 int32→u8 视图即为"低 nibble = 偶 k")⇒ `transpose(1,2).contiguous()
+      .view(uint8)` 直接得到引擎的 `[E, 2I, K/2] u8`;`w2` 同理。缩放 `[E, G, N]`
+      `transpose(1,2)` 得到引擎的 `[E, N, G]`(即 groupN=1、groupK=group_size)。
+
+    零点:引擎的 int4 表是"中心 8"(`value = nibble - 8`),只等价于**对称**量化。
+    GPTQ 检查点的 `qzeros` 存的是 `zp - 1`(主线 AMX 重排里 `+1` 还原),所以对称
+    模型的 qzeros 全为 7 → zp=8;若出现非 8 的零点,`_require_symmetric` 会显式报错
+    (逐组零点需要内核侧支持,见 docs/ROADMAP.md)。
     """
 
     _engine_attr = "MOE_WNA16"
-    _scale_attrs = ("w13_weight_scale", "w2_weight_scale")
-    _group_n, _group_k = 128, 128
+    # Attribute names differ per quant method: auto_gptq / moe_wna16 use
+    # w13_qweight / w13_scales / w13_qzeros, compressed-tensors uses
+    # w13_weight_packed / w13_weight_scale / w13_weight_zero_point.
+    _scale_attrs = (("w13_scales", "w13_weight_scale"),
+                    ("w2_scales", "w2_weight_scale"))
+    _w_names = (("w13_qweight", "w13_weight_packed", "w13_weight"),
+                ("w2_qweight", "w2_weight_packed", "w2_weight"))
+    _z_names = ("w13_qzeros", "w13_weight_zero_point",
+                "w2_qzeros", "w2_weight_zero_point")
+    _group_n, _group_k = 1, 128
     _scale_dtype = torch.float32
+
+    def _prepare_weights(self, layer) -> None:
+        w13 = self._find_scale(layer, self._w_names[0])
+        w2 = self._find_scale(layer, self._w_names[1])
+        if w13 is None or w2 is None:
+            raise NotImplementedError(
+                "xiaotu INT4 backend found no int4 weight tensors on the layer "
+                f"(looked for {self._w_names[0]} / {self._w_names[1]})"
+            )
+        group = int(getattr(self.quant_config, "group_size", 0) or 0)
+        if group <= 0:
+            group = 128
+        if bool(getattr(self.quant_config, "desc_act", False)):
+            raise NotImplementedError(
+                "xiaotu INT4 backend does not support GPTQ desc_act=True "
+                "(g_idx reordering); the engine assumes sequential K order."
+            )
+        if w13.dtype == torch.int32:
+            # GPTQ / compressed-tensors packing: nibbles along K, N last. On a
+            # little-endian host the int32 -> uint8 view exposes two nibbles per
+            # byte with the low nibble = lower K index, which is exactly the
+            # engine's [E, 2I, K/2] layout.
+            self._require_symmetric_zero_points(layer)
+            w13 = torch.empty(w13.transpose(1, 2).shape, dtype=torch.int32).copy_(
+                w13.transpose(1, 2)).view(torch.uint8)
+            w2 = torch.empty(w2.transpose(1, 2).shape, dtype=torch.int32).copy_(
+                w2.transpose(1, 2)).view(torch.uint8)
+            s13, s2 = self._scales
+            if s13 is not None and s2 is not None:
+                # GPTQ scales are [E, K/group, N]; the engine wants [E, N, K/group].
+                # Materialise into FRESH buffers with an explicit copy: chaining
+                # .transpose().contiguous() can leave the result as a view whose
+                # storage is owned elsewhere (observed as PROT_NONE pages once the
+                # owner is released -> SIGSEGV inside the engine's weight copy).
+                self._scales = (self._fresh_f32(s13.transpose(1, 2)),
+                                self._fresh_f32(s2.transpose(1, 2)))
+        elif w13.dtype != torch.uint8:
+            raise NotImplementedError(
+                f"xiaotu INT4 backend expects int32 (GPTQ/compressed-tensors) or "
+                f"uint8 (engine layout) weights, got {w13.dtype}"
+            )
+        self._engine_w13, self._engine_w2 = w13, w2
+        self._group_n, self._group_k = 1, group
+
+    @staticmethod
+    def _fresh_f32(t):
+        out = torch.empty(t.shape, dtype=torch.float32)
+        out.copy_(t)
+        return out
+
+    def _require_symmetric_zero_points(self, layer) -> None:
+        """Reject asymmetric int4: the engine's table is centered at 8.
+
+        GPTQ stores `zero_point - 1` (mainline's AMX repack adds 1 back), so a
+        symmetric checkpoint shows nibbles of 7; compressed-tensors may store 8
+        directly. Either way the effective zero point must be 8.
+        """
+        for name in self._z_names:
+            qz = getattr(layer, name, None)
+            if qz is None:
+                continue
+            b = qz.detach().to("cpu").contiguous()
+            packed = b.dtype in (torch.int32, torch.int16) and b.shape[-1] * 8 == qz.shape[-1]
+            if b.dtype != torch.uint8:
+                b = b.to(torch.int32).view(torch.uint8)
+            lo = (b & 0x0F).to(torch.int16)
+            hi = (b >> 4).to(torch.int16)
+            if packed:
+                lo = lo + 1   # mainline's unpack adds 1 to GPTQ zeros
+                hi = hi + 1
+            vals = torch.unique(torch.cat((lo.reshape(-1), hi.reshape(-1))))
+            vmin, vmax = int(vals.min()), int(vals.max())
+            symmetric = bool(torch.all((vals == 8) | (vals == 7)))
+            if not symmetric or vmin < 7:
+                raise NotImplementedError(
+                    f"xiaotu INT4 backend only implements symmetric quantization "
+                    f"(effective zero point 8); {name} has zero points in "
+                    f"[{vmin}, {vmax}]. Per-group zero points need kernel "
+                    "support; see docs/ROADMAP.md (INT4 checkpoint adaptation)."
+                )
 
     def _validate_weights(self, layer, ex_w13, ex_w2) -> None:
         # Engine layout: w13 [E, 2I, H/2] u8, w2 [E, H, I/2] u8 (nibbles along K).
-        # A WNA16 checkpoint is int32 with K packed 8-per-word and N last.
-        qzeros = [
-            n for n in ("w13_qzeros", "w2_qzeros", "w13_zeros", "w2_zeros")
-            if getattr(layer, n, None) is not None
-        ]
         layout_ok = (
             ex_w13.dtype == torch.uint8
             and ex_w13.dim() == 3
@@ -660,17 +779,15 @@ class XiaotuCPUExpertsInt4(_XiaotuExpertsMixin, CPUExpertsInt4):
             and ex_w13.shape[2] * 2 == ex_w2.shape[1]
             and ex_w2.shape[2] * 2 == ex_w13.shape[1] // 2
         )
-        if not layout_ok or qzeros:
+        if not layout_ok:
             raise NotImplementedError(
-                "xiaotu INT4/WNA16 backend cannot consume this checkpoint yet: "
+                "xiaotu INT4/WNA16 backend cannot consume this checkpoint: "
                 f"w13 shape={tuple(ex_w13.shape)} dtype={ex_w13.dtype}, "
-                f"w2 shape={tuple(ex_w2.shape)} dtype={ex_w2.dtype}, "
-                f"zero-point tensors={qzeros or 'none'}. "
-                "The engine expects the byte-packed [E, 2I, K/2] / [E, H, I/2] "
-                "'center-8' layout; mainline int4 checkpoints pack nibbles along "
-                "K as int32 and carry qzeros, which needs a repack plus "
-                "zero-point support in the kernel. "
-                "See docs/KNOWN_LIMITATIONS.md (INT4/WNA16) and docs/ROADMAP.md."
+                f"w2 shape={tuple(ex_w2.shape)} dtype={ex_w2.dtype}. "
+                "Expected the byte-packed [E, 2I, K/2] / [E, H, I/2] layout "
+                "(GPTQ/compressed-tensors are repacked automatically; AWQ's "
+                "N-packed layout is not supported yet). "
+                "See docs/KNOWN_LIMITATIONS.md (INT4/WNA16)."
             )
 
 

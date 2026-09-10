@@ -10,7 +10,7 @@
 | 维度 | 现状 |
 |---|---|
 | **指令集** | 引擎有 5 级运行时阶梯(`scalar → avx2 → avx512_base → avx512_vnni → avx512_bf16`),`scripts/build_engine_variants.sh` 一次编出全部变体;AMX 未接线(需要 AMX 硬件验证) |
-| **数据格式** | BF16 / FP16 / FP8(e4m3 W8A16)/ MXFP4 / NVFP4 / WNA16 已有内核;INT4 组量化与零点的适配进行中;INT8、MXFP8、GGUF k-quants 未做 |
+| **数据格式** | BF16 / FP16 / FP8(e4m3 W8A16)/ MXFP4 / NVFP4 / WNA16(INT4 对称量化)已通;INT4 非对称零点、AWQ N-packed 布局、INT8、MXFP8、GGUF k-quants 未做 |
 | **模型通用性** | ✅ 已从"单模型覆盖"升级为**通用 CPU experts 后端**:按格式注册进 `FusedMoEFactory`,任意模型自动选中 |
 | **路由** | ✅ 复用主线 router(softmax / sigmoid+noaux_tc / sqrtsoftplus / grouped / custom) |
 | **激活** | ✅ packed gated 激活 + `swiglu_limit/alpha/beta`;交错布局(`SWIGLUOAI`)明确拒绝 |
@@ -46,7 +46,7 @@
 |---|---|---|
 | ~~专家并行(expert_map / EP)~~ | ✅ 代码已支持(映射全局→本地 id);端到端验证受限于本机 TP=2 卡死 | – |
 | **FP8 内核提速** | 🟡 已完成两步:①去 LUT gather(位运算解码),吞吐 0.35→0.98 TFLOP/s;②小批量 N-切片 + worker 子集,B=1 单层 7.1→**0.745 ms**、端到端 decode 5.8→**11.6 tok/s**。下一步:权重预转 bf16 镜像(去掉解码算术,预期再 3–5×)与分块 GEMM(权重行复用 M 个 token) | P1 |
-| **INT4 检查点适配** | 🔴 未开始:主线 int4 检查点是 `w13 [E, K/8, 2I] int32`(nibble 沿 K 打包)+ `qzeros`,引擎期望 `[E, 2I, K/2]` 字节打包的"中心 8"布局,需要①一次重排②零点进内核(非对称量化)③组大小从 `quant_config` 读取。**当前插件显式报错**而非静默算错(见 `KNOWN_LIMITATIONS.md`) | P1 |
+| **INT4 检查点适配** | 🟡 **对称量化已完成**(检查点布局重排 + group size 从 `quant_config` 读,真实 GPTQ-Int4 MoE 端到端通过);剩余:①内核侧逐组**零点**(非对称 AWQ/GPTQ)②AWQ 的 N-packed 布局重排(需 nibble 级转置) | P1 |
 | **交错 gate/up 布局** | 让 gpt-oss 系(`SWIGLUOAI`)可用 | P2 |
 | **`apply_router_weight_on_input`** | 少数模型使用 | P3 |
 

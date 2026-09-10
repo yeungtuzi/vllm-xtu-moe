@@ -34,7 +34,7 @@ CPU 后端槽位,于是:
 | **FP8 e4m3 + block 128×128**(vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | ✅ 层内数值已验证(48 层自校验 ≤1.4e-4)+ 真实模型端到端(Qwen3-30B-A3B-FP8 单卡、Qwen3.8-Flash-Next-FP8 2×A100 TP=2+EP) |
 | **MXFP4**(e2m1 + e8m0 block 32) | `MOE_MXFP4` | ✅ |
 | **NVFP4** | `MOE_NVFP4` | ✅ 引擎侧 |
-| **INT4 / WNA16**(GPTQ / AWQ 组量化) | `MOE_WNA16` | 🔴 暂不接受真实 4-bit 检查点:主线的 `w13 [E, K/8, 2I] int32` + `qzeros` 布局与引擎的字节打包"中心 8"布局不同,插件**显式报错**而非静默算错(适配计划见 `docs/ROADMAP.md`) |
+| **INT4 / WNA16**(GPTQ / compressed-tensors 组量化) | `MOE_WNA16` | ✅ 对称量化(zero point 8)已通:检查点布局在引擎构造时一次性重排,真实 `Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4` 端到端答案正确;非对称零点与 AWQ 的 N-packed 布局会**显式报错**,详见 `docs/KNOWN_LIMITATIONS.md` |
 | INT8 W8A8 | — | ❌ 引擎尚未实现 |
 
 **路由**:直接复用主线 router(softmax、sigmoid + `noaux_tc`、

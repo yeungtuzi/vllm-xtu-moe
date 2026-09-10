@@ -442,18 +442,23 @@ public:
             sharded_call_ = 0;   // this is a flat call: task_ is valid, so reset
                                  // any stale sharded marker so late workers anchor flat.
             // MONOTONIC ticket counter (never reset). Each call occupies the
-            // ticket range [start_+0, start_+n). Workers bound to THIS call
-            // compute  i = ticket - start_  and only run for i in [0,n); any
-            // ticket >= start_+n means the worker's own range is exhausted and
-            // it re-arms for the next generation.
+            // ticket range [start_, start_+n). Workers bound to THIS call compute
+            // i = ticket - start_ and only run for i in [0,n); any ticket beyond
+            // that range means the worker's own range is exhausted and it re-arms
+            // for the next generation.
             //
-            // PUBLISH ORDER: current_gen_ is bumped BEFORE start_/remaining_ are
-            // written. A worker fast-path sees current_gen_==its snapshot gen only
-            // while the caller has not yet started the next call, so start_ still
-            // equals its snapshot start -> a range-exhausted drop there is a TRUE
-            // future-gap (safe, no lock). Once current_gen_ advances, workers
-            // re-anchor under the lock and read a consistent (start_,n_) pair.
-            gen = ++current_gen_;        // open a new generation (publish FIRST)
+            // PUBLISH ORDER (both halves matter, see the sharded twin below):
+            //  1) every field (task_, n_, remaining_) is written while holding
+            //     work_mtx_, so a worker that anchors under the lock always sees a
+            //     complete call;
+            //  2) current_gen_ is bumped BEFORE the ticket counter is read: a
+            //     worker that pulls a ticket while still observing the old
+            //     generation must have pulled it before this load, i.e. below
+            //     start_, so a stale ticket can never alias a job of this call.
+            // Reversing (2) makes stale tickets land inside the new range and be
+            // silently dropped; reading the counter before (1) let a worker
+            // decrement remaining_ before it was stored, which hung the caller.
+            gen = ++current_gen_;
             start_ = counter_.load();
             remaining_.store(n);      // outstanding work items in this call
             // diagnostic processed-bitset for this call (only when debug/trace on)
@@ -646,17 +651,31 @@ public:
             node_base_.resize((size_t)nnodes);
             node_nj_.resize((size_t)nnodes);
             sharded_task_ = std::function<void(size_t, size_t)>(fn);
+            // A sharded call has no flat task: clear it so a worker that somehow
+            // takes the flat path can never invoke the previous call's function.
+            task_ = nullptr;
+            if (diag_active()) {
+                shard_cnt_.assign((size_t)nnodes * kShardDiagStride, 0u);
+            }
             for (int n = 0; n < nnodes; ++n) {
                 node_nj_[n] = job_counts[n];
-                node_base_[n] = 0;                   // reset: base is always 0
-                node_ticket_[n].store(0);            // fresh per-call counter range [0,nj)
+                // MONOTONIC per-node ticket counters (never reset), exactly like
+                // the flat `counter_`: this call owns [node_base_[n], +nj), read
+                // right after the generation bump below. A stale worker's ticket
+                // is then below base (loc wraps huge) -> it drops out instead of
+                // aliasing a live job. Resetting the counters per call made stale
+                // tickets alias live ones and silently duplicated/skipped jobs.
                 total += job_counts[n];
             }
             n_ = total;
             worker_limit_.store(limit >= nt_ ? 0 : limit, std::memory_order_relaxed);
-            uint64_t gen = ++current_gen_;   // publish first (workers anchor under lock)
             sharded_call_ = nnodes;          // visible to workers at anchor
             start_ = 0;
+            // Bump the generation BEFORE reading the per-node counters (see
+            // parallel_for_impl for why the order matters).
+            uint64_t gen = ++current_gen_;
+            for (int n = 0; n < nnodes; ++n)
+                node_base_[n] = node_ticket_[n].load(std::memory_order_relaxed);
             remaining_.store(total);
             shard_exec_.store(0);      // diag reset per call
         }
@@ -682,6 +701,23 @@ public:
                     fprintf(stderr, "  node %d: jobs=%zu pulled=%ld\n", n, node_nj_[n], done);
                 }
                 abort();
+            }
+            if (diag_active()) {
+                size_t dup = 0, miss = 0;
+                for (int n = 0; n < nnodes; ++n) {
+                    for (size_t j = 0; j < node_nj_[n] && j < kShardDiagStride; ++j) {
+                        uint32_t c = __atomic_load_n(
+                            &shard_cnt_[(size_t)n * kShardDiagStride + j], __ATOMIC_RELAXED);
+                        if (c == 0) ++miss;
+                        else if (c > 1) ++dup;
+                    }
+                }
+                if (dup || miss) {
+                    fprintf(stderr,
+                            "[pool] SHARD-JOBDIAG gen=%llu total=%zu exec=%ld dup=%zu miss=%zu\n",
+                            (unsigned long long)current_gen_.load(), total,
+                            shard_exec_.load(), dup, miss);
+                }
             }
         }
         // NOTE: deliberately do NOT clear sharded_call_ here. A worker whose wake
@@ -764,15 +800,25 @@ private:
         node_present_ = 0;
         for (int cpu : cores_) { auto it = topo_.cpu_node.find(cpu);
             if (it != topo_.cpu_node.end()) node_present_ |= (1UL << it->second); }
+        // Publish every worker's NUMA node HERE, before the thread is spawned:
+        // the worker loop reads worker_node_[w] to pick its node-scoped ticket
+        // queue, so a first call racing with thread startup would otherwise see
+        // the default 0 and steal another node's jobs (dropping them).
+        for (size_t w = 0; w < nt_; ++w) {
+            int cpu = cores_[w % cores_.size()];
+            worker_node_[w] = topo_.cpu_node.count(cpu) ? topo_.cpu_node[cpu] : 0;
+        }
         // pin workers round-robin across the physical-core list
         for (size_t w = 0; w < nt_; ++w) {
             int cpu = cores_[w % cores_.size()];
             workers_.emplace_back([this, cpu, w] {
                 pin_to(cpu);
-                worker_node_[w] = topo_.cpu_node.count(cpu) ? topo_.cpu_node[cpu] : 0;
                 worker_loop(w);
             });
         }
+        // Wait until every worker is running before the pool accepts work, so a
+        // call issued immediately after construction cannot race with startup.
+        while (ready_.load(std::memory_order_acquire) < nt_) std::this_thread::yield();
     }
 
     static void pin_to(int cpu) {
@@ -781,6 +827,7 @@ private:
     }
 
     void worker_loop(size_t w) {
+        ready_.fetch_add(1, std::memory_order_release);
         uint64_t my_last_gen = 0;  // per-worker: generation this thread handled
         for (;;) {
             std::function<void(size_t)> local_task;
@@ -859,9 +906,20 @@ private:
                         uint64_t g = current_gen_.load(std::memory_order_acquire);
                         if (g == gen) {
                             if (loc >= nj) break;      // this node's jobs exhausted
+                            if (diag_active() && loc < kShardDiagStride) {
+                                __atomic_fetch_add(
+                                    &shard_cnt_[(size_t)myn * kShardDiagStride + loc],
+                                    1u, __ATOMIC_RELAXED);
+                            }
                             stask((size_t)myn, loc);
                             shard_exec_.fetch_add(1, std::memory_order_relaxed);
-                            if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                            // Only decrement while THIS generation is still live:
+                            // the caller publishes the next call only after this
+                            // one's barrier returned, so a decrement that arrives
+                            // after the generation advanced would corrupt the new
+                            // call's countdown.
+                            if (current_gen_.load(std::memory_order_acquire) == gen &&
+                                remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                                 std::lock_guard<std::mutex> gl(done_mtx_);
                                 done_cv_.notify_all();
                             }
@@ -869,10 +927,11 @@ private:
                         }
                         // generation advanced: NEVER abandon the consumed ticket.
                         // Re-anchor in place and reconcile it against the LIVE call:
-                        // with per-call base==0, if the ticket is in the live node
-                        // range it is a valid job of the new generation -> execute it.
-                        // (The flat parallel_for does the same; abandoning would let a
-                        // stale worker consume a current-gen ticket and skip its job.)
+                        // the ticket is a valid job of the new generation iff it
+                        // falls in that call's monotonic node range -> execute it
+                        // with the LIVE task (the snapshot `stask` belongs to the
+                        // previous call and would run the wrong function).
+                        std::function<void(size_t, size_t)> nstask;
                         uint64_t ng; size_t nb, nnj; bool live;
                         {
                             std::lock_guard<std::mutex> lk(work_mtx_);
@@ -881,18 +940,21 @@ private:
                             live = (sharded_call_ > 0) && (int)myn < sharded_call_;
                             nb = live ? node_base_[myn] : 0;
                             nnj = live ? node_nj_[myn] : 0;
+                            nstask = sharded_task_;
                         }
                         if (!live) {                   // switched away from sharded:
                             break;                     // outer wait will re-anchor flat
                         }
                         gen = ng; my_last_gen = ng;
                         worker_gen_[w].store(ng, std::memory_order_release);
+                        stask = std::move(nstask);
                         base = nb; nj = nnj;
-                        loc = t - base;                // base==0: loc==t
+                        loc = t - base;
                         if (loc >= nj) break;          // beyond live range -> re-arm outer wait
                         stask((size_t)myn, loc);
                         shard_exec_.fetch_add(1, std::memory_order_relaxed);
-                        if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        if (current_gen_.load(std::memory_order_acquire) == gen &&
+                            remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                             std::lock_guard<std::mutex> gl(done_mtx_);
                             done_cv_.notify_all();
                         }
@@ -916,6 +978,10 @@ private:
                     // It must hold done_mtx_ (the same mutex the caller's
                     // predicate-wait runs under) so the notify can never fall in
                     // the caller's pred-check -> condvar-wait window (lost wakeup).
+                    // Guard on the live generation: a late decrement for a call
+                    // whose barrier already returned must not hit the next call's
+                    // countdown.
+                    if (current_gen_.load(std::memory_order_acquire) != gen) continue;
                     if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         std::lock_guard<std::mutex> gl(done_mtx_);
                         done_cv_.notify_all();
@@ -927,14 +993,26 @@ private:
                 // the authoritative live range.
                 {
                     std::function<void(size_t)> nt;
-                    size_t nn, ns; uint64_t ng;
+                    size_t nn, ns; uint64_t ng; bool live_sharded;
                     {
                         std::lock_guard<std::mutex> lk(work_mtx_);
                         if (stop_) return;
                         ng = current_gen_.load();
+                        live_sharded = (sharded_call_ > 0);
                         nt = task_;
                         nn = n_;
                         ns = start_;
+                    }
+                    // The live call may be SHARDED: its jobs are claimed from the
+                    // per-node counters and `task_` is stale, so executing the flat
+                    // task here would run the wrong function and still decrement
+                    // the sharded call's remaining_ (dropping its real jobs).
+                    // Re-arm instead: the outer loop re-anchors with `sharded`
+                    // read correctly.
+                    if (live_sharded) {
+                        my_last_gen = ng;
+                        worker_gen_[w].store(ng, std::memory_order_release);
+                        break;
                     }
                     gen = ng;
                     my_last_gen = ng;
@@ -950,7 +1028,9 @@ private:
                     if (diag_active()) proc_vec_[i] = 1;
                     // Lock-protected notify (same reasoning as the fast path): hold
                     // done_mtx_ so the completion notify can't be missed by the
-                    // caller's pred-check -> condvar-wait transition.
+                    // caller's pred-check -> condvar-wait transition. Guarded on the
+                    // live generation like the fast path.
+                    if (current_gen_.load(std::memory_order_acquire) != gen) continue;
                     if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         std::lock_guard<std::mutex> gl(done_mtx_);
                         done_cv_.notify_all();
@@ -1007,6 +1087,10 @@ private:
     // >0: only ~this many workers may claim tickets in the current call (0 = all).
     std::atomic<size_t> worker_limit_{0};
     std::atomic<size_t> dropped_{0};  // diagnostic: tickets dropped (future-gap)
+    std::atomic<size_t> ready_{0};    // workers that reached their loop
+    // diagnostic: per-(node, local job) execution counts for sharded calls
+    static constexpr size_t kShardDiagStride = 4096;
+    std::vector<uint32_t> shard_cnt_;
     std::vector<unsigned char> proc_vec_;  // diagnostic processed-bitset
     // per-worker completion slots: worker[w] writes only worker_gen_[w].
     std::unique_ptr<std::atomic<uint64_t>[]> worker_gen_;

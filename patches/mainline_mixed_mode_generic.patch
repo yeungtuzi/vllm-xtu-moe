@@ -76,10 +76,14 @@ index 5d3212a..c322711 100644
 +            w2,
 +            w13_scale,
 +            w2_scale,
++            w13_g_idx,
++            w2_g_idx,
++            None,  # w13_g_idx_sort_indices
++            None,  # w2_g_idx_sort_indices
 +            w13_zeros,
 +            w2_zeros,
-+            w13_input_global_scale,
-+            w2_input_global_scale,
++            None,  # w13_input_global_scale
++            None,  # w2_input_global_scale
 +            w13_bias,
 +            w2_bias,
 +        )

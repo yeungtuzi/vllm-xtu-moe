@@ -627,14 +627,17 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
 // pybind11 can register MXFP4 and NVFP4 (which share the E2M1 LUT) as separate
 // classes (pybind11 keys registered classes by C++ typeid).
 struct MXFP4Tag;  // forward decl so the base can detect the fast FP4 path
-template <const float (&LUT)[16], typename Tag = void, bool E8M0 = false>
+template <const float (&LUT)[16], typename Tag = void, bool E8M0 = false,
+          bool FastFP4 = true>
 struct Packed4WeightTraitsBase
-    : WeightTraitsBase<Packed4WeightTraitsBase<LUT, Tag, E8M0>> {
+    : WeightTraitsBase<Packed4WeightTraitsBase<LUT, Tag, E8M0, FastFP4>> {
     static constexpr bool kE8M0 = E8M0;   // scale stored as 1-byte e8m0 vs fp32
     // FAST path only for the FP4 E2M1 LUT (MXFP4/NVFP4), where dequant reduces to
     // mag[nib&7]*sign and avoids the slow gather. WNA16's INT4_CENTER8 table does
-    // not decompose that way and keeps the general gather path.
-    static constexpr bool kFastFP4 = true;
+    // not decompose that way and keeps the general gather path -- it MUST pass
+    // FastFP4=false, otherwise the cross-parity fallback decodes its nibbles with
+    // the E2M1 table and silently produces wrong weights.
+    static constexpr bool kFastFP4 = FastFP4;
     // This trait can split the N (row) dimension of each GEMV across worker
     // threads (ktransformers `split_range_n`). Requires the *_slice_impl below.
     static constexpr bool kNParallel = true;
@@ -833,8 +836,10 @@ struct MXFP4Tag {};
 using MXFP4WeightTraits = Packed4WeightTraitsBase<packed4::E2M1, MXFP4Tag, true>;
 
 // WNA16: int4 weights (LUT centered at 8), fp32 per-group scales, no global scale.
+// FastFP4=false: the E2M1 fast decode does not apply to the center-8 table.
 struct WNA16Tag {};
-using WNA16WeightTraits = Packed4WeightTraitsBase<packed4::INT4_CENTER8, WNA16Tag>;
+using WNA16WeightTraits =
+    Packed4WeightTraitsBase<packed4::INT4_CENTER8, WNA16Tag, false, false>;
 
 // NVFP4: FP4 E2M1 weights (same nibble layout as MXFP4), fp32 per-group scales
 // PLUS a per-expert global scale. groupK is 32 when fed by vLLM.
