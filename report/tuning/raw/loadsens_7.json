@@ -1,0 +1,43 @@
+{
+ "summary": {
+  "ts": "2026-09-10T21:18:56",
+  "tag": "loadsens_7",
+  "server_tag": "nat_k5",
+  "natural_text": 1,
+  "client": "bench_nat_client",
+  "concurrency": 1,
+  "num_prompts": 1,
+  "output_len": 48,
+  "input_len": "nat128",
+  "completed": 1,
+  "failed": 0,
+  "duration_s": 6.49,
+  "total_output_tokens": 48,
+  "out_tok_per_s": 7.39,
+  "per_stream_tok_per_s": 7.39,
+  "mean_ttft_ms": 1688.3,
+  "mean_tpot_ms": 100.08,
+  "mean_step_ms": 208.86,
+  "p95_step_ms": 234.34,
+  "mean_tokens_per_step": 2.0,
+  "per_req_tok_per_s": [
+   9.99
+  ]
+ },
+ "requests": [
+  {
+   "idx": 0,
+   "ttft_ms": 1688.2907934486866,
+   "n_out": 48,
+   "n_steps": 24,
+   "tokens_per_step": 2.0,
+   "e2e_s": 6.492011411115527,
+   "decode_s": 4.8037206176668406,
+   "mean_step_ms": 208.85513552828974,
+   "mean_itl_ms": 100.07751286805917,
+   "p50_step_ms": 200.14583505690098,
+   "p95_step_ms": 234.33783650398254,
+   "tok_per_s": 9.992254716785242
+  }
+ ]
+}

@@ -556,3 +556,74 @@ vllm serve <CKPT> --tensor-parallel-size 1 --max-model-len 262144   --max-num-se
 ```
 
 > 与 lk-moe 生产(双卡 + 投机解码)同形对比:我们**单卡 106.15 tok/s > 他们双卡 105.74 total**。
+
+---
+
+## 16. ⛔ 单路延迟的天花板:机器的实际内存带宽(2026-09-10 21:xx 复测)
+
+**结论先行:当前机器条件下,单路 25 tok/s 做不到;限制来自"这台机器只能给 ~95–100 GB/s
+的 DRAM 读带宽",而解码每步要读 6.5 GB 的专家权重。**
+
+### 16.1 目标场景的正确测法(先纠正两个测量错误)
+
+1. 旧基线用的是 sharegpt 的**短 prompt**(实测 21 token/条),不是目标场景;
+2. `--dataset-name random` 的随机 token 会把 draft 接受率从 0.67 打到 0.22;
+3. 自研客户端最初把 SSE chunk 当 token(vLLM 每步只发一个 chunk)⇒ 吞吐被低估 ~2.5×。
+
+现在用 `scripts/bench_nat_client.py` + `report/tuning/datasets/nat*.jsonl`
+(自然文本、精确上下文长度、`stream_options.include_usage` 计 token)重测。
+
+### 16.2 当前官方数字(单卡 256K + DSpark k=5 + CUDA graph + 192 线程)
+
+| 配置 | 单路 tok/s | 每步 ms | tokens/步 | 接受长度 |
+|---|---|---|---|---|
+| C=1,ctx 128 | **11.55** | 197 | 2.69 | 2.87–3.52 |
+| C=2,ctx 128 | 7.12/路(合计 14.24) | 339 | 2.87 | ~3.4 |
+| C=1,ctx 512 | 7.64 | 211 | 3.13 | — |
+| C=2,ctx 1024 | 5.33/路(合计 10.65) | 440 | 3.50 | — |
+
+- **接受率已经达标**(自然文本 2.87–3.52,生产的 k=5 水平是 3.01)⇒ 不是接受率的锅。
+- **上下文长度不是变量**:22/64/128/512/1024/4096 token 六档,每层 period 都是 4.1–4.7 ms。
+- 每步 C=1 197 ms、C=2 339 ms ⇒ 因为 MoE 要读的**不同专家数翻倍**,成本近似翻倍。
+
+### 16.3 为什么:机器带宽 + 必须读的字节数
+
+- 引擎每层要读 = **去重后活跃专家数 × 12.6 MB**(fp4,25.2 M 参数/专家);
+  随机路由下测 36 个不同专家(454 MB)⇒ 5.5–8.1 ms/层(=56–83 GB/s)。
+- 机器实测集计读带宽:**单线程 35 GB/s、24 线程 97 GB/s、192 线程 94–97 GB/s**
+  (历史报告 `process_data/decomp/NUMA_BANDWIDTH_CCD.md` 也量到 24 CCD 只有 73.7 GB/s)。
+  本机 24×64 GB DDR5-4800 理论 ~920 GB/s ⇒ **实际只有 ~10%**。
+- ⇒ 引擎已达节点带宽的 ~80%,**内核最多再榨 15%**;要大幅提升只能减少字节数。
+
+### 16.4 另一半成本:GPU 被"饿"在低频(可恢复,但需要 root)
+
+- 我们用的 GPU2 全程 **SM 765 MHz / 1410 MHz(利用率 14–21%,45 W/250 W)**:解码是
+  CPU 端 MoE 主导,GPU 空转 ⇒ 驱动不上频。
+- 后果:每层 `rest`(注意力/dense,GPU 侧)从早先的 **0.91 ms 涨到 2.1–3.1 ms**
+  ⇒ 每步多花 40–50 ms。
+- `nvidia-smi -i 2 -lgc 1410` **当前用户无权限**(需 root)。这是本机唯一"免费"的
+  40–50 ms/步。
+
+### 16.5 达标的算术与可行方向
+
+目标 25 tok/s/路 × 2.8 token/步 ⇒ 每步要 ≤ 105 ms。当前 197 ms 的构成:
+MoE 86–116 + 注意力/dense 39(满频)~90(当前频率)+ 采样/调度 ~25。
+
+| 方向 | 能省 | 代价/前提 |
+|---|---|---|
+| GPU 锁频到 1410 MHz | 40–50 ms/步 | **需要 root**(或让 GPU 持续有活干) |
+| 把热专家放 GPU(T55,按专家而非按层) | 按占比线性省 MoE | 要改 dispatch;3 张卡共 120 GB,HBM 2 TB/s |
+| 降非层开销(采样 3.6 ms×2、logits、调度) | ~10–15 ms/步 | 需要 profile 定位 |
+| 减小 k | 反效果 | dspark 训练块长=5,截断会让接受率崩塌(§36) |
+| 内核再优化 | ≤15% | 已贴带宽上限 |
+
+### 16.6 复现命令
+
+```bash
+SINGLECOPY=0 MODE=dsv4 TAG=nat_k5 PORT=8070 TP=1 MAXLEN=262144 SEQS=128 \
+  GPU_UTIL=0.85 KV_DTYPE=fp8_ds_mla KV_MEM_BYTES=8589934592 THREADS=192 OMP=96 \
+  EAGER=0 EP=0 GPUS=2 ENV_EXTRA="XIAOTU_CD_TIMING=1" scripts/tune_serve.sh
+L=128 C=1 N=4 OUT=128 TAG=mine scripts/bench_nat_client.py   # 或 scripts/run_nat_curve.sh
+```
+
+详见 `report/tuning/NOTES.md` §35–§38。
