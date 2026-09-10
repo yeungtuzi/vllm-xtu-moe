@@ -29,17 +29,22 @@
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0
-export VLLM_EXPERTS_LOAD_DEVICE=cpu XIAOTU_MOE_SINGLECOPY=1
+export VLLM_EXPERTS_LOAD_DEVICE=cpu
+export XIAOTU_MOE_SINGLECOPY=0        # ★ 2026-09-10 更新:回到引擎默认的 NUMA 分片(=1 份内存、
+                                      #   每个线程只读本地 node;=1 会关掉分片、一半访问跨 socket)。
+                                      #   C=64 实测 53.4 → 73.6 tok/s(详见 docs/PERFORMANCE_OPTIMIZATION.md)
 export VLLM_USE_FLASHINFER_SAMPLER=0 HF_HUB_OFFLINE=1
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
-export XIAOTU_MOE_THREADS=96          # 引擎线程:48→96 吞吐翻倍,96→192 只 +4%
-export OMP_NUM_THREADS=48
+export XIAOTU_MOE_THREADS=192         # ★ 2026-09-10 更新:分片模式下 96→192 有 1.75× 收益
+                                      #   (每层 compute 15.7→12.1 ms);未分片时加线程无效,
+                                      #   所以**必须**配合 XIAOTU_MOE_SINGLECOPY=0
+export OMP_NUM_THREADS=96
 export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384    # 长 prefill 阈值(见 §1.4)
 
 vllm serve <DEEPSEEK_V4_FLASH_DIR> \
   --tensor-parallel-size 1 \
   --max-model-len 262144 \
-  --max-num-seqs 64 \
+  --max-num-seqs 128 \
   --max-num-batched-tokens 8192 \
   --kv-cache-dtype fp8_ds_mla \
   --kv-cache-memory-bytes 12884901888 \

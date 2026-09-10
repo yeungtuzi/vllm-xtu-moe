@@ -46,6 +46,83 @@ _T: dict[str, float] = {"eng": 0.0, "calls": 0, "t0": time.perf_counter()}
 
 MODEL_ARCH = "DeepseekV4ForCausalLM"
 
+
+def gpu_resident_layers() -> set[int]:
+    """常驻 GPU 的专家层(`XIAOTU_MOE_GPU_RESIDENT_LAYERS`,逗号+区间,如 "0-4,10")。
+
+    这些层的专家权重**一次性**放进显存并常驻(不再每步走 CPU 引擎),因此它们
+    贡献 0 往返、0 DRAM 权重流量;剩下的层仍在 CPU。对齐 lk-moe 的
+    `LVLLM_GPU_RESIDENT_MOE_LAYERS`。默认空 = 全部走 CPU(与旧行为一致)。
+    """
+    spec = os.environ.get("XIAOTU_MOE_GPU_RESIDENT_LAYERS", "").strip()
+    if not spec:
+        return set()
+    out: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                a, b = part.split("-", 1)
+                out.update(range(int(a), int(b) + 1))
+            else:
+                out.add(int(part))
+        except ValueError:
+            continue
+    return out
+
+
+def ep_shm_enabled() -> bool:
+    """EP 部分和改走 /dev/shm 归约(默认开;`XIAOTU_MOE_EP_SHM=0` 关回 NCCL)。
+
+    两个 rank 在同一台机器上,跨 rank 求和用共享内存只需一次 memcpy + 两个自旋
+    barrier(几十 µs),而 GPU 的 NCCL all-reduce 实测每层要 +4~6.5 ms。
+    """
+    return os.environ.get("XIAOTU_MOE_EP_SHM", "1") != "0"
+
+
+_EP_SHM_FDS: list = []   # 保持 mmap/fd 存活
+
+
+def _ep_shm_attach(layer_idx: int, tokens: int, hidden: int, world: int):
+    """为某一层创建/打开跨 rank 共享的归约缓冲,返回 (mmap, stride_bytes)。
+
+    布局:[Header 128B][rank0 部分和 stride B][rank1 部分和 stride B ...]
+    Header 的前 64B 是两个 atomic(arrive/gen)与 read_done/gen2,由引擎侧解释;
+    这里只需要保证两个 rank 打开**同名文件**且大小一致。
+    """
+    import mmap
+
+    stride = (tokens * hidden * 4 + 63) // 64 * 64
+    total = 128 + stride * world
+    path = f"/dev/shm/xiaotu_ep_L{layer_idx}_{hidden}_{tokens}_{world}.bin"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.ftruncate(fd, total)
+        mm = mmap.mmap(fd, total, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    finally:
+        pass
+    _EP_SHM_FDS.append((fd, mm, path))
+    return mm, stride
+
+
+def ep_enabled() -> bool:
+    """Expert-parallel CPU decode for TP>1 (default on; `XIAOTU_MOE_EP=0` off).
+
+    Without it every rank runs the *full* CPU expert set on the same tokens
+    (redundant 2x work at TP=2), which is why TP=2 decode used to be slower than
+    single-card. With it each rank owns `E/tp` experts, masks the routing pairs
+    that belong to another rank (weight 0 -> the engine skips them, see
+    `forward_many`'s `weights[ai] != 0.f` filter), and the partial MoE outputs are
+    summed by one TP all-reduce.
+
+    Set `XIAOTU_MOE_REDUNDANT=1` to force the old redundant behaviour.
+    """
+    if os.environ.get("XIAOTU_MOE_REDUNDANT", "0") == "1":
+        return False
+    return os.environ.get("XIAOTU_MOE_EP", "1") != "0"
+
 # Layer-index -> MoE module, so layer L can prefetch layer L+1's GPU weights.
 _LAYERS: dict[int, "CpuXiaotuMoE"] = {}
 _PREBUILD_STARTED = False
@@ -318,6 +395,11 @@ class CpuXiaotuMoE(nn.Module):
             )
 
         # ---- 共享专家(GPU,小) — 复用主线 DeepseekV4MLP ----
+        # reduce_results 必须跟主线一致(主线 mega 模式传 self.use_mega_moe=True):
+        # RowParallelLinear 在 TP>1 时是**跨 rank 的中段分片**,reduce_results=False
+        # 返回的是未归约的局部和 —— TP=1 看不出来,TP=2 就会静默算错(缺另一个 rank
+        # 的那一半)。routed 部分由我们在 forward 里单独 all-reduce(EP),共享专家
+        # 在这里自归约,与主线的组合方式一致。
         if self.n_shared_experts:
             intermediate_size = (
                 config.moe_intermediate_size * self.n_shared_experts
@@ -328,7 +410,7 @@ class CpuXiaotuMoE(nn.Module):
                 hidden_act=config.hidden_act,
                 swiglu_limit=self.swiglu_limit,
                 quant_config=vllm_config.quant_config,
-                reduce_results=False,
+                reduce_results=True,
                 is_sequence_parallel=False,
                 prefix=f"{prefix}.shared_experts",
             )
@@ -346,6 +428,16 @@ class CpuXiaotuMoE(nn.Module):
         self._timing = os.environ.get("XIAOTU_TIMING") == "1"
         self._slot = None
         self._slot_device = None
+        # ---- GPU 常驻层(见 gpu_resident_layers()) ----
+        try:
+            self._gpu_resident = extract_layer_index(prefix) in gpu_resident_layers()
+        except Exception:
+            self._gpu_resident = False
+        self._resident_slot = None
+        # ---- expert parallelism state (see ep_enabled()) ----
+        self._ep = False
+        self._ep_start = 0
+        self._ep_local = int(self.n_routed_experts)
         try:
             _LAYERS[extract_layer_index(prefix)] = self
         except Exception:
@@ -379,8 +471,8 @@ class CpuXiaotuMoE(nn.Module):
 
     def prefetch_gpu_weights(self, device) -> None:
         """Async H2D of this layer's GPU weights (issued by the previous layer)."""
-        if self.engine is None:
-            return
+        if self.engine is None or self._gpu_resident:
+            return   # 常驻层权重已在显存,不需要 ping-pong 预取
         from vllm_xiaotu_moe.gpu_prefill import _pinned_kmajor, prefetch_layer
 
         w13, s13, w2, s2, _, _, _ = self._gpu_shard()
@@ -394,6 +486,9 @@ class CpuXiaotuMoE(nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         if self.engine is not None:
             return
+        if self._gpu_resident:
+            self._build_resident_slot()
+            return
         import xiaotu_moe
 
         ex = self.experts
@@ -401,6 +496,37 @@ class CpuXiaotuMoE(nn.Module):
         w2 = ex.w2_weight.detach()
         s13 = ex.w13_weight_scale.detach()
         s2 = ex.w2_weight_scale.detach()
+
+        # ---- expert parallelism: this rank's engine holds only its shard ----
+        # The CPU weights are still the FULL set on every rank (the mainline
+        # loader is told tp_size=1 for this module), so slicing is a pure pointer
+        # offset: the engine copies `expert_num` experts out of the given base
+        # pointer, and the slice keeps dim-0 contiguity.
+        tp = 1
+        if ep_enabled():
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            tp = int(get_tensor_model_parallel_world_size())
+            if tp > 1:
+                rank = int(get_tensor_model_parallel_rank())
+                E = int(w13.shape[0])
+                L = E // tp
+                st = rank * L
+                w13 = w13[st:st + L].contiguous()
+                w2 = w2[st:st + L].contiguous()
+                s13 = s13[st:st + L].contiguous()
+                s2 = s2[st:st + L].contiguous()
+                self._ep = True
+                self._ep_start = st
+                self._ep_local = L
+                print(
+                    f"[xiaotu] EP {self.prefix}: rank {rank}/{tp} owns experts "
+                    f"[{st}, {st + L}) of {E}",
+                    flush=True,
+                )
 
         cfg = xiaotu_moe.MOEConfigV2()
         cfg.num_processes = 1
@@ -454,12 +580,79 @@ class CpuXiaotuMoE(nn.Module):
             s13.data_ptr(), s2.data_ptr(),
             0, 0,
         )
+        # CUDA graph 安全:在**捕获之前**把 pinned 缓冲按最大捕获尺寸预分配好。
+        # 捕获期间任何 cudaHostAlloc/cudaFreeHost 都会让 capture 失效
+        # (实测:cudaErrorStreamCaptureInvalidated → 引擎初始化直接失败),
+        # 所以这里一次性分配,稳态不再扩容;prefill 若需要更大缓冲会在
+        # 非捕获路径上扩容(那时 sync+free 是合法的)。
+        # ---- EP:部分和走共享内存(替代每层一次 NCCL all-reduce) ----
+        self._ep_shm_tokens = 0
+        if self._ep and ep_shm_enabled() and hasattr(self.engine, "configure_ep"):
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            _world = int(get_tensor_model_parallel_world_size())
+            _rank = int(get_tensor_model_parallel_rank())
+            # 覆盖 CPU 路径可能出现的最大 qlen:GPU prefill 阈值以上走 GPU 通路,
+            # 所以这里取 max(预分配, 阈值) 即可(两者都可由环境变量调整)。
+            _toks = int(os.environ.get("XIAOTU_MOE_EP_SHM_TOKENS", "1024"))
+            if _world > 1:
+                _mm, _stride = _ep_shm_attach(
+                    extract_layer_index(self.prefix), _toks, self.hidden_size, _world
+                )
+                self.engine.configure_ep(_rank, _world, _mm, _stride)
+                self._ep_shm_tokens = _toks
+                self._ep_shm_mm = _mm
+                print(
+                    f"[xiaotu] EP-shm {self.prefix}: rank {_rank}/{_world} "
+                    f"stride={_stride} tokens={_toks}",
+                    flush=True,
+                )
+        _pre = int(os.environ.get("XIAOTU_CD_PREALLOC_TOKENS", "512"))
+        if hasattr(self.engine, "prepare_decode_buffers"):
+            try:
+                self.engine.prepare_decode_buffers(max(1, _pre), self.top_k)
+            except Exception as _e:  # 老 .so 没有该方法时静默跳过
+                print(f"[xiaotu] prepare_decode_buffers skipped: {_e}", flush=True)
         # 引擎持有这些参数的内存(达 data_ptr),必须防被替换/释放。
         self._w13, self._w2 = w13, w2
         self._s13, self._s2 = s13, s2
         del w13, w2, s13, s2
         print(f"[xiaotu] engine built {self.prefix} "
               f"E={self.n_routed_experts} topk={self.top_k}", flush=True)
+
+    def _build_resident_slot(self) -> None:
+        """把本层(本 rank 分片)的专家权重一次性放进显存并常驻。
+
+        复用 gpu_prefill 的 K-major + PrefetchSlot 机制:`slot.bufs` 是设备缓冲,
+        这里用一次性阻塞 H2D 填好并记录 ready 事件,之后每次 forward 只需
+        `gpu_moe_layer(..., slot=self._resident_slot)`,不再有任何 H2D。
+        """
+        from vllm_xiaotu_moe.gpu_prefill import PrefetchSlot, _pinned_kmajor
+
+        dev = torch.device("cuda", torch.cuda.current_device())
+        w13, s13, w2, s2, st, L, tp = self._gpu_shard()
+        src = (
+            _pinned_kmajor(w13), _pinned_kmajor(s13),
+            _pinned_kmajor(w2), _pinned_kmajor(s2),
+        )
+        slot = PrefetchSlot()
+        slot.alloc(src, dev)
+        for buf, s_ in zip(slot.bufs, src):
+            buf.copy_(s_, non_blocking=False)
+        slot.ready = torch.cuda.Event()
+        slot.ready.record()
+        slot.busy = None
+        self._resident_slot = slot
+        self._slot_device = dev
+        gb = sum(b.numel() for b in slot.bufs) / 2**30
+        print(
+            f"[xiaotu] GPU-resident {self.prefix}: {gb:.2f} GiB on {dev} "
+            f"(tp={tp}, experts={L})",
+            flush=True,
+        )
 
     def build_engine(self):
         self.finalize_mega_moe_weights()
@@ -468,7 +661,10 @@ class CpuXiaotuMoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if self.engine is None:
+        if self._gpu_resident and self._resident_slot is not None:
+            # 常驻层:每步都在 GPU 上算,不需要阈值判断、不需要 CPU 引擎。
+            self._resident_forward_kwargs = True
+        if self.engine is None and not self._gpu_resident:
             # 结构前向退化(引擎未就绪):返回输入,保证模型可构造。
             return hidden_states
         if getattr(self.gate, "tid2eid", None) is not None and input_ids is None:
@@ -501,7 +697,8 @@ class CpuXiaotuMoE(nn.Module):
         # time), instead of the CPU engine. Activations already live on the GPU
         # (attention path), so only weights stream. Short prefills stay on CPU.
         _gp_min = gpu_prefill_min_tokens()
-        if (
+        _resident = self._gpu_resident and self._resident_slot is not None
+        if _resident or (
             _gp_min > 0
             and qlen >= _gp_min
             and not torch.cuda.is_current_stream_capturing()
@@ -511,8 +708,9 @@ class CpuXiaotuMoE(nn.Module):
 
             # Overlap: kick off the NEXT layer's H2D before doing this layer's
             # kernels, so the DMA runs concurrently with the tensor cores.
-            _ov = os.environ.get("XIAOTU_GPU_PREFETCH_AHEAD", "1") == "1"
-            _start_pinned_prebuild()
+            _ov = (not _resident) and os.environ.get("XIAOTU_GPU_PREFETCH_AHEAD", "1") == "1"
+            if not _resident:
+                _start_pinned_prebuild()
             if os.environ.get("XIAOTU_DEBUG_QLEN") == "1":
                 # Diagnostic: shows how the scheduler batches (one entry per MoE
                 # forward). Used to explain why concurrent requests do not share
@@ -537,7 +735,11 @@ class CpuXiaotuMoE(nn.Module):
             if _nvtx:
                 torch.cuda.nvtx.range_push("xiaotu_moe")
             w13, s13, w2, s2, st, L, tp = self._gpu_shard()
-            slot = self._slot if _ov else None
+            if _resident:
+                slot = self._resident_slot
+                w13, s13, w2, s2 = slot.bufs  # 已在显存(K-major),不需再传 host 张量
+            else:
+                slot = self._slot if _ov else None
             self._slot = None
             if tp > 1:
                 # Expert-parallel: remap to the local shard, then all-reduce the
@@ -580,8 +782,22 @@ class CpuXiaotuMoE(nn.Module):
         # 引擎 binding 的指针提取只认 numpy 数组或整数 data_ptr()(对 torch 张量返回
         # nullptr → cudaMemcpyAsync(nullptr) → invalid argument),故传 data_ptr()。
         h_bf16 = hidden_states.to(torch.bfloat16)
-        ids_i32 = topk_ids.to(torch.int32)
-        wts_f32 = topk_weights.to(torch.float32)
+        if self._ep:
+            # Expert-parallel: this rank only owns experts [st, st+L). Pairs that
+            # belong to another rank get weight 0 — the engine's assignment scan
+            # (`weights[ai] != 0.f`) drops them, so they cost nothing — and their
+            # id is remapped into the local range so it can never index OOB.
+            _st, _L = self._ep_start, self._ep_local
+            ids_i32 = (topk_ids - _st).clamp_(0, _L - 1).to(torch.int32)
+            _in = (topk_ids >= _st) & (topk_ids < _st + _L)
+            wts_f32 = torch.where(
+                _in,
+                topk_weights,
+                torch.zeros((), dtype=topk_weights.dtype, device=topk_weights.device),
+            ).to(torch.float32)
+        else:
+            ids_i32 = topk_ids.to(torch.int32)
+            wts_f32 = topk_weights.to(torch.float32)
         _t0 = time.perf_counter() if self._timing else 0.0
         self.engine.cpu_decode(
             stream.cuda_stream, qlen, self.top_k,
@@ -608,6 +824,16 @@ class CpuXiaotuMoE(nn.Module):
                 _T["eng"] = 0.0
                 _T["t0"] = _now
         final_hidden_states = out.to(hidden_states.dtype)
+        # EP 的跨 rank 求和:默认已在引擎的 host 回调里用 /dev/shm 完成
+        # (`XIAOTU_MOE_EP_SHM=1`,qlen ≤ _ep_shm_tokens 时);只有超出该容量
+        # (极长 prefill 走 CPU 路径)才回退到 NCCL all-reduce。
+        _need_allreduce = self._ep and qlen > self._ep_shm_tokens
+        if _need_allreduce:
+            from vllm.distributed import tensor_model_parallel_all_reduce
+
+            final_hidden_states = tensor_model_parallel_all_reduce(
+                final_hidden_states
+            )
         if os.environ.get("XIAOTU_DEBUG_L1") == "1":
             nz = (final_hidden_states != 0).sum().item()
             nn = final_hidden_states.numel()

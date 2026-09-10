@@ -1,0 +1,7 @@
+[
+ {"id":"cap_fr","messages":[{"role":"user","content":"What is the capital of France? Answer in one word."}],"max_tokens":16},
+ {"id":"math","messages":[{"role":"user","content":"Compute 17*23+19. Show only the final number."}],"max_tokens":24},
+ {"id":"code","messages":[{"role":"user","content":"Write a Python one-liner that returns the sum of squares of 1..10."}],"max_tokens":48},
+ {"id":"zh","messages":[{"role":"user","content":"用一句话解释什么是混合专家模型(MoE)。"}],"max_tokens":48},
+ {"id":"list","messages":[{"role":"user","content":"List the first 8 prime numbers separated by commas."}],"max_tokens":32}
+]

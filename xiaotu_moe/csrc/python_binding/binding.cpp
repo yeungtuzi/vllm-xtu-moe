@@ -25,6 +25,14 @@
 #include <sys/ucontext.h>
 
 #include <cuda_runtime.h>
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
+#include <algorithm>
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -71,33 +79,29 @@ struct CpuDecodeState {
     size_t out_bytes = 0;
     void (*host_fn)(void*) = nullptr;
 
+    // 捕获期间不能 free 的旧 pinned 缓冲:graph 节点可能仍引用它们。
+    std::vector<void*> retired;
+
     // 返回 true 表示发生了重新分配(旧 pinned 指针失效)。
-    bool ensure_buffers(size_t nh, size_t ni, size_t nw, size_t no) {
+    // retire=true(CUDA graph capture 期间)时只解除引用、不 cudaFreeHost ——
+    // 捕获中既不允许 cudaStreamSynchronize,也不允许释放被 graph 节点引用的内存。
+    bool ensure_buffers(size_t nh, size_t ni, size_t nw, size_t no, bool retire = false) {
         bool realloc = false;
-        if (nh > cap_hidden) {
-            if (pin_hidden) cudaFreeHost(pin_hidden);
-            cudaHostAlloc(&pin_hidden, nh, cudaHostAllocDefault);
-            cap_hidden = nh;
+        auto grow = [&](void*& p, size_t& cap, size_t need) {
+            if (need <= cap) return;
+            if (p) {
+                if (retire) retired.push_back(p);
+                else cudaFreeHost(p);
+            }
+            p = nullptr;
+            cudaHostAlloc(&p, need, cudaHostAllocDefault);
+            cap = need;
             realloc = true;
-        }
-        if (ni > cap_ids) {
-            if (pin_ids) cudaFreeHost(pin_ids);
-            cudaHostAlloc(&pin_ids, ni, cudaHostAllocDefault);
-            cap_ids = ni;
-            realloc = true;
-        }
-        if (nw > cap_weights) {
-            if (pin_weights) cudaFreeHost(pin_weights);
-            cudaHostAlloc(&pin_weights, nw, cudaHostAllocDefault);
-            cap_weights = nw;
-            realloc = true;
-        }
-        if (no > cap_out) {
-            if (pin_out) cudaFreeHost(pin_out);
-            cudaHostAlloc(&pin_out, no, cudaHostAllocDefault);
-            cap_out = no;
-            realloc = true;
-        }
+        };
+        grow(pin_hidden, cap_hidden, nh);
+        grow(pin_ids, cap_ids, ni);
+        grow(pin_weights, cap_weights, nw);
+        grow(pin_out, cap_out, no);
         return realloc;
     }
 
@@ -106,8 +110,38 @@ struct CpuDecodeState {
         if (pin_ids) cudaFreeHost(pin_ids);
         if (pin_weights) cudaFreeHost(pin_weights);
         if (pin_out) cudaFreeHost(pin_out);
+        for (void* p : retired) cudaFreeHost(p);
     }
 };
+
+// ---- EP(专家并行)跨 rank 归约:走共享内存,不进 GPU -----------------------
+// 背景:TP=2 时每个 rank 只算自己那半专家,部分和必须相加。用 GPU 的 NCCL
+// all-reduce 是每层一次跨卡集合通信(实测每层 +4~6.5 ms);而两个 rank 在**同一台
+// 机器**上,完全可以用 /dev/shm 直接交换 —— 一次 memcpy + 两个自旋 barrier,
+// 量级是几十 µs。参考实现(lk-moe)也是把 num_processes=ep_size 交给引擎内部合并。
+//
+// 布局(每个引擎/每层一个文件,由插件按层名创建):
+//   [EpShmHeader(64B)][rank0 部分和: stride B][rank1 部分和: stride B]
+struct EpShmHeader {
+    alignas(64) std::atomic<int> arrive{0};
+    std::atomic<unsigned long long> gen{0};
+    alignas(64) std::atomic<int> read_done{0};
+    std::atomic<unsigned long long> gen2{0};
+    alignas(64) int world{1};
+    int rank{0};
+    unsigned long long cap_bytes{0};
+};
+
+struct EpShmState {
+    EpShmHeader* hdr = nullptr;
+    char* parts = nullptr;       // 指向 [rank0][rank1] 部分和区
+    float* partial_copy = nullptr;  // 本 rank 的部分和暂存(malloc 的对齐缓冲)
+    int world = 1, rank = 0;
+    size_t capacity = 0;         // partial_copy 容量(字节)
+};
+
+std::mutex g_ep_mtx;
+std::unordered_map<const void*, std::unique_ptr<EpShmState>> g_ep_state;
 
 // Map engine pointer -> its pinned buffers / host-fn context. Keyed by the
 // MOE* identity; every MOE instance across every type has a unique address, so
@@ -200,6 +234,59 @@ static void bind_moe_class(py::module& m, const char* name) {
         }), py::arg("cfg"), py::arg("w13_weight"), py::arg("w2_weight"),
             py::arg("w13_scale") = py::int_(0), py::arg("w2_scale") = py::int_(0),
             py::arg("w13_global_scale") = py::int_(0), py::arg("w2_global_scale") = py::int_(0))
+        // 配置 EP 共享内存归约(插件在引擎建好后调用一次)。
+        //   shm: /dev/shm 里 mmap 的基址(两个 rank 同一文件,必须同一虚拟地址首选,
+        //        否则用相对偏移即可 —— 这里要求调用方传入**相同的映射偏移**语义:
+        //        我们只使用 (char*)shm + 64 + rank*stride 的偏移,不依赖绝对地址相等)
+        .def("configure_ep", [](MOE& self, int rank, int world,
+                                py::object shm, unsigned long long stride) {
+            intptr_t base = 0;
+            if (py::isinstance<py::int_>(shm)) {
+                base = py::cast<intptr_t>(shm);
+            } else {
+                PyObject* buf = shm.ptr();
+                if (PyObject_CheckBuffer(buf)) {
+                    Py_buffer view{};
+                    if (PyObject_GetBuffer(buf, &view, PyBUF_SIMPLE) == 0) {
+                        base = reinterpret_cast<intptr_t>(view.buf);
+                        PyBuffer_Release(&view);
+                    }
+                }
+            }
+            if (base == 0 || world < 2 || rank < 0 || rank >= world) return;
+            std::lock_guard<std::mutex> lg(g_ep_mtx);
+            auto& ep = g_ep_state[&self];
+            if (!ep) ep = std::make_unique<EpShmState>();
+            ep->hdr = reinterpret_cast<EpShmHeader*>(base);
+            ep->parts = reinterpret_cast<char*>(base) + sizeof(EpShmHeader);
+            ep->world = world;
+            ep->rank = rank;
+            ep->capacity = (size_t)stride;
+            ep->hdr->world = world;
+            ep->partial_copy =
+                (float*)std::aligned_alloc(64, ((size_t)stride + 63) / 64 * 64);
+        }, py::arg("rank"), py::arg("world"), py::arg("shm"), py::arg("stride"))
+        .def("ep_enabled", [](MOE& self) {
+            std::lock_guard<std::mutex> lg(g_ep_mtx);
+            auto it = g_ep_state.find(&self);
+            return it != g_ep_state.end() && it->second && it->second->world > 1;
+        })
+        // 显式预分配 pinned 缓冲(必须在 CUDA graph capture **之前**调用)。
+        // 捕获期间调用 cudaHostAlloc/cudaFreeHost 都会让 capture 失效
+        // (实测:cudaErrorStreamCaptureInvalidated → PyTorch CUDACachingAllocator
+        //  断言失败、引擎初始化直接失败)。所以插件在引擎建好后就用
+        // 捕获尺寸上限预分配一次,之后稳态永不扩容。
+        .def("prepare_decode_buffers", [](MOE& self, int max_qlen, int top_k) {
+            const int H = self.config().hidden_size;
+            if (max_qlen <= 0 || top_k <= 0 || H <= 0) return;
+            std::lock_guard<std::mutex> lg(g_cd_mtx);
+            auto& st = g_cd_state[&self];
+            if (!st) st = std::make_unique<CpuDecodeState>();
+            st->ensure_buffers((size_t)max_qlen * H * sizeof(uint16_t),
+                               (size_t)max_qlen * top_k * sizeof(uint32_t),
+                               (size_t)max_qlen * top_k * sizeof(float),
+                               (size_t)max_qlen * H * sizeof(float), false);
+        }, py::arg("max_qlen"), py::arg("top_k"))
         .def("cpu_decode", [](MOE& self,
                               py::object stream_obj,
                               int qlen, int top_k,
@@ -233,15 +320,25 @@ static void bind_moe_class(py::module& m, const char* name) {
             const size_t nw = (size_t)qlen * top_k * sizeof(float);
             const size_t no = (size_t)qlen * H * sizeof(float);
 
+            // 先取 capture 状态:捕获期间 cudaStreamSynchronize 会返回
+            // "operation not permitted when stream is capturing"(实测会让引擎初始化失败),
+            // 且不允许释放被 graph 节点引用的 pinned 缓冲。
+            cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s, &cap_status);
+            const bool capturing = (cap_status != cudaStreamCaptureStatusNone);
+
             std::lock_guard<std::mutex> lg(g_cd_mtx);
             auto& st = g_cd_state[&self];
             if (!st) st = std::make_unique<CpuDecodeState>();
-            if (st->ensure_buffers(nh, ni, nw, no)) {
+            if (st->ensure_buffers(nh, ni, nw, no, capturing)) {
                 // 重新分配了 pinned 缓冲:旧的缓冲可能还有 pending 的回调在读,
                 // 先排空该 stream 再继续(只在缓冲区增长时发生,稳态下不会触发)。
-                cudaError_t es = cudaStreamSynchronize(s);
-                if (es != cudaSuccess)
-                    fprintf(stderr, "[cd] streamSync err=%s\n", cudaGetErrorString(es));
+                // 捕获期间改用"退役不释放",不做同步。
+                if (!capturing) {
+                    cudaError_t es = cudaStreamSynchronize(s);
+                    if (es != cudaSuccess)
+                        fprintf(stderr, "[cd] streamSync err=%s\n", cudaGetErrorString(es));
+                }
             }
 
             st->stream = s;
@@ -283,9 +380,6 @@ static void bind_moe_class(py::module& m, const char* name) {
                 float* out;
                 bool graph_owned;   // true: 由 graph 节点持有,回调不得释放
             };
-            cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
-            cudaStreamIsCapturing(s, &cap_status);
-            const bool capturing = (cap_status != cudaStreamCaptureStatusNone);
             auto* call = new CpuDecodeCall{
                 &self, qlen, top_k,
                 (const uint16_t*)st->pin_hidden,
@@ -315,8 +409,101 @@ static void bind_moe_class(py::module& m, const char* name) {
                 const uint32_t* ids = c->ids;
                 const float* wts = c->wts;
                 float* out = c->out;
+                // ---- per-layer segmentation (XIAOTU_CD_TIMING=1) -------------
+                // period = callback-entry to callback-entry: the TRUE serialized
+                // per-layer time (the decode path is a strict layer-by-layer
+                // chain GPU -> D2H -> CPU -> H2D -> GPU). compute = the CPU MoE
+                // itself. period - compute = GPU work + copies + host-fn
+                // dispatch latency, i.e. the part a GPU-resident layer removes.
+                static const bool timing = std::getenv("XIAOTU_CD_TIMING") != nullptr;
+                static const int every = [] {
+                    const char* e = std::getenv("XIAOTU_CD_TIMING_EVERY");
+                    return e ? std::atoi(e) : 43;
+                }();
+                static double sum_compute = 0, sum_period = 0, sum_wait = 0;
+                static int n = 0;
+                static auto last_cb = std::chrono::steady_clock::now();
+                auto t_cb = std::chrono::steady_clock::now();
                 if (c->graph_owned) c.release();   // graph 还会再 replay 它
                 engine->forward_many(qlen, k, ids, wts, hid, out);
+                // ---- EP:把本 rank 的部分和与对端相加(共享内存,不进 GPU) ----
+                {
+                    EpShmState* ep = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lg(g_ep_mtx);
+                        auto it = g_ep_state.find(engine);
+                        if (it != g_ep_state.end()) ep = it->second.get();
+                    }
+                    if (ep && ep->hdr && ep->world > 1) {
+                        const size_t bytes = (size_t)qlen * (size_t)engine->config().hidden_size
+                                             * sizeof(float);
+                        if (bytes <= ep->capacity) {
+                            EpShmHeader* h = ep->hdr;
+                            // 1) 写自己的部分和(写进 shm 中本 rank 的槽位)
+                            std::memcpy(ep->parts + (size_t)ep->rank * ep->capacity,
+                                        out, bytes);
+                            // 2) 到达 barrier:最后一个到达者复位计数并推进 gen
+                            const unsigned long long gen =
+                                h->gen.load(std::memory_order_acquire);
+                            if (h->arrive.fetch_add(1, std::memory_order_acq_rel) + 1
+                                == ep->world) {
+                                h->arrive.store(0, std::memory_order_release);
+                                h->gen.fetch_add(1, std::memory_order_release);
+                            } else {
+                                while (h->gen.load(std::memory_order_acquire) == gen) {
+                                    std::this_thread::yield();
+                                }
+                            }
+                            // 3) 求和到自己的 pinned out(H2D 会把它送回 GPU)
+                            //    通用 world(=TP 大小,2 或 3)个部分和相加
+                            const float* base = (const float*)ep->parts;
+                            const size_t stride_f = ep->capacity / sizeof(float);
+                            const size_t n = bytes / sizeof(float);
+                            for (size_t i = 0; i < n; ++i) {
+                                float acc = base[i];
+                                for (int r = 1; r < ep->world; ++r)
+                                    acc += base[(size_t)r * stride_f + i];
+                                out[i] = acc;
+                            }
+                            // 4) 读完成 barrier:确保双方都读完再允许下一轮覆写
+                            const unsigned long long g2 =
+                                h->gen2.load(std::memory_order_acquire);
+                            if (h->read_done.fetch_add(1, std::memory_order_acq_rel) + 1
+                                == ep->world) {
+                                h->read_done.store(0, std::memory_order_release);
+                                h->gen2.fetch_add(1, std::memory_order_release);
+                            } else {
+                                while (h->gen2.load(std::memory_order_acquire) == g2) {
+                                    std::this_thread::yield();
+                                }
+                            }
+                        }
+                    }
+                }
+                if (timing) {
+                    auto t_end = std::chrono::steady_clock::now();
+                    const double compute_ms =
+                        std::chrono::duration<double, std::milli>(t_end - t_cb).count();
+                    const double period_ms =
+                        std::chrono::duration<double, std::milli>(t_cb - last_cb).count();
+                    last_cb = t_cb;
+                    sum_compute += compute_ms;
+                    sum_period += period_ms;
+                    sum_wait += period_ms - compute_ms;
+                    if (++n % every == 0) {
+                        fprintf(stderr,
+                                "[cd-timing] layers=%d qlen=%d k=%d "
+                                "period=%.2fms compute=%.2fms rest=%.2fms "
+                                "(compute %.0f%%, rest %.0f%%)\n",
+                                every, qlen, k,
+                                sum_period / every, sum_compute / every,
+                                sum_wait / every,
+                                100.0 * sum_compute / std::max(1e-9, sum_period),
+                                100.0 * sum_wait / std::max(1e-9, sum_period));
+                        fflush(stderr);
+                        sum_compute = sum_period = sum_wait = 0.0;
+                    }
+                }
             };
             cudaLaunchHostFunc(s, st->host_fn, call);
             if (std::getenv("XIAOTU_CD_ERRCHECK")) {

@@ -396,6 +396,16 @@ public:
                 nshard_ = 0;  // skip shard + socket-replica; else-branch copies once
             } else if (std::getenv("XIAOTU_MOE_NOSHARD") == nullptr) {
                 nshard_ = numa_node_count();
+                // XIAOTU_MOE_NSHARD=N 覆盖分片数。本机 NPS=4 ⇒ numa_node_count()=8,
+                // 但 ACPI 距离矩阵显示**同 socket 内 10/12/12/12、跨 socket 32**:
+                // 真正的局部性边界是 socket,不是 NUMA node。NPS=1(BIOS)时
+                // numa_node_count()=2 会自动得到同样的效果;在不能重启的机器上
+                // 用 NSHARD=2 等价地得到"每个 socket 一份 1/2 分片、1 份权重"。
+                // 分片越细 ⇒ 每片的线程数越少(nthreads/NS),node 内并行不足。
+                if (const char* _ns = std::getenv("XIAOTU_MOE_NSHARD")) {
+                    const int v = std::atoi(_ns);
+                    if (v >= 2) nshard_ = v;
+                }
                 const int NS = nshard_;
                 if (NS >= 2 && (I % NS == 0) && (H % NS == 0)) {
                     w13_shard_.assign((size_t)NS, nullptr);

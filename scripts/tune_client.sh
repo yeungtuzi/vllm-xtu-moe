@@ -30,7 +30,10 @@ TAG="${TAG:-${MODEL}_c${C}_n${N}_out${OUT}_$(date +%H%M%S)}"
 SERVER_TAG="${SERVER_TAG:-unknown}"
 IN_LEN="${IN_LEN:-}"
 DATASET="${DATASET:-/home/user/lvllm/ShareGPT_V3_unfiltered_cleaned_split.json}"
-TOKENIZER="${TOKENIZER:-}"
+# 本地 tokenizer 目录:`vllm bench serve` 只认路径或能联网解析的名字,而本机
+# HF_HUB_OFFLINE=1 ⇒ **必须**传本地目录,否则报 "couldn't connect to huggingface.co"。
+# DS-V4 默认用 0731 快照;Qwen3.8 等其它模型由调用方覆盖 TOKENIZER= 或 MODEL_DIR=。
+TOKENIZER="${TOKENIZER:-${MODEL_DIR:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master}}"
 export HF_HUB_OFFLINE=1
 export PATH=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin:$PATH
 

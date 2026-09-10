@@ -63,7 +63,15 @@ esac
 
 export CUDA_VISIBLE_DEVICES="$GPUS"
 export VLLM_EXPERTS_LOAD_DEVICE=cpu
-export XIAOTU_MOE_SINGLECOPY="${XIAOTU_MOE_SINGLECOPY:-1}"
+# 引擎的三种权重布局(见 moe_v2.hpp:384):
+#   (未设) 默认 = NUMA 分片:1 份权重 + 每个线程只读本节点的行(全部 page-local)
+#   XIAOTU_MOE_SINGLECOPY=1 = 单份连续拷贝、无分片(省内存,但一半访问跨 socket)
+#   XIAOTU_MOE_NOSHARD=1(配合 SINGLECOPY 未设) = 每 socket 一份副本(内存 ×2)
+# SINGLECOPY=0 表示"明确不要单拷贝",即回到默认的 NUMA 分片模式。
+case "${XIAOTU_MOE_SINGLECOPY:-1}" in
+  0|no|off) unset XIAOTU_MOE_SINGLECOPY ;;
+  *) export XIAOTU_MOE_SINGLECOPY="${XIAOTU_MOE_SINGLECOPY:-1}" ;;
+esac
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 export HF_HUB_OFFLINE=1

@@ -88,6 +88,12 @@ n-gram 查找表放进主机内存(锁页 + UVA 访问,显存不占),显存只�
 **DeepSeek-V4-Flash 与 Qwen3.8-Flash-Next-FP8 的逐步使用指南 + 初步性能实测**见
 **[`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md)**。
 
+> **新模型提示**:**DeepSeek-V4.1-Flash**(748B,2026-09-10 发布)的资源账与可行性分析见
+> **[`docs/V41_FLASH_ANALYSIS.md`](docs/V41_FLASH_ANALYSIS.md)**:它的 38.5% 权重是**纯查找表**
+> (Engram,183 GiB,每 token 只需 ~12 KB 主机流量),官方生产栈也把这张表放在**主机内存**里
+> 用 RDMA 预取 —— 与本项目的 `XIAOTU_PLE_CPU=1` 思路一致;但整条模型(CED/CSA2/FP4 KV/DSpark)
+> 需要 vLLM 主线先支持 `deepseek_v41`,本插件只覆盖 MoE 层,无法独自提供。
+
 ## 工作原理(一句话版)
 
 ```
@@ -111,6 +117,8 @@ CPU:  routed experts 的权重与计算(xiaotu 引擎,AVX-512)
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | 安装、环境变量/参数、各模型运行命令、排错 |
 | [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) | **DeepSeek-V4-Flash / Qwen3.8-Flash-Next-FP8 使用指南与初步性能** |
 | [`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md) | **调参报告:两个模型的推荐运行参数 + 全部实测** |
+| [`docs/PERFORMANCE_OPTIMIZATION.md`](docs/PERFORMANCE_OPTIMIZATION.md) | **性能优化手册:每层归因、NUMA 权重布局(单卡 +38%)、CPU-TP 设计、硬件评估与实验矩阵** |
+| [`docs/V41_FLASH_ANALYSIS.md`](docs/V41_FLASH_ANALYSIS.md) | DeepSeek-V4.1-Flash 资源账与可行性分析 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 混合模式与主线集成设计 |
 | [`docs/GPU_PREFILL.md`](docs/GPU_PREFILL.md) | 长 prefill 逐层 GPU 流式 |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | 实测:硬件、吞吐、时延、消融 |
