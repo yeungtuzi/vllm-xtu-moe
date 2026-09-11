@@ -2837,3 +2837,23 @@ FMA 循环仍在同一迭代里交替;而 lk 用栈缓冲把两者**在时间上
 3 行 × 32 K = 96 次 MAC**,但 lk 的**载入次数/字节更少**(8 行共用一个权重向量)。
 ⇒ 若属实,修法就是**把"按输出列"改成"按 8 行一块、权重载入一次复用 8 行"**(即把 `block_23` 的
 R 从 2-3 扩到 8,并在同一 group 内让 8 行的激活分别 broadcast 后与同一组权重做 FMA)。
+
+## 97. 第 53 轮:反汇编部分结果(lane 语义仍未定死)+ 正确的取窗方法
+
+**做了什么**:`objdump -d --no-show-raw-insn _lk_moe_C_avx512_vnni.so | grep -E "vfmadd231ps|vcvtph2ps|
+vpinsrw|vpbroadcastss|vmov*|..." | head -45`。
+**结果**:前 45 条匹配几乎全被 `vmov*` 占满(该 .so 很大,`vmovdqu8 %ymm0,(%rbx)` 这类是别处的循环),
+**没有截到 FMA 密集区** ⇒ §96 的 lane 语义问题**仍未定死**。
+**唯一有用证据**:
+```
+22776: vmovdqu64 %zmm1,(%rsp)
+2277d: vmovdqu64 %zmm3,0x80(%rsp)
+22785: vmovdqu64 %zmm2,0x40(%rsp)
+```
+三连 zmm 按 0/0x40/0x80 存栈(192B)⇒ **印证反汇编文档 b1 的"解码结果先写进栈工作缓冲"**这一条。
+
+**正确的取窗方法(下一轮照做)**:
+1. `objdump -d --no-show-raw-insn $SO | grep -n "vfmadd231ps" | head -20` 取**行号**;
+2. `objdump -d --no-show-raw-insn $SO | sed -n "<行号-40>,<行号+40>p"` 取**窗口**(而不是全局过滤后取前 N —— 会被别的函数占满);
+3. 只看两件事:①`vfmadd231ps` 的**第二源**(权重)是否跨 8 次迭代不变(⇒ lane=输出列);
+   ②`vpinsrw/vcvtph2ps` 的输入地址步长(2B ⇒ 连续 K;8B ⇒ 跨行)。
