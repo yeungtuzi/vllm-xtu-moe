@@ -815,6 +815,10 @@ def gpu_moe_layer(
         # 形状判空(不是数据判空):A 现在是固定的 T*K,空批之外不会为 0。
         # 全部 id 无效时它们都落进垃圾桶段,每个专家的段为空 ⇒ 内核不写 out。
         return out
+    # 【inter 需要 A=T*K 行,不是 T 行】gate_up 内核用**排序位置** g_rows 索引
+    # inter(`inter_ptr + g_rows*inter_ld`),只有写 out 时才换成 token id。
+    # 曾经按 T 行分配 ⇒ 越界写,cudaErrorIllegalAddress(第 19 轮实测)。
+    # 想省这块分配只能改成"排序后行数=有效项数"或持久缓冲,不能再动行数语义。
     inter = torch.empty((A, 2 * I), dtype=torch.bfloat16, device=device)
 
     W13_E = w13_t.stride(0)
