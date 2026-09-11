@@ -81,6 +81,10 @@ def main():
     for _ in range(max(1, neng)):
         keep.append(m.MOE_MXFP4(cfg, w13, w2, s13, s2, 0, 0))
     engine = keep[-1]
+    # ROUNDROBIN=1:像真实服务那样**轮流**调用这 neng 个引擎(每层一个),这样每个
+    # 引擎的 scratch 缓冲在一次调用后就被换掉 ⇒ scratch 常驻缓存的效果消失。
+    # 用来验证"服务内单次调用比单实例微基准慢 2x"是否来自 scratch 变冷。
+    rr = int(os.environ.get("ROUNDROBIN", "0"))
     print(f"[cpu-bench] variant={xiaotu_moe.__variant__} layer={layer} nengines={len(keep)}",
           flush=True)
 
@@ -113,8 +117,12 @@ def main():
         wts_b = rng.uniform(-1, 1, size=(B, K)).astype(np.float32)
         engine.cpu_prefill(B, K, ids_b, wts_b, x, out)
         t0 = time.perf_counter()
-        for _ in range(rep):
-            engine.cpu_prefill(B, K, ids_b, wts_b, x, out)
+        if rr:
+            for i in range(rep):
+                keep[i % len(keep)].cpu_prefill(B, K, ids_b, wts_b, x, out)
+        else:
+            for _ in range(rep):
+                engine.cpu_prefill(B, K, ids_b, wts_b, x, out)
         dt = (time.perf_counter() - t0) / rep
         # per token: K experts x (2*I*H + H*I) MACs
         flop = B * K * (2.0 * I * H + H * I) * 2 / 1e12
