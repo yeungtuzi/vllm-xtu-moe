@@ -2610,3 +2610,14 @@ job 粒度/派发开销(83)、线程数/NUMA 分片/pin/环深/并发/TP 归约/
 一次跑出哪一段占 0.28 ms —— 288KB memcpy + 几十次 vector 维护无论如何不该是 0.28 ms,
 大概率是**某个隐蔽的全局同步或分配**(例如 `exp_` 256 项的 `std::vector` 内部指针追逐、
 或 `reserve()` 触发的真实 realloc)。
+
+## 88. 第 43 轮:A2 三段打点的补丁插错作用域(编译失败),已回退
+
+给 A2 加 `[setup-prof]`(fill+bookkeeping / gather)打点,但 `const size_t na = active_.size();`
+在 `moe_v2.hpp` 里**有两个同名点**(`forward_many_nsliced` 与扁平路径),补丁打到了错误的那一处
+⇒ `error: '_su0' was not declared in this scope`,构建失败,已 `git checkout` 回退。
+
+**下一轮正确做法**:用**唯一锚点**定位 —— 在 `forward_many_nsliced` 内、紧跟
+`const size_t a2_total = exp_off_[na];`(该行只属于分片路径)之后插入统计块;
+`_su0` 放在 `const auto t_entry = ...` 之后、`_su1` 放在 gather 循环的
+`for (int e : active_) {` 之前(该行也需确认唯一,否则用 `pfor_sharded` 附近的上下文锚定)。
