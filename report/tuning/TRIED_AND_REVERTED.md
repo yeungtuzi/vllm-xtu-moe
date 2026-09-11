@@ -355,6 +355,7 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 | 触发条件 | 解码每专家 me≈3 ⇒ 走 `block_23`/小 me 路径 ⇒ 该路径是标量实现 |
 | 行动 | 重写小 me 路径为 packed zmm fp32 FMA(+ 权重解码 hoist),验收:同一微基准 BS=6/DEDUP=12 ≤0.7 ms/层、每线程 ≥2.2 GB/s |
 | 更正 | 见 NOTES §76:标量 FMA 实际来自阶段 C 归约 lambda 与 flat_thunk,**主 GEMV 是 packed FAST_FP4**;真正根因是 fp4 解码按激活行重复(me 次/权重字节),lk 每 K-block 解一次复用 8 行。结论方向不变,证据更正 |
+| 第33轮更正 | §77 的"激活侧"结论**作废**:激活仅占权重流量 0.39%(§78 算术)。累计已排除:解码未 hoist / 激活流量 / 标量 FMA / NUMA / 线程数 / pin / 环深 / 并发 / TP 归约 / H2D。下一步先用 `XIAOTU_MOE_ABL_DECODE` 消融实验区分"解码依赖链延迟" vs "访存/MLP",再改内核 |
 | 第32轮更正 | ①解码 hoist **已在 `block_23` 实现**;②两引擎输出一致(±0.5%)⇒ 2× 真实。剩余差异在**激活侧**(我们先把激活整段转 fp32 缓冲再 mul+2fma;lk 用 bf16 直取+寄存器 cvt/bcast,每 k 2 条 FMA)。见 NOTES §77 |
 | 再试条件 | 在这条做完之前,不要再去调线程/布局/barrier/常驻层来解释或改善解码 |
 
