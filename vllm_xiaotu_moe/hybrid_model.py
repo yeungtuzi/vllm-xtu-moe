@@ -221,8 +221,8 @@ def _maybe_profile() -> None:
         prof.__exit__(None, None, None)
         print("[xiaotu-profile]\n" + prof.key_averages().table(
             sort_by="cuda_time_total", row_limit=40), flush=True)
-        prof.export_chrome_trace(path)
-        print(f"[xiaotu-profile] chrome trace -> {path}", flush=True)
+        prof.export_chrome_trace(f"{path}.r{os.getpid()}")
+        print(f"[xiaotu-profile] chrome trace -> {path}.r{os.getpid()}", flush=True)
 
 
 _PROF_DEC: dict = {"prof": None, "calls": 0}
@@ -254,8 +254,8 @@ def _maybe_profile_decode() -> None:
         prof.__exit__(None, None, None)
         print("[xiaotu-dec-profile]\n" + prof.key_averages().table(
             sort_by="cuda_time_total", row_limit=30), flush=True)
-        prof.export_chrome_trace(path)
-        print(f"[xiaotu-dec-profile] chrome trace -> {path}", flush=True)
+        prof.export_chrome_trace(f"{path}.r{os.getpid()}")
+        print(f"[xiaotu-dec-profile] chrome trace -> {path}.r{os.getpid()}", flush=True)
 
 
 def _start_pinned_prebuild() -> None:

@@ -307,6 +307,15 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 | 修法(下轮) | ①路径加 rank/pid 后缀;②`XIAOTU_TORCH_PROFILE_CALLS` 从"第一次调用"改为"第一次**真实预填充**"(qlen ≥ 阈值)后再开窗;③表按 `cuda_time_total` 排序并只打印 CUDA 行 |
 | 再试条件 | 修完这三点再用它定位 GPU 侧;在那之前不要再解析它的 JSON(§58 已记过一次)|
 
+## R30. 用 profiler 找那 30 ms 时只看了 trace 的 JSON / 只看表的前几列 —— 两次都白费
+
+| 项 | 内容 |
+|---|---|
+| 错在哪 | ①第 18 轮只解析 chrome trace 的 JSON(该文件在本配置下不含 kernel 事件)却没看**日志里那张表**;②第 27 轮看了表,但用 `cut -c1-120` 把 **CUDA 列**截掉了,只看到 Self CPU 列,误判"0 条 kernel 行" |
+| 后果 | 多花 2 轮才拿到"~30 ms/层 = 两个 Triton MoE 内核"这个结论 |
+| 正确做法 | 读 `[xiaotu-profile]` 表要**完整行**(CUDA total / CUDA time avg 列在右侧);或直接对日志 `grep -A12 xiaotu-profile` 后按空格规范化再看,不要盲切列 |
+| 附带修复 | 埋点已加 rank 后缀(两 rank 不再抢同一 trace)并按 `cuda_time_total` 排序 |
+
 ---
 
 ## M. 测量陷阱(**犯过的错**,不要再犯)

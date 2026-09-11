@@ -2184,3 +2184,24 @@ spec tokens 5→3(拒绝,R10)。
 `[xiaotu-profile]` 表 0 条 kernel 行,且两 rank 争抢 `/tmp/pref_prof.json`。⇒ 那 ~30 ms/层
 仍未定位。下轮先修埋点(rank 后缀 + 从真实预填充开窗 + 按 cuda_time 排序),再用它定位。
 预填充每层账:102 ms = H2D 67-74(峰值)+ 主机 0.5 + **~30 未解释**。
+
+
+## 69. 【关键】预填充那 ~30 ms/层 = 我们的两个 Triton MoE 内核(block 配置是解码调的)
+
+修好 R29 的埋点(每 rank 独立 trace + 按 `cuda_time_total` 排序)后,86 次调用窗口的 CUDA 表:
+
+| kernel | CUDA 总计 | 每次调用 | 调用数(85 层) |
+|---|---|---|---|
+| `_down_kernel`(我们的 Triton) | 2.50 s | **29.4 ms/层** | 85 |
+| `_gate_up_kernel`(我们的 Triton) | 2.07 s | **24.3 ms/层** | 85 |
+| `Memcpy HtoD (Pinned->Device)` | 3.28 s | 7.4 ms × ~5/层 | 441 |
+| `vllm::all_reduce`(NCCL ring bf16) | 1.39 s | 9.4 ms | 148(含注意力/共享专家)|
+| fp8_einsum / marlin_gemm | 0.47 / 0.33 s | 1.4 / 0.2 ms | — |
+
+⇒ 每层 GPU 侧 ~54 ms 全在两个 MoE Triton 内核上;它们用 `BM/BN/BK/BH=64、stages=2` 这组
+**为解码调**的参数跑 T=4096(每专家 ~96 行)非常不划算。**这正是"预填充每层 102 ms =
+H2D 70 + 30"里那 30 ms 的来源**(§63 未解释项)。
+
+**下一步(便宜、不需要重启)**:`bench_gpu_moe_prefetch.py` 在 T=4096 扫
+`XIAOTU_GPU_PREFILL_{BM,BN,BK,BH,STAGES,WARPS}`(以及 `_KERNEL=split`/`LUT`),
+目标是让两个内核从 54 ms/层降到 ~20 ms/层 ⇒ 预填充 TTFT 3.77 → ~3.0 s ⇒ **1360 t/s+**。
