@@ -30,6 +30,7 @@ in VRAM per layer.
 
 import os
 import threading
+import time
 
 import torch
 
@@ -425,6 +426,31 @@ def _build_segmentation(topk_ids, topk_weights, num_experts, device):
     return sorted_tok, sorted_wts, seg_start, T * K
 
 
+_GP_TIMING = os.environ.get("XIAOTU_GP_TIMING") == "1"
+_GP_STAT = {"n": 0, "seg": 0.0, "rest": 0.0, "tok": 0}
+_GP_EVERY = 40
+
+
+def _gp_add(T: int, A: int, seg_s: float, rest_s: float) -> None:
+    """GPU 预填充路径的**主机侧**分段计时(env XIAOTU_GP_TIMING=1)。
+
+    seg  = _build_segmentation(argsort/scatter_add/arange 等)耗时
+    rest = 其后到内核 launch 之间的主机耗时(out/inter 分配、zeros 等)
+    两者都是**串在关键路径上的主机时间**,用来定位"服务里每层多出的 ~31ms"。
+    """
+    st = _GP_STAT
+    st["n"] += 1
+    st["seg"] += seg_s
+    st["rest"] += rest_s
+    st["tok"] += T
+    if st["n"] % _GP_EVERY == 0:
+        n = st["n"]
+        print(f"[gp-timing] n={n} Tavg={st['tok'] / n:.0f} "
+              f"seg={st['seg'] / n * 1e3:.2f}ms rest={st['rest'] / n * 1e3:.2f}ms "
+              f"host_total={(st['seg'] + st['rest']) / n * 1e3:.2f}ms", flush=True)
+        st.update(n=0, seg=0.0, rest=0.0, tok=0)
+
+
 _CAPTURE_DEPTH = 0
 _CAPTURE_GUARD = threading.Lock()
 _CAPTURE_WATCH_INSTALLED = False
@@ -793,6 +819,7 @@ def gpu_moe_layer(
     T = x.shape[0]
     E = w13.shape[0]
     device = torch.device(device) if not isinstance(device, torch.device) else device
+    _t0 = time.perf_counter() if _GP_TIMING else 0.0
     if slot is not None:
         # 【不要在图捕获期间 wait_event】常驻层的 slot.ready 是在**捕获外**
         # (构建时)record 的,图内等待它会触发 cudaErrorStreamCaptureIsolation
@@ -813,6 +840,7 @@ def gpu_moe_layer(
         s2_t = _kmajor_bytes(_pinned(s2).to(device, non_blocking=True))
 
     tok, wts, seg_start, A = _build_segmentation(topk_ids, topk_weights, E, device)
+    _t1 = time.perf_counter() if _GP_TIMING else 0.0
     out = torch.zeros((T, H), dtype=torch.bfloat16, device=device)
     if T == 0 or K == 0:
         # 形状判空(不是数据判空):A 现在是固定的 T*K,空批之外不会为 0。
@@ -865,6 +893,8 @@ def gpu_moe_layer(
             out, out.stride(0), W2_E, S2_E, lut_t,
             H=H, I=I, BM=BM, BH=BH, BK=BK, NS=NS, LUT=_lut, num_warps=NW,
         )
+    if _GP_TIMING:
+        _gp_add(T, A, _t1 - _t0, time.perf_counter() - _t1)
     if slot is not None:
         # Mark the slot free only after these kernels have actually finished.
         slot.busy = torch.cuda.Event()

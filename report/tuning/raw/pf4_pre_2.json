@@ -1,0 +1,43 @@
+{
+ "summary": {
+  "ts": "2026-09-11T13:03:53",
+  "tag": "pf4_pre_2",
+  "server_tag": "unknown",
+  "natural_text": 1,
+  "client": "bench_nat_client",
+  "concurrency": 1,
+  "num_prompts": 1,
+  "output_len": 16,
+  "input_len": "nat4096",
+  "completed": 1,
+  "failed": 0,
+  "duration_s": 4.71,
+  "total_output_tokens": 16,
+  "out_tok_per_s": 3.4,
+  "per_stream_tok_per_s": 3.4,
+  "mean_ttft_ms": 3742.1,
+  "mean_tpot_ms": 60.54,
+  "mean_step_ms": 161.44,
+  "p95_step_ms": 163.97,
+  "mean_tokens_per_step": 2.286,
+  "per_req_tok_per_s": [
+   16.52
+  ]
+ },
+ "requests": [
+  {
+   "idx": 0,
+   "ttft_ms": 3742.090003564954,
+   "n_out": 16,
+   "n_steps": 7,
+   "tokens_per_step": 2.2857142857142856,
+   "e2e_s": 4.710775559768081,
+   "decode_s": 0.9686855562031269,
+   "mean_step_ms": 161.44091822206974,
+   "mean_itl_ms": 60.54284726269543,
+   "p50_step_ms": 160.77911853790283,
+   "p95_step_ms": 163.9716699719429,
+   "tok_per_s": 16.517227801675723
+  }
+ ]
+}
