@@ -489,6 +489,19 @@ class CpuXiaotuMoE(nn.Module):
         if self._gpu_resident:
             self._build_resident_slot()
             return
+        # ---- 线程池自旋窗口(重要) -------------------------------------------
+        # 引擎 worker 在两次调用之间自旋 spin_idle_us 等下一次任务,引擎默认 5 ms。
+        # 但解码步里相邻两次调用只隔 ~2-4 ms ⇒ 192 个 worker 在整个解码期间几乎
+        # 全在自旋,把整机烧满(实测:解码期间进程占 166-259 核,而真正的 MoE
+        # 算力只需 ~21 核),并抢走驱动 GPU 的主线程 ⇒ 每层 `rest` 被推高。
+        # 实测(scripts/sweep_spin.sh,负载 50-100 的同程序列,单位 ms/层):
+        #   spin=5000: rest 3.30-3.47, period 6.6-7.1, C=1 7.53 tok/s(load 100)
+        #   spin=1000: rest 1.27-1.42, period 4.3-4.9, C=1 10.74 tok/s(load 75)
+        #   spin= 300: rest 0.94-0.97, period 3.7-3.9, C=1  9.61 tok/s(load 52)
+        # 超时后 caller 会 cv_.notify_all() 唤醒(limited 与 non-limited 路径都有,
+        # 见 numa_pool.hpp parallel_for 的 fallback),所以不会死锁。
+        # 可用环境变量覆盖(例如 prefill 密集场景想要更大自旋)。
+        os.environ.setdefault("XIAOTU_MOE_SPIN_IDLE_US", "300")
         import xiaotu_moe
 
         ex = self.experts

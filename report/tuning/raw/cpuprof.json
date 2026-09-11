@@ -1,0 +1,43 @@
+{
+ "summary": {
+  "ts": "2026-09-10T22:52:29",
+  "tag": "cpuprof",
+  "server_tag": "aba_new",
+  "natural_text": 1,
+  "client": "bench_nat_client",
+  "concurrency": 1,
+  "num_prompts": 1,
+  "output_len": 300,
+  "input_len": "nat128",
+  "completed": 1,
+  "failed": 0,
+  "duration_s": 26.62,
+  "total_output_tokens": 300,
+  "out_tok_per_s": 11.27,
+  "per_stream_tok_per_s": 11.27,
+  "mean_ttft_ms": 1774.5,
+  "mean_tpot_ms": 82.82,
+  "mean_step_ms": 241.23,
+  "p95_step_ms": 293.82,
+  "mean_tokens_per_step": 2.885,
+  "per_req_tok_per_s": [
+   12.07
+  ]
+ },
+ "requests": [
+  {
+   "idx": 0,
+   "ttft_ms": 1774.5280005037785,
+   "n_out": 300,
+   "n_steps": 104,
+   "tokens_per_step": 2.8846153846153846,
+   "e2e_s": 26.6213504280895,
+   "decode_s": 24.84682242758572,
+   "mean_step_ms": 241.23089823835684,
+   "mean_itl_ms": 82.82274142528574,
+   "p50_step_ms": 235.5334646999836,
+   "p95_step_ms": 293.8157767057419,
+   "tok_per_s": 12.073978508693756
+  }
+ ]
+}
