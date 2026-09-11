@@ -218,10 +218,15 @@ def _start_pinned_prebuild() -> None:
                 quads.append((w13, s13, w2, s2))
             except Exception:  # noqa: BLE001
                 pass
-        threading.Thread(
-            target=prebuild_pinned_kmajor, args=(quads,),
-            kwargs={"workers": 6}, daemon=True,
-        ).start()
+
+        def _runner():
+            # 阶段 1(纯 CPU 转置)立刻开始:warmup 期间就把转置做完,否则服务路径
+            # 会单线程逐层转置+锁页,启动拖成好几分钟。阶段 2(cudaHostRegister)
+            # 由 prebuild_pinned_kmajor 自己等 CUDA graph 捕获静止后再做
+            # (捕获期间调用会作废捕获甚至让驱动 segfault,见 TRIED_AND_REVERTED R4)。
+            prebuild_pinned_kmajor(quads, workers=6)
+
+        threading.Thread(target=_runner, daemon=True).start()
     except Exception as e:  # noqa: BLE001
         print(f"[xiaotu] pinned prebuild not started: {type(e).__name__}: {e}",
               flush=True)

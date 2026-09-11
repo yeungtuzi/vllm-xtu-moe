@@ -411,6 +411,113 @@ def _build_segmentation(topk_ids, topk_weights, num_experts, device):
     return sorted_tok, sorted_wts, seg_start, int(sorted_tok.numel())
 
 
+_CAPTURE_DEPTH = 0
+_CAPTURE_GUARD = threading.Lock()
+_CAPTURE_WATCH_INSTALLED = False
+
+
+def capture_in_progress() -> bool:
+    """True while a CUDA graph capture is running in this process."""
+    return _CAPTURE_DEPTH > 0
+
+
+def wait_no_capture(timeout_s: float = 120.0) -> None:
+    """Block until no CUDA graph capture is in flight (best effort, bounded).
+
+    Used by the background pinned prebuild: any CUDA call it makes
+    (cudaHostRegister / pin_memory) during capture both fails and **invalidates
+    the capture**, which aborts engine startup.
+    """
+    import time as _time
+
+    end = _time.monotonic() + timeout_s
+    while capture_in_progress() and _time.monotonic() < end:
+        _time.sleep(0.05)
+
+
+def wait_capture_done(quiet_s: float = 10.0, grace_s: float = 300.0,
+                      poll_s: float = 0.1) -> bool:
+    """Wait until CUDA-graph capture is finished **and has stayed quiet**.
+
+    Rationale (2026-09-11, three failed startups): vLLM builds its graphs ~100 s
+    after the first big warm-up forward — which is exactly the forward that
+    triggers the pinned prebuild. A `cudaHostRegister` already inside the driver
+    when capture begins cannot be recalled, and it both invalidates the capture
+    (`cudaErrorStreamCaptureInvalidated` -> EngineCore init fails) and has been
+    seen to segfault inside libcuda (`cuMemHostRegister_v2` -> SIGSEGV).
+
+    Timeline measured on this box (deliver13 log): warm-up forward -> +100 s ->
+    "Breakable CUDA graph enabled" -> main capture -> DSpark speculator capture.
+    A fixed grace period therefore cannot work; we wait for the capture state to
+    be *quiet* (no capture for `quiet_s`), and if this process never captures
+    (``EAGER=1``) we give up after `grace_s` and proceed.
+    """
+    import time as _time
+
+    t0 = _time.monotonic()
+    last_end = 0.0
+    seen = False
+    while _time.monotonic() - t0 < grace_s:
+        if capture_in_progress():
+            seen = True
+            while capture_in_progress() and _time.monotonic() - t0 < grace_s + 600.0:
+                _time.sleep(poll_s)
+            last_end = _time.monotonic()
+            continue
+        if seen and (_time.monotonic() - last_end) >= quiet_s:
+            return True
+        _time.sleep(poll_s)
+    return not capture_in_progress()
+
+
+def _install_capture_watch() -> None:
+    """Count CUDA graph captures process-wide by wrapping CUDAGraph begin/end.
+
+    There is no CUDA API to ask "is any stream in this context capturing?", and
+    the capturing stream lives on another thread, so we track it ourselves. The
+    wrapper is installed once and is a no-op otherwise.
+    """
+    global _CAPTURE_WATCH_INSTALLED
+    if _CAPTURE_WATCH_INSTALLED:
+        return
+    try:
+        import torch
+        cls = torch.cuda.CUDAGraph
+        if getattr(cls, "_xiaotu_capture_watched", False):
+            _CAPTURE_WATCH_INSTALLED = True
+            return
+        _begin, _end = cls.capture_begin, cls.capture_end
+
+        def capture_begin(self, *a, **k):
+            global _CAPTURE_DEPTH
+            with _CAPTURE_GUARD:
+                _CAPTURE_DEPTH += 1
+            try:
+                return _begin(self, *a, **k)
+            except BaseException:
+                with _CAPTURE_GUARD:
+                    _CAPTURE_DEPTH = max(0, _CAPTURE_DEPTH - 1)
+                raise
+
+        def capture_end(self, *a, **k):
+            global _CAPTURE_DEPTH
+            try:
+                return _end(self, *a, **k)
+            finally:
+                with _CAPTURE_GUARD:
+                    _CAPTURE_DEPTH = max(0, _CAPTURE_DEPTH - 1)
+
+        cls.capture_begin = capture_begin
+        cls.capture_end = capture_end
+        cls._xiaotu_capture_watched = True
+        _CAPTURE_WATCH_INSTALLED = True
+    except Exception:  # noqa: BLE001 - torch/driver variants: degrade to no-op
+        pass
+
+
+_install_capture_watch()
+
+
 def _register_host(t: torch.Tensor) -> bool:
     """Page-lock ``t`` **in place** (no copy) via cudaHostRegister.
 
@@ -443,25 +550,39 @@ def _key_lock(key: tuple) -> threading.Lock:
         return lk
 
 
-def _pinned(t: torch.Tensor) -> torch.Tensor:
-    # Keyed by the *storage* address, which is stable across slices of the same
-    # parameter (``param.data[a:b]``). We also hold the source storage alive so
-    # the address cannot be reused by an unrelated allocation while the entry
-    # exists (otherwise a freed tensor could alias a stale pinned copy).
+def _pin_key(t: torch.Tensor, tag: str):
+    """缓存键 + 源 storage。
+
+    键用**源 storage 地址**(对同一参数的切片是稳定的,如 ``param.data[a:b]``);
+    同时持有源 storage 的引用,避免地址被无关分配复用后命中过期条目。
+    """
     stor = t.untyped_storage()
-    key = (stor.data_ptr(), t.storage_offset(), tuple(t.shape), t.dtype)
+    return (stor.data_ptr(), t.storage_offset(), tuple(t.shape), t.dtype, tag), stor
+
+
+def _ensure_pinned(key: tuple, ent: tuple) -> torch.Tensor:
+    """确保缓存项已锁页(**就地** cudaHostRegister,失败才退回 pin_memory)。"""
+    c = ent[1]
+    if c.is_pinned():
+        return c
+    if not _register_host(c):
+        c = c.pin_memory()
+        ent = (ent[0], c)
+        _PIN_CACHE[key] = ent
+    return c
+
+
+def _pinned(t: torch.Tensor) -> torch.Tensor:
+    key, stor = _pin_key(t, "plain")
     ent = _PIN_CACHE.get(key)
     if ent is not None:
-        return ent[1]
+        return _ensure_pinned(key, ent)
     with _key_lock(key):
         ent = _PIN_CACHE.get(key)
         if ent is None:
-            c = t.contiguous()
-            if not _register_host(c):
-                c = c.pin_memory()
-            ent = (stor, c)
+            ent = (stor, t.contiguous())
             _PIN_CACHE[key] = ent
-    return ent[1]
+        return _ensure_pinned(key, ent)
 
 
 _PIN_CACHE: dict[tuple, tuple] = {}
@@ -470,6 +591,25 @@ _PIN_CACHE: dict[tuple, tuple] = {}
 def _kmajor_bytes(t):
     """[E, A, B] u8 -> [E, B, A] u8 (byte transpose; nibbles stay within bytes)."""
     return t.transpose(1, 2).contiguous()
+
+
+def _kmajor_cached(t: torch.Tensor):
+    """纯 CPU 阶段:做 K-major 转置并放入缓存(**不锁页**)。
+
+    转置是普通 CPU 拷贝,任何时刻都安全(包括 CUDA graph 捕获期间);只有
+    ``cudaHostRegister`` 不能在捕获窗口里调用(见 TRIED_AND_REVERTED R4)。
+    把两件事拆开,后台就能在 warmup 期间先把转置做完。
+    """
+    key, stor = _pin_key(t, "kmajor")
+    ent = _PIN_CACHE.get(key)
+    if ent is not None:
+        return key, ent
+    with _key_lock(key):
+        ent = _PIN_CACHE.get(key)
+        if ent is None:
+            ent = (stor, _kmajor_bytes(t))
+            _PIN_CACHE[key] = ent
+    return key, ent
 
 
 def _pinned_kmajor(t: torch.Tensor) -> torch.Tensor:
@@ -484,42 +624,47 @@ def _pinned_kmajor(t: torch.Tensor) -> torch.Tensor:
     call and re-pin 3.19 GiB per layer (~2.6 s) while also leaking pinned
     entries until the host OOMs.
     """
-    stor = t.untyped_storage()
-    key = (stor.data_ptr(), t.storage_offset(), tuple(t.shape), t.dtype, "kmajor")
-    ent = _PIN_CACHE.get(key)
-    if ent is not None:
-        return ent[1]
-    with _key_lock(key):
-        ent = _PIN_CACHE.get(key)
-        if ent is None:
-            c = _kmajor_bytes(t)
-            if not _register_host(c):
-                c = c.pin_memory()
-            ent = (stor, c)
-            _PIN_CACHE[key] = ent
-    return ent[1]
+    key, ent = _kmajor_cached(t)
+    return _ensure_pinned(key, ent)
 
 
 def prebuild_pinned_kmajor(tensors: list, workers: int = 6) -> None:
-    """Build the K-major pinned cache for many layers in parallel (once).
+    """两阶段预建 K-major 缓存(见 report/tuning/TRIED_AND_REVERTED.md R4)。
 
-    Called on the first long-prefill forward; the caller does not wait, so the
-    copies overlap with the first few layers' kernels. The per-key lock in
-    ``_pinned_kmajor`` makes a concurrent rebuild of the same layer safe.
+    阶段 1(**纯 CPU**):并行做字节转置并放进缓存(不锁页)。任何时刻都安全,
+      包括 CUDA graph 捕获期间,所以它能在 warmup 期间就跑起来 —— 这也是启动
+      速度的关键:否则服务路径会单线程地逐层转置+锁页,启动要多花好几分钟。
+    阶段 2(**CUDA**):等捕获静止(``wait_capture_done``)后并行 ``cudaHostRegister``。
+      捕获窗口里调用它会作废捕获(`cudaErrorStreamCaptureInvalidated`,启动失败),
+      甚至让 libcuda segfault(`cuMemHostRegister_v2` → SIGSEGV)。
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    def _one(quad):
+    def _transpose(quad):
         for t in quad:
             if t is not None:
                 try:
+                    _kmajor_cached(t)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[xiaotu] prebuild transpose failed: {type(e).__name__}: {e}",
+                          flush=True)
+
+    def _register(quad):
+        for t in quad:
+            if t is not None:
+                try:
+                    wait_no_capture()
                     _pinned_kmajor(t)
                 except Exception as e:  # noqa: BLE001
-                    print(f"[xiaotu] prebuild failed: {type(e).__name__}: {e}",
+                    print(f"[xiaotu] prebuild pin failed: {type(e).__name__}: {e}",
                           flush=True)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(_one, tensors))
+        list(ex.map(_transpose, tensors))
+    if not wait_capture_done():
+        return
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_register, tensors))
 
 
 # --------------------------------------------------------------------------

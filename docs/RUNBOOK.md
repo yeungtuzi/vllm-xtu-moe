@@ -82,7 +82,7 @@ xiaotu_moe variant = _avx512_bf16
 | 变量 | 推荐值 | 作用 |
 |---|---|---|
 | `VLLM_EXPERTS_LOAD_DEVICE` | `cpu` | ★ 混合模式开关:routed-expert 权重在 CPU 上构造与计算。**取值只有 `cpu` / `gpu`**(写 `cuda` 会被 vLLM 直接拒绝);`gpu` 用于同模型对照基线 |
-| `XIAOTU_MOE_SINGLECOPY` | `1` | 权重只保留一份(NUMA 分片);不设时可能按 socket 复制,内存约 2× |
+| (无开关) 权重布局 | **固定** | 权重按 NUMA node 分片,每个 node 的 worker 只读写本 node 绑定的一份(page-local);node 间只交换很小的激活切片/部分和。原先的 `XIAOTU_MOE_SINGLECOPY` 单拷贝模式**已从代码中删除** |
 | `XIAOTU_MAINLINE_SHIMS` | `1`(默认) | 在原生 vLLM 上启用混合模式所需的集成补丁;`0` 关闭 |
 | `CUDA_VISIBLE_DEVICES` | 例如 `0` | 选择使用的 GPU |
 | `HF_HUB_OFFLINE` | `1` | 离线环境(权重已在本地) |
@@ -116,7 +116,7 @@ xiaotu_moe variant = _avx512_bf16
 
 | 参数 | 建议 | 说明 |
 |---|---|---|
-| `--tensor-parallel-size` | `1`(单卡)或 `2`(配合 `XIAOTU_MOE_SINGLECOPY=1`) | 目前**不支持 expert_map(EP)**,TP>1 走权重分片 |
+| `--tensor-parallel-size` | `1`(单卡)或 `2` | 目前**不支持 expert_map(EP)**,TP>1 走权重分片 |
 | `--max-model-len` | 先 `4096`–`8192`,再按 KV 容量放大 | KV 占用随模型不同(DeepSeek-V4 约 400 KiB/token) |
 | `--gpu-memory-utilization` | `0.85` | 非专家权重 + KV cache 在显存 |
 | `--enforce-eager` | 建议先开 | 避免 CUDA graph 与 CPU 引擎 host 回调的额外变量;稳定后可尝试关闭 |
@@ -135,7 +135,6 @@ xiaotu_moe variant = _avx512_bf16
 ```bash
 export CUDA_VISIBLE_DEVICES=0
 export VLLM_EXPERTS_LOAD_DEVICE=cpu
-export XIAOTU_MOE_SINGLECOPY=1
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
 export HF_HUB_OFFLINE=1
 export VLLM_USE_FLASHINFER_SAMPLER=0
@@ -156,8 +155,7 @@ vllm serve <DEEPSEEK_V4_FLASH_DIR> \
 
 ```python
 import os
-os.environ.update(VLLM_EXPERTS_LOAD_DEVICE="cpu", XIAOTU_MOE_SINGLECOPY="1",
-                  CUDA_VISIBLE_DEVICES="0")
+os.environ.update(VLLM_EXPERTS_LOAD_DEVICE="cpu", CUDA_VISIBLE_DEVICES="0")
 from vllm import LLM, SamplingParams
 
 llm = LLM(model="<DEEPSEEK_V4_FLASH_DIR>",
@@ -182,7 +180,6 @@ export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384     # 0 = 全部 CPU
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1
 export VLLM_EXPERTS_LOAD_DEVICE=cpu
-export XIAOTU_MOE_SINGLECOPY=1
 export VLLM_ENGINE_READY_TIMEOUT_S=7200
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
@@ -204,7 +201,7 @@ vllm serve Qwen/Qwen3.8-Flash-Next-FP8 \
 离线冒烟脚本(自带计时与连贯性检查):
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 VLLM_EXPERTS_LOAD_DEVICE=cpu XIAOTU_MOE_SINGLECOPY=1 \
+CUDA_VISIBLE_DEVICES=0 VLLM_EXPERTS_LOAD_DEVICE=cpu \
   SMOKE_MODEL=Qwen/Qwen3.8-Flash-Next-FP8 python scripts/fp8_moe_smoke.py
 ```
 
@@ -280,6 +277,6 @@ curl -s http://127.0.0.1:8070/metrics | grep -E "num_requests_running|spec_decod
 | `AttributeError: '_OpNamespace' '_C' object has no attribute 'convert_weight_packed'` | 主线 CPU 后端的 AMX 重打包被触发 → 确认 `VLLM_EXPERTS_LOAD_DEVICE=cpu` 且 `XIAOTU_MAINLINE_SHIMS=1` |
 | `RuntimeError: XiaotuCPUExperts.apply called before process_weights_after_loading` | 集成补丁未生效(检查 vLLM 版本是否被 `mainline_shims` 覆盖) |
 | 启动超时 `Engine core initialization failed` | 放大 `VLLM_ENGINE_READY_TIMEOUT_S`;超大模型首次加载需要数分钟 |
-| 内存占用翻倍 / 某个 NUMA 节点被占满 | 设置 `XIAOTU_MOE_SINGLECOPY=1` |
+| 内存占用翻倍 / 某个 NUMA 节点被占满 | 检查是否有残留进程占着分片内存;分片布局不可关闭(单拷贝模式已删除) |
 | 输出不连贯 | 用 `XIAOTU_VERIFY_LAYER=1` 查看每层 `rel_rms`,并用 `XIAOTU_MOE_PROFILE=1` 看耗时分布 |
 | 想加速长 prefill | `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384` |

@@ -1,5 +1,8 @@
 # DS-V4-Flash / Qwen3.8-Flash-Next 调参记录(工作笔记)
 
+
+> **回退登记簿**:`report/tuning/TRIED_AND_REVERTED.md` — 每次「试了不好→回退」都要追加一条(R*/M* 编号),下次不要再重复已被否掉的做法。
+
 > 本文件是调参过程的**原始记录**(边测边写),结论汇总在 `docs/TUNING_REPORT.md`。
 > 协议与阶段计划见 `docs/TUNING_PLAN.md`。
 > 环境:3 × A100-PCIE-40GB 全部可用(生产 8070 已关)、EPYC 9654(无 AMX)、1.5 TiB RAM。
@@ -1812,3 +1815,110 @@ git show c2172ea^:xiaotu_moe/csrc/moe/numa_pool.hpp > /tmp/pool_orig.hpp   # 无
 ⇒ P0 结构性工作:**改成"整专家按节点分片"(expert-parallel per node)**,让
 gate/up→SiLU→down 在同一节点内完成,每层只留 1 次跨节点归约(对方 `num_processes=ep_size`
 就是这个思路;我们 backlog 的 T54)。
+
+---
+
+## 50. 【固定规则,不要再改】NUMA 分片是**唯一**权重布局;单拷贝开关已彻底删除
+
+### 50.1 规则(用户明确要求,重复出现即视为回归)
+1. 每个 CCD 开 **4-5 个核**(本机 24 CCD ⇒ `XIAOTU_MOE_THREADS=120`),不要再加核;
+2. 权重**按 NUMA node 分片**(`nshard_ = numa_node_count() = 8`),每个 node 的
+   worker 只读写 `MPOL_BIND` 到自己那份的内存 —— **全部 page-local**;
+3. node 之间只交换**很小的数据**(每层各 node 的激活切片 + 每 token 部分和),
+   走池内 all-gather + 归约,量级远小于跨 node 读权重的开销。
+
+### 50.2 已删除的东西
+- 引擎:`moe_v2.hpp` 里 `XIAOTU_MOE_SINGLECOPY` 的整段分支**删除**(不再是"默认值问题",
+  而是代码里不存在该模式)。保留的只有"分片不可用(维度不整除/分配失败)"时的
+  自动安全网(每 socket 一份副本)。
+- 脚本/文档:`tune_serve.sh`、`serve_prod_8070.sh`、`tune_nsys.sh`、`fp8_*`、`tiny_moe_equiv.py`、
+  `README*.md`、`docs/*` 里的全部引用已清掉。
+- **教训**:`tune_serve.sh` 曾默认 `SINGLECOPY=1`(注释理由是"省内存",且引用了
+  conc-4 的旧结论),导致交付配置重新退化成"单拷贝 + 全部线程读同一份内存",
+  解码 A 阶段慢 ~30 倍。**任何"省内存"的理由都不能再推翻这条规则。**
+
+### 50.3 证据(同一时间窗口轮流跑,`scripts/bench_cpu_engine.py`,DEDUP=12 / THREADS=120 / 负载 0.9)
+| 布局 | B=6 ms/层 | B=18 ms/层 |
+|---|---|---|
+| 单拷贝(flat,交付配置实际用的) | 2.01 / 2.01 | 3.35 / 3.39 |
+| **NUMA 分片(规则要求)** | **1.19 / 1.20** | **2.92 / 2.94** |
+
+⇒ 解码尺寸(B=6,na=6)DEDUP 后每层 **1.67×**;B=18 时 1.15×。
+(注:`MS-PROF` 给出的"每层 A"含首次 touch/绑页的开销,第一段 40 次调用会被冷启动
+污染,别拿它当稳态;上面表里是**计时循环内**的 ms/层,不含 warmup。)
+
+## 51. 分片区域**不要**用 THP:它把每 node 占用放大 5×,并在第 29 层把单 node 吃爆
+
+### 51.1 症状
+修复 §52 的 mbind 之后,TP=1 分片启动**仍然**在 "engine built model.layers.29" 处被杀:
+
+```
+oom-kill: constraint=CONSTRAINT_MEMORY_POLICY, nodemask=7, task=VLLM::EngineCor
+Out of memory: Killed process 1044797 total-vm:944314492kB anon-rss:593333608kB
+```
+
+`nodemask=7` + 每 node 193 GB ⇒ 是被**绑定到 node 7** 的那部分内存吃爆的(不是整机:
+整机 1511 GB,当时只用了 ~600 GB)。
+
+### 51.2 定位
+一层引擎(名义 3.2 GB)实测(逐层引擎单独跑,解析 `/proc/<pid>/numa_maps`):
+
+| | node0 | node1 | node2 | node3 | node4 | node5 | node6 | node7 | 合计 |
+|---|---|---|---|---|---|---|---|---|---|
+| THP 开 | 1.69 | 1.53 | 3.10 | 1.50 | 1.52 | 1.50 | 3.02 | **5.00** | **18.9 GB** |
+| THP 关 | — | — | — | — | — | — | — | — | **6.9 GB** |
+
+原因:分片后每个 node 只拥有每个专家的一段**稀疏跨度**(w13:8.4 MB stride 里
+2×512 KB;w2:4.2 MB stride 里 1×512 KB)。`MADV_HUGEPAGE` 让跨度覆盖到的每个
+2 MB 页**整体**落地 ⇒ 3.2 GB/层变 15-19 GB/层,且各 node 因对齐不同而不均
+(node7 一层 ~5 GB ⇒ 29 层 ≈ 145 GB,把 193 GB 吃光,于是 OOM)。
+
+### 51.3 同一窗口交错 A/B(`bench_cpu_engine.py`,B=6/DEDUP=12/THREADS=120)
+| 轮次 | THP 开 ms/层 | THP 关 ms/层 | RSS(开/关) |
+|---|---|---|---|
+| 1 | 1.20 | 1.21 | 18.9 / 6.9 GB |
+| 2 | 1.28 | **1.20** | 同上 |
+| 3 | 1.32 | **1.23** | 同上 |
+
+⇒ **关掉 THP 内存省 2.7×,速度不降反略快**。旧注释("不落大页会 thrash 4KB TLB")
+是错的论点:跨度是连续的 512 KB-1 MB,硬件预取足够。已在代码里把默认改为**关**
+(仅 `XIAOTU_MOE_SHARD_HUGEPAGE=1` 可复现旧行为,调试用)。
+
+## 52. 【bug 修复】`shard_region` 必须用 `mbind()`,不能用 `set_mempolicy()`
+
+`set_mempolicy()` 给**线程**设内存策略,而线程策略会被**之后创建的新线程继承**。
+引擎构建期间 vLLM 仍在创建线程(pinned 权重缓存等),它们在窗口内分配的大块内存
+就被绑到单个 node 上 ⇒ `CONSTRAINT_MEMORY_POLICY` 的 OOM(整进程被杀:
+`nodemask=7`,anon-rss 603 GB)。
+
+`mbind(addr, len, MPOL_BIND, mask, ...)` 只作用于**这段映射**,不会泄漏到别的分配,
+也不会被新线程继承。`numa_socket_alloc()`(socket 副本安全网)同样改成 `mbind`。
+
+## 53. 执行固定规则(NUMA 分片)后的端到端结果 —— 解码延迟腰斩
+
+配置:单卡(GPU2)TP=1 EP=0,`THREADS=120`,MAXLEN=262144,SEQS=2,KV 8GiB,
+`fp8_ds_mla`,EAGER=0,DSpark k=5(probabilistic),GPU 预填充阈值 384。
+自然文本数据集,`bench_nat_client.py`(SSE/usage 计数,见 M1)。
+
+| 口径 | 交付配置(单拷贝,§49 之前) | **本次(NUMA 分片)** | 变化 |
+|---|---|---|---|
+| 预填充 @4096(TTFT) | 639 t/s | **703 t/s**(TTFT 5.83s) | +10% |
+| 解码 C=1 聚合(`out_tok_per_s`) | 10.81 | **13.71** | +27% |
+| 解码 C=1 **TPOT** | 52-65 ms | **28.47 ms** | **2.0×** |
+| 解码 C=1 纯解码(1/TPOT) | 15-19 t/s | **35.1 t/s** | ~2× |
+| 解码 C=1 step / tok-per-step | — | 97.35 ms / 3.49 | |
+| 解码 C=2 聚合 / per-stream / TPOT | 19.93 / — / — | 15.37 / 7.68 / **72.72 ms** | 见下 |
+| 每层 period / compute / rest | ~3.7-4.0 / 2.7-2.9 / 0.9-1.1 ms | **2.30-2.47 / 1.31-1.34 / 0.97-1.16 ms** | compute **2.1×** |
+
+每层阶段分解(`XIAOTU_MOE_PROFILE`,bucket M3-8 = 解码主调用,qlen=6、k=6、na≈23):
+`setup=131µs A=749µs B=421µs C=83µs TOTAL=1385µs`。
+A(读 gate/up 分片)是最大项:聚合 195MB/749µs ≈ 260 GB/s(单拷贝时只有 ~103 GB/s)。
+
+**结论**:
+1. 固定规则(每 CCD 4-5 核 + 权重按 node 分片 + 只交换小数据)是解码延迟腰斩的直接原因;
+   交付配置此前被 `SINGLECOPY=1` 悄悄退回单拷贝,属于回归(登记簿 R1)。
+2. C=2 的 step 是 C=1 的 **2.6×**(252.7 vs 97.4 ms)⇒ 两条流**并没有被合批**(各跑各的
+   6-token step),这不是引擎的问题,是调度/DSpark 的行为;要提并发吞吐得从那里入手。
+3. 剩余时间预算:compute 1.3ms + rest 1.0ms 中,`rest` 是 GPU 侧(注意力/indexer +
+   D2H/H2D + host-fn 派发)且与 CPU 计算**串行**;要再翻倍必须减少 CPU 层数
+   (GPU 常驻专家层,需要 TP=2 的显存)或压低 A/B 的每线程带宽(2.1 GB/s vs 内层循环 5 GB/s)。

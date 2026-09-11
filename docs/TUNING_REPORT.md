@@ -30,15 +30,13 @@
 ```bash
 export CUDA_VISIBLE_DEVICES=0
 export VLLM_EXPERTS_LOAD_DEVICE=cpu
-export XIAOTU_MOE_SINGLECOPY=0        # ★ 2026-09-10 更新:回到引擎默认的 NUMA 分片(=1 份内存、
-                                      #   每个线程只读本地 node;=1 会关掉分片、一半访问跨 socket)。
-                                      #   C=64 实测 53.4 → 73.6 tok/s(详见 docs/PERFORMANCE_OPTIMIZATION.md)
+# 权重布局固定为 NUMA 分片(1 份内存,每个线程只读本地 node;单拷贝模式已删除)。
+                                      #   C=64 实测分片 vs 单拷贝 53.4 → 73.6 tok/s(详见 docs/PERFORMANCE_OPTIMIZATION.md)
 export VLLM_USE_FLASHINFER_SAMPLER=0 HF_HUB_OFFLINE=1
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
 export XIAOTU_MOE_THREADS=192         # ★ 2026-09-10 更新:分片模式下 96→192 有 1.75× 收益
                                       #   (每层 compute 15.7→12.1 ms);未分片时加线程无效,
-                                      #   所以**必须**配合 XIAOTU_MOE_SINGLECOPY=0
-export OMP_NUM_THREADS=96
+                                      #   关掉分片时加线程无效,所以布局必须是分片(=默认,已无开关)
 export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384    # 长 prefill 阈值(见 §1.4)
 
 vllm serve <DEEPSEEK_V4_FLASH_DIR> \
@@ -130,7 +128,7 @@ TP=2 + `--cpu-offload-gb`,本轮做到**单卡**:
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0
-export VLLM_EXPERTS_LOAD_DEVICE=cpu XIAOTU_MOE_SINGLECOPY=1
+export VLLM_EXPERTS_LOAD_DEVICE=cpu
 export XIAOTU_PLE_CPU=1          # ★ 新增:PLE n-gram 表放主机内存(UVA 访问)
 export XIAOTU_MOE_THREADS=96 OMP_NUM_THREADS=48
 

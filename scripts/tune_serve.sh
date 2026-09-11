@@ -68,15 +68,17 @@ esac
 
 export CUDA_VISIBLE_DEVICES="$GPUS"
 export VLLM_EXPERTS_LOAD_DEVICE=cpu
-# 引擎的三种权重布局(见 moe_v2.hpp:384):
-#   (未设) 默认 = NUMA 分片:1 份权重 + 每个线程只读本节点的行(全部 page-local)
-#   XIAOTU_MOE_SINGLECOPY=1 = 单份连续拷贝、无分片(省内存,但一半访问跨 socket)
-#   XIAOTU_MOE_NOSHARD=1(配合 SINGLECOPY 未设) = 每 socket 一份副本(内存 ×2)
-# SINGLECOPY=0 表示"明确不要单拷贝",即回到默认的 NUMA 分片模式。
-case "${XIAOTU_MOE_SINGLECOPY:-1}" in
-  0|no|off) unset XIAOTU_MOE_SINGLECOPY ;;
-  *) export XIAOTU_MOE_SINGLECOPY="${XIAOTU_MOE_SINGLECOPY:-1}" ;;
-esac
+# ---------------------------------------------------------------------------
+# 【固定规则,不要再改】CPU 专家的并行模型:
+#   1) 每个 CCD 开 4-5 个核(本机 24 CCD ⇒ THREADS=120),不要再加核;
+#   2) 权重按 NUMA node 分片(nshard_ = numa_node_count() = 8),每个 node 的
+#      worker 只读写本 node 绑定的那一份(MPOL_BIND) —— 全部 page-local;
+#   3) node 之间只交换很小的数据(每层各 node 的激活切片/部分和),用池内
+#      all-gather + 每 token 归约,量级远小于跨 node 读权重的开销。
+#
+# 引擎侧已把"单份连续拷贝"模式(XIAOTU_MOE_SINGLECOPY)**整段删除**,这里也
+# 不再有任何开关 —— 分片是唯一布局(见 moe_v2.hpp "固定规则"注释)。
+
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 export HF_HUB_OFFLINE=1

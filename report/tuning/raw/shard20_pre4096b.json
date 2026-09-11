@@ -1,0 +1,43 @@
+{
+ "summary": {
+  "ts": "2026-09-11T10:02:55",
+  "tag": "shard20_pre4096b",
+  "server_tag": "unknown",
+  "natural_text": 1,
+  "client": "bench_nat_client",
+  "concurrency": 1,
+  "num_prompts": 1,
+  "output_len": 8,
+  "input_len": "nat4096",
+  "completed": 1,
+  "failed": 0,
+  "duration_s": 6.18,
+  "total_output_tokens": 8,
+  "out_tok_per_s": 1.29,
+  "per_stream_tok_per_s": 1.29,
+  "mean_ttft_ms": 5827.9,
+  "mean_tpot_ms": 44.32,
+  "mean_step_ms": 118.17,
+  "p95_step_ms": 94.77,
+  "mean_tokens_per_step": 2.0,
+  "per_req_tok_per_s": [
+   22.56
+  ]
+ },
+ "requests": [
+  {
+   "idx": 0,
+   "ttft_ms": 5827.858075499535,
+   "n_out": 8,
+   "n_steps": 4,
+   "tokens_per_step": 2.0,
+   "e2e_s": 6.182421047240496,
+   "decode_s": 0.3545629717409611,
+   "mean_step_ms": 118.17069475849469,
+   "mean_itl_ms": 44.320371467620134,
+   "p50_step_ms": 94.77106295526028,
+   "p95_step_ms": 94.77106295526028,
+   "tok_per_s": 22.562987783858862
+  }
+ ]
+}

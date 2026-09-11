@@ -40,7 +40,6 @@ if [ "$MODE" = "fast" ]; then
     MAXLEN=262144 SEQS=128 MAX_NBT=8192 \
     KV_DTYPE=fp8_ds_mla GPU_UTIL=0.90 KV_MEM_BYTES=12884901888 \
     THREADS=192 OMP=96 EAGER=1 PREFILL_MIN=384 \
-    XIAOTU_MOE_SINGLECOPY=0 \
     SPEC="$SPEC" SERVED=DeepSeek-V4-Flash-xiaotu \
     scripts/tune_serve.sh
 else
@@ -49,7 +48,7 @@ else
     MAXLEN=1048576 SEQS=64 MAX_NBT=8192 \
     KV_DTYPE=fp8_ds_mla GPU_UTIL=0.90 KV_MEM_BYTES=19327352832 \
     THREADS=96 OMP=48 EAGER=1 PREFILL_MIN=384 \
-    XIAOTU_MOE_SINGLECOPY=1 ENV_EXTRA="XIAOTU_MOE_EP=0" \
+    ENV_EXTRA="XIAOTU_MOE_EP=0" \
     SPEC="$SPEC" SERVED=DeepSeek-V4-Flash-xiaotu \
     scripts/tune_serve.sh
 fi

@@ -64,7 +64,6 @@ pip install -e .
 
 # 3) 跑一个专家权重放不进显存的 MoE 模型
 export VLLM_EXPERTS_LOAD_DEVICE=cpu     # 专家权重放 CPU
-export XIAOTU_MOE_SINGLECOPY=1          # 权重只存一份(省内存)
 vllm serve <模型目录> \
   --tensor-parallel-size 1 \
   --max-model-len 8192 \

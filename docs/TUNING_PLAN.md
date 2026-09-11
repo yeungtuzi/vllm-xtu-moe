@@ -24,7 +24,7 @@
 |---|---|
 | GPU | 3 × A100-PCIE-40GB(SM 8.0,无 NVLink),本轮**全部可用**(生产 8070 已关闭) |
 | CPU / 内存 | EPYC 9654 2×96 核(NPS4,8 NUMA 域,无 AMX)/ 1.5 TiB DDR5(实测单流读 860 GB/s) |
-| vLLM | 主线 `6c73b08` + 本插件(`VLLM_EXPERTS_LOAD_DEVICE=cpu`,`XIAOTU_MOE_SINGLECOPY=1`) |
+| vLLM | 主线 `6c73b08` + 本插件(`VLLM_EXPERTS_LOAD_DEVICE=cpu`) |
 | 测量纪律 | 每轮记录 `uptime` 与 GPU 占用;同一配置重复 3 次取中位;**关闭 prefix caching**(避免命中缓存) |
 
 ## 2. 测量协议(所有阶段统一)
@@ -34,7 +34,7 @@
 `scripts/tune_serve.sh`(本轮新增,参数化)负责启动,固定项:
 
 ```
-VLLM_EXPERTS_LOAD_DEVICE=cpu  XIAOTU_MOE_SINGLECOPY=1  HF_HUB_OFFLINE=1
+VLLM_EXPERTS_LOAD_DEVICE=cpu  HF_HUB_OFFLINE=1
 VLLM_USE_FLASHINFER_SAMPLER=0  VLLM_ENGINE_READY_TIMEOUT_S=7200
 --host 0.0.0.0 --port <固定端口,避开 8070> --enforce-eager --kernel-config.enable_jit_warmup=false
 --served-model-name <name> --no-enable-prefix-caching

@@ -24,8 +24,7 @@ import time
 MODE = os.environ.get("MOE_MODE", "gpu")
 if MODE == "cpu":
     os.environ["VLLM_EXPERTS_LOAD_DEVICE"] = "cpu"
-    os.environ.setdefault("XIAOTU_MOE_SINGLECOPY", "1")
-else:
+    else:
     os.environ["VLLM_EXPERTS_LOAD_DEVICE"] = "gpu"
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")

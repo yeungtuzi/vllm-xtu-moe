@@ -381,20 +381,14 @@ public:
         //       copy (indexed by absolute row). Env XIAOTU_MOE_NOSHARD=1 forces the
         //       old socket-replica path (A/B toggling). Falls back to socket
         //       replication then single copy on failure / non-divisible dims.
-        // lk-moe-parity SINGLE-COPY mode (env XIAOTU_MOE_SINGLECOPY=1): hold the
-        // model exactly ONCE (one contiguous snapshot into buf_w13_/buf_w2_), with
-        // NO NUMA shard regions and NO per-socket replicas. This matches the
-        // reference lk engine's footprint (~model size ~160G) instead of the
-        // ~157G + ~136G shard copy (~300G). The MoE weight-read phase (A/B) is not
-        // the conc-4 binding constraint (see results SESSION7), so the redundant
-        // shard copy is pure memory overhead here.
-        const bool single_copy =
-            std::getenv("XIAOTU_MOE_SINGLECOPY") != nullptr;
+        // 【固定规则,不要再改】NUMA 分片是**唯一**的权重布局:每个 node 的
+        // worker 只读写 MPOL_BIND 到自己那份的内存(全部 page-local),node 之间
+        // 只交换很小的激活切片/部分和。旧的 XIAOTU_MOE_SINGLECOPY(单份连续拷贝)
+        // 模式**已彻底删除**:它让全部线程读同一份内存(7/8 的读跨 node),解码
+        // A 阶段慢 ~30 倍、端到端慢 1.67 倍。不要以任何形式恢复它。
         bool sharded_ok = false;
         if constexpr (wt::kNParallel) {
-            if (single_copy) {
-                nshard_ = 0;  // skip shard + socket-replica; else-branch copies once
-            } else if (std::getenv("XIAOTU_MOE_NOSHARD") == nullptr) {
+            if (std::getenv("XIAOTU_MOE_NOSHARD") == nullptr) {
                 nshard_ = numa_node_count();
                 // XIAOTU_MOE_NSHARD=N 覆盖分片数。本机 NPS=4 ⇒ numa_node_count()=8,
                 // 但 ACPI 距离矩阵显示**同 socket 内 10/12/12/12、跨 socket 32**:
@@ -426,8 +420,8 @@ public:
                     nshard_ = 0;
                 }
             }
-            if (!sharded_ok && !single_copy) {
-                // legacy per-socket replication (or single copy if it fails).
+            if (!sharded_ok) {
+                // 分片不可用(维度不整除 / 分配失败)时的安全网:每 socket 一份副本。
                 nsock_ = numa_socket_count();
                 sock_fill(w13, w13_bytes, sock_owned_, w13_s_);
                 sock_fill(w2, w2_bytes, sock_owned_, w2_s_);
@@ -436,15 +430,15 @@ public:
             }
         }
         if (sharded_ok) {
-            // w13_/w2_/scales already set above (single-copy sharded mode).
+            // w13_/w2_/scales already set above (sharded mode).
         } else if (nsock_ >= 2) {
-            // Replicas REPLACE the single copy. w13_/w2_ reference the socket-0
-            // replica so debug/parity accessors and any single-threaded fallback
-            // still see valid memory.
+            // Replicas for the (unexpected) case that sharding could not be set
+            // up; w13_/w2_ reference the socket-0 replica so debug/parity
+            // accessors and any single-threaded fallback still see valid memory.
             w13_ = w13_s_[0];   w2_ = w2_s_[0];
             w13_g_ = w13g_s_[0]; w2_g_ = w2g_s_[0];
         } else {
-            // single socket / replication not possible: one contiguous copy.
+            // Safety net only (single socket / sharding impossible): one copy.
             if (w13) { buf_w13_ = std::make_unique<uint8_t[]>(w13_bytes); std::memcpy(buf_w13_.get(), w13, w13_bytes); w13_ = buf_w13_.get(); }
             else     { w13_ = nullptr; }
             if (w2)  { buf_w2_ = std::make_unique<uint8_t[]>(w2_bytes); std::memcpy(buf_w2_.get(), w2, w2_bytes); w2_ = buf_w2_.get(); }
@@ -1156,20 +1150,30 @@ private:
         void* p = mmap(nullptr, total, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) return nullptr;
-        // Opt the region into 2MB transparent hugepages (host THP=madvise) so the
-        // streaming weight reads don't thrash the 4KB TLB. Default ON; env
-        // XIAOTU_MOE_SHARD_HUGEPAGE=0 disables (A/B toggle).
+        // 【THP 默认关,不要再改回去】每个 node 只拥有每个专家的一段稀疏跨度
+        // (w13 每专家 8.4MB stride 里只碰 2×512KB,w2 碰 1×512KB),MADV_HUGEPAGE
+        // 会让跨度覆盖到的每个 2MB 页**整体**落地 ⇒ 分片区域 3.2GB/层 → 15-19GB/层,
+        // 且分布不均(实测 node7 一层 ~5GB):29 层就把单 node 的 193GB 吃光 ⇒
+        //   oom-kill: constraint=CONSTRAINT_MEMORY_POLICY, nodemask=7
+        // 关掉后 6.9GB/层、速度不降反略快(同一窗口交错,B=6:1.20/1.20/1.23 关 vs
+        // 1.20/1.28/1.32 开)。旧注释"不落大页会 thrash 4KB TLB"是错的:跨度连续。
+        // 复现该 A/B 时显式 XIAOTU_MOE_SHARD_HUGEPAGE=1(仅调试用)。
         const char* hp = std::getenv("XIAOTU_MOE_SHARD_HUGEPAGE");
-        if (!hp || std::atoi(hp) != 0) madvise(p, total, MADV_HUGEPAGE);
+        if (hp && std::atoi(hp) != 0) madvise(p, total, MADV_HUGEPAGE);
         unsigned long mask = 1UL << node;
-        long rc = syscall(SYS_set_mempolicy, MPOL_BIND, &mask, sizeof(mask) * 8);
+        // 【必须用 mbind,不许用 set_mempolicy】set_mempolicy 给**线程**设策略,
+        // 会被之后新建的线程继承:引擎构建期间 vLLM 还在起 pinned 权重缓存等线程,
+        // 它们在窗口内分配的大块内存就被绑到单个 node ⇒
+        //   oom-kill: constraint=CONSTRAINT_MEMORY_POLICY, nodemask=7,
+        //             task=VLLM::EngineCor, anon-rss 603GB
+        // 整个 EngineCore 被杀(2026-09-11 实测)。mbind 只作用于这段映射,不会泄漏。
+        long rc = syscall(SYS_mbind, p, total, MPOL_BIND, &mask, sizeof(mask) * 8, 0);
         uint8_t* d = static_cast<uint8_t*>(p);
         copier(d, src, total);
-        if (rc == 0) syscall(SYS_set_mempolicy, MPOL_DEFAULT, nullptr, 0);
         if (std::getenv("XIAOTU_MOE_SHARD_DIAG") != nullptr)
             fprintf(stderr, "[SHARD-DIAG] region node=%d rc=%ld vmasize=%.1fGiB addr=%p%s\n",
                     node, rc, (double)total / (1ULL<<30), p,
-                    (rc==0) ? " (bound)" : " (unbound -> first-touch!)");
+                    (rc==0) ? " (mbind)" : " (mbind FAILED -> first-touch!)");
         return p;
     }
 

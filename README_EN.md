@@ -69,7 +69,6 @@ pip install -e .
 
 # 3) serve a MoE model whose experts do not fit in VRAM
 export VLLM_EXPERTS_LOAD_DEVICE=cpu     # keep expert weights on the CPU
-export XIAOTU_MOE_SINGLECOPY=1          # one copy of the weights (lower memory)
 vllm serve <MODEL_DIR> \
   --tensor-parallel-size 1 \
   --max-model-len 8192 \

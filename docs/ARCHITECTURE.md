@@ -128,8 +128,8 @@ out = clamp(gate, max=L) * sigmoid(alpha * clamp(gate, max=L)) * (clamp(up, ±L)
   并以 `groupN=1 / groupK=group_size` 构建引擎;重排后的张量用显式 `empty+copy_`
   分配,避免 `.contiguous()` 链留下"存储归属别处"的视图;
 - 每个层一个引擎实例,引擎之间共享同一个 NUMA 线程池;
-- `XIAOTU_MOE_SINGLECOPY=1` 时权重只保留一份并按 NUMA 节点分片,
-  每个核心只读本节点数据。
+- 权重**固定**按 NUMA 节点分片(唯一的权重布局,无开关):每个核心只读本节点
+  绑定的那一份;node 之间只交换很小的激活切片/部分和。
 
 ## 7. 长 prefill 的 GPU 路径
 

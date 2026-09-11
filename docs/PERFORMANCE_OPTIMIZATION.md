@@ -98,19 +98,19 @@ C=128 时每层时间约为 C=64 的 **2.5×**,而 C=64 约为 C=16 的 **2.9×*
 | 模式 | 触发 | 内存 | 访存特征 |
 |---|---|---|---|
 | **默认:NUMA 分片** | 都不设 | **1 份** | node n 持 gate/up 的 `[n·I/NS,(n+1)·I/NS)` 列 + down 的 `[n·H/NS,(n+1)·H/NS)` 行;每个线程只读本 node 的行 ⇒ **全部本地** |
-| 单拷贝 | `XIAOTU_MOE_SINGLECOPY=1` | 1 份 | 无分片,一半访问跨 socket |
+| 单拷贝 | `| 1 份 | 无分片,一半访问跨 socket |
 | socket 副本 | 不设 SINGLECOPY + `XIAOTU_MOE_NOSHARD=1` | **2 份** | 每 socket 一份完整副本,全本地 |
 
 **实测(C=64/out=256,同机同时段,单卡)**:
 
 | 配置 | 每层 compute | 每层 period | 吞吐 | 有效带宽 |
 |---|---|---|---|---|
-| `XIAOTU_MOE_SINGLECOPY=1`(本项目此前默认) | 22.8 ms | 25.5 ms | 53.4 tok/s | ~237 GB/s |
+| `| 22.8 ms | 25.5 ms | 53.4 tok/s | ~237 GB/s |
 | **默认 NUMA 分片(1 份内存)** | **15.9 ms** | **18.6 ms** | **73.6 tok/s** | **~340 GB/s** |
 
-> `XIAOTU_MOE_SINGLECOPY=1` 是为了"省内存"引入的,但**默认分片模式同样是 1 份内存**
+> `是为了"省内存"引入的,但**默认分片模式同样是 1 份内存**
 > (lk 系项目 README:"多个 NUMA 节点共享单份内存"),所以这档配置是**纯亏**。
-> `scripts/tune_serve.sh` 现在支持 `XIAOTU_MOE_SINGLECOPY=0` 明确回到默认分片。
+> `scripts/tune_serve.sh` 现在支持 `明确回到默认分片。
 
 **带宽天花板**:本机 STREAM 只读 96 线程本地 **754 GB/s**、单 socket triad 274 GB/s、
 全机 triad 422 GB/s。我们最好也只有 340 GB/s ⇒ **还有 2× 以上空间**(§5)。
@@ -263,8 +263,8 @@ vllm bench serve --base-url http://localhost:8070 --model DeepSeek-V4-Flash-0731
 
 | # | 目的 | 命令要点 | 状态 |
 |---|---|---|---|
-| E1 | 基线(SINGLECOPY) | `XIAOTU_MOE_SINGLECOPY=1` | ✅ 53.4 tok/s |
-| E2 | **默认分片** | `XIAOTU_MOE_SINGLECOPY=0` | ✅ **73.6 tok/s** |
+| E1 | 基线(SINGLECOPY) | `| ✅ 53.4 tok/s |
+| E2 | **默认分片** | `| ✅ **73.6 tok/s** |
 | E3 | 线程翻倍 | E2 + `THREADS=192` | 🟡 待测 |
 | E4 | socket 级分片 | E3 + `XIAOTU_MOE_NSHARD=2` | 🟡 待测 |
 | E5 | 强制 grouped | 最优 + `XIAOTU_MOE_GROUP_FACTOR=1` | 🟡 待测 |
@@ -524,7 +524,7 @@ TP=2 + 8 层 ≈ **89 tok/s**;TP=2 + 12 层 ≈ **103 tok/s**;TP=3 + 18 层 ≈ 
 | # | 配置 | C=64/out=256 | 每层 period(compute + rest) |
 |---|---|---|---|
 | 0 | 起点:`SINGLECOPY=1` + 96 线程 + eager | 54.9 | 25.5 ms(22.8 + 2.7) |
-| 1 | + **NUMA 分片**(`XIAOTU_MOE_SINGLECOPY=0`) | 73.6 | 18.5 ms(15.7 + 2.8) |
+| 1 | + **NUMA 分片**(`| 73.6 | 18.5 ms(15.7 + 2.8) |
 | 2 | + **CUDA graph**(`EAGER=0`,`--max-num-seqs≤128`) | 77.4 | 18.5 ms |
 | 3 | + **192 线程**(`XIAOTU_MOE_THREADS=192 OMP_NUM_THREADS=96`) | **90.6** | 14.9 ms(12.1 + 2.7) |
 
@@ -548,7 +548,6 @@ TP=2 + 8 层 ≈ **89 tok/s**;TP=2 + 12 层 ≈ **103 tok/s**;TP=3 + 18 层 ≈ 
 ```bash
 export CUDA_VISIBLE_DEVICES=2
 export VLLM_EXPERTS_LOAD_DEVICE=cpu
-export XIAOTU_MOE_SINGLECOPY=0        # NUMA 分片(勿开单拷贝)
 export XIAOTU_MOE_THREADS=192 OMP_NUM_THREADS=96
 export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384
 
@@ -707,7 +706,7 @@ MoE 86–116 + 注意力/dense 39(满频)~90(当前频率)+ 采样/调度 ~25。
 ### 17.10 复现命令
 
 ```bash
-SINGLECOPY=0 MODE=dsv4 TAG=nat_k5 PORT=8070 TP=1 MAXLEN=262144 SEQS=128 \
+MODE=dsv4 TAG=nat_k5 PORT=8070 TP=1 MAXLEN=262144 SEQS=128 \
   GPU_UTIL=0.85 KV_DTYPE=fp8_ds_mla KV_MEM_BYTES=8589934592 THREADS=192 OMP=96 \
   EAGER=0 EP=0 GPUS=2 ENV_EXTRA="XIAOTU_CD_TIMING=1" scripts/tune_serve.sh
 L=128 C=1 N=4 OUT=128 TAG=mine scripts/bench_nat_client.py   # 或 scripts/run_nat_curve.sh

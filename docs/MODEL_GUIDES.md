@@ -20,7 +20,6 @@
 
 ```bash
 export VLLM_EXPERTS_LOAD_DEVICE=cpu   # ★ 混合模式开关(取值只有 cpu / gpu)
-export XIAOTU_MOE_SINGLECOPY=1        # 权重只保留一份(NUMA 分片),省一半内存
 export VLLM_ENGINE_READY_TIMEOUT_S=3600   # 首次加载要建 43/48 个引擎,别让默认超时打断
 export VLLM_USE_FLASHINFER_SAMPLER=0  # 与 CPU 引擎的 host 回调同流,避免额外变量
 ```
@@ -216,7 +215,7 @@ vllm serve Qwen/Qwen3.8-Flash-Next-FP8 \
 离线冒烟脚本(自带计时与连贯性检查,推荐先用它验收):
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 VLLM_EXPERTS_LOAD_DEVICE=cpu XIAOTU_MOE_SINGLECOPY=1 \
+CUDA_VISIBLE_DEVICES=0,1 VLLM_EXPERTS_LOAD_DEVICE=cpu \
   VLLM_ENGINE_READY_TIMEOUT_S=7200 TP=2 EP=1 CPU_OFFLOAD_GB=12 \
   SMOKE_MODEL=Qwen/Qwen3.8-Flash-Next-FP8 SMOKE_LONG_TOKENS=512 \
   python scripts/fp8_moe_smoke.py
@@ -270,7 +269,7 @@ fp8 权重上已跑过(48 层 × 2304 次调用,rel_rms **1.9e-7 … 3.9e-4**,�
 | 单卡不可用 | 非专家权重 + KV 超出 40 GB;这是**显存**限制,与本插件无关 |
 | offload 成本 | `--cpu-offload-gb` 越大越省显存、decode 越慢,建议在"能起 KV"的前提下取最小值 |
 | decode 慢 | 见 §2.4,瓶颈在 offload 带宽 |
-| 加载近半小时 | 2 个 rank 各自读全部 shard + 建 48 个引擎;`XIAOTU_MOE_SINGLECOPY=1` 已是省内存配置 |
+| 加载近半小时 | 2 个 rank 各自读全部 shard + 建 48 个引擎;分片布局已是 1 份内存 |
 
 ---
 

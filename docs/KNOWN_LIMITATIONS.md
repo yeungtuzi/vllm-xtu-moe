@@ -82,7 +82,7 @@ per-engine 的可变字段;pinned 缓冲仍由引擎复用,其读写受 stream �
 
 - 首次加载超大模型(数百 GB 专家权重)需要数分钟,请放大
   `VLLM_ENGINE_READY_TIMEOUT_S`;
-- 不设 `XIAOTU_MOE_SINGLECOPY=1` 时,引擎可能按 NUMA socket 复制权重,内存占用约 2×;
+- 分片布局在极端情况下(维度不整除 / 分配失败)会退回每 socket 一份副本,内存占用约 2×(安全网,正常配置不会触发);
 - `--enforce-eager` 建议先开启,便于定位问题;稳定后可尝试关闭;
 - CPU 引擎自带线程池,`OMP_NUM_THREADS` / `VLLM_CPU_OMP_THREADS_BIND`
   只影响主线自带的 CPU 内核。

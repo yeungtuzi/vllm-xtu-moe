@@ -297,19 +297,20 @@ inline void* numa_socket_alloc(size_t bytes, int socket) {
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return nullptr;
-    long rc = syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, &mask, sizeof(mask) * 8);
-    if (rc == 0) {
-        // Fault every page in on this socket (thread policy is INTERLEAVE over
+    // mbind() 只作用于**这段映射**。绝不要用 set_mempolicy():那是给"线程"设策略,
+    // 会被随后新建的线程继承,窗口内别处的大块分配(如 vLLM 的 pinned 权重缓存)
+    // 就被绑到单个 node 上 ⇒ CONSTRAINT_MEMORY_POLICY 的 OOM,整进程被杀。
+    long rc = syscall(SYS_mbind, p, bytes, MPOL_INTERLEAVE, &mask, sizeof(mask) * 8, 0);
+    {
+        // Fault every page in on this socket (region policy is INTERLEAVE over
         // just this socket's nodes). volatile forces the stores.
         volatile char* cp = static_cast<volatile char*>(p);
         const size_t PS = 4096;
         for (size_t off = 0; off < bytes; off += PS) cp[off] = 0;
-        syscall(SYS_set_mempolicy, MPOL_DEFAULT, nullptr, 0);
-    } else {
-        // policy failed: touch anyway (default placement) to keep the region valid
-        volatile char* cp = static_cast<volatile char*>(p);
-        const size_t PS = 4096;
-        for (size_t off = 0; off < bytes; off += PS) cp[off] = 0;
+    }
+    if (rc != 0) {
+        // policy failed: pages were still touched above (default placement), so
+        // the region is valid — just not socket-local. Caller falls back.
     }
     return p;
 }

@@ -10,7 +10,7 @@
 短 prompt 时延 + 2000 token 长 prefill 的 TTFT 与 decode 速率。
 
 用法:
-  CUDA_VISIBLE_DEVICES=2 VLLM_EXPERTS_LOAD_DEVICE=cpu XIAOTU_MOE_SINGLECOPY=1 \
+  CUDA_VISIBLE_DEVICES=2 VLLM_EXPERTS_LOAD_DEVICE=cpu \
     python scripts/fp8_moe_smoke.py
 """
 import os
@@ -18,7 +18,6 @@ import sys
 import time
 
 os.environ.setdefault("VLLM_EXPERTS_LOAD_DEVICE", "cpu")
-os.environ.setdefault("XIAOTU_MOE_SINGLECOPY", "1")
 os.environ.setdefault("XIAOTU_GPU_PREFILL_MIN_TOKENS", "0")
 os.environ.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "7200")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -37,7 +36,7 @@ def main() -> int:
     print(
         f"[fp8smoke] model={MODEL}\n"
         f"[fp8smoke] experts_device={os.environ['VLLM_EXPERTS_LOAD_DEVICE']} "
-        f"singlecopy={os.environ.get('XIAOTU_MOE_SINGLECOPY')} maxlen={MAXLEN}",
+        f"maxlen={MAXLEN}",
         flush=True,
     )
     t0 = time.time()
