@@ -128,6 +128,20 @@
 | 实测 | 单卡 256K 时 KV 需求已把显存吃满(KV 检查要求 131072 给 6.71 GiB),再加常驻层无空间 |
 | 结论 | 常驻专家层必须走 **TP=2**(或降到更短上下文);不要重复"单卡 + 常驻层"的尝试 |
 
+## R14. GPU 常驻专家层 + CUDA graph 捕获(EAGER=0)— 当前不兼容
+
+| 项 | 内容 |
+|---|---|
+| 试了什么 | TP=2 + `XIAOTU_MOE_GPU_RESIDENT_LAYERS=0-5` + `EAGER=0`(CUDA graph) |
+| 实测 | 捕获阶段直接失败:`torch.AcceleratorError: CUDA error: dependency created on uncaptured work in another stream` → `operation failed due to a previous error during capture`,`Worker failed`,启动失败 |
+| 机制 | 常驻层的 GPU MoE 在 tp>1 时要归约部分和:代码在**捕获区内**调用 `tensor_model_parallel_all_reduce(gpu_out)`(`hybrid_model.py` 常驻分支),而 vLLM 的非 custom all-reduce 用侧流 + event ⇒ 捕获期间非法。非常驻的 GPU 预填充分支有 `not capturing` 门控,所以从来没踩到 |
+| 回退动作 | 该轮改用 `EAGER=1`(与之前 tp2_eager 基线单变量可比)先拿常驻层的数据 |
+| 再试条件 | **不要**在下面两处捕获不安全点修完之前重复 EAGER=0 + 常驻层 |
+| 追查 1(已修) | 失败点其实是 `gpu_prefill.py` 里 `torch.cuda.current_stream().wait_event(slot.ready)`:`cudaErrorStreamCaptureIsolation`(常驻槽位的 ready 事件在捕获外 record)。已改为捕获期间跳过该等待(数据在构建时就写完) |
+| 追查 2(**未修,阻塞**) | 再启动一次后失败点上移到 `_build_segmentation()` 的 `ids = ids[ok]`(布尔掩码索引 = 数据相关形状)⇒ `cudaErrorStreamCaptureUnsupported`。**`gpu_moe_layer` 过去只用于"非捕获"的 GPU 预填充分支(有 `not capturing` 门控),所以从未做过捕获安全审计** |
+| 修法(下轮) | 去掉数据相关形状:无效 id 映射到"垃圾桶"专家 `E`(`ids_c = where(bad, E, ids)`),`bincount(minlength=E+1)` 排序分段,内核 grid=E 不读垃圾桶段;`A` 用固定 `T*K` 上界。需同时验证非捕获路径数值不变(用 `torch_reference_layer` 对齐) |
+| 附带收益 | 修完还能让**非常驻的 GPU 预填充**也能进图(现在每步都在 EAGER 下跑) |
+
 ---
 
 ## M. 测量陷阱(**犯过的错**,不要再犯)

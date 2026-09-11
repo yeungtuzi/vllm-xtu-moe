@@ -777,7 +777,14 @@ def gpu_moe_layer(
     E = w13.shape[0]
     device = torch.device(device) if not isinstance(device, torch.device) else device
     if slot is not None:
-        torch.cuda.current_stream(device).wait_event(slot.ready)
+        # 【不要在图捕获期间 wait_event】常驻层的 slot.ready 是在**捕获外**
+        # (构建时)record 的,图内等待它会触发 cudaErrorStreamCaptureIsolation
+        # ("dependency created on uncaptured work in another stream"),整个捕获作废。
+        # 常驻槽位的数据在构建时就已写完(阻塞 H2D + 之后早已完成的事件),图内
+        # 不需要这个等待;非捕获时仍然保留(预取路径靠它保证顺序)。
+        # 见 report/tuning/TRIED_AND_REVERTED.md R14。
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.current_stream(device).wait_event(slot.ready)
         w13_t, s13_t, w2_t, s2_t = slot.bufs
     elif w13.device == device:
         w13_t = _kmajor_bytes(w13); s13_t = _kmajor_bytes(s13)

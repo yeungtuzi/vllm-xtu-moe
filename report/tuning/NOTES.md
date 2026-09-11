@@ -1922,3 +1922,56 @@ A(读 gate/up 分片)是最大项:聚合 195MB/749µs ≈ 260 GB/s(单拷贝时�
 3. 剩余时间预算:compute 1.3ms + rest 1.0ms 中,`rest` 是 GPU 侧(注意力/indexer +
    D2H/H2D + host-fn 派发)且与 CPU 计算**串行**;要再翻倍必须减少 CPU 层数
    (GPU 常驻专家层,需要 TP=2 的显存)或压低 A/B 的每线程带宽(2.1 GB/s vs 内层循环 5 GB/s)。
+
+## 54. TP=2 + GPU 常驻专家层(第一步):预填充 +47%,但 EAGER 下解码退化
+
+配置:`TP=2 EP=1 GPUS=2,0 MAXLEN=131072 KV 8GiB THREADS=60/rank OMP=1 EAGER=1
+--disable-custom-all-reduce`,`XIAOTU_MOE_GPU_RESIDENT_LAYERS=0-5`(6 层×本 rank 1.59 GiB,
+主模型 + draft 各一份 ⇒ 每卡 3.2 GiB/层),DSpark k=5。
+
+| 口径 | tp2_eager(无 常驻层,§49.2) | **tp2resE(+6 常驻层)** | 单卡分片(§53) |
+|---|---|---|---|
+| 预填充 @4096 | 761 t/s | **1117 t/s**(TTFT 3.67s,+47%) | 703 t/s |
+| 解码 C=1 聚合 / TPOT | 9.95 / — | 14.33 / **47.3 ms** | **13.71 / 28.5 ms** |
+| 解码 C=2 聚合 / per-stream | 12.87 / — | 17.47 / 8.73(TPOT 86.9ms) | 15.37 / 7.68(TPOT 72.7ms) |
+| 每层 period / compute / rest | — | 4.13-4.23 / **2.45-2.53** / 1.68-1.70 ms | 2.30-2.47 / 1.31-1.34 / 0.97-1.16 ms |
+
+**读法**:
+1. **常驻层对预填充立竿见影** (+47%):每层 3.19 GB 不再过 PCIe,而且是两条链路并行流
+   剩下的层。要冲 1500 t/s 就继续加常驻层(受显存约束,见下)。
+2. **TP=2 的 CPU 侧是净亏的**:每层 compute 从 1.31 → 2.45 ms。EP 只让每 rank 少读一半
+   专家权重,但每层多出一次**跨 rank 部分和合并 + 屏障等待**(差 ~1.1 ms/层,与 §49.2 的
+   估计一致);再加上每 rank 线程数减半(60)。⇒ 除非这些层**不在 CPU 上算**,TP=2 对
+   解码没有好处。
+3. 常驻层显存账:每层每卡 3.2 GiB(**主模型 + draft 模型各 1.59 GiB**)。当前 6 层用掉
+   32.25/40 GiB(含 KV 8 GiB)。想加层数必须先省显存:draft 模型不必常驻 / 降 KV /
+   提 GPU_UTIL。
+4. 常驻层 + CUDA graph 目前**不兼容**(见登记簿 R14),本轮先用 EAGER 拿数据。
+
+### 54.1 常驻层 + CUDA graph:两处捕获不安全点(登记簿 R14)
+1. **已修**:`gpu_moe_layer` 里对常驻槽位 `wait_event(slot.ready)` —— 事件在捕获外 record,
+   图内等待报 `cudaErrorStreamCaptureIsolation`。改为捕获期间跳过(数据构建时已写完)。
+2. **未修(阻塞)**:`_build_segmentation()` 的 `ids = ids[ok]` 布尔掩码索引是**数据相关形状**,
+   捕获不支持(`cudaErrorStreamCaptureUnsupported`)。`gpu_moe_layer` 过去只在"非捕获"的
+   GPU 预填充分支里用(`not capturing` 门控),从未被捕获过。
+   修法:无效 id 归入垃圾桶专家 `E`,`bincount(minlength=E+1)` 分段,内核 grid=E 跳过该段,
+   `A` 用固定 `T*K`;修完还能让 GPU 预填充也进图。
+
+## 55. 本轮(第 15 轮)结论与下一步
+
+| 配置 | 预填充 @4096 | 解码 C=1 TPOT | 纯解码 t/s | 备注 |
+|---|---|---|---|---|
+| 单卡分片 + CUDA graph(**当前 8070 交付**)| 703 t/s | **28.5 ms** | **35.1** | 解码最优 |
+| TP=2 + 6 常驻层,EAGER | **1117 t/s** | 47.3 ms | 21.1 | 预填充最优 |
+| TP=2 无 常驻层,EAGER(§49.2)| 761 t/s | — | ~15 | — |
+| TP=2 + 常驻层 + CUDA graph | — | — | — | 启动失败,见 R14(2 处捕获不安全点,1 已修)|
+
+下一步优先级:
+1. **修 `_build_segmentation` 的布尔掩码索引**(R14 追查 2):这是"常驻层 + 图"的唯一阻塞点,
+   修完预填充(1117)与解码(graphs)可以同时拿到;顺带让 GPU 预填充也能进图。
+2. **常驻层显存**:每层每卡 3.2 GiB 里有一半是 **draft 模型**的副本。让 draft 不常驻 / 降 KV /
+   提 GPU_UTIL,可在同样显存下把常驻层数从 6 提到 ~10-12 ⇒ 预填充冲 1500。
+3. **压低 CPU 侧每线程带宽**(A 阶段 2.1 GB/s vs 内层循环 5 GB/s):用微基准在
+   **真实解码规模**(DEDUP≈23, BS=6)扫 `XIAOTU_MOE_SHARDSPLIT` / sub 切分,别再拿 B=6/DEDUP=12
+   的旧数据外推。
+4. 未测旋钮:`VLLM_USE_V2_MODEL_RUNNER=1`(目标清单里的)、`XIAOTU_GPU_PREFETCH_AHEAD`/window。
