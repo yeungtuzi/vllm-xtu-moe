@@ -512,9 +512,13 @@ class CpuXiaotuMoE(nn.Module):
         #   176 线程:1651 / 1644     160:1649 / 1613
         # ⇒ 留 16 个核不用,单次调用快 **1.7–2.0×**;把调用线程 taskset 钉到专用核
         #   也能得到同样量级(2645→1876)。默认预留 16 核,可用 XIAOTU_MOE_THREADS 覆盖。
+        # 服务端实测(2026-09-11,负载 31-50,同配置):192 线程 8.25-9.98 tok/s、
+        # 176→11.44、160→11.66、144→12.57、128→12.66(每层 compute 4.4-5.7 → 1.61-1.67 ms),
+        # **平台期在 128-144**,即预留 ncpu-64…ncpu-48(服务进程里还有 torch/CUDA/采样
+        # 等线程,需要更多空闲核,比单实例微基准的 160-184 更靠下)。
         if os.environ.get("XIAOTU_MOE_THREADS") is None:
             _ncpu = os.cpu_count() or 8
-            _reserve = 16 if _ncpu >= 64 else max(1, _ncpu // 8)
+            _reserve = 64 if _ncpu >= 128 else (16 if _ncpu >= 64 else max(1, _ncpu // 8))
             os.environ["XIAOTU_MOE_THREADS"] = str(max(1, _ncpu - _reserve))
         import xiaotu_moe
 
