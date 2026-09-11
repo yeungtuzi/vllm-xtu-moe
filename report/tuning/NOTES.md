@@ -1611,3 +1611,25 @@ GitHub Releases API for Lvllm / Lvllmds4 / Lvllmds4-x / Lsglang):
   仅为机器带宽的 2.4% ⇒ 我们的 packed4 内核是**GEMV 结构**(权重驻 L1、**每个输出行都重读
   一遍激活**),大批量时被激活带宽压死。**预填充要达标必须把它做成真正的 GEMM**
   (激活驻留寄存器、权重流式,并在 M 方向做寄存器分块)。
+
+### 46.6 常驻专家层机制已验证;单卡放不下,必须走 TP=2
+
+- `XIAOTU_MOE_GPU_RESIDENT_LAYERS=0-1` 实测可用,日志:
+  `[xiaotu] GPU-resident model.layers.0/1.ffn: 3.19 GiB on cuda:0 (tp=1, experts=256)` ✓
+  (每层专家 3.19 GiB,与他们 `LVLLM_GPU_RESIDENT_MOE_LAYERS` 同一机制);
+- 但**单卡 256K 配置下没有空间**:GPU_UTIL 0.85 × 40 GB = 34 GB,其中 GPU 侧权重 ~26 GB +
+  KV 8 GiB ⇒ 富余 < 3.2 GB(=1 层);把 KV 缩小会被 vLLM 的 `max_model_len` 校验拦住
+  (它按 16K→6.28 GiB 的保守口径算,比实测 29.5 KB/token 严得多)。
+- ⇒ **常驻层必须配 TP=2**:每 rank GPU 权重 ~13 GB + KV 8 GiB ⇒ 富余 ~19 GB ⇒
+  可常驻 **~12 层**(每层每 rank 1.6 GiB,即 43 层里的 28%)。这正是下一轮的主实验,
+  也是对方 PRO 6000 那台(单卡 96 GB 放 14 层)的对应做法。
+
+### 46.7 下一轮计划(按目标 prefill 1500 / decode 70 / spec 100)
+
+| 优先级 | 工作 | 预期 | 依据 |
+|---|---|---|---|
+| P0 | **预填充改成真正的 GEMM**(激活驻留寄存器 + M 方向寄存器分块,权重流式) | CPU 预填充 576 → 数千 t/s | 实测每层只搬 19 GB/s(激活每行重读),是 GEMV 结构问题 |
+| P0 | **TP=2 + `XIAOTU_MOE_GPU_RESIDENT_LAYERS=0-11`** | decode 计算量 -28%,预填充少流 12×3.2 GB 的 PCIe | 对方同款做法;单卡无空间 |
+| P1 | 解码引擎 CPU 每层 2.0 → 1.1 ms(对方 9684X 同级的水平) | decode 再 +1.5–2× | 每层成本对照:我们 1.9–2.4 ms vs 对方反推 ~1.1 ms |
+| P1 | GPU 预填充的 PCIe 流式:检查是否可只流"活跃专家"(4096 token 时全活跃,无收益)或改成分块流水 | — | 139 GB/次 ≈ 5.6 s 已是 PCIe 极限 |
+| P2 | `VLLM_USE_V2_MODEL_RUNNER=1`、`num_speculative_tokens 5→3` | 未知,便宜可试 | 对方 quick start 默认 |
