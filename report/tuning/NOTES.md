@@ -2159,3 +2159,12 @@ TP=2+6 常驻层,预填充 TTFT 3733/3767 ms vs 基线 3666-3771 ms ⇒ 保持�
 至此目标清单里点名的旋钮已全部试过:GPU 常驻专家层(✅ 预填充 +47%)、GPU 预填充阈值(384,
 在用)、prefetch window/slots(实测无益,R20)、`VLLM_USE_V2_MODEL_RUNNER`(无益,R26)、
 spec tokens 5→3(拒绝,R10)。
+
+
+## 66. 第 25 轮:TP=2 反常的统一解释(跨卡归约流量)
+
+把所有 TP=2 实测串起来的一块拼图:vLLM 行并行 attention 的 o_proj 每层一次跨卡 all-reduce,
+`(T,4096)` bf16 = **33 MB/层**;A100-PCIE **无 NVLink** ⇒ 10-20 ms/层。这正好等于
+"单卡每层非 H2D 12 ms vs TP=2 30 ms" 的 18 ms 差额(R21 排除了主机侧、R22 排除了我们的
+2 ms 归约)。⇒ TP=2 预填充只 +47%(不是 +100%)、TP=2 解码净亏,都由这笔拓扑开销解释。
+下一步:TP=2 + EAGER 下去掉 `--disable-custom-all-reduce`,量那 18 ms 是否缩小。
