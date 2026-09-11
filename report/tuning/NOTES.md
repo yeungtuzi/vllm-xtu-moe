@@ -1975,3 +1975,26 @@ A(读 gate/up 分片)是最大项:聚合 195MB/749µs ≈ 260 GB/s(单拷贝时�
    **真实解码规模**(DEDUP≈23, BS=6)扫 `XIAOTU_MOE_SHARDSPLIT` / sub 切分,别再拿 B=6/DEDUP=12
    的旧数据外推。
 4. 未测旋钮:`VLLM_USE_V2_MODEL_RUNNER=1`(目标清单里的)、`XIAOTU_GPU_PREFETCH_AHEAD`/window。
+
+## 56. 预填充到 1500 t/s 的算术(TP=2 + 常驻层)
+
+实测锚点:TP=2 + 6 常驻层 → 预填充 4096 **TTFT 3.66-3.67 s = 1117 t/s**;剩 37 层要过 PCIe。
+
+- 每层每 rank 要流的字节 = 3.19 GB / 2(EP 各半)= **1.59 GB**;
+- 实测每层 ≈ **99 ms** ⇒ 单链路 **16 GB/s**(PCIe gen4 x16 峰值 25,实得 ~64%);
+- 若能把这些 H2D 与本层 GPU 计算**重叠**,每层应掉到 ~65 ms ⇒ TTFT 2.4 s ⇒ **1700 t/s**(达标);
+  当前看不出重叠(99 ≈ 64 流 + 35 算)。
+
+常驻层数受显存硬约束(TP=2,每层每 rank 1.59 GiB):KV 8 GiB + 非专家 ~5 GiB 时只能放
+**~7 层**;要更多就得压 KV(`KV_MEM_BYTES`)或提高 `GPU_UTIL`。
+
+⇒ 冲 1500 的两条路:①让预取的 H2D 与计算真正重叠(`XIAOTU_GPU_PREFETCH_AHEAD`,
+本轮正在 A/B);②再省显存换 2-4 个常驻层。
+
+### 56.1 顺带修掉的两个真 bug(见登记簿 R16)
+- `finalize_mega_moe_weights()` 对常驻层不幂等(常驻层不设 `self.engine`),且插件的
+  `hybrid_model` 在同一进程里会被加载成**两个模块对象** ⇒ 同一层建两份常驻显存,
+  13 层吃掉 ~41 GiB,把 KV 的 8 GiB 挤掉 OOM。
+- 修法:进程级状态挂 `builtins`(`_resident_state()`)+ 按 prefix 去重
+  (`resident_already_built`)+ 新硬旋钮 `XIAOTU_MOE_RESIDENT_BUDGET_GB`(超预算的层
+  自动回落成普通 CPU 层,并把 CPU 引擎建起来避免 `engine=None` 静默返回输入)。

@@ -141,6 +141,29 @@
 | 追查 2(**未修,阻塞**) | 再启动一次后失败点上移到 `_build_segmentation()` 的 `ids = ids[ok]`(布尔掩码索引 = 数据相关形状)⇒ `cudaErrorStreamCaptureUnsupported`。**`gpu_moe_layer` 过去只用于"非捕获"的 GPU 预填充分支(有 `not capturing` 门控),所以从未做过捕获安全审计** |
 | 修法(下轮) | 去掉数据相关形状:无效 id 映射到"垃圾桶"专家 `E`(`ids_c = where(bad, E, ids)`),`bincount(minlength=E+1)` 排序分段,内核 grid=E 不读垃圾桶段;`A` 用固定 `T*K` 上界。需同时验证非捕获路径数值不变(用 `torch_reference_layer` 对齐) |
 | 附带收益 | 修完还能让**非常驻的 GPU 预填充**也能进图(现在每步都在 EAGER 下跑) |
+| **结果(已解决)** | 两处都修完后:①`/tmp/test_capture_gpu_moe.py` 证明带常驻 slot 的 `gpu_moe_layer` 可捕获并重放(与 eager 逐位一致);②真实系统 TP=2+6 常驻层+`EAGER=0` **启动成功,0 捕获错误**(tag tp2resG) |
+| 教训 | 「修完捕获问题解码就会变快」是错的:TP=2 下 graph 对解码**没用**(TPOT 47.55 vs 47.32 ms),因为瓶颈是 EP 合并与线程减半,不是启动开销 — 见下一条 |
+
+## R15. TP=2(+EP)用于 **CPU 专家解码** —— 净亏,不要再试
+
+| 项 | 内容 |
+|---|---|
+| 试了什么 | TP=2 + `--enable-expert-parallel`(每 rank 128 专家 / 60 线程),指望"两个 rank 分摊专家权重读取" |
+| 实测 | 每层 compute **1.31 ms(TP=1,120 线程)→ 2.45-2.53 ms(TP=2,60 线程/rank)**;解码 C=1 TPOT **28.5 ms(TP=1,35 t/s)→ 47.3-47.6 ms(TP=2+6 常驻层,21 t/s)** |
+| 加 CUDA graph 有用吗 | **没用**:TP=2+常驻层 TPOT 47.55 ms(graph)vs 47.32 ms(EAGER)。成本在 EP 合并 + 每 rank 线程减半,不在启动开销 |
+| 机制 | EP 让每 rank 少读一半专家 ⇒ 线程数也减半 ⇒ 没有净收益;每层还多一次**跨 rank 部分和合并**(/dev/shm 双 barrier + 等待对端),按 §49.2 估计约 +1.1 ms/层 |
+| 结论 | **解码一律 TP=1**。TP=2 只用于两件事:①两条 PCIe 链路做预填充;②提供第二张卡的显存放 GPU 常驻专家层 |
+| 再试条件 | 除非能把合并成本压到 <0.1 ms/层(例如"每 rank 持全专家、不做归约"),或每 rank 线程数能翻倍而不损带宽;否则不要再用 TP=2 跑 CPU 专家解码 |
+
+## R16. 让 **draft(speculator)模型**也常驻 GPU 专家层 —— 显存翻倍,已改为默认不常驻
+
+| 项 | 内容 |
+|---|---|
+| 试了什么 | `XIAOTU_MOE_GPU_RESIDENT_LAYERS=0-5` 对所有 MoE 模块生效 ⇒ 目标模型 **和** DSpark 起草模型各常驻一份 |
+| 实测 | `[xiaotu] GPU-resident model.layers.N.ffn: 1.59 GiB` 每层出现 **4 次**(2 rank × 2 模型);6 层就占 **32.25/40 GiB**(约一半是 draft);常驻层数因此上不去 ⇒ 预填充卡在 1117 t/s |
+| 机制(**修正后的真因**) | 不是 draft!同 PID、同 prefix 的常驻加载出现**两条**,是插件的 `hybrid_model` 在同一进程里被加载成**两个模块对象**(模块级全局互不相通),加上 `finalize_mega_moe_weights()` 对常驻层可被调用两次(常驻层不设 `self.engine`,原守卫失效)⇒ 同一层建了两份常驻显存。13 层 ×2×1.59 GiB ≈ 41 GiB,把 KV 的 8 GiB 挤掉 ⇒ `memory allocation failed ... 8589934592 bytes`。另:实测 DSpark 起草模型**没有** MoE 层(否则每步会有两遍 43 层 CPU 调用,步时不会是 97 ms) |
+| 回退动作 | ①进程级共享状态挂到 `builtins`(`_resident_state()`)——模块被复制也共享,用它记录 prefix 次数与已用字节;②`finalize_mega_moe_weights()` 用 `_resident_slot is not None` 做幂等;③新增**硬旋钮** `XIAOTU_MOE_RESIDENT_BUDGET_GB`(0=不限):超出预算的层自动当普通 CPU 层(并把 CPU 引擎建起来,避免 engine=None 静默返回输入);④`_LAYERS` 只登记第一份,避免 prefetch-ahead 作用到副本 |
+| 再试条件 | 只有当显存充裕到"翻倍也无所谓"时才考虑给 draft 常驻;否则不要 |
 
 ---
 
@@ -165,3 +188,4 @@
 | 日期 | 改动 | 依据 |
 |---|---|---|
 | 2026-09-11 | 建立本文件,回填 R1-R13 + M1-M9 | 用户要求(会话中反复回退同一批做法) |
+| 2026-09-11 | 追加 R14(常驻层+图,已解决)、R15(TP=2 解码净亏)、R16(draft 不常驻) | 第 15-16 轮实测 |

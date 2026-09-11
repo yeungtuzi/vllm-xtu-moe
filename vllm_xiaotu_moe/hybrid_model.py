@@ -73,6 +73,68 @@ def gpu_resident_layers() -> set[int]:
     return out
 
 
+def _resident_state() -> dict:
+    """**进程级**共享状态(挂在 builtins 上)。
+
+    不能只用模块级全局:实测(2026-09-11)插件的 hybrid_model 在同一进程里被加载成
+    **两个模块对象**,各自的模块级全局互不相通 —— 结果同一个 prefix 的常驻层被建了
+    两份(`[xiaotu] GPU-resident ...` 同 PID 同 prefix 出现两条),13 层吃掉 41 GiB
+    ⇒ KV 8 GiB 分配失败 OOM。builtins 是解释器级的,模块复制也共享。
+    """
+    import builtins
+
+    st = getattr(builtins, "_xiaotu_resident_state", None)
+    if st is None:
+        st = {"seen": {}, "used_bytes": 0}
+        builtins._xiaotu_resident_state = st
+    return st
+
+
+def resident_already_built(prefix: str) -> bool:
+    """这个 prefix 的常驻槽位是否已经建过(进程级)。
+
+    插件模块被复制成两份时会各自调用一次 `finalize_mega_moe_weights`,同一个层就会
+    建两份常驻显存(实测 13 层 ×2×1.59 GiB ≈ 41 GiB ⇒ KV OOM)。用进程级集合去重,
+    比模块级 `self._resident_slot` 可靠。
+    """
+    st = _resident_state()
+    keys = st.setdefault("built", set())
+    if prefix in keys:
+        return True
+    keys.add(prefix)
+    return False
+
+
+def resident_budget_ok(nbytes: int) -> bool:
+    """本次常驻是否还在显存预算内(`XIAOTU_MOE_RESIDENT_BUDGET_GB`,0=不限)。
+
+    这是控制常驻层数的**硬旋钮**:比"判断哪一份是 draft"可靠得多,而且直接对应
+    目标(塞进 40 GiB)。构造顺序上目标模型在前 ⇒ 预算自然优先给目标模型。
+    """
+    gb = float(os.environ.get("XIAOTU_MOE_RESIDENT_BUDGET_GB", "0") or 0)
+    if gb <= 0:
+        return True
+    st = _resident_state()
+    if st["used_bytes"] + nbytes > int(gb * (1 << 30)):
+        return False
+    st["used_bytes"] += nbytes
+    return True
+
+
+def _is_duplicate_model_instance(prefix: str) -> bool:
+    """同一 MoE 层 prefix 是否**第二次**被构造(⇒ 是 draft/speculator 模型)。
+
+    vLLM 的 DSpark 起草模型是目标模型的又一份完整实例,层名(prefix)相同;插件
+    的模块构造顺序是"目标模型在前、draft 在后"(`LLMBaseProposer.load_model()`
+    在目标模型加载完成后调用)。用它把 draft 排除在常驻层之外,省下的显存换更多
+    目标模型常驻层(预填充的关键)。同一进程内每个模型实例只构造一次。
+    """
+    st = _resident_state()
+    n = st["seen"].get(prefix, 0)
+    st["seen"][prefix] = n + 1
+    return n > 0
+
+
 def ep_shm_enabled() -> bool:
     """EP 部分和改走 /dev/shm 归约(默认开;`XIAOTU_MOE_EP_SHM=0` 关回 NCCL)。
 
@@ -436,6 +498,15 @@ class CpuXiaotuMoE(nn.Module):
         # ---- GPU 常驻层(见 gpu_resident_layers()) ----
         try:
             self._gpu_resident = extract_layer_index(prefix) in gpu_resident_layers()
+            if self._gpu_resident and _is_duplicate_model_instance(prefix):
+                # 同一 prefix 第二次出现 = **draft/speculator 模型**(vLLM 先建目标模型,
+                # 再由 LLMBaseProposer.load_model() 建起草模型,两者层名相同)。
+                # draft 的专家权重**不需要**常驻:它只用于起草,常驻会把显存占用翻倍
+                # (实测 tp2resE:6 层每卡 3.2 GiB/层,其中一半是 draft 副本) ⇒ 常驻层数
+                # 上不去、预填充降不下来。用 XIAOTU_MOE_RESIDENT_DRAFT=1 恢复旧行为。
+                self._gpu_resident = os.environ.get("XIAOTU_MOE_RESIDENT_DRAFT", "0") == "1"
+                print(f"[xiaotu] resident skip (draft/speculator copy): {prefix} "
+                      f"-> gpu_resident={self._gpu_resident}", flush=True)
         except Exception:
             self._gpu_resident = False
         self._resident_slot = None
@@ -444,7 +515,12 @@ class CpuXiaotuMoE(nn.Module):
         self._ep_start = 0
         self._ep_local = int(self.n_routed_experts)
         try:
-            _LAYERS[extract_layer_index(prefix)] = self
+            # 只登记**第一份**(目标模型)。draft 模型层名相同,若覆盖会让
+            # prefetch-ahead(_LAYERS.get(L+1))与 pinned 预构建都作用在 draft 权重上,
+            # 主模型的 H2D 重叠失效。
+            _li = extract_layer_index(prefix)
+            if _li not in _LAYERS:
+                _LAYERS[_li] = self
         except Exception:
             pass
 
@@ -492,8 +568,25 @@ class CpuXiaotuMoE(nn.Module):
         if self.engine is not None:
             return
         if self._gpu_resident:
-            self._build_resident_slot()
-            return
+            # 【幂等 + 预算】常驻层不设 self.engine,这个钩子可能被调用两次(同一进程
+            # 里插件模块被复制成两份时尤其明显)⇒ 必须自己防重复分配,否则显存翻倍。
+            if self._resident_slot is not None or resident_already_built(self.prefix):
+                return
+            _nb = self._resident_bytes()
+            if _nb <= 0:   # 形状取不到时的兜底估计(打包 fp4 ≈ 12.6MB/专家 + 尺度)
+                _nb = int(13.5e6 * max(1, int(self._ep_local)))
+            _gb = float(os.environ.get("XIAOTU_MOE_RESIDENT_BUDGET_GB", "0") or 0)
+            _st = _resident_state()
+            print(f"[xiaotu] resident try {self.prefix}: {_nb/2**30:.2f} GiB, "
+                  f"used={_st['used_bytes']/2**30:.2f}, budget={_gb:.1f} GiB", flush=True)
+            if resident_budget_ok(_nb):
+                self._build_resident_slot()
+                return
+            # 预算用尽 ⇒ 本层当普通 CPU 层:继续往下把 CPU 引擎建起来,否则前向会
+            # 因为 engine=None 而静默返回输入(算错)。
+            self._gpu_resident = False
+            print(f"[xiaotu] resident budget exhausted -> {self.prefix} stays on CPU",
+                  flush=True)
         # ---- 线程池自旋窗口(重要) -------------------------------------------
         # 引擎 worker 在两次调用之间自旋 spin_idle_us 等下一次任务,引擎默认 5 ms。
         # 但解码步里相邻两次调用只隔 ~2-4 ms ⇒ 192 个 worker 在整个解码期间几乎
@@ -668,6 +761,15 @@ class CpuXiaotuMoE(nn.Module):
         print(f"[xiaotu] engine built {self.prefix} "
               f"E={self.n_routed_experts} topk={self.top_k}", flush=True)
 
+    def _resident_bytes(self) -> int:
+        """本层本 rank 常驻权重需要多少字节(只看形状,不做拷贝)。"""
+        try:
+            w13, s13, w2, s2, _st, _L, _tp = self._gpu_shard()
+            return int(sum(t.numel() * t.element_size()
+                           for t in (w13, s13, w2, s2) if t is not None))
+        except Exception:  # noqa: BLE001
+            return 0
+
     def _build_resident_slot(self) -> None:
         """把本层(本 rank 分片)的专家权重一次性放进显存并常驻。
 
@@ -677,6 +779,8 @@ class CpuXiaotuMoE(nn.Module):
         """
         from vllm_xiaotu_moe.gpu_prefill import PrefetchSlot, _pinned_kmajor
 
+        if self._resident_slot is not None:   # 幂等:见 finalize_mega_moe_weights()
+            return
         dev = torch.device("cuda", torch.cuda.current_device())
         w13, s13, w2, s2, st, L, tp = self._gpu_shard()
         src = (
