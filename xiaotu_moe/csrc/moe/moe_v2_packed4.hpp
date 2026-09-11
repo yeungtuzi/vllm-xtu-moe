@@ -241,6 +241,90 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         const bool bp_on = byteprof_on();
         uint64_t bp_t0 = 0;
         if (bp_on) bp_t0 = std::chrono::steady_clock::now().time_since_epoch().count();
+#if defined(__AVX512BF16__)
+        // =====================================================================
+        // vdpbf16ps 路径(2026-09-11)。动机:在"每 CCD 4-5 核"前提下瓶颈是**每字节
+        // 的指令数**而不是带宽(实测内核只吃到机器流式带宽的 13-20%)。本路径:
+        //   * 权重解码一次喂 M 行,解码结果**以 bf16 留在寄存器**(不再 cvtepu16+slli
+        //     展成 32 个 fp32)⇒ 省 4 条/组、寄存器减半;
+        //   * 激活本来就是 bf16(模型 hidden state),**不再转 fp32** ⇒ 每行每组的激活
+        //     载入从 2×zmm(128B fp32)降到 1×zmm(64B bf16),L1 流量减半;
+        //   * 每 (行,组) 从"2 载入 + mul + 2 fma"变成"1 载入 + 1 vdpbf16ps(32 MAC)
+        //     + 1 fma(叠 e8m0 组 scale)"。
+        // 数值:bf16×bf16 乘积在 fp32 内精确,累加仍是 fp32 ⇒ 与 fp32 路径等价
+        // (仅结合顺序不同),由 scripts/test_block23_equiv.py 对拍。
+        // 默认**关**(2026-09-11):实测只快 1.10×(TOTAL 1780→1616 µs,DEDUP=18 真实形状),
+        // 而且在受控对拍的 me=2 用例上 max_rel 8.4e-3 > 项目门限 2e-3(fp32 路径同档
+        // 只有 3.9e-4)⇒ 收益不足以为精度买单,保留代码+开关待后续再评估
+        // (可能的精度来源:Zen4 vdpbf16ps 的成对乘积求和舍入)。置 1 可开启做实验。
+        static const bool dotp16 = [] {
+            const char* e = std::getenv("XIAOTU_MOE_DPBF16");
+            return e && std::atoi(e) != 0;
+        }();
+        if (dotp16) {
+            alignas(16) static constexpr uint8_t d_lo[16] = {
+                0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+                0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};
+            alignas(16) static constexpr uint8_t d_hi[16] = {
+                0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
+                0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
+            const __m256i llo16 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)d_lo));
+            const __m256i lhi16 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)d_hi));
+            const __m128i nm16 = _mm_set1_epi8(0x0F);
+            const int kb_stride16 = (K + gk - 1) / gk;
+            const uint8_t* Sbytes16 = static_cast<const uint8_t*>(S);
+            const float* Sflt16 = static_cast<const float*>(S);
+            const int gcount = K / 32;
+            for (int j = n0; j < n1; ++j) {
+                const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
+                const int srow16 = (j / gn) * kb_stride16;
+                for (int m0 = 0; m0 < M; m0 += 8) {
+                    const int mr = std::min(8, M - m0);
+                    __m512 acc[8];
+                    for (int r = 0; r < mr; ++r) acc[r] = _mm512_setzero_ps();
+                    for (int g = 0; g < gcount; ++g) {
+                        const __m128i raw = _mm_loadu_si128((const __m128i*)(b_row + (size_t)g * 16));
+                        const __m128i lo = _mm_and_si128(raw, nm16);
+                        const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), nm16);
+                        const __m128i sl = _mm_unpacklo_epi8(lo, hi);
+                        const __m128i sh = _mm_unpackhi_epi8(lo, hi);
+                        const __m256i sel = _mm256_inserti128_si256(
+                            _mm256_castsi128_si256(sl), sh, 1);
+                        const __m256i bl = _mm256_shuffle_epi8(llo16, sel);
+                        const __m256i bh = _mm256_shuffle_epi8(lhi16, sel);
+                        const __m256i ul = _mm256_unpacklo_epi8(bl, bh);
+                        const __m256i uh = _mm256_unpackhi_epi8(bl, bh);
+                        const __m256i wa = _mm256_inserti128_si256(
+                            _mm256_castsi128_si256(_mm256_extracti128_si256(ul, 0)),
+                            _mm256_extracti128_si256(uh, 0), 1);
+                        const __m256i wb = _mm256_inserti128_si256(
+                            _mm256_castsi128_si256(_mm256_extracti128_si256(ul, 1)),
+                            _mm256_extracti128_si256(uh, 1), 1);
+                        const __m512i wz = _mm512_inserti64x4(
+                            _mm512_castsi256_si512(wa), wb, 1);
+                        const float sc = E8M0 ? e8m0_table()[Sbytes16[srow16 + g]]
+                                              : Sflt16[srow16 + g];
+                        const __m512 sv = _mm512_set1_ps(sc);
+                        for (int r = 0; r < mr; ++r) {
+                            const __m512i av = _mm512_loadu_si512(
+                                (const void*)(A + (size_t)(m0 + r) * K + (size_t)g * 32));
+                            const __m512 t = _mm512_dpbf16_ps(
+                                _mm512_setzero_ps(), (__m512bh)wz, (__m512bh)av);
+                            acc[r] = _mm512_fmadd_ps(t, sv, acc[r]);
+                        }
+                    }
+                    for (int r = 0; r < mr; ++r)
+                        C[(size_t)(m0 + r) * N + j] = hsum512(acc[r]) * global_scale;
+                }
+            }
+            if (bp_on) {
+                auto bp_t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+                byteprof_accum((size_t)(n1 - n0) * (size_t)(K / 2), (uint64_t)(bp_t1 - bp_t0));
+            }
+            return;
+        }
+#endif  // __AVX512BF16__
+
         // Activations -> FP32 in NATURAL (non-permuted) order once, so the inner
         // loop pairs plain zmm loads with the decoded natural-order weights.
         thread_local std::vector<float> a32_storage;

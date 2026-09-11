@@ -1,0 +1,58 @@
+{
+ "summary": {
+  "ts": "2026-09-11T04:06:34",
+  "tag": "cab_scalec_c1",
+  "server_tag": "cab_scalec",
+  "natural_text": 1,
+  "client": "bench_nat_client",
+  "concurrency": 1,
+  "num_prompts": 2,
+  "output_len": 200,
+  "input_len": "nat128",
+  "completed": 2,
+  "failed": 0,
+  "duration_s": 34.23,
+  "total_output_tokens": 400,
+  "out_tok_per_s": 11.69,
+  "per_stream_tok_per_s": 11.69,
+  "mean_ttft_ms": 3244.3,
+  "mean_tpot_ms": 69.34,
+  "mean_step_ms": 208.46,
+  "p95_step_ms": 228.82,
+  "mean_tokens_per_step": 2.971,
+  "per_req_tok_per_s": [
+   13.59,
+   15.36
+  ]
+ },
+ "requests": [
+  {
+   "idx": 0,
+   "ttft_ms": 4239.086519926786,
+   "n_out": 200,
+   "n_steps": 71,
+   "tokens_per_step": 2.816901408450704,
+   "e2e_s": 18.952697031199932,
+   "decode_s": 14.713610511273146,
+   "mean_step_ms": 210.19386718315738,
+   "mean_itl_ms": 73.56805255636573,
+   "p50_step_ms": 210.95249988138676,
+   "p95_step_ms": 235.41314341127872,
+   "tok_per_s": 13.592856753056346
+  },
+  {
+   "idx": 1,
+   "ttft_ms": 2249.503780156374,
+   "n_out": 200,
+   "n_steps": 64,
+   "tokens_per_step": 3.125,
+   "e2e_s": 15.273699784651399,
+   "decode_s": 13.024196004495025,
+   "mean_step_ms": 206.7325703858856,
+   "mean_itl_ms": 65.12098002247512,
+   "p50_step_ms": 205.99914528429508,
+   "p95_step_ms": 222.22863137722015,
+   "tok_per_s": 15.356034255855352
+  }
+ ]
+}
