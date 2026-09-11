@@ -769,6 +769,10 @@ def prefetch_layer(w13, s13, w2, s2, device):
     if slots is None:
         # 环深度可配(默认 2 = 一层的预取窗口)。更深 = 给 H2D 更多提前量,代价是
         # VRAM:每个槽 ≈ 一层权重(TP=2 每 rank 1.7 GB,TP=1 3.4 GB)。
+        # 【下限必须是 2,不能用 1 槽省显存】实测(/tmp/test_1slot.py,2026-09-11):
+        # 只有 1 槽时,为 L+1 发起的 H2D 会覆盖 L 正在用的那份权重 ⇒ 本层被算成
+        # 下一层的权重(err_vs_L=17.5 vs err_vs_L+1=0.096),是**正确性 bug**。
+        # 想省这 ~3GB 请改 XIAOTU_MOE_RESIDENT_BUDGET_GB(少放常驻层),不要动这里。
         nslots = max(2, int(os.environ.get("XIAOTU_MOE_PREFETCH_SLOTS", "2") or 2))
         slots = [PrefetchSlot() for _ in range(nslots)]
         _SLOTS[key] = slots
