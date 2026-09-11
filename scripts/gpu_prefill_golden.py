@@ -51,6 +51,32 @@ def run_case(H, I, E, T, K, device, seed):
     return diff.max().item()
 
 
+def run_masked_case(H, I, E, T, K, device, seed):
+    """EP 掩码路径:-1 id + 权重 0 必须与"直接删掉这些项"完全一致。
+
+    这是 2026-09-11 把 `_build_segmentation` 改成形状静态(垃圾桶专家桶)后
+    新增的回归用例 —— 垃圾桶段必须被内核完全忽略。
+    """
+    w13, s13, w2, s2 = make_layer(H, I, E, seed)
+    w13g = w13.to(device); s13g = s13.to(device); w2g = w2.to(device); s2g = s2.to(device)
+    x = torch.randn(T, H, dtype=torch.bfloat16, device=device)
+    ids = torch.randint(0, E, (T, K), device=device, dtype=torch.int64)
+    tw = torch.rand(T, K, device=device) + 0.5
+    # 第 0 列全部置为"别的 rank 的专家"(-1 + 权重 0),其余保留
+    ids_m = ids.clone(); ids_m[:, 0] = -1
+    tw_m = tw.clone(); tw_m[:, 0] = 0.0
+    got = gpu_moe_layer(x, ids_m, tw_m, w13g, s13g, w2g, s2g,
+                        H=H, I=I, K=K, device=device)
+    ref = torch_reference_layer(x, ids_m, tw_m, w13g, s13g, w2g, s2g, H, I)
+    diff = (got.float() - ref.float()).abs()
+    rms = (diff.pow(2).mean().sqrt() / ref.float().pow(2).mean().sqrt()).item()
+    nz = int((got != 0).any(dim=1).sum().item())
+    print(f"  masked H={H} I={I} E={E} T={T} K={K}: max_abs={diff.max().item():.5f} "
+          f"rms_rel={rms:.2e} rows_nonzero={nz}/{T}")
+    assert diff.max().item() < 0.5 * ref.abs().mean().item() + 1e-2, "masked mismatch"
+    return diff.max().item()
+
+
 def main() -> int:
     dev = torch.cuda.current_device()
     torch.cuda.set_device(dev)
@@ -61,6 +87,10 @@ def main() -> int:
     if os.environ.get("TEST_FULL") == "1":
         print("[golden] full DS-V4 dims (T=4):")
         run_case(H=4096, I=2048, E=256, T=4, K=6, device=dev, seed=3)
+    print("[golden] EP-masked path (trash bucket):")
+    run_masked_case(H=256, I=128, E=8, T=32, K=3, device=dev, seed=4)
+    if os.environ.get("TEST_FULL") == "1":
+        run_masked_case(H=4096, I=2048, E=256, T=4, K=6, device=dev, seed=5)
     print("[golden] ALL PASS")
     return 0
 

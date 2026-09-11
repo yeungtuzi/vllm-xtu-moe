@@ -391,24 +391,38 @@ def _down_kernel_split(
 
 
 def _build_segmentation(topk_ids, topk_weights, num_experts, device):
+    """把 [T,K] 路由压成按专家分段的排序列表(供两个 Triton 内核按段遍历)。
+
+    **必须是形状静态的**:CUDA graph 捕获期间不允许出现数据相关的形状
+    (`ids[ok]` 这种布尔掩码索引会触发 `cudaErrorStreamCaptureUnsupported`,
+    见 report/tuning/TRIED_AND_REVERTED.md R14)。所以无效/不属于本 rank 的
+    id 不删除,而是**归入垃圾桶专家桶 `num_experts`**(它排在最后,内核 grid=E
+    不会读它)⇒ 与"过滤掉"完全等价。
+
+    返回的 ``A`` 固定为 ``T*K``(内核只按段边界取行,``A`` 只用来定缓冲大小;
+    注意 ``inter`` 是按 **token id** 索引的,所以行数本来就要 ≥ T)。
+    """
     T, K = topk_ids.shape
     ids = topk_ids.to(torch.int32).reshape(-1)
     wts = topk_weights.to(torch.float32).reshape(-1)
     tok_ids = torch.arange(T, device=device).repeat_interleave(K)
-    ok = (ids >= 0) & (ids < num_experts)
-    ids = ids[ok]; wts = wts[ok]; tok_ids = tok_ids[ok]
-    if ids.numel() == 0:
-        return (torch.empty(0, dtype=torch.int64, device=device),
-                torch.empty(0, dtype=torch.float32, device=device),
-                torch.zeros(1, dtype=torch.int32, device=device), 0)
-    sorted_order = ids.argsort(stable=True)
-    sorted_tok = tok_ids[sorted_order]
-    sorted_wts = wts[sorted_order]
-    counts = torch.bincount(ids[sorted_order], minlength=num_experts).to(torch.int32)
+    # 垃圾桶桶:任何 <0 / ≥E 的 id 都映射到 E(固定形状,无掩码索引)
+    bad = (ids < 0) | (ids >= num_experts)
+    ids_c = torch.where(
+        bad, torch.full((), num_experts, dtype=torch.int32, device=device), ids)
+    order = torch.argsort(ids_c, stable=True)
+    sorted_tok = tok_ids[order]
+    sorted_wts = wts[order]
+    # scatter_add 而不是 bincount:bincount 会从数据里求 max 来决定输出长度(可能同步);
+    # scatter_add 的输出长度固定为 E+1。取前 E 个桶(垃圾桶段排在最后,内核不读)。
+    ones = torch.ones_like(ids_c, dtype=torch.int32)
+    counts = torch.zeros(num_experts + 1, dtype=torch.int32, device=device)
+    counts.scatter_add_(0, ids_c.long(), ones)
+    counts = counts[:num_experts]
     seg_start = torch.cat(
         [torch.zeros(1, dtype=torch.int32, device=device), torch.cumsum(counts, dim=0)]
     )
-    return sorted_tok, sorted_wts, seg_start, int(sorted_tok.numel())
+    return sorted_tok, sorted_wts, seg_start, T * K
 
 
 _CAPTURE_DEPTH = 0
@@ -797,7 +811,9 @@ def gpu_moe_layer(
 
     tok, wts, seg_start, A = _build_segmentation(topk_ids, topk_weights, E, device)
     out = torch.zeros((T, H), dtype=torch.bfloat16, device=device)
-    if A == 0:
+    if T == 0 or K == 0:
+        # 形状判空(不是数据判空):A 现在是固定的 T*K,空批之外不会为 0。
+        # 全部 id 无效时它们都落进垃圾桶段,每个专家的段为空 ⇒ 内核不写 out。
         return out
     inter = torch.empty((A, 2 * I), dtype=torch.bfloat16, device=device)
 
