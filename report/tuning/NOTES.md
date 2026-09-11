@@ -2316,3 +2316,19 @@ vs lk 0.57-0.67 ms(§73,同 API 同线程同权重)。**不是 NUMA、不是线�
 - 第一处代码改动(下一步):`xiaotu_moe/csrc/moe/moe_v2_packed4.hpp` 的小 me 路径(单行 + `block_23`)
   —— 权重 fp4→fp32 解码 hoist 到 K-block 级工作缓冲,内层全 packed zmm fp32 FMA、累加器 ≥8-16 链,
   热路径禁止 `ss` 标量 FMA(R34/§74)。
+
+## 76. 【更正 §74】标量 FMA 在**归约 lambda**,不在主 GEMV;真正的杠杆是"解码摊销"
+
+把 .so 里 `vfmadd*ss` 的地址映射回符号:前几名全是 `MOE_V2<...>::forward_many` 内的
+lambda(阶段 C 的 `out_t[h] += w*d[h]` 标量归约)与 `NumaWorkPool::flat_thunk` 小 lambda;
+**主 GEMV 不在其中**(它走 FAST_FP4 packed fp32 路径;`XIAOTU_MOE_DPBF16=1` 只再快 1.7%,
+`GEMM_NR=0/16/32` 分别为 1.41/1.20/1.29 ms,都不如默认 1.18)。
+⇒ §74/R34 的"小 me 路径退化为标量 FMA"**作废**(静态直方图把阶段 C 也算进去了)。
+
+修正后的根因:FAST_FP4 **在 (行,组) 内层现场解码 fp4→fp32**,解码量随**激活行数**重复
+(me≈3 ⇒ 3 次/权重字节);lk 是**每 K-block 解一次**(2×zmm)再复用 8 行。⇒ 每权重字节我们
+约 2-3× 指令 ⇒ 只吃到机器带宽 13-20%(A 相 135 GB/s)vs lk 265-376 GB/s。
+**是指令/解码摊销问题。**
+
+下一步:把 FAST_FP4 的解码从 (行,组) 内层提到 **K-block 级**(每 64 列解一次到寄存器/工作
+缓冲,再对 me 行做 packed `vfmadd231ps`,累加链尽量多)。验收同前:BS=6/DEDUP=12 ≤0.7 ms/层。
