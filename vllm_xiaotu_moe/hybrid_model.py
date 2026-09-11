@@ -902,7 +902,11 @@ class CpuXiaotuMoE(nn.Module):
                     H=self.hidden_size, I=self.moe_intermediate_size,
                     K=self.top_k, device=hidden_states.device, slot=slot,
                 )
-                gpu_out = tensor_model_parallel_all_reduce(gpu_out)
+                if os.environ.get("XIAOTU_SKIP_AR", "0") != "1":
+                    gpu_out = tensor_model_parallel_all_reduce(gpu_out)
+                # XIAOTU_SKIP_AR=1 仅供**计时诊断**:跳过这条每层跨 rank 归约
+                # (MoE 输出 (T,4096) bf16 = 33MB,A100-PCIE 无 NVLink;数值会不完整)。
+                # 用来量"每层归约"在 GPU 预填充里占多少;默认关,交付路径不受影响。
             else:
                 gpu_out = gpu_moe_layer(
                     hidden_states, topk_ids, topk_weights,
