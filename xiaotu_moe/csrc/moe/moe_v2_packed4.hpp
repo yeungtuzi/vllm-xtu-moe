@@ -389,6 +389,62 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         const __m512 whi_ = _mm512_castsi512_ps(_mm512_slli_epi32(ihi_, 16));
 
         const int group_count = K / 32;
+        // =====================================================================
+        // GEMM 分块路径(2026-09-11,预填充用):把 j(输出行)循环放到**内层**,
+        // 让每个 K 组的激活**一次载入、被 NR 个输出行复用**。
+        // 原结构是 GEMV:j 在最外层 = 每行输出都把整条激活重读一遍 ⇒ 激活:权重
+        // 流量 = 64:1,大批量(预填充)时被激活带宽压死(实测每层只到 19 GB/s)。
+        // 分块后激活流量降为 1/NR,权重仍只解码一次/行。
+        // 寄存器预算:acc[MR][NR] + av[MR][2] + wlo/whi/sv/d ⇒ MR=4,NR=4 时 28 个 zmm。
+        // 数值:每个 (行, token) 仍是"每 K 组 mul+2×fma 后累加",与单行路径同序。
+        // 默认 NR=8(实测预填充 1.22×、解码 1.15×,数值对拍 8/8);=0 回退旧 GEMV 路径。
+        static const int gemm_nr = [] {
+            const char* e = std::getenv("XIAOTU_MOE_GEMM_NR");
+            return e ? std::atoi(e) : 8;
+        }();
+        if (gemm_nr > 0) {
+            constexpr int MR = 4;
+            const int NR = std::min(gemm_nr, 8);
+            for (int m0 = 0; m0 < M; m0 += MR) {
+                const int mr = std::min(MR, M - m0);
+                for (int j0 = n0; j0 < n1; j0 += NR) {
+                    const int nj = std::min(NR, n1 - j0);
+                    __m512 acc[MR][8];
+                    for (int r = 0; r < mr; ++r)
+                        for (int jj = 0; jj < nj; ++jj) acc[r][jj] = _mm512_setzero_ps();
+                    for (int g = 0; g < group_count; ++g) {
+                        const int base = g * 32;
+                        __m512 av[MR][2];
+                        for (int r = 0; r < mr; ++r) {
+                            const float* ap = a32 + (size_t)(m0 + r) * K + base;
+                            av[r][0] = _mm512_loadu_ps(ap);
+                            av[r][1] = _mm512_loadu_ps(ap + 16);
+                        }
+                        for (int jj = 0; jj < nj; ++jj) {
+                            const int j = j0 + jj;
+                            const uint8_t* brow = W + (size_t)(j - rowshift) * (K / 2);
+                            XIAOTU_DECODE_GROUP_AVX512(brow, g);
+                            const float sc = row_scale((j / gn) * kb_stride, g);
+                            const __m512 sv = _mm512_set1_ps(sc);
+                            for (int r = 0; r < mr; ++r) {
+                                __m512 d = _mm512_mul_ps(wlo_, av[r][0]);
+                                d = _mm512_fmadd_ps(whi_, av[r][1], d);
+                                acc[r][jj] = _mm512_fmadd_ps(d, sv, acc[r][jj]);
+                            }
+                        }
+                    }
+                    for (int r = 0; r < mr; ++r)
+                        for (int jj = 0; jj < nj; ++jj)
+                            C[(size_t)(m0 + r) * N + j0 + jj] =
+                                hsum512(acc[r][jj]) * global_scale;
+                }
+            }
+            if (bp_on) {
+                auto bp_t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+                byteprof_accum((size_t)(n1 - n0) * (size_t)(K / 2), (uint64_t)(bp_t1 - bp_t0));
+            }
+            return;
+        }
         for (int j = n0; j < n1; ++j) {
             const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
             const int srow = (j / gn) * kb_stride;            // 每行一次除法
