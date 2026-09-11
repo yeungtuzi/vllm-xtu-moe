@@ -2205,3 +2205,11 @@ H2D 70 + 30"里那 30 ms 的来源**(§63 未解释项)。
 **下一步(便宜、不需要重启)**:`bench_gpu_moe_prefetch.py` 在 T=4096 扫
 `XIAOTU_GPU_PREFILL_{BM,BN,BK,BH,STAGES,WARPS}`(以及 `_KERNEL=split`/`LUT`),
 目标是让两个内核从 54 ms/层降到 ~20 ms/层 ⇒ 预填充 TTFT 3.77 → ~3.0 s ⇒ **1360 t/s+**。
+
+
+## 70. 第 29 轮:kernel 参数扫描被污染,本轮无有效结论(R31)
+
+T=4096 扫 WARPS/BM/BN/BK/STAGES:三种配置 `ovl` 全为 127.7 ms(基线 63.9),说明该窗口
+PCIe/主机被外部负载拖慢,不能比较。下一次必须在**安静窗口 + 同进程交替**下扫,且只看 `seq`
+(=`H2D + 内核`,H2D 是常数 ⇒ 差值是内核时间)。基线锚点:T=4096 seq **129.5-130.2 ms**、
+ovl **63.9-64.0 ms**;profiler 实测每层两个 MoE 内核共 **53.7 ms**(§69)。
