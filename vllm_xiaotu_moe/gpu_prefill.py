@@ -64,7 +64,12 @@ def gpu_prefill_min_tokens() -> int:
     ``os.environ`` changes, so a file is the only way to switch the threshold at
     runtime (used by the measurement harness).
     """
-    f = os.environ.get("XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE")
+    # 注意:变量名必须同时接受带/不带 VLLM_ 前缀两种写法 —— `scripts/tune_serve.sh`
+    # 导出的是 VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE,而这里原先只读
+    # XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE ⇒ **阈值文件从未生效**,导致所有"运行时切换
+    # 阈值"的 A/B(2026-09-11 预填充对比)实际上都走了同一条 GPU 路径。
+    f = os.environ.get("XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE") or \
+        os.environ.get("VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE")
     if f:
         try:
             with open(f) as fh:

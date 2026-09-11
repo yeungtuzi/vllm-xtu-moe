@@ -1683,3 +1683,29 @@ GPU 路径是 PCIe 25 GB/s 流 139 GB,内核改进对它无效。
 ① 现在只有 ~21 GB/s(614 t/s);② 可能被调度器分成多个 chunk(每 chunk 都要重读 139 GB)。
 ⇒ 下一轮:开 `XIAOTU_MOE_PROFILE` 量预填充单次调用(M、na、A/B/C 与达成带宽),
 并检查 chunk 数与 `--max-num-batched-tokens` 的配合;必要时让预填充走"一次读完"的路径。
+
+### 47.6 【重要更正】预填充路径的真实数据 + 一个真 bug
+
+**Bug**:`scripts/tune_serve.sh` 导出 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE`,而
+`gpu_prefill.py` 只读 `XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE`(少 `VLLM_` 前缀)⇒
+**运行时阈值文件从未生效**,我 §47.5 那两次"CPU vs GPU 预填充 A/B"其实两条腿都走了
+GPU 路(因为 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384` 仍生效)。已修(两种拼写都接受)。
+
+**修正后的预填充实测(4096 token)**:
+
+| 路径 | 吞吐 | 说明 |
+|---|---|---|
+| GPU 流式(`gpu_moe_layer`,阈值 384) | **586–671 t/s** | 6.99 s 里 PCIe 流 139 GB 占 **5.4 s(77%)**、GPU MoE 计算 1.5 s、注意力 0.097 s |
+| CPU 引擎(阈值 999999,修 bug 后) | **19 t/s(214 s)** | 完全不可用 |
+
+CPU 预填充为什么这么慢(引擎 NS-PROF 分桶):
+`bucket=M>8 na≈13-39 | setup=170–340 ms A=480–785 ms B=170–394 ms → 每次调用 0.8–1.4 s`
+⇒ **setup(数据搬运)就是主项**:每层要 gather 24576 个 assignment × 4096×2 B ≈ **201 MB**
+的激活,加上 `a32` 的 fp32 转换 ≈ **340 MB/层**,而 MoE 的权重读取才 3.2 GB/层。
+⇒ CPU 预填充路径需要先把"gather + fp32 转换"改成按需/分块,否则永远不可用。
+
+**结论(预填充的正确方向)**:
+1. 预填充继续用 **GPU 流式路径**(比 CPU 快 30×);
+2. 要往 1500 t/s 走,必须减少 PCIe 字节:**TP=2 让两条 PCIe 链路并行各流一半 ⇒ ≈2×**
+   (再加上若干层常驻显存不流)⇒ 这正好也是解码需要的配置;
+3. CPU 预填充路径若要用,必须重写 gather/转换(记录为后续项)。
