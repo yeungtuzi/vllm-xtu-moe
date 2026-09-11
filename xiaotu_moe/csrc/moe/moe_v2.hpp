@@ -872,6 +872,12 @@ public:
                     n1 = std::min<int>(n1, n0 + sep);
                     if (n0 >= n1) return;
                 }
+                if (MOE_V2::diag_barrier()) {   // 诊断:XIAOTU_MOE_DIAG_BARRIER=1 时空转
+                    for (size_t mi = 0; mi < me; ++mi) {
+                        float* bs = g.both.data() + mi * (size_t)2 * (size_t)inter;
+                        for (int i = n0; i < n1; ++i) { bs[i] = 1.f; bs[inter + i] = 1.f; }
+                    }
+                } else
                 wt::gate_up_slice_batched((int)me, g.xg.data(), w13_shard_[n], w13_g_, w13_gs_,
                                           g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1);
                 // FUSED (lk does 3 barriers, we now do 3): gated-SiLU + f32->bf16
@@ -955,6 +961,12 @@ public:
                     n1 = std::min<int>(n1, n0 + sep);
                     if (n0 >= n1) return;
                 }
+                if (MOE_V2::diag_barrier()) {   // 诊断:同上
+                    for (size_t mi = 0; mi < me; ++mi) {
+                        float* d = g.down.data() + mi * (size_t)hidden;
+                        for (int i = n0; i < n1; ++i) d[i] = 1.f;
+                    }
+                } else
                 wt::down_slice_batched((int)me, g.abf16.data(), w2_shard_[n], w2_g_, w2_gs_,
                                        g.down.data(), hidden, inter, (size_t)eid, groupN, groupK, n0, n1);
             });
@@ -1068,6 +1080,11 @@ private:
     size_t prof_calls_ = 0;
     int64_t prof_A_ = 0, prof_A2_ = 0, prof_B0_ = 0, prof_B_ = 0, prof_C_ = 0, prof_ovh_ = 0;
     size_t prof_M_ = 0, prof_na_ = 0;
+    static bool diag_barrier() {
+        static const bool v = (std::getenv("XIAOTU_MOE_DIAG_BARRIER") != nullptr);
+        return v;
+    }
+
     void prof_init() {
         prof_ = std::getenv("XIAOTU_MOE_PROFILE") != nullptr;
         if (prof_) {

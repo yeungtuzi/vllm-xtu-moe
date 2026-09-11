@@ -436,7 +436,9 @@ public:
         uint64_t gen;
         {
             std::lock_guard<std::mutex> lk(work_mtx_);
-            task_ = std::function<void(size_t)>(fn);  // type-erased copy
+            task_ = std::function<void(size_t)>(fn);  // type-erased copy(仅保留给兼容/诊断)
+            pub_flat_ = &flat_thunk<F>; pub_flat_ctx_ = (void*)&fn;
+            pub_shard_ = nullptr; pub_shard_ctx_ = nullptr;
             n_ = n;
             worker_limit_.store(limit >= nt_ ? 0 : limit, std::memory_order_relaxed);
             sharded_call_ = 0;   // this is a flat call: task_ is valid, so reset
@@ -651,6 +653,8 @@ public:
             node_base_.resize((size_t)nnodes);
             node_nj_.resize((size_t)nnodes);
             sharded_task_ = std::function<void(size_t, size_t)>(fn);
+            pub_shard_ = &shard_thunk<F>; pub_shard_ctx_ = (void*)&fn;
+            pub_flat_ = nullptr; pub_flat_ctx_ = nullptr;
             // A sharded call has no flat task: clear it so a worker that somehow
             // takes the flat path can never invoke the previous call's function.
             task_ = nullptr;
@@ -830,8 +834,8 @@ private:
         ready_.fetch_add(1, std::memory_order_release);
         uint64_t my_last_gen = 0;  // per-worker: generation this thread handled
         for (;;) {
-            std::function<void(size_t)> local_task;
-            std::function<void(size_t, size_t)> stask;
+            void (*lf_)(void*, size_t) = nullptr;   void* lc_ = nullptr;
+            void (*sf_)(void*, size_t, size_t) = nullptr; void* sc_ = nullptr;
             size_t n = 0, start = 0;
             uint64_t gen = 0; bool sharded = false;
             // --- HOT-RESTART SPIN (mirrors lktransformers' lock-free spin).
@@ -880,8 +884,8 @@ private:
                 gen = current_gen_.load();
                 my_last_gen = gen;
                 worker_gen_[w].store(gen, std::memory_order_release);
-                local_task = task_;   // copy the type-erased function
-                stask = sharded_task_;
+                lf_ = pub_flat_;  lc_ = pub_flat_ctx_;
+                sf_ = pub_shard_; sc_ = pub_shard_ctx_;
                 n = n_;
                 start = start_;       // this call's first ticket
                 sharded = (sharded_call_ > 0);
@@ -911,7 +915,7 @@ private:
                                     &shard_cnt_[(size_t)myn * kShardDiagStride + loc],
                                     1u, __ATOMIC_RELAXED);
                             }
-                            stask((size_t)myn, loc);
+                            if (sf_) sf_(sc_, (size_t)myn, loc);
                             shard_exec_.fetch_add(1, std::memory_order_relaxed);
                             // Only decrement while THIS generation is still live:
                             // the caller publishes the next call only after this
@@ -931,7 +935,7 @@ private:
                         // falls in that call's monotonic node range -> execute it
                         // with the LIVE task (the snapshot `stask` belongs to the
                         // previous call and would run the wrong function).
-                        std::function<void(size_t, size_t)> nstask;
+                        void (*nfn)(void*, size_t, size_t) = nullptr; void* nctx = nullptr;
                         uint64_t ng; size_t nb, nnj; bool live;
                         {
                             std::lock_guard<std::mutex> lk(work_mtx_);
@@ -940,18 +944,18 @@ private:
                             live = (sharded_call_ > 0) && (int)myn < sharded_call_;
                             nb = live ? node_base_[myn] : 0;
                             nnj = live ? node_nj_[myn] : 0;
-                            nstask = sharded_task_;
+                            nfn = pub_shard_; nctx = pub_shard_ctx_;
                         }
                         if (!live) {                   // switched away from sharded:
                             break;                     // outer wait will re-anchor flat
                         }
                         gen = ng; my_last_gen = ng;
                         worker_gen_[w].store(ng, std::memory_order_release);
-                        stask = std::move(nstask);
+                        sf_ = nfn; sc_ = nctx;
                         base = nb; nj = nnj;
                         loc = t - base;
                         if (loc >= nj) break;          // beyond live range -> re-arm outer wait
-                        stask((size_t)myn, loc);
+                        if (sf_) sf_(sc_, (size_t)myn, loc);
                         shard_exec_.fetch_add(1, std::memory_order_relaxed);
                         if (current_gen_.load(std::memory_order_acquire) == gen &&
                             remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -972,7 +976,7 @@ private:
                     // Snapshot is authoritative: caller has not started the next
                     // call (publish-first), so start_/n_/task_ unchanged.
                     if (i >= n) break;   // true future-gap -> safe lock-free drop
-                    local_task(i);
+                    if (lf_) lf_(lc_, i);
                     if (diag_active()) proc_vec_[i] = 1;
                     // Last worker to reach 0 notifies the completion condvar.
                     // It must hold done_mtx_ (the same mutex the caller's
@@ -992,14 +996,14 @@ private:
                 // the lock (consistent start_/n_/task_), then evaluate t against
                 // the authoritative live range.
                 {
-                    std::function<void(size_t)> nt;
+                    void (*nlf)(void*, size_t) = nullptr; void* nlc = nullptr;
                     size_t nn, ns; uint64_t ng; bool live_sharded;
                     {
                         std::lock_guard<std::mutex> lk(work_mtx_);
                         if (stop_) return;
                         ng = current_gen_.load();
                         live_sharded = (sharded_call_ > 0);
-                        nt = task_;
+                        nlf = pub_flat_; nlc = pub_flat_ctx_;
                         nn = n_;
                         ns = start_;
                     }
@@ -1017,14 +1021,14 @@ private:
                     gen = ng;
                     my_last_gen = ng;
                     worker_gen_[w].store(ng, std::memory_order_release);
-                    local_task = std::move(nt);
+                    lf_ = nlf; lc_ = nlc;
                     n = nn; start = ns;
                     i = t - start;
                     if (i >= n) {               // genuinely beyond live range -> re-arm
                         dropped_.fetch_add(1, std::memory_order_relaxed);
                         break;
                     }
-                    local_task(i);
+                    if (lf_) lf_(lc_, i);
                     if (diag_active()) proc_vec_[i] = 1;
                     // Lock-protected notify (same reasoning as the fast path): hold
                     // done_mtx_ so the completion notify can't be missed by the
@@ -1109,6 +1113,22 @@ private:
     // workers pull only from their OWN node's ticket counter so every job is
     // executed by a worker bound to the node that owns the weight rows it reads
     // (lktransformers intra-node model). Mirrors the flat parallel_for state.
+    // ---- 无锁任务发布(2026-09-11)------------------------------------------
+    // 原实现:每个 worker 每次拿任务都要在全局 work_mtx_ 下 `local_task = task_;
+    // stask = sharded_task_;` —— 120 个 worker × 每层 3 个阶段 ⇒ 大量锁竞争 +
+    // 每个 std::function 拷贝都可能是堆分配。实测把矩阵计算体挖空后,
+    // "纯 job 分解 + 屏障"仍要 614 µs/次调用(占 41%)。
+    // 现在改成发布 (fn, ctx) 两个机器字:调用方在 `++current_gen_` 之前写入,
+    // worker 在确认了新一代之后直接读(不加锁、不拷贝、不分配)。
+    template <typename F> static void flat_thunk(void* c, size_t i) {
+        (*static_cast<F*>(c))(i);
+    }
+    template <typename F> static void shard_thunk(void* c, size_t n, size_t j) {
+        (*static_cast<F*>(c))(n, j);
+    }
+    void (*pub_flat_)(void*, size_t) = nullptr;   void* pub_flat_ctx_ = nullptr;
+    void (*pub_shard_)(void*, size_t, size_t) = nullptr; void* pub_shard_ctx_ = nullptr;
+
     std::function<void(size_t, size_t)> sharded_task_;  // fn(node, local)
     int sharded_call_ = 0;                              // #nodes if current call is sharded
     std::atomic<long> shard_exec_{0};                   // diag: actual stask executions
