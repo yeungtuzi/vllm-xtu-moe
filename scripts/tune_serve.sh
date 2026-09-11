@@ -37,7 +37,11 @@ EAGER="${EAGER:-1}"
 TP="${TP:-1}"
 PREFILL_MIN="${PREFILL_MIN:-384}"
 PREFILL_FILE="${PREFILL_FILE:-}"
-THREADS="${THREADS:-96}"
+# 176 = 192 核 - 16:给调用线程(MoE host-fn 回调 / torch / CUDA 驱动 / 采样)留核。
+# 实测(2026-09-11,微基准 2 轮复现):worker 数 == 核数时,调用线程只能抢某个 worker
+# 的核 ⇒ 该 worker 成为屏障的拖后腿者,单次引擎调用 2.8-3.3 ms;留 16 核后 1.64-1.65 ms
+# (1.7-2.0x)。服务端同向:每层 compute 4.4-5.7 → 3.2-3.6 ms。
+THREADS="${THREADS:-176}"
 OMP="${OMP:-48}"
 SPEC="${SPEC:-}"
 EXTRA="${EXTRA:-}"
