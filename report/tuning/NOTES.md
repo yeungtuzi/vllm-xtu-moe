@@ -2939,3 +2939,27 @@ Triton kernel 现在按行主序 K 分块读 `w13`)。因此建议先在**独立
       pinned 缓存已存在,零新增内存);
 - [ ] 验收:`scripts/bench_engine_ab.py`(BS=6/DEDUP=12/THREADS=120)**≤0.7 ms/层、每线程 ≥2.2 GB/s**;
       再切 8070 复核 TPOT 28-31 → ~20 ms。
+
+## 101. 第 57 轮:§100 的前提**已运行时验证**
+
+```python
+from vllm_xiaotu_moe.gpu_prefill import _kmajor_bytes
+t  = arange(3*8*6).reshape(3,8,6)      # [E][N][K/2]
+km = _kmajor_bytes(t)
+# in  (3, 8, 6) stride (48, 6, 1)
+# km  (3, 6, 8) stride (48, 8, 1)   ← [E][K/2][N],列维连续
+# transpose 正确: True
+# 同一 k 上 8 列: [0, 6, 12, 18, 24, 30, 36, 42]  ← 连续 ✓
+# 尺度 _kmajor_bytes(s) → (3, 2, 8) = [E][K/32][N] ✓
+```
+
+⇒ §100 的两条前提都成立:①K-major(`[E][K/2][N]`,列连续)由 `_kmajor_bytes` 正确产生;
+②尺度同样可得 `[E][K/32][N]`。**列向量化内层所需的取数形态(一次 32 B 拿到 32 列)已具备**,
+且这份缓冲在 GPU 预填充路径上本就已经为每层建好 ⇒ 下一轮可直接按 §100 的四项清单实现。
+
+**给下一轮的提醒(避免又白跑)**:
+- 先用 `XIAOTU_MOE_LKLOOP=1` 门控新路径、保留 `block_23` 作 A/B 对照;
+- 验收只认 `scripts/bench_engine_ab.py`(BS=6/DEDUP=12/THREADS=120)的 **ms/层**(目标 ≤0.7)
+  与每线程 ≥2.2 GB/s;改前先 `grep -c` 锚点(§88/§92 的教训);
+- 若新路径达标,**必须**再跑一次 `gpu_prefill_golden.py` 与 `test_block23_equiv.py` 做数值对拍
+  (row_scale 的 K-major 索引是唯一容易写错的地方)。
