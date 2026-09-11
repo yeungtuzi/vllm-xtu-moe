@@ -760,6 +760,8 @@ public:
             g.act.resize(me * (size_t)inter);
             g.abf16.resize(me * (size_t)inter);
             g.down.resize(me * (size_t)hidden);
+            static const bool _nogather = std::getenv("XIAOTU_MOE_NOGATHER") != nullptr;
+            if (_nogather) continue;   // 计时诊断:跳过 gather(数值无效),量收益上限(NOTES §89)
             for (size_t m = 0; m < me; ++m) {
                 size_t t = g.ai_list[m] / (size_t)k;
                 std::memcpy(g.xg.data() + m * (size_t)hidden, input + t * (size_t)hidden,
