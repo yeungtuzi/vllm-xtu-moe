@@ -2304,3 +2304,15 @@ vs lk 0.57-0.67 ms(§73,同 API 同线程同权重)。**不是 NUMA、不是线�
 2. 验收标准(同一微基准,`ENG=xiaotu /tmp/bench_both.py`):BS=6/DEDUP=12 **≤0.7 ms/层**
    (现在 1.22),每线程 ≥2.2 GB/s;达标后再看服务端 TPOT(现在 28-31 ms → 目标 ~20)。
 3. 之后再评估 3 阶段融合(登记簿里评估为 low-medium),不要先动它。
+
+
+## 75. 目标已重排(2026-09-11):**第一条 = 引擎效率对齐 lk_moe**,其余目标在其后
+
+- 目标 revision 8,phase=active、maxGoalRounds=60(此前 30 轮用尽被 blocked,用户要求改目标并继续)。
+- 验收工具已固化:`scripts/bench_engine_ab.py`(`ENG=xiaotu|lk`,同一同步 API/同一权重/同线程;
+  **lk 必须 `LK_THREADS=120`**,否则假慢 70×)。
+- 基线(BS=6/DEDUP=12/THREADS=120):**xiaotu 1.22 ms/层(124 GB/s)vs lk 0.57 ms/层(265 GB/s)**;
+  目标 **≤0.7 ms/层、每线程 ≥2.2 GB/s**,然后服务端 TPOT 28-31 → ~20 ms。
+- 第一处代码改动(下一步):`xiaotu_moe/csrc/moe/moe_v2_packed4.hpp` 的小 me 路径(单行 + `block_23`)
+  —— 权重 fp4→fp32 解码 hoist 到 K-block 级工作缓冲,内层全 packed zmm fp32 FMA、累加器 ≥8-16 链,
+  热路径禁止 `ss` 标量 FMA(R34/§74)。
