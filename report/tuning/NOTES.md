@@ -2332,3 +2332,33 @@ lambda(阶段 C 的 `out_t[h] += w*d[h]` 标量归约)与 `NumaWorkPool::flat_th
 
 下一步:把 FAST_FP4 的解码从 (行,组) 内层提到 **K-block 级**(每 64 列解一次到寄存器/工作
 缓冲,再对 me 行做 packed `vfmadd231ps`,累加链尽量多)。验收同前:BS=6/DEDUP=12 ≤0.7 ms/层。
+
+## 77. 第 32 轮:两项决定性事实 —— 解码 hoist **已实现**;2× 差距**真实可比**
+
+**① "把解码 hoist 到 K-block 级"这条其实已经在代码里了。**
+`moe_v2_packed4.hpp` 的 `block_23`(解码关键路径,me=2/3):
+```cpp
+for (int g = 0; g < group_count; g++) {
+    const int base = g * 32;
+    XIAOTU_DECODE_GROUP_AVX512(b_row, g);      // ← 解码在行循环**外面**
+    const __m512 sv = _mm512_set1_ps(row_scale(srow, g));
+    for (int r = 0; r < R; ++r) {              // ← 2/3 行复用同一份解码
+        __m512 d = _mm512_mul_ps(wlo_, _mm512_loadu_ps(pr[r] + base));
+        d = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(pr[r] + base + 16), d);
+        acc[r][p] = _mm512_fmadd_ps(d, sv, acc[r][p]);
+    }
+}
+```
+⇒ 目标第一条里"每 K-block 先解码再对 me 行做 FMA"的**结构已经满足**(注释里还记着当年从"每行重复解码"改过来的 1.78× 收益)。
+**② 两引擎输出一致**(同一权重/同一输入/同一 routing,`cpu_prefill`):
+xiaotu `absmean=11234.88`、lk `absmean=11235.16`,逐元素最大差 <0.5% ⇒ **2× 不是"工作量不同"的假象**,
+是内核执行效率差。
+
+**③ 与 lk 热内核的剩余差异(下一轮要打的)**:
+- lk:激活保持 **bf16**,每个 k 用 `vpinsrw + vcvtph2ps + vpbroadcastss`(载入 2B)后 **2 条 FMA**;
+  我们:先把激活整段转成 **fp32 缓冲 a32**(每个 (r,g) 载入 128B),再 `mul + 2 fma` ⇒ 激活侧 L1 流量 ×2、
+  且多一遍 a32 转换(§330-334 那两行)。
+- lk:每 K-block 解码结果**写进栈缓冲**,FMA 循环里只剩 2 条 zmm 载入 + 8×(cvt+bcast+2 FMA);
+  我们:解码结果留在寄存器(更省),但激活侧更重。
+⇒ 下一轮:把激活侧改成 **bf16 直取 + 寄存器内转换/broadcast**(去掉 a32 缓冲),把每 (r,g) 的
+`2 load + mul + 2 fma` 压到 lk 的 `1 load(2B) + cvt + bcast + 2 fma`。验收不变(≤0.7 ms/层)。
