@@ -297,6 +297,16 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 | 附带发现 | `VLLM_USE_V2_MODEL_RUNNER=0` 会直接启动失败(`Model Runner V1 does not support: dspark speculative decoding`)⇒ 本模型 + DSpark **必须**走 V2 runner(默认即如此,不要显式设 0)|
 | 再试条件 | 不要再在 AR 实现/归约上找这 30 ms;必须用 nsys/nvtx 时间线看 GPU 侧(kernel 级)|
 
+## R29. 用插件自带 `XIAOTU_TORCH_PROFILE` 拿 GPU kernel 时间线 —— 当前拿不到(埋点两个缺陷)
+
+| 项 | 内容 |
+|---|---|
+| 期望 | `_maybe_profile()` 已带 `activities=[CPU, CUDA]`,以为 `prof.key_averages().table()` 能列出 kernel |
+| 实测 | 日志里 `[xiaotu-profile]` 表**只有** `cudaDeviceSynchronize` / `Activity Buffer Request`,**0 条 kernel 行**;两个 rank 还争抢同一路径(`Failed to rename /tmp/pref_prof.json.tmp to /tmp/pref_prof.json`)|
+| 结论 | 该埋点当前无法回答"那 ~30 ms/层是哪些 kernel":①窗口从**第一次 MoE forward** 开始(可能落在纯 CPU 的 dummy 阶段)②trace 路径没有 rank 后缀,两个 rank 互相覆盖 |
+| 修法(下轮) | ①路径加 rank/pid 后缀;②`XIAOTU_TORCH_PROFILE_CALLS` 从"第一次调用"改为"第一次**真实预填充**"(qlen ≥ 阈值)后再开窗;③表按 `cuda_time_total` 排序并只打印 CUDA 行 |
+| 再试条件 | 修完这三点再用它定位 GPU 侧;在那之前不要再解析它的 JSON(§58 已记过一次)|
+
 ---
 
 ## M. 测量陷阱(**犯过的错**,不要再犯)

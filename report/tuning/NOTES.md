@@ -2177,3 +2177,10 @@ spec tokens 5→3(拒绝,R10)。
 - 至此预填充每层 102 ms = H2D 67-74(峰值)+ 主机 0.5 + **~30 未解释**,已排除:主机侧(21)、
   环深(20)、归约(22+28)、attention(59)、并发(18)、pin 落点(58)。**唯一出路是 nsys 的
   kernel 级时间线**(插件 profiler 的 chrome trace 在本配置下没有 GPU kernel 事件,见 §58)。
+
+
+## 68. 第 27 轮:GPU 侧可见性仍缺失(profiler 埋点两个缺陷,R29)
+
+`[xiaotu-profile]` 表 0 条 kernel 行,且两 rank 争抢 `/tmp/pref_prof.json`。⇒ 那 ~30 ms/层
+仍未定位。下轮先修埋点(rank 后缀 + 从真实预填充开窗 + 按 cuda_time 排序),再用它定位。
+预填充每层账:102 ms = H2D 67-74(峰值)+ 主机 0.5 + **~30 未解释**。
