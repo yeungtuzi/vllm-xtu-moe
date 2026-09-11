@@ -427,6 +427,18 @@ def _build_segmentation(topk_ids, topk_weights, num_experts, device):
 
 
 _GP_TIMING = os.environ.get("XIAOTU_GP_TIMING") == "1"
+_GP_H2D = {"n": 0, "ms": 0.0}
+
+
+def _gp_h2d(ms: float) -> None:
+    st = _GP_H2D
+    st["n"] += 1
+    st["ms"] += ms
+    if st["n"] % 40 == 0:
+        print(f"[gp-h2d] n={st['n']} per_layer={st['ms'] / st['n']:.1f}ms", flush=True)
+        st.update(n=0, ms=0.0)
+
+
 _GP_STAT = {"n": 0, "seg": 0.0, "rest": 0.0, "tok": 0}
 _GP_EVERY = 40
 
@@ -716,12 +728,14 @@ def prebuild_pinned_kmajor(tensors: list, workers: int = 6) -> None:
 # never overwrites bytes the GPU is still reading.
 # --------------------------------------------------------------------------
 class PrefetchSlot:
-    __slots__ = ("bufs", "ready", "busy")
+    __slots__ = ("bufs", "ready", "busy", "t0", "t1")
 
     def __init__(self):
         self.bufs = None
         self.ready = None
         self.busy = None
+        self.t0 = None   # XIAOTU_GP_TIMING: H2D 起止事件(量服务里真实传输时间)
+        self.t1 = None
 
     def alloc(self, tensors, device):
         shapes = tuple(tuple(t.shape) for t in tensors)
@@ -794,11 +808,18 @@ def prefetch_layer(w13, s13, w2, s2, device):
     st = _prefetch_stream(dev)
     if slot.busy is not None:
         st.wait_event(slot.busy)
+    timing = os.environ.get("XIAOTU_GP_TIMING") == "1"
+    if timing:
+        slot.t0 = torch.cuda.Event(enable_timing=True)
+        slot.t1 = torch.cuda.Event(enable_timing=True)
+        slot.t0.record(st)
     with torch.cuda.stream(st):
         for buf, src in zip(slot.bufs, (w13, s13, w2, s2)):
             buf.copy_(src, non_blocking=True)
         slot.ready = torch.cuda.Event()
         slot.ready.record(st)
+        if timing:
+            slot.t1.record(st)
     return slot
 
 
@@ -899,6 +920,11 @@ def gpu_moe_layer(
         )
     if _GP_TIMING:
         _gp_add(T, A, _t1 - _t0, time.perf_counter() - _t1)
+        if slot is not None and getattr(slot, "t0", None) is not None:
+            try:   # H2D 传输时间(事件已完成:本层已在等 ready)
+                _gp_h2d(slot.t0.elapsed_time(slot.t1))
+            except Exception:  # noqa: BLE001
+                pass
     if slot is not None:
         # Mark the slot free only after these kernels have actually finished.
         slot.busy = torch.cuda.Event()
