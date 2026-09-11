@@ -1,0 +1,43 @@
+{
+ "summary": {
+  "ts": "2026-09-11T13:42:34",
+  "tag": "pf7_pre_3",
+  "server_tag": "unknown",
+  "natural_text": 1,
+  "client": "bench_nat_client",
+  "concurrency": 1,
+  "num_prompts": 1,
+  "output_len": 16,
+  "input_len": "nat4096",
+  "completed": 1,
+  "failed": 0,
+  "duration_s": 4.81,
+  "total_output_tokens": 16,
+  "out_tok_per_s": 3.33,
+  "per_stream_tok_per_s": 3.33,
+  "mean_ttft_ms": 3767.2,
+  "mean_tpot_ms": 65.15,
+  "mean_step_ms": 173.73,
+  "p95_step_ms": 178.79,
+  "mean_tokens_per_step": 2.286,
+  "per_req_tok_per_s": [
+   15.35
+  ]
+ },
+ "requests": [
+  {
+   "idx": 0,
+   "ttft_ms": 3767.1820279210806,
+   "n_out": 16,
+   "n_steps": 7,
+   "tokens_per_step": 2.2857142857142856,
+   "e2e_s": 4.8095866069197655,
+   "decode_s": 1.0424045789986849,
+   "mean_step_ms": 173.7261718759934,
+   "mean_itl_ms": 65.1502861874178,
+   "p50_step_ms": 172.89379984140396,
+   "p95_step_ms": 178.78733947873116,
+   "tok_per_s": 15.349126742487368
+  }
+ ]
+}

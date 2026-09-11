@@ -2151,3 +2151,11 @@ TTFT → 2.6 s ⇒ 1580 t/s(达标)**。这是最后一次收窄:问题在 GPU �
 
 每 GB 收益:槽 ≈ **780 ms/GB**,常驻层 ≈ **44 ms/GB** ⇒ 要省显存先砍常驻层(有
 `XIAOTU_MOE_RESIDENT_BUDGET_GB`),不要关重叠。登记簿 R25。
+
+
+## 65. 第 24 轮:`VLLM_USE_V2_MODEL_RUNNER=1` 实测无收益(登记 R26)
+
+TP=2+6 常驻层,预填充 TTFT 3733/3767 ms vs 基线 3666-3771 ms ⇒ 保持不设。
+至此目标清单里点名的旋钮已全部试过:GPU 常驻专家层(✅ 预填充 +47%)、GPU 预填充阈值(384,
+在用)、prefetch window/slots(实测无益,R20)、`VLLM_USE_V2_MODEL_RUNNER`(无益,R26)、
+spec tokens 5→3(拒绝,R10)。
