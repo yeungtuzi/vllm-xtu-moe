@@ -1998,3 +1998,27 @@ A(读 gate/up 分片)是最大项:聚合 195MB/749µs ≈ 260 GB/s(单拷贝时�
 - 修法:进程级状态挂 `builtins`(`_resident_state()`)+ 按 prefix 去重
   (`resident_already_built`)+ 新硬旋钮 `XIAOTU_MOE_RESIDENT_BUDGET_GB`(超预算的层
   自动回落成普通 CPU 层,并把 CPU 引擎建起来避免 `engine=None` 静默返回输入)。
+
+### 56.2 预取重叠 A/B + 微基准上限(第 16 轮实测)
+TP=2 + 6 常驻层、其余同配置,只改 `XIAOTU_GPU_PREFETCH_AHEAD`:
+
+| 配置 | 预填充 4096 TTFT | 推算每层 |
+|---|---|---|
+| `XIAOTU_GPU_PREFETCH_AHEAD=1`(默认) | **3.70 / 3.66 s**(1105-1117 t/s)| 100 ms |
+| `XIAOTU_GPU_PREFETCH_AHEAD=0` | **6.40 / 6.33 / 6.32 s** | 172 ms |
+
+⇒ 预取重叠**确实在工作且不可缺少**(关掉几乎慢一倍)。
+
+微基准上限(`scripts/bench_gpu_moe_prefetch.py`,E=128/topk=6,1.594 GiB/层 = TP=2 每 rank 量):
+
+| T | 串行 ms/层 | **重叠 ms/层** | 加速 | 重叠 tok/s |
+|---|---|---|---|---|
+| 2048 | 110.2 | 64.1 | 1.72x | 743 |
+| **4096** | 130.0 | **63.9** | **2.03x** | **1490** |
+| 8192 | 175.3 | 98.1 | 1.79x | 1943 |
+| 16384 | 267.3 | 189.0 | 1.41x | 2016 |
+
+⇒ 重叠后 63.9 ms/层 = 1.594 GiB / 63.9 ms = **25 GB/s = PCIe gen4 x16 峰值**(微基准已达硬件上限);
+真实服务里是 ~100 ms/层 ⇒ **还有 1.56× 的"框架开销"**(EAGER 逐层 Python/launch、breakable graph
+分段、两 rank 协同)才是预填充没到 1500 的原因 —— 不是 PCIe、不是 CPU。下轮查这里
+(而不是继续加常驻层:显存只够 ~7-10 层)。
