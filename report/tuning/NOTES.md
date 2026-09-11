@@ -1726,3 +1726,38 @@ CPU 预填充为什么这么慢(引擎 NS-PROF 分桶):
 - 解码:常驻 ~12 层(28%)+ 每层 CPU 成本下降 ⇒ 向 70 靠近;
 - 需要用他们的启动参数对齐:`--disable-custom-all-reduce`、`LVLLM_GPU_PREFETCH_WINDOW=1`
   (我们 `XIAOTU_GPU_PREFETCH_AHEAD=1` 默认开)、`--max-num-seqs 2` ✓。
+
+---
+
+## 48. TP=2 启动阻塞(第 13 轮遇到,必须解决才能走"常驻层 + 双 PCIe"路线)
+
+### 48.1 现象与证据(3 次尝试,症状一致)
+
+| 尝试 | 配置 | 结果 |
+|---|---|---|
+| 1 | TP=2, EP=1, 常驻 0-11, spin=300, KV 8 GiB | 常驻层加载成功(`GPU-resident` 16 次),随后 **Triton CUDA OOM**(显存不够)|
+| 2 | TP=2, EP=1, 常驻 0-3, spin=300, KV 8 GiB | 引擎逐层建成(`EP ... rank 0/2 owns experts [0,128)`),随后 **挂死**:`shm_broadcast: No available shared memory broadcast block found in 60 seconds` 反复出现 |
+| 3 | TP=2, EP=1, 常驻 0-3, **spin=5000**, KV 8 GiB | 同上,仍挂 |
+| 4 | TP=2, EP=1, **XIAOTU_MOE_GEMM_NR=0(旧 GEMV 内核)**, spin 默认 | 同上,仍挂 ⇒ **不是本轮 GEMM 改动引入的** |
+
+⇒ 阻塞点在 **EngineCore 的 warmup 阶段**(引擎已建成、模型已加载),不是加载/显存问题。
+本会话早期(第 1-2 轮)TP=2+EP 是**能起来的**,此后引擎侧改过三处(自旋默认 5000→300、
+线程预留、无锁任务发布、job 过度分片),需要在下一轮用 **bisect** 定位:
+
+```bash
+# 依次回退并各试一次 TP=2 启动(每次 ~10 min)
+git show c2172ea^:xiaotu_moe/csrc/moe/numa_pool.hpp > /tmp/pool_orig.hpp   # 无锁发布之前
+# 1) 只回退无锁任务发布  2) 只回退 job 过度分片(moe_v2.hpp 的 need 公式)
+#  3) 回退自旋默认(插件里 setdefault 300 → 5000)
+```
+
+最可疑的是**无锁任务发布**(worker 不再在 `work_mtx_` 下取快照 —— 与 §33 记录的
+"池自身竞态"同类);第 4 次尝试已排除 GEMM 内核。
+
+### 48.2 顺带确认的事
+
+- **GPU 常驻层在 TP=2 下能加载**:`XIAOTU_MOE_GPU_RESIDENT_LAYERS=0-3` 正常
+  (每层每 rank ~1.6 GiB);显存预算要算上 KV(vLLM 对 131072 上下文按 6.71 GiB 校验,
+  比实测 29.5 KB/token 严 2×)。
+- 多 rank 共机时**自旋窗必须更大**(spin=300 在 TP=1 是甜的,TP=2 下连启动都过不去)——
+  与 §31 "两个 rank 共机时自旋把机器烧穿"是同一类问题,但这次是唤醒不足而非自旋过多。
