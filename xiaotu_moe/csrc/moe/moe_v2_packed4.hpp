@@ -262,6 +262,8 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
             return e && std::atoi(e) != 0;
         }();
         if (dotp16) {
+            static bool once_ = [](){ fprintf(stderr, "[dotp16] BRANCH TAKEN (bf16 dot path)\n"); return true; }();
+            (void)once_;
             alignas(16) static constexpr uint8_t d_lo[16] = {
                 0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
                 0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};
