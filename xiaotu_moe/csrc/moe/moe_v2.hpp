@@ -823,7 +823,12 @@ public:
             else if (nshard_ >= 2 && pool_.nthreads() > 1 && (!eov || std::atoi(eov) < 0)) {
                 const int NS = nshard_;
                 size_t tpn = std::max<size_t>(1, pool_.nthreads() / (size_t)NS);
-                size_t need = (tpn + na - 1) / na;                    // ceil(tpn/na)
+                // 每 worker 约 4 个 job(原来 ceil(tpn/na) 在 na≈tpn 时只有 1 个
+                // job/worker ⇒ 一个掉队 job 就拖慢整个阶段:实测 auto(=1) 时
+                // A+B=1448-1469 µs、subA=2→1217、4→1166-1199、8→1174-1236,
+                // 即 1.2x,每核带宽 1.15→1.44 GB/s)。仍受 spanA/32 的上限约束。
+                size_t need = (4 * tpn + na - 1) / na;                // ≈ 4 jobs/worker
+                if (need < 2) need = 2;
                 size_t spanA = (size_t)(inter / NS);
                 subA = (int)std::min<size_t>(need, std::max<size_t>(1, spanA / 32));
                 if (subA < 1) subA = 1;

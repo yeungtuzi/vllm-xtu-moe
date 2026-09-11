@@ -392,6 +392,11 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         for (int j = n0; j < n1; ++j) {
             const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
             const int srow = (j / gn) * kb_stride;            // 每行一次除法
+            // 整行预取:下一行有 K/2 字节(4096 维 ⇒ 2048 B = 32 条 cache line),
+            // 原实现只预取前 4 条 ⇒ 每行的前 28 条线仍要现取,worker 在行首停等
+            // DRAM(实测每核只有 1.2 GB/s,而单核流式能到 36 GB/s)。
+            const uint8_t* next_row = (j + 1 < n1)
+                ? W + (size_t)(j + 1 - rowshift) * (K / 2) : nullptr;
             if (j + 1 < n1) {
                 const char* nr = (const char*)(W + (size_t)(j + 1 - rowshift) * (K / 2));
                 _mm_prefetch(nr, _MM_HINT_T0);
@@ -413,6 +418,9 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 for (int g = 0; g < group_count; g++) {
                     const int base = g * 32;
                     XIAOTU_DECODE_GROUP_AVX512(b_row, g);
+                    if (next_row && ((g) & 3) == 0)
+                        _mm_prefetch((const char*)next_row + ((size_t)((g) >> 2) << 6),
+                                     _MM_HINT_T0);
                     const float scale = row_scale(srow, g);
                     const __m512 sv = _mm512_set1_ps(scale);
                     // ILP-16: round-robin over 4 independent partial chains per
@@ -466,6 +474,9 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 for (int g = 0; g < group_count; g++) {
                     const int base = g * 32;
                     XIAOTU_DECODE_GROUP_AVX512(b_row, g);
+                    if (next_row && ((g) & 3) == 0)
+                        _mm_prefetch((const char*)next_row + ((size_t)((g) >> 2) << 6),
+                                     _MM_HINT_T0);
                     const __m512 sv = _mm512_set1_ps(row_scale(srow, g));
                     const int p = g & 3;
                     for (int r = 0; r < R; ++r) {
@@ -505,6 +516,9 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 for (int g = 0; g < group_count; g++) {
                     const int base = g * 32;
                     XIAOTU_DECODE_GROUP_AVX512(b_row, g);
+                    if (next_row && ((g) & 3) == 0)
+                        _mm_prefetch((const char*)next_row + ((size_t)((g) >> 2) << 6),
+                                     _MM_HINT_T0);
                     __m512 d = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p0 + base));
                     d = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p0 + base + 16), d);
                     const float scale = row_scale(srow, g);
