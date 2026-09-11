@@ -2911,3 +2911,31 @@ nibble 解码**,再对 R=2-3 行做 `2 load + mul + 2 FMA` ⇒ 覆盖同样的 3
 **风险提示(务必先评估)**:第 1 步会**同时影响 CPU 解码与 GPU 预填充两条路径**(GPU 侧的
 Triton kernel 现在按行主序 K 分块读 `w13`)。因此建议先在**独立的实验分支/开关**上做,
 并保留原布局直到验收通过。
+
+## 100. 【修法简化】K-major 布局**已经存在**于插件里(GPU 预填充的 pinned 缓存)
+
+`gpu_prefill._kmajor_bytes(t) = t.transpose(1, 2).contiguous()` ⇒ 对 `w13 [E][N][K/2]` 得到
+**`[E][K/2][N]` = K-major**(每个 k 字节上 N 列连续)✓ 正是 §99 要求 §98 列向量化所需的布局!
+而这条路径**已经在跑**:`_pinned_kmajor()` 为**每一层**建好 K-major 的 **pinned 主机缓冲**,
+供 GPU 逐层 H2D 使用(TP=1 时缓存覆盖全部 43 层 ≈ 139 GB,常驻主机内存)。
+
+⇒ **不必再造第二份布局**:让 CPU 引擎的 `forward_many` 支持"K-major 权重"输入(新增一个
+入口/开关),由插件把**已有的** `_pinned_kmajor(w13)` 传进去即可。要点:
+1. **尺度也要 K-major**:`s13 [E][N][K/32]` → `[E][K/32][N]`(`_kmajor_bytes(s13)` 同样成立 ✓
+   已经在缓存里),`row_scale` 索引从 `srow + gi` 改成 `gi*N + col`(其中 col 是该 zmm lane 的列号)✓
+   与列向量化的 lane 天然对齐;
+2. **列向量化内层**(`XIAOTU_MOE_LKLOOP=1`):对 32 列一块,循环 k:取 K-major 的
+   `wbuf[k/2][cols]`(连续 32 B = 32 列 ✓ 无需 gather)→ nibble 解码到栈缓冲 → 激活
+   `movzwl + shl 16 + vbroadcastss` → 2 条 `vfmadd231ps`(lane = 32 列,2×16);
+3. **GPU 预填充不受影响**(它本来就用 K-major)⇒ §99 里"两种布局要同时维护/内存 ×2"的风险**消除**
+   ✓ 反而变成"两条路径共用同一份 K-major 缓存";
+4. 行主序的 `w13` 仍留给 CPU 的**旧路径**做回归对照(`XIAOTU_MOE_LKLOOP=0`)。
+
+**实施清单(下一轮直接做)**
+- [ ] `moe_v2.hpp`:加一个"K-major 权重"引擎构造/入口(或给 `forward_many` 加 layout 参数);
+- [ ] `moe_v2_packed4.hpp`:新增列向量化小 me 路径(lane=输出列,2×16;权重先解码进栈缓冲;
+      激活 2 B 加载 + `<<16` + 广播);
+- [ ] 插件侧:`hybrid_model.py` 在 CPU 解码时把 `_pinned_kmajor(w13/w2/s13/s2)` 传给引擎(TP=1 的
+      pinned 缓存已存在,零新增内存);
+- [ ] 验收:`scripts/bench_engine_ab.py`(BS=6/DEDUP=12/THREADS=120)**≤0.7 ms/层、每线程 ≥2.2 GB/s**;
+      再切 8070 复核 TPOT 28-31 → ~20 ms。
