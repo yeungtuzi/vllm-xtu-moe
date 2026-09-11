@@ -58,6 +58,7 @@
 | 实测(3 次启动失败) | ① 捕获期间调用 ⇒ `cudaErrorStreamCaptureInvalidated` ⇒ `RuntimeError: Engine core initialization failed`;② 同一调用还会让 **libcuda segfault**(`cuMemHostRegister_v2` → SIGSEGV,EngineCore 被杀);③ 改成"等捕获结束再开始"后,90s 宽限期在 vLLM 的 warmup→捕获(~100s)时间线之前到期,仍然撞上 |
 | 机制 | 捕获窗口由 vLLM 在 warmup 之后约 100s 打开(主模型 + DSpark 投机器各一次);已经在驱动内部执行的注册调用无法撤回 |
 | 回退动作 | 两阶段:阶段 1 = 纯 CPU 的 K-major 转置(任何时刻都安全)在后台并行预建;阶段 2 = 等"捕获静止 `quiet_s=10s`"后再并行 `cudaHostRegister`;服务路径命中未锁页的缓存项时就地锁页(服务期没有捕获) |
+| 结果 | 两阶段拆分后启动 **285s 就绪**(此前 wait 版本 8 分钟以上且仍撞捕获),日志无 `prebuild * failed` / `StreamCaptureInvalidated` / `SIGSEGV` |
 | 再试条件 | 不要把 `cudaHostRegister`/`pin_memory` 放回"捕获可能正在进行的窗口";纯 CPU 部分可以 |
 
 ## R5. `XIAOTU_MOE_DPBF16`(bf16 点积累加路径)— 保持默认关
