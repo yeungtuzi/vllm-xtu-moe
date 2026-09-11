@@ -1,0 +1,43 @@
+{
+ "summary": {
+  "ts": "2026-09-11T01:52:15",
+  "tag": "nsprof_c1",
+  "server_tag": "nsprof",
+  "natural_text": 1,
+  "client": "bench_nat_client",
+  "concurrency": 1,
+  "num_prompts": 1,
+  "output_len": 120,
+  "input_len": "nat128",
+  "completed": 1,
+  "failed": 0,
+  "duration_s": 21.12,
+  "total_output_tokens": 120,
+  "out_tok_per_s": 5.68,
+  "per_stream_tok_per_s": 5.68,
+  "mean_ttft_ms": 6195.8,
+  "mean_tpot_ms": 124.36,
+  "mean_step_ms": 339.15,
+  "p95_step_ms": 677.16,
+  "mean_tokens_per_step": 2.667,
+  "per_req_tok_per_s": [
+   8.04
+  ]
+ },
+ "requests": [
+  {
+   "idx": 0,
+   "ttft_ms": 6195.828953757882,
+   "n_out": 120,
+   "n_steps": 45,
+   "tokens_per_step": 2.6666666666666665,
+   "e2e_s": 21.11860532872379,
+   "decode_s": 14.922776374965906,
+   "mean_step_ms": 339.1531192358922,
+   "mean_itl_ms": 124.35646979138255,
+   "p50_step_ms": 300.45873392373323,
+   "p95_step_ms": 677.1634817123413,
+   "tok_per_s": 8.04139906574685
+  }
+ ]
+}
