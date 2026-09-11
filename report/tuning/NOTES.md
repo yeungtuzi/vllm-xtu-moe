@@ -2278,3 +2278,29 @@ ENG=xiaotu XIAOTU_MOE_THREADS=120 ... /home/user/anaconda3/envs/vllm-xiaotu-moe/
 **结论更正**:§44.1 那个"同模式端到端我们快 1.46×"是**服务器级**对照(两边 fork 的调用/同步不同),
 不能代表内核;干净的内核对内核对照是**lk 快 ~2.0×**。⇒ 我们引擎还有 ~2× 的明确提升空间,
 方向是"每线程带宽从 1.0-1.5 提到 2.2-3.1 GB/s"(而不是继续调线程数/布局)。
+
+
+## 74. 【关键】根因定位:我们的解码路径退化成**标量 FMA**,lk 全程 packed fp32 FMA
+
+方法:`objdump -d --no-show-raw-insn xiaotu_moe/build/_xiaotu_moe_C_avx512_bf16*.so`
+后统计指令直方图;lk 侧用 `process_data/decomp/LK_MOE_KERNEL_DECOMP.final.md` 的热内核反汇编。
+
+| | 我们(avx512_bf16 变体,全库统计)| lk(热内核 `0xa1d7b..0xa4b20`)|
+|---|---|---|
+| packed fp32 FMA | `vfmadd*ps` **243** | **`vfmadd231ps` 158(全部)** |
+| **标量 FMA** | **`vfmadd*ss` 491** ✗ | **0** |
+| bf16 点积 | `vdpbf16ps` 18 | 无(不需要)|
+| fp4 解码 | `vpandd/vpand` 135、`vpshufb` 28、`vpmovzxbd` 28、`vpsrlw` 23 | 提到独立 load 阶段,每 K-block 解一次 |
+| 寄存器分块 | 小 me 走 `block_23`(2/3 行)| **8 行 × 64 列,16 个独立 zmm 累加器**,权重解码后跨 8 行复用 |
+
+**因果链**:解码每专家 me≈3(BS=6、K=6、DEDUP=12)⇒ 走小 me 路径 ⇒ 该路径是**标量实现**
+⇒ 每字节约 3× 解码/调度开销 ⇒ 每线程 1.0-1.5 GB/s vs lk 2.2-3.1 GB/s ⇒ 每层 1.22-1.32 ms
+vs lk 0.57-0.67 ms(§73,同 API 同线程同权重)。**不是 NUMA、不是线程数、不是 barrier 数。**
+
+**下一步(按优先级)**:
+1. 把 `csrc/moe/moe_v2_packed4.hpp` 小 me 路径(单行 + `block_23`)改成**全程 zmm packed fp32 FMA**:
+   每 K-block 先把权重 fp4→fp32 解码到一个 64 列工作缓冲(2 × zmm),再对 me 行做 packed FMA,
+   累加器 ≥8 个独立链(照 lk 的 16 链做法);`vdpbf16ps` 若用就把权重预转 bf16 对,避免逐行转换。
+2. 验收标准(同一微基准,`ENG=xiaotu /tmp/bench_both.py`):BS=6/DEDUP=12 **≤0.7 ms/层**
+   (现在 1.22),每线程 ≥2.2 GB/s;达标后再看服务端 TPOT(现在 28-31 ms → 目标 ~20)。
+3. 之后再评估 3 阶段融合(登记簿里评估为 low-medium),不要先动它。
