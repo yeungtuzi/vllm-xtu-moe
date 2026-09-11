@@ -705,6 +705,7 @@ public:
         const size_t NASS = (size_t)M * (size_t)k;
         if (M <= 0 || k <= 0 || inter <= 0 || hidden <= 0) return;
         prof_init();
+        auto _suA = std::chrono::steady_clock::now();
         // 整个 forward_many 的入点(pA0 之前的 setup 也要计入,否则"引擎内部阶段
         // 之和"会小于 binding 侧量到的回调时长,差额无从归属)。
         const auto t_entry = std::chrono::steady_clock::now();
@@ -747,6 +748,7 @@ public:
             }
         }
         if (active_.empty()) return;
+        auto _suB = std::chrono::steady_clock::now();
 
         // Gather contiguous per-expert input rows and size the output buffers.
         // resize() only grows capacity; steady state reuses it (no allocation).
@@ -837,6 +839,20 @@ public:
         exp_off_[0] = 0;
         for (size_t e_idx = 0; e_idx < na; ++e_idx)
             exp_off_[e_idx + 1] = exp_off_[e_idx] + exp_[active_[e_idx]].ai_list.size() * (size_t)nc_gu;
+        {   // A2 内部两段打点(XIAOTU_MOE_SETUP_PROF=1;NOTES §88.1 的正确锚点)
+            static const bool _sp = std::getenv("XIAOTU_MOE_SETUP_PROF") != nullptr;
+            if (_sp) {
+                auto _suC = std::chrono::steady_clock::now();
+                static double s_pre = 0, s_gath = 0; static int s_n = 0;
+                s_pre += std::chrono::duration<double, std::milli>(_suB - _suA).count();
+                s_gath += std::chrono::duration<double, std::milli>(_suC - _suB).count();
+                if (++s_n % 40 == 0) {
+                    fprintf(stderr, "[setup-prof] n=%d per-call(us): pre_bookkeeping=%.1f gather=%.1f total=%.1f\n",
+                            s_n, s_pre / s_n * 1e3, s_gath / s_n * 1e3, (s_pre + s_gath) / s_n * 1e3);
+                    s_pre = s_gath = 0; s_n = 0;
+                }
+            }
+        }
         const size_t a2_total = exp_off_[na];
 
         using clk = std::chrono::steady_clock;

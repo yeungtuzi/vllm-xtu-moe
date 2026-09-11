@@ -2629,3 +2629,28 @@ job 粒度/派发开销(83)、线程数/NUMA 分片/pin/环深/并发/TP 归约/
 **正确锚点**:`_su0` 用紧邻的 `const auto t_entry = std::chrono::steady_clock::now();` 之后
 (配合 `prof_init();` 的上下文),或直接用 `a2_total`(`const size_t a2_total = exp_off_[na];`,
 该行只在分片路径出现)作为后续锚点。
+
+## 89. 【定位】A2 的 97% 在 **per-expert gather**(295 KB 却花 267 µs ⇒ 1.1 GB/s)
+
+新增 env 埋点 `XIAOTU_MOE_SETUP_PROF=1`(唯一锚点;`moe_v2.hpp`),REP=200 稳态:
+
+```
+[setup-prof] n=40 per-call(us): pre_bookkeeping=8.6-9.4  gather=266.8-267.7  total=276.2
+```
+
+- **pre(fill + count_/inst_idx_/active_ 记账)= 9 µs** ✓ 正常;
+- **gather = 267 µs = A2 的 97%、整层的 22%**;
+- gather 做的是:12 个活跃专家 × me(=3) 行 × 8 KB memcpy(hidden bf16)= **295 KB**,
+  外加每专家 5 次缓冲容量维护 ⇒ 等效 **1.1 GB/s**,比普通 memcpy(10-20 GB/s)慢 10-20×。
+
+**为什么慢(候选)**:①每次 memcpy 只有 8 KB、且散落在 256 个 `ExpBuf` 里的 12 个上 ⇒
+**目标页/行冷启动 + RFO 写分配**(295 KB 写 + 295 KB 读 = 590 KB,仍应 ~30-60 µs);
+②`resize()` 已在 R42 排除;③指针追逐穿过 `std::vector<ExpBuf>`(256 项)带来 TLB/缓存抖动。
+
+**修法(按收益/风险排序)**:
+1. **取消 gather**:内核本来就按行反复读 `x[me][K]`(每行被读 K/32 次),把"行号数组"
+   (`tok` id)传给 `gate_up_slice_batched`/`down_slice_batched`,让内层直接 `input + tok[m]*hidden`
+   取行 ⇒ gather 的 267 µs **全部省掉**、还少一次 295 KB 的写读。需改这两个 slice 内核的入口与
+   `linear.h/mlp.cpp` 的调用点(中等改动,收益 ~22%)。
+2. 若 1 太大:**非时态写**(`_mm_stream_si128`)做 gather,去掉写分配 ⇒ 预期 2-3×。
+3. 或每专家**一次性预留 & 复用一个紧凑 arena**(而不是 256 个独立 vector),改善 TLB/局部性。
