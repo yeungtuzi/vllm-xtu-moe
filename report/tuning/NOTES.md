@@ -2811,3 +2811,29 @@ FMA 循环仍在同一迭代里交替;而 lk 用栈缓冲把两者**在时间上
 (栈缓冲 + 16 链 + bf16 激活直取),与现有路径做 A/B;若达标(≤0.7 ms/层),它就是结论;
 若不达标,则说明差异不在内层结构,而在**外层(池/job/内存)**,此时应把精力转到
 "把 8 个 node 的 job 合并成更长的连续工作单元"。
+
+## 96. 【实施规格】照搬 lk 热内核的可行步骤(先澄清一处语义歧义)
+
+**必须先澄清的歧义**:`process_data/decomp/LK_MOE_KERNEL_DECOMP.final.md` 的 b1 节自相矛盾 ——
+一处写"tile = 8 activations × **64 output columns**, 16 zmm accumulators(8 行 × 2 列组)",
+另一处写"Columns covered per tile: 64 (= **2 zmm × 32 columns** each)"(zmm 只有 16 个 fp32 lane)。
+⇒ **在照搬之前,必须先把"向量 lane 装的是 K 还是输出列"这件事定死**,否则照搬必然走样。
+
+**做法(两步,第一步很便宜)**:
+1. **重新反汇编定位 lane 语义**:`objdump -d --no-show-raw-insn lk_moe/_lk_moe_C_avx512_vnni.so`
+   取热内核区段(`0xa1d7b..0xa4b20` 附近;若 ASLR/节区偏移不同,用 `_lk_moe_symbols_demangled.txt`
+   里的 `forward_many` 地址重定位),然后看:
+   - 两条 `vfmadd231ps zmmA, zmmAct_bcast, zmmW` 的**第二个源操作数**(zmmW)是**载入后不变**(⇒ lane=输出列,
+     一个 K 值广播激活)还是**每 k 变化**(⇒ lane=K,一个输出列累积);
+   - `vpinsrw/vcvtph2ps/vpbroadcastss` 序列的**输入地址步长**:步长 2 B(bf16 连续 K)还是 8 B(跨行)。
+   这两点一看就定死 lane 语义。
+2. **按结论实现** `XIAOTU_MOE_LKLOOP=1` 分支(默认关),与现有 `block_23` 同窗口 A/B;判据不变
+   (≤0.7 ms/层)。
+
+**若第 1 步显示 lane=输出列 + K 顺序**(与我们的"lane=K + 4 partial"不同),那么差异点就清楚了:
+我们的做法**每个输出列都要把整条 K 流重读一遍激活**(激活在 L1,代价小),而 lk 是
+**权重载入一次、跨 8 行复用**(权重在 DRAM,代价大)——这正是 §94.6 收敛到的"每线程在飞长度"
+问题的一个具体形态:**lk 的每个 zmm 载入服务 8 行 × 16 列 = 128 次 MAC,我们的每个 128 B 载入服务
+3 行 × 32 K = 96 次 MAC**,但 lk 的**载入次数/字节更少**(8 行共用一个权重向量)。
+⇒ 若属实,修法就是**把"按输出列"改成"按 8 行一块、权重载入一次复用 8 行"**(即把 `block_23` 的
+R 从 2-3 扩到 8,并在同一 group 内让 8 行的激活分别 broadcast 后与同一组权重做 FMA)。
