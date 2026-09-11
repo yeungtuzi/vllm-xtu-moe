@@ -711,6 +711,9 @@ public:
         const size_t NASS = (size_t)M * (size_t)k;
         if (M <= 0 || k <= 0 || inter <= 0 || hidden <= 0) return;
         prof_init();
+        // 整个 forward_many 的入点(pA0 之前的 setup 也要计入,否则"引擎内部阶段
+        // 之和"会小于 binding 侧量到的回调时长,差额无从归属)。
+        const auto t_entry = std::chrono::steady_clock::now();
 
         // Every phase goes through these: wlimit>0 restricts the call to a worker
         // subset (small-batch decode, where the barrier tail would otherwise cost
@@ -982,7 +985,8 @@ public:
         auto pC = clk::now();
         prof_add((size_t)M, active_.size(),
                  std::chrono::duration_cast<std::chrono::nanoseconds>(pA1 - pA0).count(),
-                 0, 0,
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(pA0 - t_entry).count(),
+                 0,
                  std::chrono::duration_cast<std::chrono::nanoseconds>(pB1 - pA1).count(),
                  std::chrono::duration_cast<std::chrono::nanoseconds>(pC - pB1).count(),
                  std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - pC).count());
@@ -1065,9 +1069,39 @@ private:
             static bool once = [](){ fprintf(stderr, "[MOE-PROF] profiling ENABLED (XIAOTU_MOE_PROFILE set)\n"); return true; }();
         }
     }
+    // 按调用规模分桶:解码主调用是 M=qlen(1+投机token 数),dspark draft 的 MoE 层
+    // 会以小 M 混进来。混在一起平均会把两件事搅成一本糊涂账(实测被误导过),
+    // 所以分开累计并分别打印。
+    struct ProfBucket { size_t calls = 0, na = 0; int64_t setup = 0, A = 0, B = 0, C = 0, ovh = 0; };
+    ProfBucket pbuf_[3];
+    static int prof_bucket(size_t M) { return M <= 2 ? 0 : (M <= 8 ? 1 : 2); }
+
     void prof_add(size_t M, size_t na, int64_t dA, int64_t dA2, int64_t dB0,
                   int64_t dB, int64_t dC, int64_t dovh) {
         if (!prof_) return;
+        {
+            ProfBucket& b = pbuf_[prof_bucket(M)];
+            b.calls++; b.na += na;
+            b.setup += dA2; b.A += dA; b.B += dB + dB0; b.C += dC; b.ovh += dovh;
+            static const char* names[3] = {"M<=2 ", "M3-8 ", "M>8  "};
+            static size_t npb = 0;
+            if (++npb % 200 == 0) {
+                for (int i = 0; i < 3; ++i) {
+                    ProfBucket& q = pbuf_[i];
+                    if (!q.calls) continue;
+                    double c = (double)q.calls;
+                    fprintf(stderr,
+                        "[NS-PROF] bucket=%s calls=%zu na=%.1f | per-call(us): "
+                        "setup=%.0f A=%.0f B=%.0f C=%.0f ovh=%.0f TOTAL=%.0f\n",
+                        names[i], q.calls, (double)q.na / c,
+                        q.setup / c / 1e3, q.A / c / 1e3, q.B / c / 1e3,
+                        q.C / c / 1e3, q.ovh / c / 1e3,
+                        (q.setup + q.A + q.B + q.C + q.ovh) / c / 1e3);
+                    q = ProfBucket{};
+                }
+                npb = 0;
+            }
+        }
         prof_A_ += dA; prof_A2_ += dA2; prof_B0_ += dB0; prof_B_ += dB;
         prof_C_ += dC; prof_ovh_ += dovh; prof_M_ += M; prof_na_ += na; ++prof_calls_;
         if (prof_calls_ % prof_every_ == 0) {

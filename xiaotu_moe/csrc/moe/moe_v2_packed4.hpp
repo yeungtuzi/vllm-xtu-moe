@@ -258,6 +258,18 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         alignas(16) static constexpr uint8_t fp4_bf16_hi[16] = {
             0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
             0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
+        // ---- 行级 scale 索引(去掉内层每 group 的整数除法)-------------------
+        // 本分支已保证 gk == 32 ⇒ kbase/gk 恒等于 g(kbase = g*32)、(K+gk-1)/gk
+        // 恒等于 K/32,两者都与 g 无关;只有 (n/gn) 是每行一个。原来的 scale_at()
+        // 在**每行每个 group** 都做两次整数除法(Zen4 上 div ~20-40 cycle),
+        // 而内层是 128 group/行 ⇒ 单次调用上万次除法,纯浪费。
+        const int kb_stride = (K + gk - 1) / gk;              // == group_count
+        const uint8_t* Sbytes = static_cast<const uint8_t*>(S);
+        const float* Sflt = static_cast<const float*>(S);
+        auto row_scale = [&](int srow, int gi) -> float {
+            if constexpr (E8M0) return e8m0_table()[Sbytes[srow + gi]];
+            return Sflt[srow + gi];
+        };
         const __m256i lut_lo256_ = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_lo));
         const __m256i lut_hi256_ = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_hi));
         const __m128i nib_mask = _mm_set1_epi8(0x0F);
@@ -295,6 +307,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         const int group_count = K / 32;
         for (int j = n0; j < n1; ++j) {
             const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
+            const int srow = (j / gn) * kb_stride;            // 每行一次除法
             if (j + 1 < n1) {
                 const char* nr = (const char*)(W + (size_t)(j + 1 - rowshift) * (K / 2));
                 _mm_prefetch(nr, _MM_HINT_T0);
@@ -316,7 +329,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 for (int g = 0; g < group_count; g++) {
                     const int base = g * 32;
                     XIAOTU_DECODE_GROUP_AVX512(b_row, g);
-                    const float scale = scale_at(j, g * 32);
+                    const float scale = row_scale(srow, g);
                     const __m512 sv = _mm512_set1_ps(scale);
                     // ILP-16: round-robin over 4 independent partial chains per
                     // token (4 tokens x 4 partials = 16 in-flight vfmadd231ps),
@@ -369,7 +382,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 for (int g = 0; g < group_count; g++) {
                     const int base = g * 32;
                     XIAOTU_DECODE_GROUP_AVX512(b_row, g);
-                    const __m512 sv = _mm512_set1_ps(scale_at(j, g * 32));
+                    const __m512 sv = _mm512_set1_ps(row_scale(srow, g));
                     const int p = g & 3;
                     for (int r = 0; r < R; ++r) {
                         __m512 d = _mm512_mul_ps(wlo_, _mm512_loadu_ps(pr[r] + base));
@@ -410,7 +423,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                     XIAOTU_DECODE_GROUP_AVX512(b_row, g);
                     __m512 d = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p0 + base));
                     d = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p0 + base + 16), d);
-                    const float scale = scale_at(j, g * 32);
+                    const float scale = row_scale(srow, g);
                     const int p = g & 3;
                     t[p] = _mm512_fmadd_ps(d, _mm512_set1_ps(scale), t[p]);
                 }
