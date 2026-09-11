@@ -2255,3 +2255,26 @@ grouped-GEMM / persistent CTA / 小行数专家的合并调度)。登记 R32。
 **待复验(与用户规则相关,未做)**:参考配置的线程规则是 `LK_THREADS = 核数 ÷ GPU 数`(单卡 192),
 你给的规则是"每 CCD 4-5 核"(120)。当年"192 比 120 慢 18%"是在**未分片**路径上测的;
 分片路径下未复验。若要试,必须按 M5 在安静窗口同窗口 A/B,并且只作为数据、不改默认规则。
+
+
+## 73. 【更正·关键】独立引擎对引擎:lk_moe 的 CPU 解码内核比我们快 ~2.0×
+
+用户要求做"只测 decode"的对照。用**同一个同步 API**(`cpu_prefill(B,K,ids,wts,x,out)`,
+两边都接受,numpy 与裸指针都**零拷贝**)、同一份真实第 3 层权重、BS=6、K=6、THREADS=120:
+
+| 引擎 | DEDUP=12 ms/层 | DEDUP=23 ms/层 | 每层字节 | 聚合带宽 | 每线程 |
+|---|---|---|---|---|---|
+| xiaotu-moe(本仓库)| 1.22 | 1.32 | 151 / 252 MB | **124 / 184 GB/s** | 1.0-1.5 GB/s |
+| **lk_moe**(lvllmds4-x env)| **0.57** | **0.67** | 151 / 252 MB | **265 / 376 GB/s** | 2.2-3.1 GB/s |
+
+跑法(必须给 lk 用它自己的线程变量,否则它只用个位数线程 → 假慢 70×,这一步坑过一次):
+```
+ENG=lk LK_THREADS=120 CUDA_VISIBLE_DEVICES=0 XIAOTU_LAYER1_NPZ=<model> BS=6 DEDUP=12 \
+  /home/user/anaconda3/envs/lvllmds4-x/bin/python /tmp/bench_both.py
+ENG=xiaotu XIAOTU_MOE_THREADS=120 ... /home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python /tmp/bench_both.py
+```
+(`/tmp/bench_both.py` = `scripts/bench_cpu_engine.py` + `ENG=xiaotu|lk` 开关 + lk 的裸指针构造/调用适配)
+
+**结论更正**:§44.1 那个"同模式端到端我们快 1.46×"是**服务器级**对照(两边 fork 的调用/同步不同),
+不能代表内核;干净的内核对内核对照是**lk 快 ~2.0×**。⇒ 我们引擎还有 ~2× 的明确提升空间,
+方向是"每线程带宽从 1.0-1.5 提到 2.2-3.1 GB/s"(而不是继续调线程数/布局)。
