@@ -1,0 +1,43 @@
+{
+ "summary": {
+  "ts": "2026-09-11T12:19:24",
+  "tag": "profr_3",
+  "server_tag": "unknown",
+  "natural_text": 1,
+  "client": "bench_nat_client",
+  "concurrency": 1,
+  "num_prompts": 1,
+  "output_len": 16,
+  "input_len": "nat4096",
+  "completed": 1,
+  "failed": 0,
+  "duration_s": 4.93,
+  "total_output_tokens": 16,
+  "out_tok_per_s": 3.24,
+  "per_stream_tok_per_s": 3.24,
+  "mean_ttft_ms": 3769.1,
+  "mean_tpot_ms": 72.84,
+  "mean_step_ms": 166.48,
+  "p95_step_ms": 168.88,
+  "mean_tokens_per_step": 2.0,
+  "per_req_tok_per_s": [
+   13.73
+  ]
+ },
+ "requests": [
+  {
+   "idx": 0,
+   "ttft_ms": 3769.1039722412825,
+   "n_out": 16,
+   "n_steps": 8,
+   "tokens_per_step": 2.0,
+   "e2e_s": 4.934512685984373,
+   "decode_s": 1.1654087137430906,
+   "mean_step_ms": 166.47964077336448,
+   "mean_itl_ms": 72.83804460894316,
+   "p50_step_ms": 167.98420436680317,
+   "p95_step_ms": 168.87824051082134,
+   "tok_per_s": 13.729089040883155
+  }
+ ]
+}

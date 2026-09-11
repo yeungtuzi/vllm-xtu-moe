@@ -2041,3 +2041,17 @@ B=4096 预填充的时间账(TP=2 + 6 常驻层,实测 TTFT 3.66-3.70 s):
 
 常驻层的显存硬账(TP=2,KV 8 GiB,GPU_UTIL 0.85):6 层 → 32.25/40 GiB;12 层 → OOM
 ⇒ 上界 ~7-10 层。
+
+
+## 58. 第 18 轮:重叠问题的进一步排查 + 工具坑
+
+1. **pin 住主机缓冲的落点/建法不是瓶颈**:同一层 1.07 GB 的 K-major pinned 缓冲,
+   主线程建 vs `prebuild_pinned_kmajor` 6 线程建,H2D 速率 **19.6 vs 20.1 GB/s**(基本一样)。
+   两种建法的页面都撒在多个 NUMA 节点上(ATen 并行拷贝),但速率不变 ⇒ 跨节点读不是主因。
+   微基准里重叠后的等效速率是 1.712 GB / 63.9 ms = **26.8 GB/s**(接近 gen4 x16 上限)。
+2. **工具坑**:`XIAOTU_TORCH_PROFILE=/tmp/x.json` 导出的 trace 里**没有 GPU kernel 事件**
+   (只有 CPU/annotation;`cat` 过滤 kernel/gpu_memcpy 得到 0 条),本轮无法用它定位
+   "H2D 与 attention 是否重叠"。下一轮改用插件已有的 `XIAOTU_NVTX=1` + `scripts/tune_nsys.sh`
+   走 nsys 时间线(能看到 memcpy 与 attention kernel 的实际重叠/串行)。
+3. 服务里每层 ~100 ms 的构成仍未直接测到:`H2D ≈ 64-85 ms` + `attention/框架 ≈ 36 ms`,
+   关键问题是这两者是否并行。这是下一轮唯一要先回答的问题。
