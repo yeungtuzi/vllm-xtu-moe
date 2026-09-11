@@ -1530,3 +1530,59 @@ A/B 基本不变。
 ⇒ **28 ms/步几乎全是 DSpark draft 模型的前向 + 6 个 token 的采样/验证**,
 不是调度器开销(调度/流式在无投机时只有 ~1 ms)。这也解释了为什么 `--max-num-seqs`、
 graph 模式之类的调度侧旋钮对我们帮助有限。
+
+---
+
+## 46. 与 lk-moe 生态的横向对照(2026-09-11,按用户要求搜索其文档/发布说明)
+
+搜索到的官方资料([LvLLM README](https://raw.githubusercontent.com/guqiong96/Lvllm/main/README.md)、
+[Lvllmds4-x README](https://raw.githubusercontent.com/guqiong96/Lvllmds4-x/main/README.md)、
+GitHub Releases API for Lvllm / Lvllmds4 / Lvllmds4-x / Lsglang):
+
+| 模型 | 机器 | 预填充 | 解码 | 投机解码 | 来源 |
+|---|---|---|---|---|---|
+| **DS-V4-Flash-0731**(我们同一个) | EPYC 7642×2 + 16ch DDR4-3200 + **3090×2** | 1060 t/s | **26 t/s** | **35–47 t/s** | Lvllmds4-x README |
+| DS-V4-Flash-0731 | EPYC 9684X×2 + 24ch DDR5-4800 + PRO 6000 | 3100 | 75 | 100–115 | 同上 |
+| DS-V4-Flash-0731(无投机) | 同上 7642 机器 + **5060Ti×2** | — | **25 → 28 t/s**(v2.3.10 "decode +10~15%") | 关 | Lvllm v2.3.10 release notes |
+| **DS-V4.1-Flash**(316 GB,比我们模型大一倍) | EPYC 7642×2 + 16ch DDR4-3200 + **3090×2** | — | **~30 t/s** | 有(c128 target-verify CG) | Lsglang v1.5.2 |
+| 用户给的图:DS-V4.1-Flash | 未标注(显然是更强的机器) | 1280→14733(2048 起平台 ~12-13k) | **131.4**(128)→130.5(65536)→**118**(524288) | 可能开 | 用户提供 |
+
+### 46.1 从那张图能读出的隐含信息
+
+1. **解码与上下文长度几乎无关**:128→65536 输入只掉 0.7%,524288 才掉 10% ⇒
+   每 token 成本由**常数项(专家计算)**主导,稀疏注意力/indexer 在 512K 上下文下
+   几乎不增加成本;
+2. **预填充在 2048 输入处跳变**(1280 → 3506 → 14733 t/s)⇒ 对应
+   `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024`,即 **≥1024 token 才切到 GPU 预填充**;
+3. 那张图的**机器规格没有标注**,不能直接拿来对标本机;同族 release notes 里
+   同款模型在 2×3090+DDR4-3200 上是 **26–30 t/s**,这才是与我们的可比口径。
+
+### 46.2 我们与"2×3090 + DDR4-3200"的可比口径对照
+
+| 指标 | lk-moe(2×3090 + DDR4-3200,16ch) | 我们(A100×3 + DDR5-4800, 192 核) |
+|---|---|---|
+| 解码(单路,无投机) | 25–28 t/s | ~9.5–13(mode 相关) |
+| 解码(单路,投机) | 35–47 t/s | 13.2(客户端口径)/ ~19–20(每 token 延迟口径) |
+| 预填充 | 1060 t/s @32768 | **668 t/s @4096**(实测) |
+
+⇒ **我们的硬件全面更好(DDR5-4800 24ch vs DDR4-3200 16ch;A100 40GB×3 vs 3090 24GB×2),
+但预填充/解码都落后约 1.5–2.5×** ⇒ 差距在实现,不在硬件(与用户判断一致)。
+
+### 46.3 他们文档里我们**还没用上**的旋钮(按预期收益排序)
+
+| 旋钮 | 他们怎么用 | 我们的对应物 | 状态 |
+|---|---|---|---|
+| **`LVLLM_GPU_RESIDENT_MOE_LAYERS`** | PRO 6000 上 `"0-13,43-45"`(14 层专家 + **draft 模型 43-45 层**常驻显存)⇒ "Faster Prefill & Decode" | `XIAOTU_MOE_GPU_RESIDENT_LAYERS`(插件已实现,未启用) | ❌ 未用 |
+| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024` + `LVLLM_GPU_PREFETCH_WINDOW=1` | ≥1024 token 切 GPU 预填充,并预取下一层权重与计算重叠 | `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` + `XIAOTU_GPU_PREFETCH_AHEAD` | 🟡 阈值 384,预取默认开 |
+| `VLLM_USE_V2_MODEL_RUNNER=1` | 最新 quick start 默认带 | 未设 | ❌ 未试 |
+| `num_speculative_tokens` 5→3 | v2.3.11 明确写"更平滑的解码" | 我们固定 5(与训练块长一致) | 🟡 可 A/B |
+| `--max-num-seqs 2` / `--max-num-batched-tokens 4096` / `OMP_NUM_THREADS=1` | 官方 quick start | 已对齐 | ✅ |
+| `LK_THREADS=48`(=核数/GPU 数) | 官方公式 | 我们按"每 CCD 4-5 核"=120 | 🟡 两种口径都试过,120 更好 |
+
+### 46.4 我们的预填充路径是要害(实测 668 t/s @4096)
+
+`gpu_prefill.gpu_moe_layer()` 的做法是**每层把该层的专家权重经 PCIe 流进显存**再算:
+43 层 × ~3.2 GB ≈ **139 GB / 次预填充**,PCIe ~25 GB/s ⇒ 约 5.6 s —— 与我们实测的
+6.1 s(TTFT @4096)吻合。⇒ 我们的"GPU 预填充"其实是 **PCIe 带宽受限**,不是 GPU 算力受限;
+而 lk-moe 的做法是**让一部分层的专家常驻显存**(0-13 → 14 层不流),其余层用 CPU 引擎,
+并用 prefetch window 把下一层 H2D 与当前层计算重叠。
