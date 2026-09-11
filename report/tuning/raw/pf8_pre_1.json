@@ -1,0 +1,31 @@
+{
+ "summary": {
+  "ts": "2026-09-11T13:55:22",
+  "tag": "pf8_pre_1",
+  "server_tag": "unknown",
+  "natural_text": 1,
+  "client": "bench_nat_client",
+  "concurrency": 1,
+  "num_prompts": 1,
+  "output_len": 16,
+  "input_len": "nat4096",
+  "completed": 0,
+  "failed": 1,
+  "duration_s": 0.0,
+  "total_output_tokens": 0,
+  "out_tok_per_s": 0.0,
+  "per_stream_tok_per_s": 0.0,
+  "mean_ttft_ms": null,
+  "mean_tpot_ms": null,
+  "mean_step_ms": null,
+  "p95_step_ms": null,
+  "mean_tokens_per_step": null,
+  "per_req_tok_per_s": []
+ },
+ "requests": [
+  {
+   "idx": 0,
+   "error": "ClientConnectorError(ConnectionKey(host='127.0.0.1', port=8070, is_ssl=False, ssl=True, proxy=None, proxy_auth=None, proxy_headers_hash=None), ConnectionRefusedError(111, \"Connect call failed ('127.0.0.1', 8070)\"))"
+  }
+ ]
+}

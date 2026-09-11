@@ -287,6 +287,16 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 (即用 vLLM 的 custom AR,它在 EAGER 下没有 R14 的捕获问题)。若每层那 ~18 ms 缩小
 ⇒ 归约假设成立,预填充 TTFT 应从 3.70 s 掉向 ~3.0 s(1360 t/s+)。
 
+## R28. 换 vLLM **custom all-reduce** 消除 TP=2 每层那 ~18 ms —— 实测无变化
+
+| 项 | 内容 |
+|---|---|
+| 动机 | R27 推断 TP=2 每层多出的 ~18 ms 是兜底 AR(33 MB/层过 PCIe);若成立,换 custom AR 应显著变快 |
+| 实测 | TP=2 + 6 常驻层 + EAGER=1,去掉 `--disable-custom-all-reduce`:预填充 TTFT **3750 / 3768 ms** vs 兜底 AR 基线 3666-3771 ms ⇒ **无差别**;H2D 仍 67.4 ms/层(与基线一致)|
+| 结论 | AR 的实现方式**不是**那 ~30 ms/层的来源(R27 的归约假设未证实)。注意:custom AR 在本配置下能正常启动(不像 R14 的常驻层+图组合)|
+| 附带发现 | `VLLM_USE_V2_MODEL_RUNNER=0` 会直接启动失败(`Model Runner V1 does not support: dspark speculative decoding`)⇒ 本模型 + DSpark **必须**走 V2 runner(默认即如此,不要显式设 0)|
+| 再试条件 | 不要再在 AR 实现/归约上找这 30 ms;必须用 nsys/nvtx 时间线看 GPU 侧(kernel 级)|
+
 ---
 
 ## M. 测量陷阱(**犯过的错**,不要再犯)

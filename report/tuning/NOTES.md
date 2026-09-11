@@ -2168,3 +2168,12 @@ spec tokens 5→3(拒绝,R10)。
 "单卡每层非 H2D 12 ms vs TP=2 30 ms" 的 18 ms 差额(R21 排除了主机侧、R22 排除了我们的
 2 ms 归约)。⇒ TP=2 预填充只 +47%(不是 +100%)、TP=2 解码净亏,都由这笔拓扑开销解释。
 下一步:TP=2 + EAGER 下去掉 `--disable-custom-all-reduce`,量那 18 ms 是否缩小。
+
+
+## 67. 第 26 轮:custom AR 无变化(R28);TP=2 那 ~30 ms/层仍未定位到具体 kernel
+
+- custom all-reduce vs 兜底 AR:TTFT 3750/3768 vs 3666-3771 ms,无差别 ⇒ 归约实现不是原因。
+- `VLLM_USE_V2_MODEL_RUNNER=0` ⇒ 启动失败(V1 不支持 dspark)⇒ 不要显式设 0。
+- 至此预填充每层 102 ms = H2D 67-74(峰值)+ 主机 0.5 + **~30 未解释**,已排除:主机侧(21)、
+  环深(20)、归约(22+28)、attention(59)、并发(18)、pin 落点(58)。**唯一出路是 nsys 的
+  kernel 级时间线**(插件 profiler 的 chrome trace 在本配置下没有 GPU kernel 事件,见 §58)。
