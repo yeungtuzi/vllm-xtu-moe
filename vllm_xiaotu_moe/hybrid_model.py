@@ -502,6 +502,20 @@ class CpuXiaotuMoE(nn.Module):
         # 见 numa_pool.hpp parallel_for 的 fallback),所以不会死锁。
         # 可用环境变量覆盖(例如 prefill 密集场景想要更大自旋)。
         os.environ.setdefault("XIAOTU_MOE_SPIN_IDLE_US", "300")
+        # ---- 线程数:给调用线程留核(2026-09-11 实测,重要) ------------------
+        # 引擎把 192 个 worker 各钉到一个物理核(CCD-slot-major)。如果 worker 数
+        # 等于核数,调用线程(MoE host-function 回调、torch/CUDA 驱动线程、采样线程)
+        # 就只能在某个 worker 的核上抢时间 ⇒ 那个 worker 成为"拖后腿的",
+        # 而**每个阶段都要等最慢的 worker**(屏障尾延迟)。实测(微基准,2 轮复现,
+        # 单次引擎调用合计 单位 µs):
+        #   192 线程:2791 / 3256     184:1791 / 1693
+        #   176 线程:1651 / 1644     160:1649 / 1613
+        # ⇒ 留 16 个核不用,单次调用快 **1.7–2.0×**;把调用线程 taskset 钉到专用核
+        #   也能得到同样量级(2645→1876)。默认预留 16 核,可用 XIAOTU_MOE_THREADS 覆盖。
+        if os.environ.get("XIAOTU_MOE_THREADS") is None:
+            _ncpu = os.cpu_count() or 8
+            _reserve = 16 if _ncpu >= 64 else max(1, _ncpu // 8)
+            os.environ["XIAOTU_MOE_THREADS"] = str(max(1, _ncpu - _reserve))
         import xiaotu_moe
 
         ex = self.experts

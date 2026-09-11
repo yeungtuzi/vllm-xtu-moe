@@ -73,8 +73,16 @@ def main():
     cfg.max_batch_size = 8192; cfg.max_num_seqs = 256
     cfg.stride = 32; cfg.group_min_len = 10; cfg.group_max_len = 4096 + 128
     cfg.groupN = 1; cfg.groupK = 32; cfg.activation_type = 0
-    engine = m.MOE_MXFP4(cfg, w13, w2, s13, s2, 0, 0)
-    print(f"[cpu-bench] variant={xiaotu_moe.__variant__} layer={layer}", flush=True)
+    # NENGINES>1:像真实服务那样建多个引擎(每层一个),只对最后一个计时。
+    # 目的:验证"服务内单次调用比单实例微基准慢 3x"是否来自**多实例的内存放置**
+    # (服务里 43 层 x ~3.2 GB 分片 ≈ 139 GB,而微基准只有 3.2 GB)。
+    neng = int(os.environ.get("NENGINES", "1"))
+    keep = []
+    for _ in range(max(1, neng)):
+        keep.append(m.MOE_MXFP4(cfg, w13, w2, s13, s2, 0, 0))
+    engine = keep[-1]
+    print(f"[cpu-bench] variant={xiaotu_moe.__variant__} layer={layer} nengines={len(keep)}",
+          flush=True)
 
     rng = np.random.default_rng(7)
     ids = rng.integers(0, E, size=(1, K)).astype(np.int32)
