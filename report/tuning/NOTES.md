@@ -2621,3 +2621,11 @@ job 粒度/派发开销(83)、线程数/NUMA 分片/pin/环深/并发/TP 归约/
 `const size_t a2_total = exp_off_[na];`(该行只属于分片路径)之后插入统计块;
 `_su0` 放在 `const auto t_entry = ...` 之后、`_su1` 放在 gather 循环的
 `for (int e : active_) {` 之前(该行也需确认唯一,否则用 `pfor_sharded` 附近的上下文锚定)。
+
+### 88.1 更正(同一轮内自查)
+`grep -n "const size_t na = active_.size();"` 只有**一处**(line 767)⇒ 上面"na 有两个同名点"的判断**错了**。
+真正的错因是 **`std::fill(output, output + M*hidden, 0)` 这个锚点不唯一**(扁平路径里也有),
+补丁把 `_su0` 声明插到了另一个函数里,而统计块落在 `forward_many_nsliced` ⇒ `_su0` 不在作用域。
+**正确锚点**:`_su0` 用紧邻的 `const auto t_entry = std::chrono::steady_clock::now();` 之后
+(配合 `prof_init();` 的上下文),或直接用 `a2_total`(`const size_t a2_total = exp_off_[na];`,
+该行只在分片路径出现)作为后续锚点。
