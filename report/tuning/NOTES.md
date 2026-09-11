@@ -1761,3 +1761,54 @@ git show c2172ea^:xiaotu_moe/csrc/moe/numa_pool.hpp > /tmp/pool_orig.hpp   # 无
   比实测 29.5 KB/token 严 2×)。
 - 多 rank 共机时**自旋窗必须更大**(spin=300 在 TP=1 是甜的,TP=2 下连启动都过不去)——
   与 §31 "两个 rank 共机时自旋把机器烧穿"是同一类问题,但这次是唤醒不足而非自旋过多。
+
+---
+
+## 49. 【已解决】TP=2 启动挂死的真因:EP 屏障的 **/dev/shm 残留文件**
+
+### 49.1 症状与排除过程(第 13 轮的"阻塞")
+
+症状:TP=2 时引擎逐层建成后**永远不就绪**,EngineCore 反复打印
+`shm_broadcast: No available shared memory broadcast block found in 60 seconds`
+(该消息的语义是"引擎卡住",不是 shm 空间不足;/dev/shm 只用了 1%)。
+
+逐项排除(每次一次完整启动测试):
+| 假设 | 实验 | 结论 |
+|---|---|---|
+| 本轮 GEMM 内核 | `XIAOTU_MOE_GEMM_NR=0` | 仍挂 ⇒ 排除 |
+| 无锁任务发布 | 回退到 `c2172ea^` 的原始 `numa_pool.hpp` | 仍挂 ⇒ 排除 |
+| 自旋窗太小 | `XIAOTU_MOE_SPIN_IDLE_US=5000` | 仍挂 ⇒ 排除 |
+| CUDA graph 捕获 | `EAGER=1` | 仍挂 ⇒ 排除 |
+| 我们池的死锁 | 引擎日志里 `WATCHDOG/STALL/SLOW parallel_for` 计数 = 0 | ⇒ 不是池 |
+
+**真因**:被 kill 的 TP≥2 进程在 `/dev/shm` 留下 46 个 `xiaotu_ep_L*_4096_1024_2.bin`
+(EP 双 barrier 的世代计数等状态)。新进程 attach 到状态错乱的旧文件 ⇒ 两个 rank 的
+`gen`/`arrive` 永远对不上 ⇒ 永久互等。`rm -f /dev/shm/xiaotu_ep_*.bin` 后
+**TP=2 在 250 s 内正常就绪**。
+
+**已固化**:`scripts/tune_serve.sh` 启动前自动清理这些文件(带原因注释)。
+**建议后续**:插件侧可在创建/attach 时做一次"世代握手"或用含 PID/nonce 的文件名,
+从根上避免;当前先用启动前清理。
+
+### 49.2 TP=2 实测(单机双卡,EP=1,eager)
+
+| 口径 | TP=1 单卡 | **TP=2(EP=1)** | 说明 |
+|---|---|---|---|
+| 预填充 4096 token | 639 t/s | **761 t/s(+19%)** | 两条 PCIe 链路并行流权重 ✓ |
+| 解码 C=1 | 10.81 | 9.95 | EP 每层跨 rank 合并在拖后腿 |
+| 解码 C=2 合计 | 19.93 | 12.87 | 同上 |
+
+⇒ 与本会话 §30 的结论一致:**EP 的 shm 双 barrier 每层要等 ~1-3 ms**。
+要走"TP=2 + 常驻层"路线,必须先把这个合并代价压下去(否则解码反而退步)。
+
+### 49.3 解码差距的定量结论(与 lk 的核心差距)
+
+- 有效带宽对照:对方 9684X 那台(24ch DDR5-4800)**每层约 1.2 ms**(由 75 t/s 反推)
+  ≈ **230 GB/s 聚合 / 48 线程 = 4.8 GB/s 每线程**;
+- 我们的引擎:**每层 2.7 ms**(277 MB ⇒ **103 GB/s / 120 线程 = 0.86 GB/s 每线程**);
+- 而我们**自己内层循环的 standalone 实测是 5 GB/s/核**(= 对方的水平!)。
+⇒ **差距 100% 在引擎结构**(每层 3 阶段屏障 + 行分片导致的跨节点同步 + 每 worker 串行 job),
+不是内核指令、不是内存带宽、不是线程数。
+⇒ P0 结构性工作:**改成"整专家按节点分片"(expert-parallel per node)**,让
+gate/up→SiLU→down 在同一节点内完成,每层只留 1 次跨节点归约(对方 `num_processes=ep_size`
+就是这个思路;我们 backlog 的 T54)。

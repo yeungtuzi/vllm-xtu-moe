@@ -126,6 +126,14 @@ fi
   nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
 } > "$OUTDIR/$TAG.env"
 
+# 【必做】清理 EP 跨-rank 屏障的残留 shm 文件。
+# 2026-09-11 定位:被 kill 掉的 TP>=2 进程会在 /dev/shm 留下
+# `xiaotu_ep_L*_<hidden>_<tokens>_<world>.bin`,里面存着双 barrier 的世代计数;
+# 新进程 attach 到状态错乱的旧文件后,两个 rank 的世代对不上 ⇒ **永久互等**,
+# 表现为 vLLM 的 `shm_broadcast: No available shared memory broadcast block found
+# in 60 seconds` 反复出现、引擎永远不就绪。清掉即可正常启动(实测:清理后 TP=2 250s 就绪)。
+rm -f /dev/shm/xiaotu_ep_*.bin
+
 # 等显存真正释放(上一轮进程可能还在退出中),避免 "Free memory ... less than desired"
 for _g in $(echo "$GPUS" | tr ',' ' '); do
   for _i in $(seq 1 60); do
