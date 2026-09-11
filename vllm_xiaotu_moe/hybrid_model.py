@@ -502,24 +502,33 @@ class CpuXiaotuMoE(nn.Module):
         # 见 numa_pool.hpp parallel_for 的 fallback),所以不会死锁。
         # 可用环境变量覆盖(例如 prefill 密集场景想要更大自旋)。
         os.environ.setdefault("XIAOTU_MOE_SPIN_IDLE_US", "300")
-        # ---- 线程数:给调用线程留核(2026-09-11 实测,重要) ------------------
-        # 引擎把 192 个 worker 各钉到一个物理核(CCD-slot-major)。如果 worker 数
-        # 等于核数,调用线程(MoE host-function 回调、torch/CUDA 驱动线程、采样线程)
-        # 就只能在某个 worker 的核上抢时间 ⇒ 那个 worker 成为"拖后腿的",
-        # 而**每个阶段都要等最慢的 worker**(屏障尾延迟)。实测(微基准,2 轮复现,
-        # 单次引擎调用合计 单位 µs):
-        #   192 线程:2791 / 3256     184:1791 / 1693
-        #   176 线程:1651 / 1644     160:1649 / 1613
-        # ⇒ 留 16 个核不用,单次调用快 **1.7–2.0×**;把调用线程 taskset 钉到专用核
-        #   也能得到同样量级(2645→1876)。默认预留 16 核,可用 XIAOTU_MOE_THREADS 覆盖。
-        # 服务端实测(2026-09-11,负载 31-50,同配置):192 线程 8.25-9.98 tok/s、
-        # 176→11.44、160→11.66、144→12.57、128→12.66(每层 compute 4.4-5.7 → 1.61-1.67 ms),
-        # **平台期在 128-144**,即预留 ncpu-64…ncpu-48(服务进程里还有 torch/CUDA/采样
-        # 等线程,需要更多空闲核,比单实例微基准的 160-184 更靠下)。
+        # ---- 线程数:按"每 CCD 4-5 核"定(用户给定规则,2026-09-11)-----------
+        # 规则:解码性能的最优解是**每个 CCD 只开 4-5 个核心**;更多核心拿不到更多
+        # 带宽,反而抢 L3 与散热/power 预算,实测更慢。本机 24 CCD ⇒ 96-120 线程。
+        # 佐证:本仓库 process_data/decomp/NUMA_BANDWIDTH_CCD.md(1 CCD ~30 GB/s、
+        # 越过 6-8 CCD 后每 CCD 效率下降);LvLLM/lk_moe 官方 README(线程数 = 物理核
+        # ÷ GPU 数;声明 L3 命中率 >50%、跨 node 通信 <3%)。
+        # 实测(本仓库 NOTES §43/§44):192 线程 8.25-9.98 tok/s(C=1)、176→11.44、
+        # 160→11.66、144→12.57、128→12.66 ⇒ 与"少开核"方向一致。
+        # ⇒ 默认取 n_ccd × 5(上限 = 核数),用户仍可用 XIAOTU_MOE_THREADS 覆盖。
         if os.environ.get("XIAOTU_MOE_THREADS") is None:
             _ncpu = os.cpu_count() or 8
-            _reserve = 64 if _ncpu >= 128 else (16 if _ncpu >= 64 else max(1, _ncpu // 8))
-            os.environ["XIAOTU_MOE_THREADS"] = str(max(1, _ncpu - _reserve))
+            _nccd = 0
+            try:
+                _l3 = set()
+                for _c in range(_ncpu):
+                    _p = f"/sys/devices/system/cpu/cpu{_c}/cache/index3/id"
+                    if os.path.exists(_p):
+                        with open(_p) as _f:
+                            _l3.add(_f.read().strip())
+                _nccd = len(_l3)
+            except OSError:
+                _nccd = 0
+            if _nccd > 0:
+                _want = _nccd * 5                     # 每 CCD 5 核
+            else:
+                _want = max(1, int(_ncpu * 5 / 8))    # 回退:核数 * 5/8
+            os.environ["XIAOTU_MOE_THREADS"] = str(max(1, min(_ncpu, _want)))
         import xiaotu_moe
 
         ex = self.experts
