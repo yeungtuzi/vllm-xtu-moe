@@ -713,3 +713,28 @@ L=128 C=1 N=4 OUT=128 TAG=mine scripts/bench_nat_client.py   # 或 scripts/run_n
 ```
 
 详见 `report/tuning/NOTES.md` §35–§38。
+
+## 【2026-xx 第 67 轮】CPU 解码引擎 2× 差距的根因:并行区固定同步开销(不是内核)
+
+**结论(详见 `report/tuning/NOTES.md` §113)**:`forward_many_nsliced` 每层有 4-5 个
+`parallel_for` 区域,而**每个区域的固定开销约 113 µs**——用一个"保留派发、body 为空"的
+探针测出,且严格线性:
+
+| 空 body 并行区个数 | 报出耗时 | 每区 | 层时间 |
+|---|---|---|---|
+| 1 | 177 µs | 177 µs | 1.19 ms |
+| 10 | 1140 µs | 114 µs | 2.16 ms |
+| 50 | 5670 µs | 113 µs | 6.62 ms |
+
+时钟已核验(`steady_clock::now()` = 25.8 ns/次),不是计时伪影。
+
+**根因**:`xiaotu_moe/csrc/moe/numa_pool.hpp` 的 `have_work:`(约 884 行)里,每个 worker
+锚定新 generation 都要抢**全局 `work_mtx_`**;120 个 worker 争用同一把 futex 互斥 ⇒ ~113 µs/区。
+
+**为什么这解释了全部历史证据**:扣掉每个区域的 113 µs 后,A 相 ≈294 GB/s、B 相 ≈263 GB/s,
+**与 lk_moe 的 265 GB/s 同级** ⇒ 我们与 lk 的 2× 差距**全部来自同步,不来自内核**。
+过去针对内层循环的所有尝试(字节数/指令形状/ILP/bf16 点积/布局/预取/分块/线程数/NUMA 映射)
+无效是必然的。
+
+**下一步**:把锚定路径去锁(seqlock 复读 `current_gen_`,或 per-worker 发布槽),
+目标 113 µs → <5 µs,预期每层 **1.19 → 0.65-0.75 ms**,直接命中 ≤0.7 ms 验收线。
