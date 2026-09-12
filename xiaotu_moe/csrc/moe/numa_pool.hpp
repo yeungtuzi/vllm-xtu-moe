@@ -710,6 +710,7 @@ public:
             inrange2_.store(0);        // diag reset per call
             snap_retry_.store(0);      // diag reset per call
             snap_mismatch_.store(0);   // diag reset per call
+            issued_.store(0);          // diag reset per call
             current_gen_.store(gen, std::memory_order_release);       // 偶数:就绪
         }
         cv_.notify_all();
@@ -762,10 +763,12 @@ public:
                 // ⇒ 可以直接读健康态的收敛基线,把 §199(c) 的二选一变成事实。
                 fprintf(stderr,
                         "[pool] SHARD-JOBDIAG gen=%llu total=%zu exec=%ld dup=%zu miss=%zu "
-                        "abandoned=%ld inrange=%ld inrange2=%ld\n",
+                        "abandoned=%ld inrange=%ld inrange2=%ld issued=%ld **unclassified=%ld**\n",
                         (unsigned long long)current_gen_.load(), total,
                         shard_exec_.load(), dup, miss,
-                        abandoned_.load(), inrange_.load(), inrange2_.load());
+                        abandoned_.load(), inrange_.load(), inrange2_.load(),
+                        issued_.load(),
+                        issued_.load() - inrange_.load() - inrange2_.load() - abandoned_.load());
             }
         }
         // NOTE: deliberately do NOT clear sharded_call_ here. A worker whose wake
@@ -984,6 +987,7 @@ private:
                         }
                         if (g2 != gen) snap_mismatch_.fetch_add(1, std::memory_order_relaxed);
                         size_t t = node_ticket_[myn].v.fetch_add(1, std::memory_order_relaxed);
+                        issued_.fetch_add(1, std::memory_order_relaxed);   // 无损账:领票即记
                         uint64_t g = current_gen_.load(std::memory_order_acquire);
                         if (g == gen && g2 == gen) {
                             base = base2;
@@ -1274,6 +1278,10 @@ private:
     //   snap_mismatch_ : 快照成功但 g2 != worker 缓存的 gen(⇒ 走 re-anchor)
     std::atomic<long> snap_retry_{0};
     std::atomic<long> snap_mismatch_{0};
+    // 【第 138 轮·无损账】领票后**立刻**自增。此后无论走哪条分支都必须恰好一次计入
+    // inrange_/inrange2_/abandoned_ 之一 ⇒ `issued - inrange - inrange2 - abandoned`
+    // 就是"领了票却没有被分类"的票数(健康态应为 0)。用于回答:那张票到底去哪了。
+    std::atomic<long> issued_{0};
     static constexpr size_t kMaxNodeShards = 128;       // ample for any EPYC topology
     // 【轮 76】每个 node 的票号计数器**各自独占一条 cacheline**。原来 8 个计数器挤在
     // 同一条线上,120 个 worker 的 fetch_add 让这条线在 core 之间来回弹(伪共享),

@@ -6258,3 +6258,37 @@ node 3: jobs=16 pulled=31      node 7: jobs=16 pulled=31
 若健康态该值为 0 而故障态为 1,就说明**存在一条领票后不分类的路径**;
 届时重点检查 **re-anchor 分支里的 `if (stop_) return;`**(它会带着已领的票直接返回)
 以及任何其它提前 `return/break`。**这一步仍是纯诊断,不改控制流。**
+
+## 201. 无损账建成并验证:`unclassified = 0`(健康态);本版又稳过 2 个完整会话
+
+### (a) 计账自洽性验证(健康调用)
+```
+SHARD-JOBDIAG total=384 exec=384 abandoned=120 inrange=384 inrange2=0 issued=504 unclassified=0
+SHARD-JOBDIAG total=192 exec=192 abandoned=120 inrange=192 inrange2=0 issued=312 unclassified=0
+SHARD-JOBDIAG total=384 exec=384 abandoned=120 inrange=384 inrange2=0 issued=504 unclassified=0
+```
+- **`issued = total + abandoned` 精确成立**:504 = 384+120、312 = 192+120
+  ⇒ 账是闭合的,**每个领出的票都被分类了**;
+- **`unclassified = 0`** ⇒ 健康态下**不存在"领票后不分类"的路径**(那条 `if (stop_) return;`
+  在正常运行时不会被触发,至少在健康调用上从未发生);
+- `inrange == total` 且 `exec == total` ⇒ 与 §200 的判据一致。
+
+### (b) 关于 `abandoned` 的最终定性(结束 §179/§200 的反复)
+- 本轮三个样本都是 **120**;而 §200 的六个样本是 69/88/108/118/120/120。
+- 机制:**120 = 每个 worker 每代恰好多领一次**(`issued = total + 120` 精确成立即为此意);
+  当某个 worker 那一代没来得及多领(被调度/唤醒影响)时该值就低于 120。
+- ⇒ 正确表述:**`abandoned ≈ 线程数` 是"稳态常见值",不是不变式、也不是判据**。
+  §179(b) 的"≡线程数"过强,**§200 的更正成立**;§198(c)/§199(b) 基于它的算术作废。
+
+### (c) 本版稳定性
+带无损账的这一版**又连续跑完 2 个完整会话(48 请求)、零看门狗**。
+⇒ 加上 §195 那次失败,当前复发率约"每 3~6 个会话一次",符合"大幅改善但未根除"的定性。
+
+### (d) 下一轮:**必须抓到一次故障**才能二分
+健康态已确定 `unclassified = 0`。所以故障时的读数只有两种可能:
+| 故障读数 | 结论 |
+|---|---|
+| `unclassified = 1` | 存在"领票后不分类"的路径(重点查 re-anchor 的 `if (stop_) return;` 等提前返回) |
+| `unclassified = 0` 且 `inrange = total-1` | 那张票**被算进了 abandoned** ⇒ **发布出来的区间本身少一张** ⇒ 回到 §196 的原子预留修法 |
+⇒ 做法:用当前版本**多跑几个会话**(每会话 24 请求),直到抓到一个 `WATCHDOG(sharded)`,
+读它的 `判据` 行即可定论。**这是纯观察,不需要改代码。**
