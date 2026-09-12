@@ -6584,3 +6584,36 @@ repro.py 里的解码请求(`mt=8`/`mt=32`)在回退路径下要慢约 11 倍 �
    (`max_resident_ctas` 与 `hw_resident_cap` 的比较逻辑在 `topk.cu:115-125`)。
 若确认是**驻留数不匹配**,那是一个**很局部的上游修复**(钳制网格或回退非协作路径),
 而不是"放大 workspace"。
+
+## 210. **`persistent_topk` 的两个假设都被代码本身否证** ⇒ 它很可能只是"报信者",不是真凶
+
+### (a) 读主机侧逻辑得到的结论(`topk.cu:120-160`)
+1. **`state_bytes` 只有 ~100 KB,远小于 1 MiB**:
+   ```cpp
+   size_t state_bytes = num_groups * sizeof(P::RadixRowState);
+   // 注释原文:"~3 KB per group, ~100 KB for the largest grids on this hardware"
+   ```
+   ⇒ **§206 的"1 MiB 不够"假设彻底否证**(连余量都很大)。
+2. **协作启动放不下时,代码会主动回退**:
+   ```cpp
+   if (needs_cooperative && total_ctas > hw_resident_cap) { ... top_k_per_row_decode(...); return; }
+   ```
+   且前面还专门按 SM 留了 headroom(`max_resident_ctas -= headroom`),注释里写明了
+   "the most deadlock-prone case"已处理。
+   ⇒ **§209 的"网格超过驻留上限导致协作死锁"假设也否证**。
+
+### (b) 更重要的推论:**真凶可能根本不在这个内核里**
+- 我当初把它列为嫌疑,唯一依据是**第 116 轮的报错点**(`persistent_topk` 的 occupancy query)。
+- 但我自己在 §205 就写过:**sticky CUDA error 会在"下一处同步点"才暴露** ——
+  也就是说 `persistent_topk` 很可能只是**报信者**,真正的越界发生在**更早的某个内核**。
+- 现在它的**尺寸与网格两条路径都被代码自身证明是稳妥的** ⇒ **应当把它降级为"报信者"**,
+  继续在它身上读代码是**方向性错误**。
+
+### (c) 修正后的下一轮(回到"找第一个越界的内核")
+1. **`compute-sanitizer --tool memcheck`** 跑同一序列 —— 它直接报出**越界的内核名与行号**,
+   不依赖 sticky error 的暴露位置。这是唯一能绕过"报信者"问题的办法。
+2. 备选:`CUDA_LAUNCH_BLOCKING=1` 上次失败是因为**故障 A 先触发**(§203);
+   现在故障 A 已大幅减少,**可以再试一次**,但记得同时设 `SHARD_WD=60` 兜底。
+3. 缩小攻击面:故障前兆固定为 `nat8192 + max_tokens=8` 的 30 秒停顿 ⇒
+   优先怀疑**该形状**上跑的内核(decode 分支的 attention/indexer/MoE 相关),
+   而不是预填充路径。
