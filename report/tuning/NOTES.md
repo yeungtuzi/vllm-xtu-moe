@@ -6691,3 +6691,34 @@ torch.AcceleratorError: CUDA error: an illegal memory access was encountered
 - 有了快速复现器,即使 sanitizer 慢 10–50×,也只需十几到几十个请求就能跑到越界;
 - 它会直接给出**内核名 + 行号**,以及是读越界还是写越界。
 这是一条**收敛路径**,不再是"等偶发"。
+
+## 213. `compute-sanitizer` 首跑:**复现成功但零输出** —— 先确认"它是否真的挂上了"
+
+### (a) 复现结果(猛打脚本 + sanitizer 服务)
+```
+#1 6830ms  #2 6702ms  #3 nat8192/mt1 6047ms
+#4 nat8192/mt8 **90112ms** <-- 停顿!
+#5 nat8192/mt8 **FAIL**
+```
+⇒ **快速复现器在 sanitizer 下依然十几请求必现**(这次是第 4 个停顿、第 5 个就挂),
+装置可用性没问题。
+
+### (b) 但 sanitizer **零输出**
+- `/tmp/cs_report_*.txt`:**只有**早先 `vllm --version` 那次留下的那份(110 字节,
+  "Target application terminated before first instrumented API call");
+- vLLM 日志里 **没有任何** `COMPUTE-SANITIZER` 行,也没有 `Invalid __global` / `ERROR SUMMARY`。
+⇒ 两种可能,**必须先用一条命令分辨**:
+1. **它根本没挂到服务进程上**(垫片只对 `vllm --version` 生效,而服务可能绕过了 PATH);
+2. **挂上了,但 memcheck 在被杀之前没发现任何越界**(memcheck 的 `ERROR SUMMARY`
+   只在**正常退出**时打印,而进程是被 `abort()`/异常终止的)。
+
+### (c) 下一轮第一步(便宜且必须)
+跑一次启用了 sanitizer 的服务,并在**加载期间**直接查进程树:
+```
+pgrep -af compute-sanitizer | head; pgrep -af "bin/vllm serve" | head
+```
+- 若**没有** `compute-sanitizer` 进程 ⇒ 是 (b1):垫片没生效(改法:直接改
+  `tune_serve.sh` 里的 `vllm serve` 为绝对路径的 sanitizer 调用);
+- 若**有** ⇒ 是 (b2):说明 memcheck 没抓到 ⇒ 嫌疑转向**memcheck 覆盖不足的路径**
+  (例如协作式内核 `cooperative groups`、或非内存类错误),那就改用
+  `--tool racecheck`/`synccheck`,或回到"分段同步"的思路手工二分。
