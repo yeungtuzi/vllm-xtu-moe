@@ -695,6 +695,8 @@ public:
                 node_base_[n] = node_ticket_[n].v.load(std::memory_order_relaxed);
             remaining_.store(total);
             shard_exec_.store(0);      // diag reset per call
+            abandoned_.store(0);       // diag reset per call
+            skipped_dec_.store(0);     // diag reset per call
             current_gen_.store(gen, std::memory_order_release);       // 偶数:就绪
         }
         cv_.notify_all();
@@ -714,6 +716,9 @@ public:
                 fprintf(stderr, "[pool] WATCHDOG(sharded) gen=%llu total=%zu rem=%zu exec=%ld\n",
                         (unsigned long long)current_gen_.load(), total, remaining_.load(),
                         shard_exec_.load());
+                fprintf(stderr, "  [判据] abandoned=%ld skipped_dec=%ld  "
+                        "(非零者即丢票/跳过递减的真正路径)\n",
+                        abandoned_.load(), skipped_dec_.load());
                 for (int n = 0; n < (int)node_nj_.size(); ++n) {
                     long done = (long)node_ticket_[n].v.load() - (long)node_base_[n];
                     fprintf(stderr, "  node %d: jobs=%zu pulled=%ld\n", n, node_nj_[n], done);
@@ -940,7 +945,7 @@ private:
                         size_t loc = t - base;
                         uint64_t g = current_gen_.load(std::memory_order_acquire);
                         if (g == gen) {
-                            if (loc >= nj) break;      // this node's jobs exhausted
+                            if (loc >= nj) { abandoned_.fetch_add(1, std::memory_order_relaxed); break; }  // this node's jobs exhausted
                             if (diag_active() && loc < kShardDiagStride) {
                                 __atomic_fetch_add(
                                     &shard_cnt_[(size_t)myn * kShardDiagStride + loc],
@@ -953,10 +958,14 @@ private:
                             // one's barrier returned, so a decrement that arrives
                             // after the generation advanced would corrupt the new
                             // call's countdown.
-                            if (current_gen_.load(std::memory_order_acquire) == gen &&
+                            {
+                            const bool _gok = (current_gen_.load(std::memory_order_acquire) == gen);
+                            if (!_gok) skipped_dec_.fetch_add(1, std::memory_order_relaxed);
+                            if (_gok &&
                                 remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                                 std::lock_guard<std::mutex> gl(done_mtx_);
                                 done_cv_.notify_all();
+                            }
                             }
                             continue;
                         }
@@ -978,6 +987,7 @@ private:
                             nfn = pub_shard_; nctx = pub_shard_ctx_;
                         }
                         if (!live) {                   // switched away from sharded:
+                            abandoned_.fetch_add(1, std::memory_order_relaxed);
                             break;                     // outer wait will re-anchor flat
                         }
                         gen = ng; my_last_gen = ng;
@@ -985,13 +995,17 @@ private:
                         sf_ = nfn; sc_ = nctx;
                         base = nb; nj = nnj;
                         loc = t - base;
-                        if (loc >= nj) break;          // beyond live range -> re-arm outer wait
+                        if (loc >= nj) { abandoned_.fetch_add(1, std::memory_order_relaxed); break; }  // beyond live range -> re-arm outer wait
                         if (sf_) sf_(sc_, (size_t)myn, loc);
                         shard_exec_.fetch_add(1, std::memory_order_relaxed);
-                        if (current_gen_.load(std::memory_order_acquire) == gen &&
+                        {
+                        const bool _gok = (current_gen_.load(std::memory_order_acquire) == gen);
+                        if (!_gok) skipped_dec_.fetch_add(1, std::memory_order_relaxed);
+                        if (_gok &&
                             remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                             std::lock_guard<std::mutex> gl(done_mtx_);
                             done_cv_.notify_all();
+                        }
                         }
                         continue;
                     }
@@ -1163,6 +1177,11 @@ private:
     std::function<void(size_t, size_t)> sharded_task_;  // fn(node, local)
     int sharded_call_ = 0;                              // #nodes if current call is sharded
     std::atomic<long> shard_exec_{0};                   // diag: actual stask executions
+    // 【第 123 轮纯诊断】不动任何控制流,只计数,用来区分"丢票"与"递减被世代守卫跳过"。
+    // 崩溃签名是 exec==total 而 rem==1/2,而每个 exec 后都紧跟一个带守卫的递减
+    // ⇒ 必然有一处 break 丢弃了已领票据,或有一处守卫把递减跳过了。谁非零即定位。
+    std::atomic<long> abandoned_{0};                    // diag: 已领票后在 break 处被丢弃
+    std::atomic<long> skipped_dec_{0};                  // diag: 执行了但世代守卫为假,递减被跳过
     static constexpr size_t kMaxNodeShards = 128;       // ample for any EPYC topology
     // 【轮 76】每个 node 的票号计数器**各自独占一条 cacheline**。原来 8 个计数器挤在
     // 同一条线上,120 个 worker 的 fetch_add 让这条线在 core 之间来回弹(伪共享),
