@@ -528,3 +528,7 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 | 2026-xx | R58(reserve 替换已回退)、R59(SHARDSPLIT 大值更差);NOTES §116(提前预取 0.78→0.76-0.77) | 第 70 轮 |
 
 | R60 | 只增不减 resize(`if (size()<need) resize(need)`)替掉每次都 resize | **成功,已保留**。resize 24-34 → 1.4-1.5 µs、对拍 7 OK、最佳 0.75 ms。注意与 R58(reserve)的区别:`size()` 语义不变 ⇒ 不会算错。**R58 的正解就是这一条,reserve 不要再试** |
+
+| R61 | `XIAOTU_MOE_GEMM_NR=16` | **不要用**。交替 min:8→0.75/0.75、16→0.77/0.78、4→0.79 ⇒ 16 明显更差,保持默认 8 |
+| R62 | 提高 `XIAOTU_MOE_SPIN_IDLE_US` 到 2e6 以减少 park/唤醒 | **不采纳**。交替 min:默认(min 0.71)优于 2 s(min 0.74)。空区探针里出现的"119 µs→17.1 µs"在真实配置下不可复现 |
+| R63 | 用 `XIAOTU_MOE_PROFILE` 的 A/B/C 绝对值做优化依据 | **停止**。同一配置 A 在 18.5-76.1 ms 间摆动(sum 可到 93 ms > 40×层时间)⇒ 该相位计时被污染,只可看 B(稳定)。要分解必须在 worker 内累计 |

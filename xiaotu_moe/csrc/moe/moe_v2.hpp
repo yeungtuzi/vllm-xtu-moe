@@ -765,7 +765,13 @@ public:
         // Gather contiguous per-expert input rows and size the output buffers.
         // resize() only grows capacity; steady state reuses it (no allocation).
         static const bool _nogather = std::getenv("XIAOTU_MOE_NOGATHER") != nullptr;
-        constexpr size_t kGChunk = 4;   // gather 每行的分段数(轮 69,见下)
+        // gather 每行的分段数(轮 69 引入,4 段 = 144 个 2 KB job)。轮 72 起可用
+        // XIAOTU_MOE_GCHUNK 覆盖,便于零重建扫描(=1 表示每行一个 job,即轮 67 的形态)。
+        const size_t kGChunk = [] {
+            const char* e = std::getenv("XIAOTU_MOE_GCHUNK");
+            const long v = e ? std::atol(e) : 0;
+            return (size_t)(v > 0 ? v : 4);
+        }();
         for (int e : active_) {
             ExpBuf& g = exp_[e];
             size_t me = g.ai_list.size();
