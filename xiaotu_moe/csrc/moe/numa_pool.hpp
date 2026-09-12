@@ -693,7 +693,7 @@ public:
             current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
             for (int n = 0; n < nnodes; ++n)
                 node_base_[n] = node_ticket_[n].v.load(std::memory_order_relaxed);
-            remaining_.store(total);
+            remaining_sh_[sh_slot(gen)].store(total);   // 【模式A修】分片专用分桶倒计时
             shard_exec_.store(0);      // diag reset per call
             abandoned_.store(0);       // diag reset per call
             skipped_dec_.store(0);     // diag reset per call
@@ -702,6 +702,9 @@ public:
         cv_.notify_all();
         {
             std::unique_lock<std::mutex> lk(done_mtx_);
+            // 发布已完成 ⇒ 此刻 current_gen_ 就是本次分片调用的偶数代 `gen`(发布块的局部
+            // `gen` 不在本作用域内)。等待期间不可能有新一代发布(那需要本次先归零)。
+            const int _gslot = sh_slot(current_gen_.load(std::memory_order_acquire));
             auto t0 = std::chrono::steady_clock::now();
             long dsec = 300;
             if (const char* se = std::getenv("XIAOTU_MOE_SHARD_WD")) {
@@ -710,11 +713,12 @@ public:
             const auto deadline = t0 + std::chrono::seconds(dsec);
             bool late = !done_cv_.wait_until(lk, deadline, [&] {
                 if (stop_) return true;
-                return remaining_.load(std::memory_order_acquire) == 0;
+                return remaining_sh_[_gslot].load(std::memory_order_acquire) == 0;
             });
             if (late) {
                 fprintf(stderr, "[pool] WATCHDOG(sharded) gen=%llu total=%zu rem=%zu exec=%ld\n",
-                        (unsigned long long)current_gen_.load(), total, remaining_.load(),
+                        (unsigned long long)current_gen_.load(), total,
+                        remaining_sh_[_gslot].load(),
                         shard_exec_.load());
                 fprintf(stderr, "  [判据] abandoned=%ld skipped_dec=%ld  "
                         "(非零者即丢票/跳过递减的真正路径)\n",
@@ -953,19 +957,15 @@ private:
                             }
                             if (sf_) sf_(sc_, (size_t)myn, loc);
                             shard_exec_.fetch_add(1, std::memory_order_relaxed);
-                            // Only decrement while THIS generation is still live:
-                            // the caller publishes the next call only after this
-                            // one's barrier returned, so a decrement that arrives
-                            // after the generation advanced would corrupt the new
-                            // call's countdown.
-                            {
-                            const bool _gok = (current_gen_.load(std::memory_order_acquire) == gen);
-                            if (!_gok) skipped_dec_.fetch_add(1, std::memory_order_relaxed);
-                            if (_gok &&
-                                remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                            // 【模式A修】无条件递减到**本代自己的桶**。
+                            // 旧代码是 `if (current_gen_ == gen && remaining_.fetch_sub(..))`,
+                            // 守卫为假时递减被静默跳过 ⇒ 调用方永不归零(实测 skipped_dec==缺口)。
+                            // 分桶后迟到递减只影响自己那代,不会污染下一代 ⇒ 守卫可安全删除。
+                            // skipped_dec_ 保留为**不变式检查**:修好后应恒为 0,非 0 即新 bug。
+                            if (remaining_sh_[sh_slot(gen)].fetch_sub(
+                                    1, std::memory_order_acq_rel) == 1) {
                                 std::lock_guard<std::mutex> gl(done_mtx_);
                                 done_cv_.notify_all();
-                            }
                             }
                             continue;
                         }
@@ -998,14 +998,11 @@ private:
                         if (loc >= nj) { abandoned_.fetch_add(1, std::memory_order_relaxed); break; }  // beyond live range -> re-arm outer wait
                         if (sf_) sf_(sc_, (size_t)myn, loc);
                         shard_exec_.fetch_add(1, std::memory_order_relaxed);
-                        {
-                        const bool _gok = (current_gen_.load(std::memory_order_acquire) == gen);
-                        if (!_gok) skipped_dec_.fetch_add(1, std::memory_order_relaxed);
-                        if (_gok &&
-                            remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        // 【模式A修】同 fast path:无条件递减到本代自己的桶(见上)。
+                        if (remaining_sh_[sh_slot(gen)].fetch_sub(
+                                1, std::memory_order_acq_rel) == 1) {
                             std::lock_guard<std::mutex> gl(done_mtx_);
                             done_cv_.notify_all();
-                        }
                         }
                         continue;
                     }
@@ -1177,6 +1174,18 @@ private:
     std::function<void(size_t, size_t)> sharded_task_;  // fn(node, local)
     int sharded_call_ = 0;                              // #nodes if current call is sharded
     std::atomic<long> shard_exec_{0};                   // diag: actual stask executions
+    // 【第 123 轮修·模式 A】分片路径按**世代奇偶**分桶的倒计时。
+    // 原来分片路径与 flat 路径共用 `remaining_`,且在递减处加了"再读一次 current_gen_"的守卫
+    // —— 守卫为假时递减被**静默跳过**,而该票据所属代的调用方**已把它计入 total**
+    // ⇒ 调用方永远等不到 0 ⇒ 看门狗 `abort()`。实测证据(NOTES §179/§180):三份 dump 里
+    // `skipped_dec` 与缺口**精确相等**(exec=total, rem=1, skipped_dec=1)。
+    // 分桶后,属于第 g 代的递减**只能**落到 `remaining_sh_[sh_slot(g)]`,而 g+2 代用**另一个**
+    // 桶 ⇒ **结构上不可能**污染下一代 ⇒ 守卫不再需要,可改为"领票即必减"。
+    // 桶复用安全性:g+4 的 store(total) 只在 g+2 归零后才执行,而 g 代的递减在 g+2 归零前
+    // 必已全部完成(g+2 的发布以 g 归零为前提)⇒ 复用安全。票据由 fetch_add 唯一领取 ⇒ 不漏减不多减。
+    // 注意 `gen` 恒为**偶数**(就绪态),所以槽位取 (gen>>1)&1,**不能**用 gen&1(恒 0)。
+    std::atomic<size_t> remaining_sh_[2] = {};
+    static int sh_slot(uint64_t gen) { return (int)((gen >> 1) & 1ULL); }
     // 【第 123 轮纯诊断】不动任何控制流,只计数,用来区分"丢票"与"递减被世代守卫跳过"。
     // 崩溃签名是 exec==total 而 rem==1/2,而每个 exec 后都紧跟一个带守卫的递减
     // ⇒ 必然有一处 break 丢弃了已领票据,或有一处守卫把递减跳过了。谁非零即定位。
