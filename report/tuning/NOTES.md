@@ -6654,3 +6654,40 @@ clb2 服务:已 READY,会话 1 完成(**24 个成功请求**),health=200
   所以需要更多轮次才能等到故障 B。
 - 抓到后按 §211(c):看**首个 CUDA error 前 12~15 行的 Python 调用栈**,
   即可定位是哪个阶段的内核(attention / indexer / MoE / GPU 预填充)。
+
+## 212. **突破**:猛打前兆形状 = 快速复现器;错误暴露在 `prepare_inputs` 的 `fill_`
+
+### (a) 实验设计改了,效果立刻出来
+不再等混合序列偶遇,而是**反复只打前兆形状** `nat8192 + max_tokens=8`:
+```
+#1  41143ms <-- 停顿      #7  53233ms <-- 停顿
+#5  30385ms <-- 停顿      #11 46020ms <-- 停顿
+#12 nat8192/mt1 **FAIL**   (CLB 下正常约 12000ms)
+```
+- **停顿在这个形状上约占 1/3**(4/11),不是罕见事件;
+- **故障 B 在第 12 个请求触发** —— 而混合序列要 96~192 个请求。
+⇒ **这是一个可用的快速复现器**,后面所有定位都可以用它,不必再靠等。
+
+### (b) 错误现场(CLB 下仍带完整 Python 栈)
+```
+File ".../vllm/v1/worker/gpu/model_runner.py", ... in prepare_inputs
+    is_padding[:num_tokens].fill_(False)
+torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+```
+- 报错点是 **`prepare_inputs` 里对 `is_padding` 的 `fill_`**,也就是**输入准备阶段**,
+  **不是模型前向**里的任何算子;
+- ⇒ 这是典型的 **sticky CUDA error**:真正的越界发生在**更早的某个内核**,
+  在这里的下一处 CUDA 调用才被报出来(与 §205 的推断一致)。
+
+### (c) 为什么 CLB 没能把它定位到"发起越界的那次 launch"
+两种可能:
+1. 越界内核在**另一条 stream** 上(CLB 的同步语义按流划分,跨流不一定拦住);
+2. 越界发生在**更早的请求**里,而 sticky error 直到第 12 个请求的 `fill_` 才被观察到
+   (即"12 个请求"里某一步就已经坏了,只是一直没有同步点暴露)。
+⇒ 无论哪种,**必须上 `compute-sanitizer`** —— 它按内存访问逐条检查,与 stream/时机无关。
+
+### (d) 下一轮(现在可行了)
+`compute-sanitizer --tool memcheck` 包住 `vllm serve` 启动,**用 (a) 的猛打脚本**做负载:
+- 有了快速复现器,即使 sanitizer 慢 10–50×,也只需十几到几十个请求就能跑到越界;
+- 它会直接给出**内核名 + 行号**,以及是读越界还是写越界。
+这是一条**收敛路径**,不再是"等偶发"。
