@@ -463,11 +463,19 @@ public:
             // Reversing (2) makes stale tickets land inside the new range and be
             // silently dropped; reading the counter before (1) let a worker
             // decrement remaining_ before it was stored, which hung the caller.
-            gen = ++current_gen_;
+            // 【轮 69 奇偶 seqlock】current_gen_ 现在是**序号**:奇数 = "正在发布",
+            // 偶数 = "已就绪"。调用方必须在读 counter_ 之前先 store 奇数、写完全部字段
+            // 再 store 偶数。这样 worker 只需接受偶数即可,不会看到"新 gen + 旧 start_"
+            // 的撕裂(轮 68 的朴素"复读 gen"正是死在这里:撕裂时 gen 已新、start_ 还旧,
+            // 复读一致 ⇒ 查不出来 ⇒ worker 丢票 ⇒ remaining_ 永不归零)。
+            // 原有的"先掀 gen 再读 counter_ 以保证陈旧票落在 start_ 之前"不变。
+            gen = current_gen_.load(std::memory_order_relaxed) + 2;   // 下一个偶数代
+            current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
             start_ = counter_.load();
             remaining_.store(n);      // outstanding work items in this call
             // diagnostic processed-bitset for this call (only when debug/trace on)
             if (diag_active()) proc_vec_.assign(n, 0);
+            current_gen_.store(gen, std::memory_order_release);       // 偶数:就绪
         }
         // Unlimited calls wake everybody (prefill needs the whole pool). Limited
         // calls rely on their participants already spinning, so the fast path
@@ -679,12 +687,15 @@ public:
             sharded_call_ = nnodes;          // visible to workers at anchor
             start_ = 0;
             // Bump the generation BEFORE reading the per-node counters (see
-            // parallel_for_impl for why the order matters).
-            uint64_t gen = ++current_gen_;
+            // parallel_for_impl for why the order matters). 【轮 69】同样用奇偶 seqlock:
+            // 奇数=发布中,偶数=就绪,worker 只接受偶数。
+            uint64_t gen = current_gen_.load(std::memory_order_relaxed) + 2;
+            current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
             for (int n = 0; n < nnodes; ++n)
                 node_base_[n] = node_ticket_[n].load(std::memory_order_relaxed);
             remaining_.store(total);
             shard_exec_.store(0);      // diag reset per call
+            current_gen_.store(gen, std::memory_order_release);       // 偶数:就绪
         }
         cv_.notify_all();
         {
@@ -883,15 +894,32 @@ private:
             }
         have_work:
             {
-                std::lock_guard<std::mutex> lk(work_mtx_);
-                gen = current_gen_.load();
-                my_last_gen = gen;
-                worker_gen_[w].store(gen, std::memory_order_release);
-                lf_ = pub_flat_;  lc_ = pub_flat_ctx_;
-                sf_ = pub_shard_; sc_ = pub_shard_ctx_;
-                n = n_;
-                start = start_;       // this call's first ticket
-                sharded = (sharded_call_ > 0);
+                // 【轮 69 去锚定锁】§113 实测:120 个 worker 每次换 generation 都抢全局
+                // work_mtx_ ⇒ **每个并行区固定 ~113 µs**(空 body pfor 也是 113 µs)。
+                // 轮 68 只做"读 gen → 读字段 → 复读 gen"的朴素 seqlock ⇒ 确定性挂死,
+                // 因为调用方在"掀 gen"与"读 counter_ 写 start_"之间有个窗口,撕裂形态是
+                // **新 gen + 旧 start_**(复读 gen 一致,查不出来)。
+                // 现在 current_gen_ 是奇偶序号(见 parallel_for_impl):奇数 = 发布中。
+                // worker 只接受**偶数**代,并复读确认 ⇒ 绝不接受半发布的调用。
+                // 未抢到票的 worker 不参与 remaining_ 计数,错过一代是安全的。
+                for (;;) {
+                    const uint64_t s = current_gen_.load(std::memory_order_acquire);
+                    if (s & 1u) { _mm_pause(); continue; }   // 奇数:调用方正在发布,等它写完
+                    lf_ = __atomic_load_n(&pub_flat_, __ATOMIC_RELAXED);
+                    lc_ = __atomic_load_n(&pub_flat_ctx_, __ATOMIC_RELAXED);
+                    sf_ = __atomic_load_n(&pub_shard_, __ATOMIC_RELAXED);
+                    sc_ = __atomic_load_n(&pub_shard_ctx_, __ATOMIC_RELAXED);
+                    n = __atomic_load_n(&n_, __ATOMIC_RELAXED);
+                    start = __atomic_load_n(&start_, __ATOMIC_RELAXED);
+                    sharded = (__atomic_load_n(&sharded_call_, __ATOMIC_RELAXED) > 0);
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    if (current_gen_.load(std::memory_order_relaxed) == s) {
+                        gen = s;
+                        my_last_gen = s;
+                        worker_gen_[w].store(s, std::memory_order_release);
+                        break;
+                    }
+                }
             }
             // Worker-subset gate: a limited call lets only ~limit workers claim
             // tickets (stride selection keeps them spread across NUMA nodes). The

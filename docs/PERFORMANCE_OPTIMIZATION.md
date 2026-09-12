@@ -738,3 +738,18 @@ L=128 C=1 N=4 OUT=128 TAG=mine scripts/bench_nat_client.py   # 或 scripts/run_n
 
 **下一步**:把锚定路径去锁(seqlock 复读 `current_gen_`,或 per-worker 发布槽),
 目标 113 µs → <5 µs,预期每层 **1.19 → 0.65-0.75 ms**,直接命中 ≤0.7 ms 验收线。
+
+
+## 【第 69 轮】CPU 解码:去锚定锁成功(奇偶 seqlock)⇒ 每层 1.14-1.24 → 0.78 ms
+
+第 68 轮把根因定位到 `numa_pool.hpp` 的锚定锁(每并行区 113 µs 固定开销)但朴素 seqlock 挂死;
+本轮按 §114 处方实现**奇偶 seqlock**(奇数=发布中、偶数=就绪),保留"先掀 gen 再读 counter_"
+的刻意顺序。`scripts/test_block23_equiv.py` 两次通过(7 OK、无挂死)。
+
+| 配置 | 改前 | 改后 | lk_moe |
+|---|---|---|---|
+| DEDUP=12 | 1.14-1.24 ms / 117-122 tok/s | **0.78 ms / 178 tok/s**(最佳 0.72) | 0.57 ms |
+| DEDUP=23 | 1.32 ms | **0.88-0.95 ms / 147-158 tok/s** | 0.67 ms |
+
+聚合 124 → **194 GB/s**;每线程 1.0-1.5 → **1.61 GB/s**(目标 2.2)。与 lk 差距 2.0×+ → ~1.37×。
+附带:gather 由 36 个 8 KB job 切成 144 个 2 KB job(字节级等价),110 → 37-47 µs。

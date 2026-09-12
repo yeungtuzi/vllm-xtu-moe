@@ -753,6 +753,7 @@ public:
         // Gather contiguous per-expert input rows and size the output buffers.
         // resize() only grows capacity; steady state reuses it (no allocation).
         static const bool _nogather = std::getenv("XIAOTU_MOE_NOGATHER") != nullptr;
+        constexpr size_t kGChunk = 4;   // gather 每行的分段数(轮 69,见下)
         for (int e : active_) {
             ExpBuf& g = exp_[e];
             size_t me = g.ai_list.size();
@@ -792,13 +793,22 @@ public:
                     }
                 }
             } else
-            pfor(NASS, [&](size_t ai) {   // 计时诊断:XIAOTU_MOE_NOGATHER=1 跳过(数值无效)
+            pfor(NASS * kGChunk, [&](size_t j) {   // 计时诊断:XIAOTU_MOE_NOGATHER=1 跳过(数值无效)
+                const size_t ai = j / kGChunk;
+                const size_t c = j % kGChunk;
                 const uint32_t eid = expert_ids[ai];
                 if (eid >= (uint32_t)nel || weights[ai] == 0.f) return;
                 const size_t m = inst_idx_[ai];
                 const size_t t = ai / (size_t)k;
-                std::memcpy(exp_[eid].xg.data() + m * (size_t)hidden, input + t * (size_t)hidden,
-                            (size_t)hidden * sizeof(uint16_t));
+                // 【轮 69】每行切成 kGChunk 段:原来每行一个 job(8 KB),只有 NASS=36 个
+                // 线程参与,单线程串行搬 8 KB 且源是冷 DRAM ⇒ 实测 ~110 µs(2.4 GB/s,
+                // 纯延迟、不是带宽)。切成 4×2 KB 后 144 个 job 铺满 120 线程,
+                // 把 DRAM 访问摊开到更多并行流上。**字节级等价**(同一区间、同一数据)。
+                const size_t off = c * ((size_t)hidden / kGChunk);
+                const size_t len = ((c + 1) == kGChunk) ? ((size_t)hidden - off)
+                                                        : ((size_t)hidden / kGChunk);
+                std::memcpy(exp_[eid].xg.data() + m * (size_t)hidden + off,
+                            input + t * (size_t)hidden + off, len * sizeof(uint16_t));
             });
         }
         auto _suG = std::chrono::steady_clock::now();
