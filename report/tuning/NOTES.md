@@ -6411,3 +6411,51 @@ SHARD-JOBDIAG total=384 exec=384 abandoned=120 inrange=384 inrange2=0 issued=504
    (注意:不能在热路径常开 —— R92 的教训;只作为一次性诊断,并在同一次运行里不启用其他埋点);
 3. 同时注意:**30 秒这个数字本身值得查** —— 是否有某个 30 s 的超时/重试常量
    (例如 NCCL 或某个 barrier 的 timeout)在停顿期间把状态搞坏。
+
+## 206. 故障 B 的**具体嫌疑**:`persistent_topk` 的 workspace 是**固定 1 MiB**,与上下文长度无关
+
+### (a) 代码事实(主线仓,非我方代码)
+`vllm/model_executor/layers/sparse_attn_indexer.py`:
+```python
+RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024        # 固定 1 MiB
+use_persistent_topk = current_platform.is_cuda() and topk_tokens in (512, 1024, 2048)
+...
+(topk_workspace,) = workspace_manager.get_simultaneous(
+    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8))          # 只申请 1 MiB
+torch.ops._C.persistent_topk(
+    logits, seq_lens, topk_indices,
+    topk_workspace, topk_tokens,
+    logits.shape[1])                                      # ← 列数 = 批内最大序列长度
+```
+`persistent_topk` 是**预编译扩展**(`/workspace/csrc/libtorch_stable/topk.cu`),
+而我方**完全不参与**这段代码。
+
+### (b) 为什么它和故障 B 的形状吻合
+1. **第 116 轮的崩溃点就是这里**:`launch_persistent_topk, topk.cu:107,
+   occupancy query failed: an illegal memory access`,调用栈
+   `layer → attn → _sparse_indexer_and_attn → sparse_indexer → sparse_attn_indexer`,
+   且注释显示走的是 **decode 分支**(用 `decode_metadata`)。
+2. 故障 B 的触发形状正是 **`qlen=8` 的解码 + KV 已有 8192 token**;
+   而 workspace 是**固定 1 MiB,不随上下文长度增长** ⇒ 上下文越长,该内核需要的
+   workspace 越大 ⇒ **一旦超过 1 MiB 就越界写**。
+3. 这解释了三件事:①为什么只在长上下文之后出现;②为什么前兆是"停顿"
+   (越界前内核可能在错误的内存上打转);③为什么报错点飘忽
+   (sticky CUDA error 在下一处同步点才暴露)。
+
+### (c) 下一轮的判别实验(一次改动即可定性)
+**把 `use_persistent_topk` 强制为假**,让它回退到 `ops.top_k_per_row_decode`(Triton 实现):
+```python
+# vllm/model_executor/layers/sparse_attn_indexer.py(主线仓,实验性,可回退)
+use_persistent_topk = False     # ← 原来是 current_platform.is_cuda() and topk_tokens in (...)
+```
+- 若故障 B **消失** ⇒ 就是这个上游内核的 workspace 越界,结论成立;
+- 若**仍在** ⇒ 该假设否证,回到 sanitizer 路线。
+- **注意**:改的是主线仓(共享检出),必须记录并可一键 `git checkout` 回退;
+  这台机器上只有我方在用,所以可以做。
+- 若确认,长期解法有三条(择一):①把 `RADIX_TOPK_WORKSPACE_SIZE` 调大(需确认内核
+  真实需求与是否按 `logits.shape[1]` 缩放);②沿用回退路径(用 Triton 版 top-k);
+  ③在上游修 kernel。
+
+### (d) 顺带
+这也再次说明:**故障 B 大概率不是 xiaotu 插件的问题,而是上游 DSA indexer 在长上下文下的问题。**
+第 116 轮我把它记为"新失败模式"后就转去追线程池了 —— 这次不会再放下。
