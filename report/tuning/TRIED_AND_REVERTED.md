@@ -532,3 +532,5 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 | R61 | `XIAOTU_MOE_GEMM_NR=16` | **不要用**。交替 min:8→0.75/0.75、16→0.77/0.78、4→0.79 ⇒ 16 明显更差,保持默认 8 |
 | R62 | 提高 `XIAOTU_MOE_SPIN_IDLE_US` 到 2e6 以减少 park/唤醒 | **不采纳**。交替 min:默认(min 0.71)优于 2 s(min 0.74)。空区探针里出现的"119 µs→17.1 µs"在真实配置下不可复现 |
 | R63 | 用 `XIAOTU_MOE_PROFILE` 的 A/B/C 绝对值做优化依据 | **停止**。同一配置 A 在 18.5-76.1 ms 间摆动(sum 可到 93 ms > 40×层时间)⇒ 该相位计时被污染,只可看 B(稳定)。要分解必须在 worker 内累计 |
+
+| R64 | 用 gather 把每个专家的激活行拷成连续 `xg` | **已被 row-map 取代(永久删除)**。内核只在一处需要连续激活行(FP32 转换),把"行号"交给它即可;省掉 25 µs memcpy + 17 µs 并行区。`XIAOTU_MOE_NOGATHER/SERIAL_GATHER/NOOP_GATHER/GCHUNK` 随之作废,**不要再加回 gather** |

@@ -212,7 +212,16 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                                  int M, int N, int K,
                                  int groupN, int groupK,
                                  int n0 = 0, int n1 = -1,
-                                 int rowshift = 0) {
+                                 int rowshift = 0,
+                                 // 【轮 73】rowmap != nullptr 时,激活的第 i 行取自
+                                 // A + rowmap[i]*K(而不是 A + i*K)。有了它,gate/up 可以直接
+                                 // 读"按 token 去重"的输入缓冲,不必先把每个专家的激活行
+                                 // gather 成连续的 xg —— 省掉一整段 memcpy **和一个完整的并行区**。
+                                 // 下游全部走 a32(由下面的转换点一次性建成),所以只需改行基址。
+                                 const uint32_t* rowmap = nullptr) {
+    auto arow_at = [&](int i) -> const uint16_t* {
+        return A + (size_t)(rowmap ? rowmap[i] : (uint32_t)i) * (size_t)K;
+    };
     if (K <= 0 || (K & 1)) return;  // packed layout requires even K
     if (n1 < 0 || n1 > N) n1 = N;
     if (n1 <= n0) return;
@@ -309,7 +318,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                         const __m512 sv = _mm512_set1_ps(sc);
                         for (int r = 0; r < mr; ++r) {
                             const __m512i av = _mm512_loadu_si512(
-                                (const void*)(A + (size_t)(m0 + r) * K + (size_t)g * 32));
+                                (const void*)(arow_at(m0 + r) + (size_t)g * 32));
                             const __m512 t = _mm512_dpbf16_ps(
                                 _mm512_setzero_ps(), (__m512bh)wz, (__m512bh)av);
                             acc[r] = _mm512_fmadd_ps(t, sv, acc[r]);
@@ -333,7 +342,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         if (a32_storage.size() < (size_t)M * (size_t)K) a32_storage.resize((size_t)M * (size_t)K);
         float* a32 = a32_storage.data();
         for (int mi = 0; mi < M; mi++) {
-            const uint16_t* a_row = A + (size_t)mi * K;
+            const uint16_t* a_row = arow_at(mi);
             float* p_row = a32 + (size_t)mi * K;
             for (int k = 0; k < K; k++) p_row[k] = bf16::bf16_to_fp32(a_row[k]);
         }
@@ -621,7 +630,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         float* a_perm = a_perm_storage.data();
         const int group_count = K / 32;
         for (int mi = 0; mi < M; mi++) {
-            const uint16_t* a_row = A + (size_t)mi * K;
+            const uint16_t* a_row = arow_at(mi);
             float* p_row = a_perm + (size_t)mi * K;
             for (int g = 0; g < group_count; g++) {
                 const int base = g * 32;
@@ -745,7 +754,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
     const __m256 mag_tab = _mm256_loadu_ps(kMag8);
     const __m256 sign_tab = _mm256_setr_ps(1.0f, -1.0f, 0, 0, 0, 0, 0, 0);
     for (int i = 0; i < M; ++i) {
-        const uint16_t* Arow = A + (size_t)i * K;
+        const uint16_t* Arow = arow_at(i);
         float* Crow = C + (size_t)i * N;
         for (int j = n0; j < n1; ++j) {
             const uint8_t* Wrow = W + (size_t)(j - rowshift) * (K / 2);
@@ -831,7 +840,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
 #else
     (void)lut;
     for (int i = 0; i < M; ++i) {
-        const uint16_t* Arow = A + (size_t)i * K;
+        const uint16_t* Arow = arow_at(i);
         float* Crow = C + (size_t)i * N;
         for (int j = n0; j < n1; ++j) {
             const uint8_t* Wrow = W + (size_t)(j - rowshift) * (K / 2);
@@ -998,7 +1007,8 @@ struct Packed4WeightTraitsBase
     // gets M-way FMA ILP via its 4-token blocked loop (ktransformers pattern).
     static void gate_up_slice_batch_impl(int me, const uint16_t* xg, const void* w13, const void* w13_g,
                                          const float* w13_gs, float* both_buf, int inter, int hidden,
-                                         size_t eid, int groupN, int groupK, int n0, int n1) {
+                                         size_t eid, int groupN, int groupK, int n0, int n1,
+                                         const uint32_t* rowmap = nullptr) {
         if (me <= 0) return;
         if (n1 < 0 || n1 > inter) n1 = inter;
         if (n1 <= n0) return;
@@ -1023,9 +1033,9 @@ struct Packed4WeightTraitsBase
         // both_buf rows are strided by n2; indices [n0,n1) = gate chunk and
         // [inter+n0, inter+n1) = up chunk, both over ALL me rows at once.
         packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, base, LUT, sbase, gs, both_buf,
-                                            me, n2, hidden, groupN, groupK, n0, n1);
+                                            me, n2, hidden, groupN, groupK, n0, n1, 0, rowmap);
         packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, base, LUT, sbase, gs, both_buf,
-                                            me, n2, hidden, groupN, groupK, inter + n0, inter + n1);
+                                            me, n2, hidden, groupN, groupK, inter + n0, inter + n1, 0, rowmap);
     }
 
     static void down_slice_batch_impl(int me, const uint16_t* actg, const void* w2, const void* w2_g,

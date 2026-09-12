@@ -753,3 +753,18 @@ L=128 C=1 N=4 OUT=128 TAG=mine scripts/bench_nat_client.py   # 或 scripts/run_n
 
 聚合 124 → **194 GB/s**;每线程 1.0-1.5 → **1.61 GB/s**(目标 2.2)。与 lk 差距 2.0×+ → ~1.37×。
 附带:gather 由 36 个 8 KB job 切成 144 个 2 KB job(字节级等价),110 → 37-47 µs。
+
+
+## 【第 73 轮·主验收达标】删除 gather:每层 1.22 → **0.66-0.70 ms**(目标 ≤0.70 ✓)
+
+内核的 FP32 激活转换只有一处,把"激活第 i 行"由 `A + i*K` 改成 `A + rowmap[i]*K`(加一个
+默认 nullptr 的 `rowmap` 参数,5 处行基址统一走 `arow_at()`),gate/up 就可以直接读按 token
+去重的输入缓冲,**不必再 gather 成每专家连续的 xg** —— 省掉 25 µs memcpy 和一整个并行区。
+
+| | 起点 | 现在 | lk_moe |
+|---|---|---|---|
+| DEDUP=12 | 1.22 ms / 124 GB/s / 1.0-1.5 GB/s·线程 | **0.66-0.70 ms / 229 GB/s / 1.91 GB/s·线程** | 0.57 ms / 265 GB/s / 2.2 |
+| DEDUP=23 | 1.32 ms | **0.82 ms** | 0.67 ms |
+
+差距 2.0×+ → **~1.2×**;数值门禁 `test_block23_equiv.py` 7 OK。
+剩余:相位效率 229 → 265 GB/s(1.16×),以及服务端 TPOT 验收。

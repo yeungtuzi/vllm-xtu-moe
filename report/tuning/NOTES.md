@@ -3471,3 +3471,35 @@ DEDUP=12:**0.71-0.76 ms**(best 0.71;43L 30.7 ms;195 tok/s;TFLOP 2.54),验收 ≤
 扣掉 setup(~52 µs,其中 gather 区 ~40 µs)后 151 MB 跑在 ~0.70 ms ⇒ **216 GB/s**(lk 265)。
 剩余两条路:①干掉 gather 区(~40 µs,需在内核加 row-map 让激活行不必先拷成连续);
 ②A/B 相效率 216 → 265。
+
+## 119. 【里程碑·主验收达标】轮 73:内核加 row-map 彻底删除 gather ⇒ **DEDUP=12 每层 0.66/0.69/0.70 ms**(验收 ≤0.70 ✓)
+
+### 做法(改动面比预想小得多)
+内核里激活的 FP32 转换**只有一处**(`moe_v2_packed4.hpp` 的 `a32_storage` 构建),`a32` 一旦建好
+下游全部不变 ⇒ 只要让"转换源的第 i 行"可由 row-map 指定,就能取消 gather:
+1. `matmul_packed4_group(..., int rowshift = 0, const uint32_t* rowmap = nullptr)`,函数开头加
+   `arow_at(i) = A + (rowmap ? rowmap[i] : i) * K`;**全部 5 处激活行基址**(主转换、排列变体、
+   dpbf16 路径、两处标量路径)统一改用它。
+2. `rowmap` 贯通 `gate_up_slice_batch_impl`(packed4 与 CRTP 默认实现都要支持)与
+   `gate_up_slice_batched`(默认 nullptr ⇒ 其它 ISA 变体行为不变)。
+3. `forward_many_nsliced`:`ExpBuf` 加 `std::vector<uint32_t> rowmap`(me 个行号 = `ai_list[m]/k`),
+   在**原有的串行 bookkeeping 里**填好(≤36 项,零新增并行区);两个 gate/up call site 改传
+   `input` + `g.rowmap.data()`;**整个 gather 并行区删除**(xg 不再使用;`down` 仍保留容量)。
+   ⇒ `XIAOTU_MOE_NOGATHER / SERIAL_GATHER / NOOP_GATHER / GCHUNK` 四个诊断旋钮随之作废(代码已删)。
+
+### 实测(BS=6/K=6/THREADS=120/真实层权重)
+| | 起点 | 轮 72 | **轮 73** | lk_moe | 比值 |
+|---|---|---|---|---|---|
+| DEDUP=12 | 1.22 ms(124 GB/s) | 0.71-0.76 | **0.66 / 0.69 / 0.70 ms**(200-211 tok/s,TFLOP 2.59-2.75) | 0.57 ms | **1.16-1.23×** |
+| DEDUP=23 | 1.32 ms(184 GB/s) | 0.88-0.95 | **0.82 / 0.82 ms**(169-170 tok/s) | 0.67 ms | 1.22× |
+
+- `[setup-prof]`:**gather = 0.0 µs**,setup 合计 **12.6-13.2 µs**(改前 ~52-190 µs)。
+- 数值门禁(R55):`test_block23_equiv.py` **7 OK**(me=2/3/混合/4-7)。
+- 聚合带宽 124 → **229 GB/s**(/120 线程 = 1.91 GB/s/线程);lk 是 265 GB/s(2.2)。
+- **验收①的 ms 指标达标(≤0.70);每线程 GB/s 指标尚差(1.91 vs 2.2,即 229 vs 265 GB/s ≈ 1.16×)。**
+
+### 剩余(收尾阶段)
+1. 相位效率 229 → 265 GB/s(1.16×):这才是最后一段。注意 `XIAOTU_MOE_PROFILE` 的 A 相计时
+   已证实不可信(R63),要重开相位分解必须在 worker 内累计。
+2. 验收②:把 8070 切到该引擎并测 TPOT(28-31 ms → 目标 ~20 ms)与纯解码 t/s(~35 → ~50)。
+3. 验收③:回归脚本固化(`scripts/bench_engine_ab.py` 已是门禁,建议把对拍与 bench 一并写进脚本头)。

@@ -176,15 +176,18 @@ struct WeightTraitsBase {
     // (matmul_packed4_group's 4-token blocked path).
     static void gate_up_slice_batched(int me, const uint16_t* xg, const void* w13, const void* w13_g,
                                       const float* w13_gs, float* both_buf, int inter, int hidden,
-                                      size_t eid, int groupN, int groupK, int n0, int n1) {
+                                      size_t eid, int groupN, int groupK, int n0, int n1,
+                                      const uint32_t* rowmap = nullptr) {
         Derived::gate_up_slice_batch_impl(me, xg, w13, w13_g, w13_gs, both_buf, inter, hidden,
-                                          eid, groupN, groupK, n0, n1);
+                                          eid, groupN, groupK, n0, n1, rowmap);
     }
     static void gate_up_slice_batch_impl(int me, const uint16_t* xg, const void* w13, const void* w13_g,
                                          const float* w13_gs, float* both_buf, int inter, int hidden,
-                                         size_t eid, int groupN, int groupK, int n0, int n1) {
+                                         size_t eid, int groupN, int groupK, int n0, int n1,
+                                         const uint32_t* rowmap = nullptr) {
         for (int mi = 0; mi < me; ++mi)
-            Derived::gate_up_slice_impl(xg + (size_t)mi * hidden, w13, w13_g, w13_gs,
+            Derived::gate_up_slice_impl(xg + (size_t)(rowmap ? rowmap[mi] : (uint32_t)mi) * hidden,
+                                        w13, w13_g, w13_gs,
                                         both_buf + (size_t)mi * (2 * inter),
                                         inter, hidden, eid, groupN, groupK, n0, n1);
     }
@@ -764,79 +767,27 @@ public:
 
         // Gather contiguous per-expert input rows and size the output buffers.
         // resize() only grows capacity; steady state reuses it (no allocation).
-        static const bool _nogather = std::getenv("XIAOTU_MOE_NOGATHER") != nullptr;
-        // gather 每行的分段数(轮 69 引入,4 段 = 144 个 2 KB job)。轮 72 起可用
-        // XIAOTU_MOE_GCHUNK 覆盖,便于零重建扫描(=1 表示每行一个 job,即轮 67 的形态)。
-        const size_t kGChunk = [] {
-            const char* e = std::getenv("XIAOTU_MOE_GCHUNK");
-            const long v = e ? std::atol(e) : 0;
-            return (size_t)(v > 0 ? v : 4);
-        }();
+        // 【轮 73】gather 彻底删除:改为把"每行在去重输入里的行号"作为 rowmap 交给内核,
+        // gate/up 直接从 input 取数,不再先拷贝成每专家连续的 xg ⇒ 省掉一整段 memcpy
+        // **和一个完整的并行区**(轮 67-72 实测 setup ~52 µs,其中 gather 区约 40 µs)。
         for (int e : active_) {
             ExpBuf& g = exp_[e];
-            size_t me = g.ai_list.size();
-            // 【轮 71】改成"只增不减"的 resize:原来 `resize(need)` 在路由变化使 me 在
-            // 2/3 间振荡时会先 shrink 再 grow,而**每次 grow 都零填充新元素**,实测稳定
-            // 花 24-34 µs/次(每层 ~4%)。现在 size 永远保持在历史最大值 ⇒ grow 只发生
-            // 一次,之后不再零填充。与轮 70 的 reserve 方案(R58,直接算错)的区别:
-            // 这里 `size()` 始终 ≥ need,零填充语义也完全不变,不依赖任何隐藏 size() 行为。
+            const size_t me = g.ai_list.size();
+            // 【轮 71】只增不减的 resize:消除 me 在 2/3 间振荡导致的反复零填充
+            // (实测 24-34 µs → 1.5 µs)。
             const size_t nx = me * (size_t)hidden;
             const size_t n2 = me * (size_t)2 * (size_t)inter;
             const size_t ni = me * (size_t)inter;
-            if (g.xg.size()    < nx) g.xg.resize(nx);
+            // xg 已不再使用(保留成员仅为兼容);down 仍被阶段 B/C 使用,必须保证容量。
+            if (g.down.size()  < nx) g.down.resize(nx);
             if (g.both.size()  < n2) g.both.resize(n2);
             if (g.act.size()   < ni) g.act.resize(ni);
             if (g.abf16.size() < ni) g.abf16.resize(ni);
-            if (g.down.size()  < nx) g.down.resize(nx);
+            if (g.rowmap.size() < me) g.rowmap.resize(me);
+            for (size_t m = 0; m < me; ++m)      // assignment ai 的激活行 = ai / k
+                g.rowmap[m] = (uint32_t)(g.ai_list[m] / (size_t)k);
         }
-        // 轮 67【并行 gather】:原来是**串行 for**(见 NOTES §113)。12 个专家 x me=3 行
-        // x hidden*2=8KB = 288 KB 的单线程 memcpy,把整段 DRAM 延迟暴露在关键路径上,
-        // 同一时刻其余 ~119 个线程在下一个 barrier 上空等。实测 [setup-prof]
-        // gather=267 us/层 = 每层总时间(1.19 ms)的 21%,而 A 相本身能跑到 210 GB/s,
-        // 说明这段是纯延迟、不是带宽。改成按 assignment 并行(每个 job 搬一行 8 KB,
-        // 共 NASS=BS*K 个 job),用 inst_idx_ 定位该 assignment 在专家内的行号,
-        // 与串行版**逐字节等价**(同一地址、同一长度、同一数据)。
         auto _suB2 = std::chrono::steady_clock::now();
-        if (!_nogather) {
-            // 对照开关:XIAOTU_MOE_SERIAL_GATHER=1 回到旧的串行 gather(逐字节同结果),
-            // 用于在同一 session 内做串行 vs 并行的真实 A/B(避免跨窗口漂移)。
-            static const bool _serialg = std::getenv("XIAOTU_MOE_SERIAL_GATHER") != nullptr;
-            static const bool _noopg = std::getenv("XIAOTU_MOE_NOOP_GATHER") != nullptr;
-            if (_noopg) {
-                // 计时诊断:保留 pfor 派发、body 为空 ⇒ 量出"并行区派发+同步"的固定开销。
-                // 若此值 ≈ gather 实测值,则引擎的时间不是花在访存上而是花在同步上。
-                // 值 N>1 时重复 N 次:用于判定该开销是"每区一次"还是"每次调用固定"。
-                static const long _np = std::max<long>(1, std::atol(std::getenv("XIAOTU_MOE_NOOP_GATHER")));
-                for (long _i = 0; _i < _np; ++_i) pfor(NASS, [&](size_t) {});
-            } else if (_serialg) {
-                for (int e : active_) {
-                    ExpBuf& g = exp_[e];
-                    const size_t me = g.ai_list.size();
-                    for (size_t m = 0; m < me; ++m) {
-                        const size_t t = g.ai_list[m] / (size_t)k;
-                        std::memcpy(g.xg.data() + m * (size_t)hidden, input + t * (size_t)hidden,
-                                    (size_t)hidden * sizeof(uint16_t));
-                    }
-                }
-            } else
-            pfor(NASS * kGChunk, [&](size_t j) {   // 计时诊断:XIAOTU_MOE_NOGATHER=1 跳过(数值无效)
-                const size_t ai = j / kGChunk;
-                const size_t c = j % kGChunk;
-                const uint32_t eid = expert_ids[ai];
-                if (eid >= (uint32_t)nel || weights[ai] == 0.f) return;
-                const size_t m = inst_idx_[ai];
-                const size_t t = ai / (size_t)k;
-                // 【轮 69】每行切成 kGChunk 段:原来每行一个 job(8 KB),只有 NASS=36 个
-                // 线程参与,单线程串行搬 8 KB 且源是冷 DRAM ⇒ 实测 ~110 µs(2.4 GB/s,
-                // 纯延迟、不是带宽)。切成 4×2 KB 后 144 个 job 铺满 120 线程,
-                // 把 DRAM 访问摊开到更多并行流上。**字节级等价**(同一区间、同一数据)。
-                const size_t off = c * ((size_t)hidden / kGChunk);
-                const size_t len = ((c + 1) == kGChunk) ? ((size_t)hidden - off)
-                                                        : ((size_t)hidden / kGChunk);
-                std::memcpy(exp_[eid].xg.data() + m * (size_t)hidden + off,
-                            input + t * (size_t)hidden + off, len * sizeof(uint16_t));
-            });
-        }
         auto _suG = std::chrono::steady_clock::now();
         const size_t na = active_.size();
 
@@ -964,8 +915,9 @@ public:
                         for (int i = n0; i < n1; ++i) { bs[i] = 1.f; bs[inter + i] = 1.f; }
                     }
                 } else
-                wt::gate_up_slice_batched((int)me, g.xg.data(), w13_shard_[n], w13_g_, w13_gs_,
-                                          g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1);
+                wt::gate_up_slice_batched((int)me, input, w13_shard_[n], w13_g_, w13_gs_,
+                                          g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1,
+                                          g.rowmap.data());
                 // FUSED (lk does 3 barriers, we now do 3): gated-SiLU + f32->bf16
                 // applied inline on this node's chunk for every instance, replacing
                 // the former separate A2/B0 global barriers. Identical numerics.
@@ -999,8 +951,9 @@ public:
                 if (n1 > inter) n1 = inter;
                 if (n0 >= n1) return;
                 const int s = xiaotu_moe::current_socket();   // worker's pinned socket
-                wt::gate_up_slice_batched((int)me, g.xg.data(), w13_for(s), w13g_for(s), w13_gs_,
-                                          g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1);
+                wt::gate_up_slice_batched((int)me, input, w13_for(s), w13g_for(s), w13_gs_,
+                                          g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1,
+                                          g.rowmap.data());
                 // FUSED gated-SiLU + f32->bf16 (lk-style single phase), replacing A2/B0.
                 const float* bc = g.both.data();
                 uint16_t* ab = g.abf16.data();
@@ -1362,6 +1315,7 @@ private:
     // version regressed ~25% because it mmap/munmap'd every buffer every call).
     struct ExpBuf {
         std::vector<uint16_t> xg, abf16;   // me*hidden / me*inter (bf16 rows)
+        std::vector<uint32_t> rowmap;      // me:每行在"去重输入"里的行号(轮 73 取代 gather)
         std::vector<float>    both, act, down;  // me*2*inter / me*inter / me*hidden
         std::vector<size_t>   ai_list;
     };
