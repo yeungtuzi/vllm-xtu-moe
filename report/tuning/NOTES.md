@@ -4832,3 +4832,42 @@ spec_decode_num_accepted_tokens_per_pos_total{position="1"} =  58
 2. V1 下逐个加回:**① 投机 → ② draft 3 子模块常驻(4.77 GiB/卡)→ ③ 目标层常驻(每卡 1.59 GiB)→ ④ CUDA graph**;
 3. 若 TP=2 在 V1 下全通 ⇒ 交付配置加 `VLLM_USE_V2_MODEL_RUNNER=0`,并把"V2 runner 在 TP=2 不可用"记入 `TRIED_AND_REVERTED.md`;
 4. 预期收益(§161 的账):预填充 H2D 144.7 → ~72 ms/层;draft 3 子模块可常驻;1M KV 29.4 GiB 可容纳。
+
+## 164. 【突破】第 113 轮:TP=2 跑通 —— 根因是 **`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` 默认 300 s 太短**;预填充 701 → **1159 t/s**
+
+### 根因(一句话)
+`vllm/envs.py:250`:`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = **300**`,而它就是
+`vllm/v1/executor/multiproc_executor.py:429-433` 的 `dequeue_timeout`;
+TP=2 的预热(两个 rank 各加载 ~69 GB CPU 侧专家 + 建 pinned 缓冲,彼此争抢)**超过 300 s**
+⇒ EngineCore `RuntimeError: cancelled`(此前所有 TP=2 失败都是这个,与 V1/V2 runner、投机、常驻层无关)。
+
+### 能跑通的配置(实测 210 s 就绪)
+```bash
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
+VLLM_USE_V2_MODEL_RUNNER=0 \
+# TP=2 + --enforce-eager + 无投机 + 无常驻 + KV 8 GiB + maxlen 262144
+```
+日志:`GPU KV cache size: 291,535 tokens` → **`Application startup complete`**,procs=3,8070 UP。
+
+### 【收益】预填充第一战
+| 配置 | 预填充 8192(C=1) |
+|---|---|
+| TP=1 | **701 t/s** |
+| **TP=2** | **1159 t/s**(TTFT 7065 ms) |
+⇒ **1.65×**,与 §150 的算术预测(TP=2 ⇒ H2D 144.7→~72 ms/层 ⇒ ~1360 t/s)基本吻合。
+
+### 为什么这是第二条的转折点(§161 的三条目标全部解锁)
+| 目标 | 现在 |
+|---|---|
+| 预填充 ≥1500 | 1159 起步;**再加常驻层**(TP=2 每卡 1.59 GiB/层 ⇒ 预算 12-20 GB 可放 **7-12 个目标层**,每层省 ~72 ms H2D)预期可越 1500 |
+| 解码/投机 | draft 3 子模块只需 **4.77 GiB/卡** ⇒ 可以与 KV/目标层共存,"draft 上 GPU"的假设终于可测 |
+| 1M 上下文 | KV 29.4 GiB 分到两卡 ⇒ 可行 |
+
+### 待办(下一轮)
+1. 重测 **C=1/C=2 解码**(本轮 decode 测量因客户端字段缺失报了 ZeroDivision,需重跑);
+2. **加常驻层**:`XIAOTU_MOE_GPU_RESIDENT_LAYERS="0-5"` + `RESIDENT_BUDGET_GB=12`(TP=2 每卡 1.59 GiB/层)
+   ⇒ 再测预填充,目标 ≥1500;
+3. 加回**投机** + **draft 3 子模块常驻**(4.77 GiB/卡)⇒ 测单流/聚合解码,拿到"draft 上 GPU"的真实数字;
+4. 把 `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600` + `VLLM_USE_V2_MODEL_RUNNER=0` **写进交付脚本**
+   (`scripts/serve_prod_8070.sh` / `tune_serve.sh`),并在 `TRIED_AND_REVERTED.md` 记:
+   "V2 runner 在 TP=2 下预热不完成"与"execute-timeout 默认值必须放大"。
