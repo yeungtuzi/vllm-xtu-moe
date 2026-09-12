@@ -4705,3 +4705,20 @@ KV 已按 8 GiB 分配(291,535 token),随后
 
 ### 本轮恢复的可用配置(已验证过的最佳解码数)
 `TP=1 + 无投机 + max-num-seqs 4 + KV 8 GiB`:C=1 **22.2 t/s**、C=2 聚合 **40.4 t/s(+82%)**(§153)。
+
+## 159. 第 106 轮:draft 的真实身份 —— **`mtp.0`,不是 `layers.43-45`**
+
+直接从权重索引(`*.index.json` 的 `weight_map`)读到:
+- **目标模型只有 `layers.0 .. layers.42`(共 43 层)**;
+- **draft/MTP 存在 `mtp.0.*` 下**(样例键:`mtp.0.hc_attn_base`、`mtp.0.hc_ffn_base`、`mtp.0.hc_attn_fn`);
+- 模型 config 的 `num_hidden_layers=43` + `num_nextn_predict_layers=1` 与此一致。
+
+但启动日志里出现的是 `resident model.layers.43/44/45.ffn: 3.19 GiB on cuda:0`
+⇒ **插件把 draft 的 3 个子模块映射成了层号 43/44/45**(所以参考配置写 `43-45` 指的是同一批东西)。
+⇒ 我方 §158 的"draft 3 层共 9.57 GiB"是**真实占用**,不是重复计数。
+
+### 由此确定的下一步(显存墙内的最小可行变体)
+1. **只常驻 draft 的 1 个子模块**(`GPU_RESIDENT_LAYERS=45` 或 `43`)⇒ 3.19 GiB 而不是 9.57;
+   但需先确认 draft 前向实际用到哪几个(若三个都用,只常驻一个只是部分收益);
+2. 或者 **KV 降到 2 GiB** + 三个 draft 层全常驻(14.2+9.57+2 = 25.8 GiB,余 ~13 GiB);
+3. 两者都不行 ⇒ 记入 `FUTURE_PLAN.md`,等 TP=2 修好(每卡 1.59 GiB/层)再谈。
