@@ -9,6 +9,14 @@
 #
 # 做法:只看 /proc/<pid>/cmdline 的 **argv[0]**(可执行文件路径)是否为本环境的
 #   vllm/python,并且 argv 里含 "serve";同时排除自身与所有祖先进程。
+#
+# 【2026-09-12 修复 · M8c】vLLM 的 EngineCore/Worker 子进程会把 **argv[0] 改写成
+#   "VLLM::EngineCore" / "VLLM::Worker_TP<n>"**(实测 /proc/<pid>/cmdline 前两段
+#   就是这两个字符串)。旧版只匹配 ENV_PY 前缀 ⇒ 只杀掉 API server,
+#   **留下孤儿 EngineCore+Worker 各占 ~26 GiB/卡**,下一次启动就报
+#   ValueError: Free memory on device cuda:1 (13.16/39.49 GiB) ... less than desired
+#   GPU memory utilization (0.9, 35.54 GiB) —— 白等一轮 13 分钟加载。
+#   现在把 "VLLM::" 前缀一并匹配。
 # 用法:scripts/kill_serve.sh            # 杀并等显存释放
 #       WAIT=30 scripts/kill_serve.sh
 set -uo pipefail
@@ -32,13 +40,20 @@ for f in glob.glob('/proc/[0-9]*/cmdline'):
     if not argv or not argv[0]: continue
     a0 = argv[0].decode('utf8', 'ignore')
     rest = b' '.join(argv[1:]).decode('utf8', 'ignore')
-    if a0.startswith(ENV_PY) and ('serve' in rest or '/vllm' in a0):
-        try: os.kill(pid, 9); killed.append(pid)
+    is_ours = a0.startswith(ENV_PY) or a0.startswith('VLLM::')
+    if is_ours and ('serve' in rest or '/vllm' in a0 or a0.startswith('VLLM::')):
+        try: os.kill(pid, 9); killed.append((pid, a0))
         except Exception: pass
 print(f'[kill_serve] killed={killed}')
 PY
 sleep "$WAIT"
-echo "[kill_serve] 残留=$(ps -eo args | grep -ac 'vllm serv[e]')"
+echo "[kill_serve] 残留=$(ps -eo args | grep -acE 'vllm serv[e]|VLLM::(EngineCore|Worker)')"
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
 rm -f /dev/shm/xiaotu_ep_*.bin
-echo "[kill_serve] 完成(显存应已释放;再启动前请确认上面均为 0 MiB —— M9)"
+# 硬校验:任一卡 used >= 1024 MiB 就报错退出,避免又白等一轮 13 分钟加载(M9)
+_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
+if echo "$_used" | awk '$1 >= 1024 {exit 1}'; then
+  echo "[kill_serve] 完成(显存已释放,可以启动)"
+else
+  echo "[kill_serve] **警告:仍有卡占用 >=1 GiB,不要启动**(M9)"; exit 3
+fi

@@ -586,3 +586,19 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 - **不是**:Triton workspace OOM(R89 的那种)、也不是显存不足(GPU 0/1 = 38.2/40 GiB,无 OOM 报错)。
 - **状态**:**未解决**,已列入下一轮第一优先级;在定位前,**不要把 32K 以上长预填充当成可用能力**,
   也不要把它写进交付配置。
+
+## M8c. `kill_serve.sh` 只杀 API server、留下孤儿 EngineCore/Worker(又被白等一轮)
+- **现象**:`scripts/kill_serve.sh` 报 `killed=[]` 却"完成";下一次启动报
+  `ValueError: Free memory on device cuda:1 (13.16/39.49 GiB) on startup is less than
+  desired GPU memory utilization (0.9, 35.54 GiB)`,白等一轮 13 分钟加载后才失败。
+- **根因**:vLLM 的引擎子进程会**改写 `argv[0]`**。实测 `/proc/<pid>/cmdline` 首段就是
+  `VLLM::EngineCore` / `VLLM::Worker_TP0` / `VLLM::Worker_TP1`。旧脚本只匹配
+  `ENV_PY` 前缀(`.../envs/vllm-xiaotu-moe/bin/`)⇒ 只有 API server 命中并被杀,
+  EngineCore+Worker 存活并各占 ~26 GiB/卡。
+- **修复**(`scripts/kill_serve.sh`):①argv[0] 增加 `VLLM::` 前缀匹配;
+  ②残留检查改为 `grep -acE 'vllm serv[e]|VLLM::(EngineCore|Worker)'`;
+  ③新增**硬校验**:任一卡 `used >= 1024 MiB` 就 `exit 3`,不再"假完成"。
+- **验证**:对 3 个真实孤儿(1193440/1193547/1193548)`killed=[(…,'VLLM::EngineCore'),
+  (…,'VLLM::Worker_TP0'),(…,'VLLM::Worker_TP1')]`,三卡全部回到 0 MiB,exit=0。
+- **教训**:凡是"等显存释放"类脚本,**必须自带失败退出码**,否则它会把 M9 伪装成
+  "环境问题",让人在错误方向上多花一整轮。
