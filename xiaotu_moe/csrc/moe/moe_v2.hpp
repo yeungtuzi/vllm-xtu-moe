@@ -722,6 +722,18 @@ public:
             else        pool_.parallel_for_sharded(nn, jc, fn);
         };
 
+        // 【轮 70】提前预取本层输入激活(去重后约 NASS/k 行 × hidden×2 字节 ≈ 188 KB):
+        // gather 阶段实测仍在 ~40 µs(288 KB ⇒ 7 GB/s),瓶颈是**冷 DRAM 延迟**而非带宽,
+        // 且它必须等 bookkeeping + exp_off_ 之后才发起访问,这段延迟完全暴露。
+        // 在函数入口就把这些行拉进 cache(非阻塞提示,只改时序、不改任何语义/数值),
+        // 让 DRAM 往返与后面的 bookkeeping 重叠。
+        {
+            const size_t grows = (size_t)(NASS / (size_t)(k > 0 ? k : 1)) + 1;
+            const char* ip = (const char*)input;
+            const size_t ibytes = grows * (size_t)hidden * sizeof(uint16_t);
+            for (size_t o = 0; o < ibytes; o += 64) __builtin_prefetch(ip + o, 0, 3);
+        }
+
         std::fill(output, output + (size_t)M * (size_t)hidden, 0.f);
 
         // Per-expert instance bookkeeping (persistent exp_/active_/inst_idx_
