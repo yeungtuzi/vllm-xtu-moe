@@ -952,18 +952,26 @@ private:
                 if (myn >= 0 && myn < sharded_call_) {
                     size_t base = 0, nj = 0, loc = 0;
                     for (;;) {
+                        // 【第 128 轮修·读端 seqlock,正确顺序】**先取一致快照,再领票**。
+                        // 第 127 轮我把复读校验放在 fetch_add **之后**,校验失败就 `continue`
+                        // ⇒ **把已经领走的票静默丢弃**(既不执行也不递减),等于自己造了一个
+                        // `remaining_` 少减点(实测 §188:inrange=126 < entered=127,总数仍 127<128)。
+                        // 不变式:**`fetch_add` 之后绝不允许无归属地 continue/break 走掉**。
+                        // 因此快照阶段(可能自旋重试)**不得领票**;只有拿到一致快照后才领票,
+                        // 且领到的票要么走快路径执行+递减,要么交给下面的 re-anchor 分支重新归属。
+                        size_t base2 = 0, nj2 = 0; uint64_t g2 = 0;
+                        for (;;) {
+                            g2 = current_gen_.load(std::memory_order_acquire);
+                            if (g2 & 1) continue;            // 奇数=发布中 ⇒ 自旋(此时不领票,不会丢)
+                            base2 = node_base_[myn];
+                            nj2 = node_nj_[myn];
+                            if (current_gen_.load(std::memory_order_acquire) == g2) break;  // 一致快照
+                        }
                         size_t t = node_ticket_[myn].v.fetch_add(1, std::memory_order_relaxed);
                         uint64_t g = current_gen_.load(std::memory_order_acquire);
-                        if (g == gen) {
-                            // 【第 127 轮修·**读端 seqlock**】必须在**确认偶代之后**才读
-                            // base/nj,并**复读世代校验**。旧代码在进循环前一次性读
-                            // base/nj(:953),而 writer 在"奇数→偶数"窗口内改写它们(§184),
-                            // 读者可能取到"新 nj + 旧 base"(或反之)⇒ 可领区间错位
-                            // ⇒ **一张票永远不被看成 in-range** ⇒ remaining_sh_ 停在 1
-                            // ⇒ 看门狗 abort()。实测签名:inrange==entered==479 < total=480(§186)。
-                            base = node_base_[myn];
-                            nj = node_nj_[myn];
-                            if (current_gen_.load(std::memory_order_acquire) != gen) continue;
+                        if (g == gen && g2 == gen) {
+                            base = base2;
+                            nj = nj2;
                             loc = t - base;
                             if (loc >= nj) { abandoned_.fetch_add(1, std::memory_order_relaxed); break; }  // this node's jobs exhausted
                             inrange_.fetch_add(1, std::memory_order_relaxed);   // diag: 范围内的票被领走
