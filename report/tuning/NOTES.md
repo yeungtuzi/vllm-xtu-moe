@@ -4285,3 +4285,46 @@ NR=8 时 `acc[4][8]=32` + `av[4][2]=8` + 4 ⇒ **约 44 个 zmm > 32 个架构�
 ### 本条起的工作纪律(沿用)
 结论写 NOTES/docs、每次回退记 TRIED_AND_REVERTED、每改一项实测 **C=1/C=2 tok/s + 每层 compute/rest
 分解(`XIAOTU_CD_TIMING=1`)**、门禁脚本 `scripts/check_engine_aligned.sh`(数值+性能)。
+
+## 144. 第 97 轮(第二条开工):参考口径澄清、EP 机制、TP=2 的两种失败模式
+
+### 1) 参考口径澄清(用户第 96 轮指出)
+[Lvllmds4 README](https://raw.githubusercontent.com/guqiong96/Lvllmds4/main/README.md) 的官方对照表:
+| 项目 | 上游分支 | CPU | 内存 | GPU | 预填充 | 解码 | 投机 |
+|---|---|---|---|---|---|---|---|
+| Lvllmds4-x-v2.3.9 | `yhfgyyf/vllm-deepseek-v4-sm89` | EPYC 7642×2 | 16ch DDR4-3200 | **3090 × 2** | 1060 @32768 | 26 | 35-47 |
+| Lvllmds4-v2.3.9 | `jasl/vllm`(SM120) | EPYC 9684x×2 | 24ch DDR5-4800 | **pro 6000 × 1** | 3100 @131072 | 75 | 100-115 |
+⇒ **PRO 6000 那台是单卡**,它预填充快是必然的(原生 NVFP4 + 算力强);
+⇒ **对标口径应以"双卡 3090 那台"为准**(1060/26/35-47),我方机器(192 核 + DDR5-4800 24ch + A100-40G×2)应显著高于它。
+(记录:`docs/PERFORMANCE_OPTIMIZATION.md` 里此前把 3100 当成对标目标,现已更正口径。)
+
+### 2) TP=2 时我们**做 EP**(证据)
+启动日志:`EP model.layers.43.ffn: rank 0/2 owns experts [0, 128) of 256`(每个 rank 持 128/256 个专家),
+以及 `GPU-resident model.layers.5.ffn: 1.59 GiB on cuda:0 (tp=2, experts=128)`。
+⇒ **每卡每常驻层 1.59 GiB(TP=1 是 3.2 GB)** ⇒ **同样显存预算能常驻约 2× 的层数** —— 这正是
+"双卡容量宽裕"的真实机制,但它是**专家切分 + 同机共享内存归约**,不是"每卡复制相同内容"。
+- 归约代价:每层一次部分和合并,量级 `tokens × hidden`(6 token 时 98 KB,可忽略;
+  **8192 token 的预填充时 134 MB/层,不可忽略** —— 这是 EP 在长预填充下的隐性成本)。
+- 相关旋钮:`XIAOTU_MOE_EP`(默认 1)/ `XIAOTU_MOE_EP_SHM`(默认 1,共享内存归约)/
+  `XIAOTU_MOE_REDUNDANT`(1=旧的"两 rank 都跑全部专家"冗余模式,只用于对照)。
+- 用户提的"两卡各放完整共享权重 + 分层 ping/pong":属 **PP(层切分)**,只有一次层边界激活交接
+  (比 EP 的每层归约更省),但需要 micro-batch 填流水线气泡;且我们的插件未验证过 PP 路径。
+
+### 3) **TP=2 当前起不来(两种失败模式,已记为待查项)**
+| 模式 | 现象 | 定位 |
+|---|---|---|
+| 关 EAGER(默认 CUDA graph) | KV 分配完成后,worker 不再消费 shm 广播块,每 60 s 打 `No available shared memory broadcast block`,EngineCore 在 RPC 超时后 `cancelled`(实测 ≈317 s) | 预热/图捕获阶段卡住(非配置错) |
+| **开 EAGER** | worker 在 `Enforce eager set, disabling torch.compile and CUDAGraphs` 之后**静默死亡**(无 Python 堆栈 ⇒ 原生崩溃) | 与图捕获无关 |
+- **`XIAOTU_MOE_EP=0` 不能修复**模式二 ⇒ 不只是 EP 的问题 ⇒ **相对 §54/§56 的记录(TP=2+常驻0-5+EAGER=1105-1117 t/s)是回归**,
+  需单独二分(建议:去掉 resident / 去掉 spec / 去掉 EP 逐项试,并抓 coredump 或 `dmesg`)。
+- 结论:**第二条不能依赖 TP=2**,先用 TP=1 拿可测收益。
+
+### 4) 【操作教训复发】M9
+kill 服务器后仅等 5 s 就重启 ⇒ 新进程看到 GPU0 只剩 7.42/39.49 GiB 空闲,
+报 `ValueError: Free memory ... less than desired GPU memory utilization`,启动中止。
+**规矩:kill 后至少等 18-20 s,并用 `nvidia-smi` 确认全 0 再启动。**(M9 原文只写了"等 ~10s",现收紧到 ≥18 s。)
+
+### 5) 第二条的下一步(不依赖 TP=2)
+TP=1 下 `XIAOTU_MOE_RESIDENT_BUDGET_GB` 之前只给了 12 GB(≈3.7 层);GPU0 启动时空闲 38.75 GiB
+⇒ 提到 **24 GB(≈7 层)** 再叠加 KV 8 GiB 仍有余量。先按此测量**预填充/C=1 解码/C=2 吞吐**,
+再横向扫 `budget`、`XIAOTU_MOE_PREFETCH_SLOTS`、`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS`、spec tokens。
