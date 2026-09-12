@@ -734,3 +734,15 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
   "让这个内核正确地工作"(放大 workspace / 修上游)来解决。
 - 主线仓的补丁**保留**(作为诊断/兜底),但**不作为交付配置**;
   交付必须用 `persistent_topk`。
+
+## M8d. `pkill -f "compute-sanitizer"` 第 4 次自伤(同一家族)
+- **现象**:第 166 轮里我用 `pkill -f "compute-sanitizer"` 清理 sanitizer 残留,
+  结果**把我自己那条命令行也匹配并杀掉了**(我的 bash 命令行里就含这个字符串)⇒
+  整个后台作业被 SIGTERM 终止,白起一次服务。
+- **教训(第 5 次重申,这次必须变成条件反射)**:
+  **凡是 `pkill -f <pattern>`,只要 pattern 出现在自己这条命令行里,就会自杀。**
+  正确写法:`pkill -f "compute-sanitize[r]"`(括号技巧**在这里有效**,因为 pattern
+  本身不含字面量 `compute-sanitizer`),或改用 `pgrep -f "...[r]"` 再逐个 `kill`。
+- 注:`scripts/kill_serve.sh` 早已用"读 /proc/<pid>/cmdline 的 argv[0]"避开了这个问题,
+  **清理由它负责的进程时应当只用它**;`pkill -f` 只用于它管不到的东西(如 sanitizer),
+  并且必须带括号保护。
