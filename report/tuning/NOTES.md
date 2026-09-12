@@ -4794,3 +4794,27 @@ spec_decode_num_accepted_tokens_per_pos_total{position="1"} =  58
 按 §161,先测**最小组合**:`TP=2 + EAGER + 无投机 + 无常驻 + KV 8 GiB + maxlen 262144`
 (此前每次 TP=2 都带投机,**这个变量从未被隔离**)。启动中,尚无 OOM/崩溃。
 后续按顺序加回:**① 投机 → ② 常驻层 → ③ CUDA graph**,逐步定位崩溃点。
+
+## 163. 第 111 轮:【TP=2 回归定位】最小组合也崩 ⇒ 病根在 **V2 Model Runner**,不是投机/常驻层
+
+### 隔离实验(逐项排除,本轮做了最关键的一步)
+| 实验 | 配置 | 结果 |
+|---|---|---|
+| A | TP=2 + EAGER + **无投机** + **无常驻** | **仍崩**(已过 KV 分配 `GPU KV cache size: 291,535 tokens`,死在预热阶段,**无 Python 堆栈** ⇒ 原生崩溃) |
+⇒ **投机与常驻层都被排除**;崩溃是 **TP=2 路径本身**固有的。
+这与 §54/§56 的记录(TP=2+常驻0-5+EAGER = 1105-1117 t/s)**矛盾** ⇒ 期间代码/配置有回归。
+
+### 定位到 `VLLM_USE_V2_MODEL_RUNNER`(目标里点名的"未启用旋钮")
+- TP=2 失败日志里有 **`Using V2 Model Runner`**;
+- vLLM 源码:`vllm/config/vllm.py:2747` 注释 "It should be enabled with explicit
+  VLLM_USE_V2_MODEL_RUNNER environ",且 `envs.VLLM_USE_V2_MODEL_RUNNER is None` 有分支
+  ⇒ **V2 runner 是显式 opt-in 的开关**;
+- **实验 B:`VLLM_USE_V2_MODEL_RUNNER=0`(强制 V1)+ TP=2 + EAGER + 无投机 + 无常驻**
+  ⇒ **不再崩溃**:已过 KV 分配、日志无 `V2 Model Runner`、进程存活(仍在加载)。
+⇒ **V2 model runner 是 TP=2 崩溃的头号嫌疑**,而这正是做法要求(3)里"补齐未启用旋钮"的一项。
+
+### 下一步
+1. 等实验 B 就绪 ⇒ 立刻测 **预填充 8192/32768 + C=1/C=2 解码 + cd-timing**,拿到 TP=2 的基线数字;
+2. 在 V1 runner 下逐个加回:**① 投机 → ② draft 3 子模块常驻 → ③ 目标层常驻 → ④ CUDA graph**;
+3. 若 V1 下 TP=2 全部可用 ⇒ 把 `VLLM_USE_V2_MODEL_RUNNER=0` 写进交付配置,并记入
+   `TRIED_AND_REVERTED.md`(V2 runner 在 TP=2 下不可用)。
