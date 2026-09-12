@@ -5399,3 +5399,47 @@ std::atomic<size_t> remaining_[2];          // 代替单个 remaining_
 "请求几次就 abort"已记为 item 2 的**前置阻塞项**,写入 `FUTURE_PLAN.md` 的 P0,
 含精确判据(`exec==total && rem==0` + 复现序列 24 请求全过 + 数值门禁 + **一次持续压测**
 `C=8/N=32` 全程存活),以及已埋好的两个纯诊断计数器(`abandoned_` / `skipped_dec_`)。
+
+## 179. **决定性诊断读数**:`abandoned≡线程数`(基线噪声)、`skipped_dec≈0`(否证世代守卫)⇒ 卡在**任务体**而非计数协议
+
+### (a) 读数(两个纯诊断计数器,均来自**启动阶段**的失败 dump)
+```
+diag2_a1: [pool] WATCHDOG(sharded) gen=598 total=256 rem=1 exec=256
+          [判据] abandoned=120 skipped_dec=1
+diag2_a2: [pool] WATCHDOG(sharded) gen=568 total=128 rem=2 exec=126
+          [判据] abandoned=120 skipped_dec=0
+```
+
+### (b) `abandoned=120` **不是** bug,是稳态基线
+`120` **恰好等于工作线程数**(`scripts/tune_serve.sh` 的 `THREADS` 默认 120)。
+机制:某代任务的票被领完后,每个 worker 会再 `fetch_add` 一次、发现 `loc >= nj` 就
+`break` 回去重新 arm ⇒ **每代每 worker 恰好一次"多领即弃"** ⇒ 基线就是 `#workers`。
+⇒ 与 `miss=1` 同类:**`abandoned` 也是基线噪声,不能当丢票证据**。
+(此处再次印证那条规矩:诊断计数器必须先建立**基线值**,否则非零即误判。)
+
+### (c) `skipped_dec ≈ 0` ⇒ **否证"递减被世代守卫跳过"**(第 6 个被否证的假设)
+两个 dump 的 `skipped_dec` 分别是 1 和 0。若"世代前进导致守卫为假、递减被跳过"是主因,
+这里应该等于缺口的数量级(1~2)——但 a2 缺口是 2 而 `skipped_dec=0`。
+⇒ `:956`/`:991` 的守卫**不是**问题所在,不必再改那里(省下一轮)。
+
+### (d) **唯一的真信号是 `exec` 的缺口**,它指向**任务体**
+| dump | total | exec | 缺口 | 含义 |
+|---|---|---|---|---|
+| a1 | 256 | 256 | 0 | 全部执行了,但少一次递减(见下) |
+| a2 | 128 | **126** | **2** | **2 个被计入的任务被领走后,既没执行、也没走到任何 break** |
+a2 是最干净的证据:`abandoned` 仍是正常的 120,而 `exec` 少 2 ⇒ 持有那两张票的 worker
+**停在了 `sf_(sc_, myn, loc)` 内部(或阻塞在 re-anchor 的 `work_mtx_` 上)**,
+既没 `shard_exec_++` 也没 break。
+a1 的"(exec 满但 rem 少 1)"同样可以由"某个 worker 在任务体里卡住、由另一个 worker
+重复执行了同一张票"解释 —— 此时 `dup` 本应 >1,而 `dup` 计数器已被证明不可信(§174b)。
+⇒ **结论:不要再查票据/世代/递减协议,要查"任务体里会阻塞的东西"。**
+
+### (e) 下一轮(方向已换,具体可查的候选)
+1. **任务体里是否有会长时间阻塞的东西**:`sf_` 最终落到 CPU MoE 的 shard 回调,
+   其中可能拿 `work_mtx_`/其它 mutex、或**回调进 Python/torch 而争 GIL**。
+   若主线程长时间持 GIL(torch 算子/采样),120 个 worker 会集体排队 ——
+   这能解释"8-token 解码跑 90 秒"这种量级的停顿,以及只有个别 worker 未归位。
+2. **最便宜的判别实验**:把 `XIAOTU_MOE_THREADS` 从 120 降到 32 跑同一复现序列。
+   若是 GIL/锁竞争,降线程数应显著改变触发概率;若是纯计算越界,则不变。
+3. 在任务体入口/出口各加一个计数器(`entered`/`left`),卡住时两者之差即"进了没出"的 worker 数
+   —— 这能把 (d) 的推断变成直接证据。
