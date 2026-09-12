@@ -110,3 +110,57 @@
 **机制(模式 A)**:`:983` re-anchor 把 worker 本地 `gen` 改成"活代"⇒ 迟到 worker 的递减
 记到活代上(活代被多减、早到 0、调用方提前返回),自己那代被少减 ⇒ 净效果是某次调用永不归零。
 **两模式都要修**,只修一个仍会挂死。`abandoned≡#workers` 与 `miss=1` 为**基线噪声,不得当证据**。
+
+---
+
+## P0-A 修复规格(可直接机械执行;**已证明**,不是猜测)
+
+**证据**:三份 dump 中 `skipped_dec` 与缺口**精确相等**(a1/a3:`exec=256=total, rem=1, skipped_dec=1`),
+即 `:956`/`:991` 的世代守卫确实跳过了递减(模式 A,占 2/3)。**所有观测到的失败都是
+`WATCHDOG(sharded)`** ⇒ **只需改分片路径**,不要碰 flat 路径(它的 10 处 `remaining_` 引用保持原样)。
+
+### 改动(分片路径专用,**新增**一个按世代奇偶分桶的计数器,不动 flat 的 `remaining_`)
+1. **声明**(紧邻 `shard_exec_`,约 :1165 一带):
+   ```cpp
+   std::atomic<size_t> remaining_sh_[2];   // 按世代奇偶分桶的分片计数(见下)
+   static int sh_slot(uint64_t gen) { return (int)((gen >> 1) & 1ULL); }
+   ```
+   注意 `gen` 恒为**偶数**(就绪态),所以用 `(gen>>1)&1`,**不能**用 `gen&1`(恒 0)。
+2. **发布**(:696):`remaining_.store(total);` → `remaining_sh_[sh_slot(gen)].store(total);`
+3. **等待**(:713 谓词):`remaining_.load(acquire) == 0` → `remaining_sh_[sh_slot(gen)].load(acquire) == 0`
+4. **看门狗打印**(:717):`remaining_.load()` → `remaining_sh_[sh_slot(gen)].load()`
+5. **两处递减**(:957-965 与 :991-992 一带):**去掉世代守卫,无条件递减**
+   ```cpp
+   if (!torch_dummy) {}                    // (占位说明:此处不再有守卫)
+   if (remaining_sh_[sh_slot(gen)].fetch_sub(1, acq_rel) == 1) { notify_all(); }
+   ```
+   （原 `if (current_gen_ == gen && ...)` 的守卫整段删除;`skipped_dec_` 的计数点改为
+   **不变式检查**:修复后它应恒为 0,非 0 即引入新 bug —— 保留计数,便于回归。）
+
+### 为什么奇偶分桶能修好(安全性论证)
+- 原守卫要解决的问题是:**迟到 worker 的递减会污染新一代的倒计时**。
+- 分桶后,一个属于第 `g` 代的递减**只能**落到 `remaining_sh_[sh_slot(g)]`;
+  第 `g+2` 代用**另一个**桶 ⇒ **结构上不可能**污染下一代 ⇒ 守卫不再需要。
+- **桶的复用**:第 `g+4` 代才会复用 `sh_slot(g)`。而复用发生在 `:696` 的 `store(total)`,
+  它只在该调用已经等到 `g+2` 归零之后才执行;`g` 代的递减在 `g+2` 归零前必已全部完成
+  (`g+2` 的发布以 `g` 归零为前提,见 `:709-712` 的等待)。⇒ 复用是安全的。
+- **不会漏减**:每张票由 `fetch_add` 唯一领取,领票者必走"执行 + 递减"。
+- **不会多减**:票据唯一 ⇒ 递减唯一。
+- 若某 worker 在 re-anchor 后把 `gen` 改成活代 `ng`,它递减的是**活代**的桶,而它执行的
+  任务也用活代的 `loc`/任务函数 ⇒ **执行与递减属于同一代**,自洽。
+
+### 验证(缺一不可)
+1. 重编译:`PYBIND11_INC=<env>/lib/python3.12/site-packages/torch/include \
+   PYTHON=<env>/bin/python scripts/build_engine_variants.sh`
+2. `XIAOTU_MOE_POOL_TRACE=1 XIAOTU_MOE_SHARD_WD=60` 启动,**连续 3 次会话**跑
+   `/tmp/repro.py` 的 24 请求序列:**全部通过**;`skipped_dec_` 恒 0;`exec==total && rem==0`。
+3. 数值门禁 `scripts/check_engine_aligned.sh`(**R55 强制**)。
+4. **一次 `C=8/N=32` 持续压测跑完并给出持续吞吐**(`scripts/tune_client.sh`)。
+5. 若仍有模式 B(`exec` 缺口、`skipped_dec=0`),再按 §179(e) 查任务体阻塞
+   (`entered`/`left` 计数器定位"进了没出"的 worker)。
+
+### 反面约束(不要做的事)
+- **不要**动 flat 路径的 `remaining_`;
+- **不要**再依据 `miss=1` 或 `abandoned=120` 改代码(两者均为基线噪声,已三次确认);
+- **不要**在前向热路径加同步埋点(R92);
+- 改动必须有读数支撑(R94 的教训)。
