@@ -5076,3 +5076,37 @@ DMA 模型预测应有 ~9-10%(因为 DMA 占 8192 档 57%、32768 档 49%)⇒ **
   距 1500 还差 **~27%**。@8192 = 1371-1396 t/s。
 - 下一步唯一够量级的杠杆:解决 32K 档那 51% 的非 DMA 时间(怀疑 chunked-prefill 的
   稀疏 indexer O(context) 项 + 每块固定开销)。
+
+## 170. 第 119 轮:参考仓 prefetch window 是**死旋钮**;MTP 层在参考实现里**永远常驻**;我的 GPU 埋点把引擎挂死(R92)
+
+### (a) 【要求 (1) 的直接产出】`LVLLM_GPU_PREFETCH_WINDOW` 从未被使用
+全仓 grep(`Lvllmds4-x`,只统计 `--include=*.py`):
+| 出现处 | 内容 |
+|---|---|
+| `vllm/envs.py:252` | 类型声明 `LVLLM_GPU_PREFETCH_WINDOW: int = 1` |
+| `vllm/envs.py:1860-1861` | getter,**默认值写的是 `"3"`**(与上一行的 1 不一致) |
+| `vllm/envs.py:2142 / 2226` | 列入环境变量清单 + `get_gpu_prefetch_window()` 返回它 |
+| `vllm/model_executor/layers/fused_moe/routed_experts.py:36` | **只是 import,函数体里从未调用** |
+⇒ 除声明/getter/import 外**没有任何消费点**。**该旋钮是死代码**,
+参考那台 3100 t/s 的预填充**与 prefetch window 无关**。
+⇒ **不要**再去"对齐 window 深度";我们 `hybrid_model.py:857` 的真实双向流重叠
+(`gpu_prefill.py:726` side stream + `PrefetchSlot`)**在机制上比参考更完整**。
+(另外注意:声明默认 1、getter 默认 3,自相矛盾 —— 也印证它没被认真接过线。)
+
+### (b) 参考实现的层分类规则(`vllm/envs.py`)
+```
+is_lk_moe_mtp_layer(name)        = name.startswith("mtp.")
+is_lk_moe_gpu_prefill_layer(n)   = use_gpu_prefill and not resident(n) and not mtp(n)
+is_lk_moe_gpu_resident_layer(n)  = (mtp(n) ⇒ True) or n ∈ LVLLM_GPU_RESIDENT_MOE_LAYERS
+```
+⇒ **MTP/draft 层无条件常驻显存**(不参与流式预填充、也不落 CPU)。
+这解释了参考配置 `LVLLM_GPU_RESIDENT_MOE_LAYERS="0-13,43-45"` 为什么要把 43-45 写进去 ——
+其实即使不写也会常驻。**我方对应动作:把 draft 的 3 个子模块也常驻**
+(TP=2 每 rank 4.77 GiB,比 8 个专家层便宜),这是**解码/投机**路径的杠杆,不是预填充的。
+
+### (c) 本轮失败(R92)
+GPU 事件 + `torch.cuda.synchronize()` 埋点 ⇒ 线程池 WATCHDOG 卡死 + worker 死亡,
+`kern/layer` 读出负值,数据作废,已 `git checkout` 回退。
+⇒ GPU 侧分解改用 **nsys(进程外)**,不再侵入前向热路径。
+⇒ 同时说明:**R91 的"32K 崩溃与常驻强相关"仍成立但要重测**(r119 的常驻=0 崩溃
+是新埋点引入的变量,不能算反例)。

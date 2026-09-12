@@ -619,3 +619,24 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 - **结论**:8 层常驻 = 用 12.7 GiB 显存换 2-4% 预填充,同时引入长上下文段错误 ⇒
   **净负**。交付配置改为 `XIAOTU_MOE_GPU_RESIDENT_LAYERS` 不设(常驻=0)。
 - 注:R89(Triton OOM 只在常驻层存在时出现)与本条同源,可一并归档为该机制的第三个反例。
+
+## R92. 在前向热路径里插 GPU 事件 + `torch.cuda.synchronize()` 埋点 —— **把引擎挂死,数据全废**
+- **动机**:`_gp_add` 的 seg/rest 都是 host 侧 `perf_counter`,而内核是**异步**的,
+  所以此前所有 prefill 数字里**没有一项是 GPU 侧时间**;想量出"每层 compute / 未重叠 DMA"。
+- **做法(已回退)**:在 `gpu_moe_layer` 里每层建 3 个 `torch.cuda.Event`,`e_in`(进层)、
+  `e_k0`(等到预取 ready 后)、`e_k1`(内核发射完);攒够 40 层就 `torch.cuda.synchronize()`
+  读 `elapsed_time`,打印 `[gp-gpu] wait/kern/layer`。
+- **后果(实测)**:
+  1. 读出的 `kern`/`layer` 是**负值**(`wait=+78.4/+22.3/+5.8ms`,而 `kern=-64.4ms`)——
+     三个事件的时基互相不一致,说明该路径上的"当前流/线程"语义与我的假设不符;
+  2. CPU 线程池**卡死**:日志连续 4 分钟刷
+     `[pool] WATCHDOG(sharded) gen=650 total=256 rem=1 exec=256` + `node 0..7 jobs=32 pulled=47`,
+     同时 `shm_broadcast: No available shared memory broadcast block found in 60 seconds`;
+  3. 常驻=0 下**第 2 次 8192 就崩**:`Worker proc VllmWorker-1 died unexpectedly (exit code: None)`
+     ⇒ 本轮所有 `[gp-gpu]` 数字**作废**;`seg` 也从 4.66-6.39ms 涨到 11.76-22.31ms(埋点自身开销)。
+- **结论**:**不要在 MoE 前向热路径里做任何会阻塞/同步的埋点**。GPU 侧分解改用
+  **nsys(进程外,不侵入)** —— 仓库里已有 `scripts/tune_nsys.sh`。
+- **副产物(必须记住)**:这条**反过来污染了我对 32K 崩溃的归因**。r119 之前"常驻=0
+  5/5 通过"是**无埋点**状态测的,可信;r119 的常驻=0 崩溃**不能**算作反例,
+  因为埋点是新引入的变量。⇒ 第 119 轮需在**无埋点**状态下重测常驻=0 的 32K 稳定性,
+  才能维持/推翻 R91。
