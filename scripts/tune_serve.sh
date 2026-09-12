@@ -145,7 +145,9 @@ for _g in $(echo "$GPUS" | tr ',' ' '); do
   done
 done
 LOG="$OUTDIR/$TAG.log"
-nohup vllm serve "${ARGS[@]}" > "$LOG" 2>&1 &
+# 【第 159 轮】SERVE_WRAP 钩子:允许把 serve 命令包在外部工具下(如 compute-sanitizer)。
+# 例:SERVE_WRAP="/usr/local/cuda/bin/compute-sanitizer --tool memcheck --target-processes all" scripts/tune_serve.sh
+nohup ${SERVE_WRAP:-} vllm serve "${ARGS[@]}" > "$LOG" 2>&1 &
 echo $! > "$OUTDIR/$TAG.pid"
 echo "[tune_serve] tag=$TAG pid=$(cat "$OUTDIR/$TAG.pid") log=$LOG"
 

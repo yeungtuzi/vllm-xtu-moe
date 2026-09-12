@@ -6722,3 +6722,39 @@ pgrep -af compute-sanitizer | head; pgrep -af "bin/vllm serve" | head
 - 若**有** ⇒ 是 (b2):说明 memcheck 没抓到 ⇒ 嫌疑转向**memcheck 覆盖不足的路径**
   (例如协作式内核 `cooperative groups`、或非内存类错误),那就改用
   `--tool racecheck`/`synccheck`,或回到"分段同步"的思路手工二分。
+
+## 214. **确认并修好**:上一轮 sanitizer **根本没挂上**(零输出 ≠ 没有越界)
+
+### (a) 分辨结果:是情况 1
+进程树检查(第 159 轮):
+```
+# 修复前(靠 PATH 垫片):
+--- 进程树 ---        (空)                    ← 没有任何 compute-sanitizer 进程
+--- vllm serve ---    1289324 python .../bin/vllm serve ...   ← 直接就是真实服务
+```
+⇒ **PATH 垫片没有生效**,服务是**裸跑**的 ⇒ 上一轮"sanitizer 零输出"**不能**被解读为
+"memcheck 没发现越界" —— 它压根没在监控。**我已按 §213c 的规矩先分辨、再下结论。**
+
+### (b) 修法:给 `tune_serve.sh` 加 `SERVE_WRAP` 钩子(可回退、对以后也有用)
+```bash
+# scripts/tune_serve.sh:148
+nohup ${SERVE_WRAP:-} vllm serve "${ARGS[@]}" > "$LOG" 2>&1 &
+```
+用法:
+```bash
+SERVE_WRAP="/usr/local/cuda/bin/compute-sanitizer --tool memcheck --target-processes all --launch-timeout 600" ...
+```
+
+### (c) 验证:这次真的挂上了
+```
+1290106 /usr/local/cuda-12.1/.../compute-sanitizer --tool memcheck --target-processes all ... vllm serve ...
+1290112 .../compute-sanitizer/TreeLauncherSubreaper serve ...
+1290118 python .../bin/vllm serve ...      ← 被 sanitizer 拉起的实际服务
+```
+⇒ `--target-processes all` 也把 TP worker 子进程纳入了。
+
+### (d) 下一轮
+服务在 sanitizer 下加载完成后,跑 §212 的**猛打脚本**(十几请求必现),
+然后读 sanitizer 的输出(stderr,会进 vLLM 日志)⇒ 直接得到**越界的内核名 + 行号**。
+**注意**:memcheck 的 `ERROR SUMMARY` 只在**正常退出**时打印,而故障会让进程异常终止 ——
+所以要看的是**越界报告本身**(`Invalid __global` / `out-of-bounds`),不是 summary。
