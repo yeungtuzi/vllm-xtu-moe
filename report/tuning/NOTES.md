@@ -4402,3 +4402,35 @@ layers=43 qlen=6  k=6 period=4.54ms compute=1.30ms rest=3.24ms (compute 29%, res
 `ImportError: Please install vllm[bench] for bench support`(该 env 缺 pandas)。
 ⇒ 用 `scripts/tune_client.sh`(random/sharegpt 路径,不读 jsonl;第 74/75 轮已验证可用),
 或 `pip install pandas` 到 vllm-xiaotu-moe env。**下一轮开工前先修这个,否则测不出数。**
+
+## 148. 第 98 轮:第二条**起跑线**测到了;红旗解除;并算出解码目标的真实距离
+
+### 基线健康(8070:TP=1 + CUDA graph + 无常驻 + KV 8 GiB + spec k=5)
+客户端(`tune_client.sh`,L=512,C=1,N=8,OUT=64,IN_LEN=256):
+**TPOT = 57.38 ms**(≈**17.4 tok/s 单流**)、out_tok/s 11.61(含 TTFT 1.90 s 摊薄)、TTFT 1897 ms。
+服务端 `XIAOTU_CD_TIMING`:
+```
+layers=43 qlen=6 k=6 period=1.73ms compute=0.99ms rest=0.74ms (compute 57%, rest 43%)
+layers=43 qlen=6 k=6 period=1.72ms compute=0.97ms rest=0.75ms (compute 57%, rest 43%)
+```
+⇒ **`rest` 回到 0.74-0.75 ms/层**(§120 是 0.77)⇒ §147 的"rest 3.2-3.6"确系**我反复起停服务的环境残差**,不是回归。✅
+
+### 解码目标的真实距离(算术)
+- 每步 = 43 层 × 1.72 ms = **74 ms/步**;被接受的投机 token ≈ **1.3 个/步**(由 74/57.4 反推)
+  ⇒ 单流 **17.4 tok/s**。
+- 目标 **≥70 t/s** ⇒ 需要 ≤14.3 ms/token ⇒ 步 ≤ **18.6 ms** ⇒ 每层 ≤ **0.43 ms**
+  ⇒ 比现状(1.72)好 **4×**。
+- 靠"常驻层"达到:需把 43 层压到 ~11 层在 CPU ⇒ **常驻 ~32 层**;按 §145 的账
+  (TP=1 3.19 GiB/层)= **102 GiB**,TP=2(1.59 GiB/层)= **51 GiB**
+  ⇒ **两种都远超 40 GiB/卡(且 KV 与它互斥)** ⇒ **解码 ≥70 t/s 不可能靠常驻层在本机达成。**
+- 对照口径:SM80 参考(3090×2)解码 **26 t/s**(38 ms/token)—— 我们 17.4 是它的 **0.67×**;
+  PRO6000 的 75 t/s 是强得多的 GPU。⇒ 现实目标应是**先追平 26、再靠下面三条逼近上限**。
+
+### 由此确定的四条杠杆(下一轮按收益排序逐条实测)
+1. **投机接受率**:目前 ~1.3 tok/步。`num_speculative_tokens`(现 5)扫 3/5/7 + draft 的采样参数
+   ⇒ 若接受率能到 2.5,步成本不变而单流直接 **×1.9**(17.4 → 33)。
+2. **`rest` 0.75 ms/层**:这是纯 GPU 侧(拷贝+派发+注意力),`XIAOTU_GPU_PREFETCH_AHEAD` /
+   `XIAOTU_MOE_PREFETCH_SLOTS` 等**尚未在本配置下扫过**;常驻层能整段消掉它(但容量受限,见上)。
+3. **C≥2 聚合**:步成本被多路摊薄 ⇒ 面向"吞吐 ≥70"的另一个口径(需先确认目标口径是单流还是聚合)。
+4. **`compute` 0.97 ms/层**:即第一条的引擎(§97 已结案,0.65/0.84 是其在 DEDUP=12/23 的值;
+   服务端的 0.97 对应更大 na)。
