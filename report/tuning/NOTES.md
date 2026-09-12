@@ -5610,3 +5610,42 @@ if (loc < nj) inrange_.fetch_add(1, relaxed);     // 本代"范围内"的票被�
   `diag_active()` 分支与 `sf_` 之间的东西);
 - `inrange_ == entered_` ⇒ 那张票**根本没被领**(= 票号区间与实际 job 数不一致,
   即 `node_base_`/`node_nj_` 的发布与 worker 的读之间有**撕裂**),这会把矛头转向发布时序。
+
+## 184. **真根因**:分片发布违反了本文件自己的 seqlock 不变式 ⇒ worker 少看到一张票
+
+### (a) 决定性读数(`inrange_` 计数器,原假设二分的结果)
+```
+会话1: #1 8192/mt1 ok 6137ms → #2 8192/mt8 ok 6749ms → #3 32768 ok 28105ms
+       → #4 512/mt32 **84882ms**(停顿) → #5 FAIL;会话2 #1 FAIL
+WATCHDOG(sharded) gen=3936 total=128 rem=1 exec=127
+判据] abandoned=120 underflow=0  entered=127 left=127 **inrange=127**
+```
+**`inrange == entered == 127 < total = 128`** ⇒ 二分得到**第二支**:
+**那张票根本没有被任何 worker 看成"范围内"** ⇒ 不是锁、不是任务体、不是世代守卫,
+而是**发布/读取之间的一致性 bug**。
+
+### (b) 根因:`node_nj_` 写在**奇数(发布中)store 之前**
+`numa_pool.hpp:455-471` 自己写下的不变式是:
+> 调用方必须在读 `counter_` 之前先 store 奇数、**写完全部字段**再 store 偶数。
+> 这样 worker 只需接受偶数即可,不会看到"新 gen + 旧 start_"的撕裂
+> (轮 68 的朴素"复读 gen"正是死在这里:撕裂时 gen 已新、start_ 还旧,复读一致
+> ⇒ 查不出来 ⇒ **worker 丢票 ⇒ remaining_ 永不归零**)。
+
+而分片发布把 `node_nj_[n] = job_counts[n]`(`:675-684`)以及 `n_`/`worker_limit_`/
+`sharded_call_`/`start_` 都写在 `:693` 的奇数 store **之前**。后果:
+**仍在上一代(偶代)的 worker 在 `:937` 读到的是新一代的 `node_nj_`,而它的 `base`/gen 还是旧的**
+⇒ 可领区间变小(或错位)⇒ **丢掉一张票** ⇒ 该代 `remaining_sh_` 永远停在 1 ⇒ 看门狗 `abort()`。
+- 这**解释了为什么 R94 只把 `base` 的读序后移无效**:被撕裂的是 `node_nj_`,不是 `base`。
+- 也解释了为什么故障非确定性:同一请求快一次、慢一次(89899ms),取决于是否撞上发布窗口。
+- 也解释了为什么启动阶段最易触发(预热期并发发布最密集)。
+
+### (c) 修复(第 124 轮,已编译通过)
+把 `node_nj_`/`total`/`n_`/`worker_limit_`/`sharded_call_`/`start_` 的写入**整体移进
+"奇数 store → 偶数 store"的发布窗口内**,无条件遵守既有不变式;
+`node_base_` **仍**留在奇数 store 之后读(陈旧票必须落在 base 之前,这条不能动)。
+
+### (d) 待验证(下一轮,四项缺一不可)
+① 连续 3 次会话 24 请求全过、无看门狗;② 判据 `inrange==entered==total && rem==0`;
+③ `scripts/check_engine_aligned.sh` 数值门禁(R55);④ 一次 `C=8/N=32` 持续压测跑完。
+**注意**:flat 路径(`:1044-1048` 的世代守卫跳过递减、`:1072-1076` 丢弃已领 flat 票据)
+是**同型的另外两处**,尚未修 —— 若验证中报 `WATCHDOG`(非 sharded)即命中它们。

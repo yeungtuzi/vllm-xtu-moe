@@ -672,25 +672,25 @@ public:
             if (diag_active()) {
                 shard_cnt_.assign((size_t)nnodes * kShardDiagStride, 0u);
             }
+            // 【第 124 轮·真根因修复】下面这些字段原本写在**奇数 store 之前**,
+            // 直接违反本文件 :455-471 自己写下的不变式:"先 store 奇数 → 写完全部字段
+            // → 再 store 偶数,worker 只接受偶数"。后果:仍在上一代(偶代)的 worker 会在
+            // :937 读到**新一代的 node_nj_** 而 node_base_ 还是旧的 ⇒ 可领区间变小
+            // ⇒ **丢掉一张票** ⇒ remaining_sh_ 永不归零 ⇒ 300s 后看门狗 abort()。
+            // 实测证据(NOTES §184):inrange=entered=127 < total=128,
+            // 即 worker 眼里"范围内"的票只有 127 张,而倒计时按 128 计。
+            // 注意 node_base_ 必须**仍**在奇数 store 之后读(陈旧票要落在 base 之前)。
+            uint64_t gen = current_gen_.load(std::memory_order_relaxed) + 2;
+            current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
+            total = 0;
             for (int n = 0; n < nnodes; ++n) {
                 node_nj_[n] = job_counts[n];
-                // MONOTONIC per-node ticket counters (never reset), exactly like
-                // the flat `counter_`: this call owns [node_base_[n], +nj), read
-                // right after the generation bump below. A stale worker's ticket
-                // is then below base (loc wraps huge) -> it drops out instead of
-                // aliasing a live job. Resetting the counters per call made stale
-                // tickets alias live ones and silently duplicated/skipped jobs.
                 total += job_counts[n];
             }
             n_ = total;
             worker_limit_.store(limit >= nt_ ? 0 : limit, std::memory_order_relaxed);
             sharded_call_ = nnodes;          // visible to workers at anchor
             start_ = 0;
-            // Bump the generation BEFORE reading the per-node counters (see
-            // parallel_for_impl for why the order matters). 【轮 69】同样用奇偶 seqlock:
-            // 奇数=发布中,偶数=就绪,worker 只接受偶数。
-            uint64_t gen = current_gen_.load(std::memory_order_relaxed) + 2;
-            current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
             for (int n = 0; n < nnodes; ++n)
                 node_base_[n] = node_ticket_[n].v.load(std::memory_order_relaxed);
             remaining_sh_[sh_slot(gen)].store(total);   // 【模式A修】分片专用分桶倒计时
@@ -700,6 +700,7 @@ public:
             underflow_.store(0);       // diag reset per call
             entered_.store(0);         // diag reset per call
             left_.store(0);            // diag reset per call
+            inrange_.store(0);         // diag reset per call
             current_gen_.store(gen, std::memory_order_release);       // 偶数:就绪
         }
         cv_.notify_all();
@@ -724,9 +725,11 @@ public:
                         remaining_sh_[_gslot].load(),
                         shard_exec_.load());
                 fprintf(stderr, "  [判据] abandoned=%ld underflow=%ld  "
-                        "entered=%ld left=%ld  ⇒ entered-left = 卡在任务体里的 worker 数\n",
+                        "entered=%ld left=%ld inrange=%ld\n"
+                        "         (entered-left>0=卡在任务体; inrange-entered=1=票在fast path内消失;"
+                        " inrange==entered=票根本没被领⇒发布撕裂)\n",
                         abandoned_.load(), underflow_.load(),
-                        entered_.load(), left_.load());
+                        entered_.load(), left_.load(), inrange_.load());
                 for (int n = 0; n < (int)node_nj_.size(); ++n) {
                     long done = (long)node_ticket_[n].v.load() - (long)node_base_[n];
                     fprintf(stderr, "  node %d: jobs=%zu pulled=%ld\n", n, node_nj_[n], done);
@@ -954,6 +957,7 @@ private:
                         uint64_t g = current_gen_.load(std::memory_order_acquire);
                         if (g == gen) {
                             if (loc >= nj) { abandoned_.fetch_add(1, std::memory_order_relaxed); break; }  // this node's jobs exhausted
+                            inrange_.fetch_add(1, std::memory_order_relaxed);   // diag: 范围内的票被领走
                             if (diag_active() && loc < kShardDiagStride) {
                                 __atomic_fetch_add(
                                     &shard_cnt_[(size_t)myn * kShardDiagStride + loc],
@@ -1213,6 +1217,11 @@ private:
     // `sf_(...)` 里面,看门狗触发时 `entered - left` 就等于"进了没出"的 worker 数。
     std::atomic<long> entered_{0};
     std::atomic<long> left_{0};
+    // 【第 124 轮】"本代范围内"的票被领走的次数。与 `entered_` 比较即可二分:
+    //   inrange == entered + 1 ⇒ 有一张范围内的票在 fast path 内消失了(继续查分支内);
+    //   inrange == entered     ⇒ 那张票**根本没被领** ⇒ node_base_/node_nj_ 发布与 worker
+    //                            读取之间撕裂(票号区间与实际 job 数不一致)。
+    std::atomic<long> inrange_{0};
     static constexpr size_t kMaxNodeShards = 128;       // ample for any EPYC topology
     // 【轮 76】每个 node 的票号计数器**各自独占一条 cacheline**。原来 8 个计数器挤在
     // 同一条线上,120 个 worker 的 fetch_add 让这条线在 core 之间来回弹(伪共享),
