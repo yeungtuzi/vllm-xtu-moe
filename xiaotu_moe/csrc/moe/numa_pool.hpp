@@ -957,6 +957,14 @@ private:
             // Worker-subset gate: a limited call lets only ~limit workers claim
             // tickets (stride selection keeps them spread across NUMA nodes). The
             // others claim nothing and simply re-arm, so they are not waited on.
+            // 【第 180 轮·消融实验,仅 env 控制,绝不进交付配置】
+            // 中性争用:每任务对一条共享原子做一次 RMW,只为复现 POOL_TRACE 的争用特征
+            // (内容与任何判定无关)。目的:验证"额外的一处共享内存争用"是否足以抑制停顿。
+            static std::atomic<long> s_ablate_cont{0};
+            static const bool s_ablate_on = [] {
+                const char* e = std::getenv("XIAOTU_MOE_ABLATE_CONTENTION");
+                return e != nullptr && e[0] == '1';
+            }();
             const size_t wlim = worker_limit_.load(std::memory_order_relaxed);
             if (wlim > 0 && wlim < nt_) {
                 size_t stride = nt_ / wlim;
@@ -1006,6 +1014,8 @@ private:
                                 left_.fetch_add(1, std::memory_order_relaxed);
                             }
                             shard_exec_.fetch_add(1, std::memory_order_relaxed);
+                        if (s_ablate_on) s_ablate_cont.fetch_add(1, std::memory_order_relaxed);
+                            if (s_ablate_on) s_ablate_cont.fetch_add(1, std::memory_order_relaxed);
                             // 【模式A修】无条件递减到**本代自己的桶**。
                             // 旧代码是 `if (current_gen_ == gen && remaining_.fetch_sub(..))`,
                             // 守卫为假时递减被静默跳过 ⇒ 调用方永不归零(实测 skipped_dec==缺口)。
@@ -1054,6 +1064,7 @@ private:
                             left_.fetch_add(1, std::memory_order_relaxed);
                         }
                         shard_exec_.fetch_add(1, std::memory_order_relaxed);
+                        if (s_ablate_on) s_ablate_cont.fetch_add(1, std::memory_order_relaxed);
                         // 【模式A修】同 fast path:无条件递减到本代自己的桶(见上)。
                         if (remaining_sh_[sh_slot(gen)].fetch_sub(
                                 1, std::memory_order_acq_rel) == 1) {
