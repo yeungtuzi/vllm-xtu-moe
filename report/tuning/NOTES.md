@@ -5110,3 +5110,40 @@ GPU 事件 + `torch.cuda.synchronize()` 埋点 ⇒ 线程池 WATCHDOG 卡死 + w
 ⇒ GPU 侧分解改用 **nsys(进程外)**,不再侵入前向热路径。
 ⇒ 同时说明:**R91 的"32K 崩溃与常驻强相关"仍成立但要重测**(r119 的常驻=0 崩溃
 是新埋点引入的变量,不能算反例)。
+
+## 171. 第 120 轮:**更正根因** —— `RuntimeError: cancelled` 是 worker 死亡的次生症状,不是超时;并量化"每次实验 13 分钟"的浪费
+
+### (a) 【更正】`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` 从来不是启动失败的原因
+此前(第 96-113 轮,已写入旧结论)把 TP=2 启动失败归因为
+"`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` 默认 300s 太小 ⇒ dequeue 超时"。
+**读代码后否掉**:
+```python
+# vllm/v1/executor/multiproc_executor.py:425-436
+dequeue_timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+status, result = mq.dequeue(timeout=dequeue_timeout)
+```
+而异常链实际是 `mq.dequeue` → `shm_broadcast.py:889 dequeue` → `acquire_read` →
+`shm_broadcast.py:797 raise RuntimeError("cancelled")`。
+`acquire_read` 抛 "cancelled" 的条件是**广播对象被取消**(写端/worker 已退出),
+**与 timeout 无关**;而且 `deadline` 为 None 时 timeout 就是 None(无限等)。
+⇒ **正确因果**:worker **先死** → shm 写端关闭 → EngineCore 的读端被 cancel →
+报 `cancelled`。所以 `cancelled` 只是**尸检报告**,不是死因。
+⇒ 推论:**把 execute-timeout 调大对启动失败没有任何作用**;要找的是 worker 为什么死
+(证据:r118b/r119 两次都是 `Worker proc VllmWorker-N died unexpectedly (exit code: None)`,
+**无任何 Python traceback** ⇒ 原生层被杀/段错误)。
+⇒ r120(纯交付配置、无埋点、无常驻)启动也失败,同一签名 ⇒ **该故障与常驻层、与我方
+插件埋点都无关,是 TP=2 启动/预热阶段的偶发原生死亡**(约 1/3 概率)。
+
+### (b) 【时间经济学】13 分钟加载 = 本轮真正的成本中心
+本轮 44 分钟里约 39 分钟是**三次模型加载**,其中一次(r120)纯属白烧(启动即死)。
+教训与对策(已落地):
+1. `scripts/serve_retry.sh`(新):启动失败自动重试(默认 3 次),每次先 `kill_serve.sh`
+   清干净再试;成功则把 tag 写 `/tmp/serve_retry.last_tag`。
+2. `scripts/bench_battery.py`(新):**一次加载内跑完整测量组** —— 预填充阶梯
+   (nat8192 热身 + nat8192 + nat32768,每档后探活)+ 解码 C=1/2/3(单流/聚合/TPOT),
+   而不是"改一个旋钮→重启→只测一个点"。
+3. 不再用长 `sleep` 轮询;加载期间改为并行做分析/写脚本。
+
+### (c) 顺带核准:TP=2 启动偶发失败**不是**用户环境变更引起的
+"静默原则已暂停"意味着可以自由并行占用本机,但**同一对 GPU 无法并行跑两个 TP=2 实例**
+(每个实例占 26 GiB/40 GiB)⇒ 加速手段只能是"减少重启次数 + 一次测更多",即 (b)。
