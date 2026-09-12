@@ -3270,3 +3270,60 @@ NT=1/15/60/120 → 每线程 4.10 / 1.94 / 1.31 / 0.76 GB/s(聚合 4 / 29 / 78 /
    `[E][K/2][N]` K-major 权重 + 2 字节步长的激活;我们用 `[E][N][K/2]`。把 K-major 真正接进
    decode 引擎会让激活访存由"32 行跨 K strided"变为连续,**改变的是访存次数而非指令数**——
    这与实验 2"指令路径已封顶"的结论方向一致。
+
+## 113. 【本轮决定性发现】每层 4-5 个并行区 × **113 µs 固定同步开销** = 2× 差距的真正来源;内核无罪
+
+### 起因:原以为 0.25 ms 的 gather 是"串行 memcpy"
+`forward_many_nsliced` 的 gather(把每个专家的 me 行激活搬到连续 `xg`)原是**串行 for**
+(12 专家 × me=3 行 × hidden*2=8KB = 288 KB 单线程),而同一时刻其余 ~119 线程在下一个
+barrier 上空等;`[setup-prof]` 报 gather=237-267 µs(每层 1.19 ms 的 21%),
+A 相却已能跑到 210 GB/s ⇒ 怀疑是纯延迟。
+
+### 改动 1:gather 并行化(保留)
+按 assignment 分 job(`NASS` 个,每个搬一行 8 KB),用 `inst_idx_[ai]` 定位 expert 内行号,
+与串行版**逐字节等价**。数值对拍 `scripts/test_block23_equiv.py`:me=2 / me=3 / 混合 / me=4..7
+全部 OK(me=1 的 1.87e-2 是既有的 NR=8 fp32 重结合偏差,与本改动无关)。
+同 session 交替三对:P(并行)=**1.13 / 1.19 / 1.12**,S(串行)=**1.20 / 1.25 / 1.29** ms/层
+⇒ 并行略优且从不更差,保留为默认;诊断开关 `XIAOTU_MOE_SERIAL_GATHER=1` 保留可回退。
+
+### 改动 2:三段打点 + **空 body 探针**(决定性的)
+把 A2 拆成 `resize / gather / nc_sub` 三段,并加 `XIAOTU_MOE_NOOP_GATHER=N`
+(保留 pfor 派发、body 为空,重复 N 次)。实测(BS=6/DEDUP=12/THREADS=120):
+
+| NOOP_GATHER | 报出的 gather | 每区开销 | 层时间 |
+|---|---|---|---|
+| 1 | 177 µs | 177 µs | 1.19 ms |
+| 10 | 1140 µs | 114 µs | 2.16 ms |
+| 50 | 5670 µs | 113 µs | 6.62 ms |
+
+**空 body、36 个 job 的 `pfor` 每次要 113-177 µs**,且层时间**精确线性**(每加一个区 +110 µs)。
+时钟本身已核验:`steady_clock::now()` = 25.8 ns/次(`/tmp/clk.cpp`),不是计时伪影。
+并行/串行/空体三种 gather 的墙上时间在噪声内无差异(1.13-1.31 ms)⇒
+**那 237 µs"gather"根本不是 memcpy 的数据搬运**。
+
+### 根因(`numa_pool.hpp:884`)
+worker 每次锚定新 generation 都要抢**全局 `work_mtx_`**:
+```cpp
+have_work:
+    { std::lock_guard<std::mutex> lk(work_mtx_);   // ← 120 个 worker 争用同一个 futex 互斥
+      gen = current_gen_.load(); ... lf_ = pub_flat_; n = n_; start = start_; ... }
+```
+120 个 worker × 争用同一把互斥锁 ≈ 113 µs/区。锁内只做**读**,但作者的发布顺序注释说明它防的是
+"worker 读到新 gen 却读到旧字段"的竞态(§88 系列曾因顺序错误直接挂死),所以不能简单删锁。
+
+### 为什么这一条解释了全部历史证据
+- A 相 0.48 ms(100 MB)与 B 相 0.33 ms(50 MB)各自包含一个 ~113 µs 区 ⇒
+  扣掉后 A≈294 GB/s、B≈263 GB/s —— **正好等于 lk 的 265 GB/s**。
+- 每层约 4-5 个区(gather / A / B / C…)× 113 µs ≈ **0.45-0.57 ms**,加上真实访存 ~0.57 ms
+  ≈ 实测 1.19 ms。lk 是"3 barriers"且每 barrier 只有几 µs。
+- **推论:过去所有针对内层内核的尝试(字节数、指令形状、ILP、bf16 点积、布局、预取、
+  分块、线程数、NUMA 映射)全部无效是必然的——时间从来不在内核里。**
+  §109 的"同 TU 内 bf16 = 1.98×"在引擎里只 +1.7% 也由此完全解释。
+
+### 下一轮的唯一正确方向(按优先级)
+1. **把锚定路径去锁**:per-worker 发布槽(worker w 只轮询**自己 cacheline 上**的
+   `wstate_[w]{gen,fn,ctx,n,start}`,由 master 在区内顺序写 120 份 <1 µs),
+   或双缓冲不可变 `CallState` 指针。目标是 113 µs → <5 µs。
+   预期:1.19 → **0.65-0.75 ms/层**,直接命中 ≤0.7 ms 验收。
+2. 减少每层并行区个数(C 合进 B、gather 合进 A)——在 1 修好前收益有限(每区省 113 µs)。
+3. 只有当 1、2 都做完且仍不达标,才回到内核(届时用 lk 的 K-major 布局)。

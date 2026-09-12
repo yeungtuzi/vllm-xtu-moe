@@ -752,6 +752,7 @@ public:
 
         // Gather contiguous per-expert input rows and size the output buffers.
         // resize() only grows capacity; steady state reuses it (no allocation).
+        static const bool _nogather = std::getenv("XIAOTU_MOE_NOGATHER") != nullptr;
         for (int e : active_) {
             ExpBuf& g = exp_[e];
             size_t me = g.ai_list.size();
@@ -760,14 +761,47 @@ public:
             g.act.resize(me * (size_t)inter);
             g.abf16.resize(me * (size_t)inter);
             g.down.resize(me * (size_t)hidden);
-            static const bool _nogather = std::getenv("XIAOTU_MOE_NOGATHER") != nullptr;
-            if (_nogather) continue;   // 计时诊断:跳过 gather(数值无效),量收益上限(NOTES §89)
-            for (size_t m = 0; m < me; ++m) {
-                size_t t = g.ai_list[m] / (size_t)k;
-                std::memcpy(g.xg.data() + m * (size_t)hidden, input + t * (size_t)hidden,
-                            (size_t)hidden * sizeof(uint16_t));
-            }
         }
+        // 轮 67【并行 gather】:原来是**串行 for**(见 NOTES §113)。12 个专家 x me=3 行
+        // x hidden*2=8KB = 288 KB 的单线程 memcpy,把整段 DRAM 延迟暴露在关键路径上,
+        // 同一时刻其余 ~119 个线程在下一个 barrier 上空等。实测 [setup-prof]
+        // gather=267 us/层 = 每层总时间(1.19 ms)的 21%,而 A 相本身能跑到 210 GB/s,
+        // 说明这段是纯延迟、不是带宽。改成按 assignment 并行(每个 job 搬一行 8 KB,
+        // 共 NASS=BS*K 个 job),用 inst_idx_ 定位该 assignment 在专家内的行号,
+        // 与串行版**逐字节等价**(同一地址、同一长度、同一数据)。
+        auto _suB2 = std::chrono::steady_clock::now();
+        if (!_nogather) {
+            // 对照开关:XIAOTU_MOE_SERIAL_GATHER=1 回到旧的串行 gather(逐字节同结果),
+            // 用于在同一 session 内做串行 vs 并行的真实 A/B(避免跨窗口漂移)。
+            static const bool _serialg = std::getenv("XIAOTU_MOE_SERIAL_GATHER") != nullptr;
+            static const bool _noopg = std::getenv("XIAOTU_MOE_NOOP_GATHER") != nullptr;
+            if (_noopg) {
+                // 计时诊断:保留 pfor 派发、body 为空 ⇒ 量出"并行区派发+同步"的固定开销。
+                // 若此值 ≈ gather 实测值,则引擎的时间不是花在访存上而是花在同步上。
+                // 值 N>1 时重复 N 次:用于判定该开销是"每区一次"还是"每次调用固定"。
+                static const long _np = std::max<long>(1, std::atol(std::getenv("XIAOTU_MOE_NOOP_GATHER")));
+                for (long _i = 0; _i < _np; ++_i) pfor(NASS, [&](size_t) {});
+            } else if (_serialg) {
+                for (int e : active_) {
+                    ExpBuf& g = exp_[e];
+                    const size_t me = g.ai_list.size();
+                    for (size_t m = 0; m < me; ++m) {
+                        const size_t t = g.ai_list[m] / (size_t)k;
+                        std::memcpy(g.xg.data() + m * (size_t)hidden, input + t * (size_t)hidden,
+                                    (size_t)hidden * sizeof(uint16_t));
+                    }
+                }
+            } else
+            pfor(NASS, [&](size_t ai) {   // 计时诊断:XIAOTU_MOE_NOGATHER=1 跳过(数值无效)
+                const uint32_t eid = expert_ids[ai];
+                if (eid >= (uint32_t)nel || weights[ai] == 0.f) return;
+                const size_t m = inst_idx_[ai];
+                const size_t t = ai / (size_t)k;
+                std::memcpy(exp_[eid].xg.data() + m * (size_t)hidden, input + t * (size_t)hidden,
+                            (size_t)hidden * sizeof(uint16_t));
+            });
+        }
+        auto _suG = std::chrono::steady_clock::now();
         const size_t na = active_.size();
 
         // Number of N-chunks per active expert (~4x jobs/thread, coarse ~128 rows).
@@ -841,17 +875,21 @@ public:
         exp_off_[0] = 0;
         for (size_t e_idx = 0; e_idx < na; ++e_idx)
             exp_off_[e_idx + 1] = exp_off_[e_idx] + exp_[active_[e_idx]].ai_list.size() * (size_t)nc_gu;
-        {   // A2 内部两段打点(XIAOTU_MOE_SETUP_PROF=1;NOTES §88.1 的正确锚点)
+        {   // A2 四段打点(XIAOTU_MOE_SETUP_PROF=1;NOTES §88.1/§113 的正确锚点)
             static const bool _sp = std::getenv("XIAOTU_MOE_SETUP_PROF") != nullptr;
             if (_sp) {
                 auto _suC = std::chrono::steady_clock::now();
-                static double s_pre = 0, s_gath = 0; static int s_n = 0;
-                s_pre += std::chrono::duration<double, std::milli>(_suB - _suA).count();
-                s_gath += std::chrono::duration<double, std::milli>(_suC - _suB).count();
+                static double s_pre = 0, s_res = 0, s_gath = 0, s_nc = 0; static int s_n = 0;
+                s_pre  += std::chrono::duration<double, std::milli>(_suB - _suA).count();
+                s_res  += std::chrono::duration<double, std::milli>(_suB2 - _suB).count();
+                s_gath += std::chrono::duration<double, std::milli>(_suG - _suB2).count();
+                s_nc   += std::chrono::duration<double, std::milli>(_suC - _suG).count();
                 if (++s_n % 40 == 0) {
-                    fprintf(stderr, "[setup-prof] n=%d per-call(us): pre_bookkeeping=%.1f gather=%.1f total=%.1f\n",
-                            s_n, s_pre / s_n * 1e3, s_gath / s_n * 1e3, (s_pre + s_gath) / s_n * 1e3);
-                    s_pre = s_gath = 0; s_n = 0;
+                    fprintf(stderr, "[setup-prof] n=%d per-call(us): pre_bookkeeping=%.1f resize=%.1f "
+                            "gather=%.1f nc_sub=%.1f total=%.1f\n",
+                            s_n, s_pre / s_n * 1e3, s_res / s_n * 1e3, s_gath / s_n * 1e3,
+                            s_nc / s_n * 1e3, (s_pre + s_res + s_gath + s_nc) / s_n * 1e3);
+                    s_pre = s_res = s_gath = s_nc = 0; s_n = 0;
                 }
             }
         }
