@@ -11,8 +11,16 @@
   ENG=lk LK_THREADS=120 CUDA_VISIBLE_DEVICES=0 XIAOTU_LAYER1_NPZ=<model> BS=6 DEDUP=12 REP=60 \
     /home/user/anaconda3/envs/lvllmds4-x/bin/python scripts/bench_engine_ab.py
 
-基线值(2026-09-11,BS=6/DEDUP=12/THREADS=120):xiaotu 1.22 ms/层(124 GB/s),
-lk 0.57 ms/层(265 GB/s)⇒ 目标 ≤0.7 ms/层、每线程 ≥2.2 GB/s(NOTES §73/§74、R33/R34)。
+基线值(BS=6/K=6/THREADS=120/真实层权重):
+  起点 2026-09-11:DEDUP=12 xiaotu **1.22** ms/层(124 GB/s)vs lk 0.57 ms/层(265 GB/s)
+  现在(轮 67-73 之后):DEDUP=12 xiaotu **0.66-0.68** ms/层(229 GB/s、1.9 GB/s·线程)
+                       DEDUP=23 xiaotu 0.82-0.85 ms/层 vs lk 0.67
+  ⇒ 验收 ① `≤0.70 ms/层` **已达标**;`每线程 ≥2.2 GB/s` 在 DEDUP=12 差 15%(已完整归因:
+  内核向量化维度,lane=K vs lk 的 lane=输出列;服务端真实形状 na≈32 时已达 2.92 GB/s·线程
+  超过 lk)。结论鏈见 report/tuning/NOTES.md §113-§128。
+
+**门禁**:`scripts/check_engine_aligned.sh` 一条命令跑"数值对拍 + 本基准"(R55:任何动
+numa_pool 同步结构或内层循环的改动都必须先过对拍,轮 68/70 两次事故都是 bench 全过而对拍挂)。
 
 原 docstring: CPU xiaotu engine microbench: per-layer cost vs batch size (real weights).
 

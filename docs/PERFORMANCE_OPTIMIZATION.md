@@ -768,3 +768,17 @@ L=128 C=1 N=4 OUT=128 TAG=mine scripts/bench_nat_client.py   # 或 scripts/run_n
 
 差距 2.0×+ → **~1.2×**;数值门禁 `test_block23_equiv.py` 7 OK。
 剩余:相位效率 229 → 265 GB/s(1.16×),以及服务端 TPOT 验收。
+
+
+## 【第 82 轮】回归门禁落地 + 服务端 TPOT 的硬件上限
+
+**门禁**(验收③完成):`scripts/check_engine_aligned.sh` 一条命令跑
+`test_block23_equiv.py`(数值,需 7 OK)+ `bench_engine_ab.py`(性能,DEDUP=12,≤0.70 ms/层),
+实测 **0.65-0.67 ms/层 ⇒ 通过**。两项检查用不同 fixture(`NPZ_EQ`/`NPZ`)。
+
+**服务端 TPOT=57.8 ms 的构成**(`XIAOTU_CD_TIMING=1`,新引擎):
+`compute 1.25 + rest 0.77 = 2.02 ms/层` × 43 层 ÷ 1.5 个被接受投机 token ≈ 57.9 ms。
+要到 ~20 ms 需每层 ≤0.70 ms,而 compute 单项已 1.25 ms —— 且引擎在 na≈32 已达
+**350 GB/s = 2.92 GB/s·线程(超过 lk 的 2.2)**。⇒ 只能靠 GPU 常驻层,但每层专家 3.2 GB、
+43 层共 138 GB,单卡 40 GB 只剩 8.99 GB ⇒ 最多 2 层;TP=2 约 25 层 ⇒ 下限 ~24 ms。
+**结论:CPU 引擎已对齐(基准 ms 达标、服务端形状每线程超 lk);~20 ms 受显存容量限制。**
