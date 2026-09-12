@@ -4777,3 +4777,20 @@ spec_decode_num_accepted_tokens_per_pos_total{position="1"} =  58
 | **1M 上下文** | KV = **29.4 GiB**(29.4 KB/token,§160)⇒ 单卡 40 GB 装不下,必须 TP=2 |
 ⇒ **修好 TP=2 是第二条的单一最高优先级**;它的失败模式已记录(§146:关 EAGER 预热 shm 卡死;
 开 EAGER worker 静默原生崩溃;关常驻层也复现 ⇒ 不是常驻层独因)。
+
+## 162. 第 110 轮:TP=2 二分启动 + **把 M8 工具化**(`scripts/kill_serve.sh`)
+
+### M8 第三次复发(必须工具化)
+本会话第 3 次因为 `pkill -f "vllm serve"`/等价匹配**杀掉了调用者自己**:
+第 96 轮、第 102 轮、第 110 轮(这次是 `python3` 脚本按整条 cmdline 匹配,
+而调用它的 bash 的 cmdline 里含 heredoc 文本 ⇒ 自己命中;括号技巧也无效,
+因为真实调用 `vllm serve <path>` 就在同一条命令行里)。
+⇒ 新增 **`scripts/kill_serve.sh`**:只检查 `/proc/<pid>/cmdline` 的 **argv[0]**
+(是否为本环境 `bin/` 下的可执行文件)+ argv 含 `serve`,并**显式排除自身与所有祖先进程**;
+杀完自动 `sleep 22` + 打印各卡显存 + 清 `/dev/shm/xiaotu_ep_*.bin`(顺带治 M9)。
+复盘文档里"记录≠免疫,必须工具化"这条现在有了第 3 个实例与对应工具。
+
+### TP=2 二分(本轮开始)
+按 §161,先测**最小组合**:`TP=2 + EAGER + 无投机 + 无常驻 + KV 8 GiB + maxlen 262144`
+(此前每次 TP=2 都带投机,**这个变量从未被隔离**)。启动中,尚无 OOM/崩溃。
+后续按顺序加回:**① 投机 → ② 常驻层 → ③ CUDA graph**,逐步定位崩溃点。
