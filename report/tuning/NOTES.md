@@ -4328,3 +4328,32 @@ kill 服务器后仅等 5 s 就重启 ⇒ 新进程看到 GPU0 只剩 7.42/39.49
 TP=1 下 `XIAOTU_MOE_RESIDENT_BUDGET_GB` 之前只给了 12 GB(≈3.7 层);GPU0 启动时空闲 38.75 GiB
 ⇒ 提到 **24 GB(≈7 层)** 再叠加 KV 8 GiB 仍有余量。先按此测量**预填充/C=1 解码/C=2 吞吐**,
 再横向扫 `budget`、`XIAOTU_MOE_PREFETCH_SLOTS`、`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS`、spec tokens。
+
+## 145. 第 97 轮:第二条的显存"精确账"与三处失败(供下一轮直接用)
+
+### 显存精确账(TP=1,A100-40G,实测)
+| 项 | 值 | 来源 |
+|---|---|---|
+| 启动时空闲 | **38.75 GiB** | worker 日志 |
+| 固定开销(非专家权重 + 工作区) | **≈14.2 GiB** | OOM 明细反推 |
+| 每常驻层(TP=1) | **3.19 GiB** | `resident try ... used=22.31`(7 层) |
+| 每常驻层(TP=2/rank) | **1.59 GiB** | `GPU-resident ... (tp=2, experts=128)` |
+| 预热额外需要 | **≈2-3 GiB** 余量 | 20 GB 预算(19.1 GiB)仍在 warmup 阶段失败 |
+
+⇒ TP=1 可常驻层数上限 ≈ `(38.75 - 14.2 - KV - 3)/3.19`:
+- KV 8 GiB → **约 4 层**;KV 2 GiB → 约 6 层(实测 7 层=22.31 GiB **OOM**)。
+- 也就是说:**"常驻层 vs KV"在单卡上是硬性二选一**,这也再次印证双卡的价值在于"总量翻倍后再二分"。
+
+### 本轮三处失败(都不是"贴上限",而是配置/内存)
+1. **TP=2 关 EAGER**:KV 分配后 worker 不消费 shm 广播 ⇒ 预热卡死到 RPC 超时(≈317 s)。
+2. **TP=2 开 EAGER**:worker 在禁用 torch.compile 后**静默原生崩溃**;`XIAOTU_MOE_EP=0` 不修复 ⇒ 相对 §54/§56 是回归。
+3. **TP=1 常驻 7 层(预算 24, KV 8 或 2)**:GPU OOM(实测余 937 MB 时还要 2 GiB)。
+4. **TP=1 常驻 6 层(预算 20, KV 2)**:失败于 `RuntimeError: torch_call_dispatcher("aten::empty", "memory…")`
+   ⇒ 指向 **pinned host 缓冲分配**(我们的 GPU-prefill 预填充会建 pinned 的 K-major 权重缓冲),
+   而非 GPU OOM —— 下一轮应先查 `ulimit -l` / `MemLock` 上限与 `XIAOTU_MOE_PREFETCH_SLOTS`/pinned 预建规模。
+
+### 当前状态
+已把 8070 恢复到**已知可用**配置(TP=1 + 常驻 0-5 + 预算 12 + KV 8 GiB + EAGER),启动中。
+下一轮第一件事:等它就绪后测 **预填充(L=32768,C=1,TTFT→t/s)/ C=1 解码 / C=2 吞吐**;
+并生成缺失的数据集(`report/tuning/datasets/` 现有 32/128/512/1024/4096,**缺 8192 与 32768**,
+用 `LENS="8192 32768" N=8 scripts/make_nat_dataset.py` 生成)。
