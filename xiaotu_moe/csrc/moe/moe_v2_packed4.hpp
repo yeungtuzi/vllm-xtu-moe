@@ -341,10 +341,33 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         thread_local std::vector<float> a32_storage;
         if (a32_storage.size() < (size_t)M * (size_t)K) a32_storage.resize((size_t)M * (size_t)K);
         float* a32 = a32_storage.data();
+        // 【轮 80】诊断:量 a32 转换(bf16->fp32)到底吃掉多少 CPU 时间。
+        // 动机:该转换**每个 (expert, 列切片, matmul) 调用都重转整个 M x K 块**(与列切片无关),
+        // 同一块被重复转 2*subA+subB ~= 32 次;总工作量 ∝ NASS*subA*K = **与 na 无关**,
+        // 正好匹配 §126 拟合出的"固定项 0.383 ms"。XIAOTU_MOE_A32_PROF=1 打开。
+        static const bool _a32p = std::getenv("XIAOTU_MOE_A32_PROF") != nullptr;
+        const auto _a32_t0 = _a32p ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
         for (int mi = 0; mi < M; mi++) {
             const uint16_t* a_row = arow_at(mi);
             float* p_row = a32 + (size_t)mi * K;
             for (int k = 0; k < K; k++) p_row[k] = bf16::bf16_to_fp32(a_row[k]);
+        }
+        if (_a32p) {
+            static thread_local uint64_t l_ns = 0, l_n = 0;
+            l_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - _a32_t0).count();
+            static const uint64_t _every = [] {
+                const char* e = std::getenv("XIAOTU_MOE_A32_EVERY");
+                const long v = e ? std::atol(e) : 0;
+                return (uint64_t)(v > 0 ? v : 400);
+            }();
+            if (++l_n % _every == 0) {
+                static uint64_t g_ns = 0;
+                const uint64_t tot = __atomic_fetch_add(&g_ns, l_ns, __ATOMIC_RELAXED) + l_ns;
+                fprintf(stderr, "[a32-prof] thread avg=%.2f us/call  global_total=%.2f core-ms\n",
+                        (double)l_ns / (double)l_n / 1e3, (double)tot / 1e6);
+            }
         }
         // E2M1 -> BF16 byte LUTs (same values as packed4::E2M1, APACHE-2.0 ktransformers).
         alignas(16) static constexpr uint8_t fp4_bf16_lo[16] = {
