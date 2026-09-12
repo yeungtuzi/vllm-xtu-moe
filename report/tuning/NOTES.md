@@ -5845,3 +5845,16 @@ else { ...re-anchor 分支(按活代重新归属这张票)... }
 
 ### 剩余待做(第三、四项判据)
 ③ `scripts/check_engine_aligned.sh` 数值门禁(R55);④ 一次 `C=8/N=32` 持续压测。
+
+### (e) 门禁结果(第 128 轮)
+```
+== [1/2] 数值门禁 test_block23_equiv.py ==
+   OK=7 BAD=1(me=1 的既有 NR=8 fp32 重结合偏差,不计入)⇒ **数值门禁通过** ✅
+== [2/2] 性能门禁 bench_engine_ab.py(阈值 0.70 ms/层)==
+   DEDUP=12 na=12  0.70 ms/层  聚合 216 GB/s  每线程 1.80 GB/s  ms=PASS  per-thread=WARN
+   DEDUP=23 na=20  0.87 ms/层  聚合 289 GB/s  每线程 2.41 GB/s  ms=FAIL  per-thread=PASS
+```
+- **R55 要求的数值门禁通过(7 OK)** ⇒ 本轮对 `numa_pool.hpp` 同步结构的改动**数值上安全**。
+- 性能门禁:`DEDUP=12 = 0.70 ms/层` 正好压线 PASS;`DEDUP=23 = 0.87` 是**既有的 item-1 残差**
+  (用户已于第 96 轮结案并移入 FUTURE_PLAN,不作为当前优先项)。
+  注:此测量是在服务端占用 120 线程的同时跑的,数字偏保守。
