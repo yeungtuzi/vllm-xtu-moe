@@ -218,7 +218,12 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                                  // 读"按 token 去重"的输入缓冲,不必先把每个专家的激活行
                                  // gather 成连续的 xg —— 省掉一整段 memcpy **和一个完整的并行区**。
                                  // 下游全部走 a32(由下面的转换点一次性建成),所以只需改行基址。
-                                 const uint32_t* rowmap = nullptr) {
+                                 const uint32_t* rowmap = nullptr,
+                                 // 【轮 85】a32_in != nullptr 时直接复用已转好的 fp32 激活(跳过转换),
+                                 // a32_out 非空则回传本次所用缓冲的指针。gate 与 up 两次 matmul 读的是
+                                 // **同一块激活**,原来各转一遍 ⇒ 转换次数减半(§131 处方第 1 步)。
+                                 // 不做"跨 job 缓存":rowmap 内容每层都会被重写,按指针做键会陈旧。
+                                 const float* a32_in = nullptr, float** a32_out = nullptr) {
     auto arow_at = [&](int i) -> const uint16_t* {
         return A + (size_t)(rowmap ? rowmap[i] : (uint32_t)i) * (size_t)K;
     };
@@ -346,6 +351,10 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         // 同一块被重复转 2*subA+subB ~= 32 次;总工作量 ∝ NASS*subA*K = **与 na 无关**,
         // 正好匹配 §126 拟合出的"固定项 0.383 ms"。XIAOTU_MOE_A32_PROF=1 打开。
         static const bool _a32p = std::getenv("XIAOTU_MOE_A32_PROF") != nullptr;
+        if (a32_in) {                       // 【轮 85】复用同一 job 上一次的转换结果
+            a32 = const_cast<float*>(a32_in);
+            if (a32_out) *a32_out = a32;
+        } else {
         const auto _a32_t0 = _a32p ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point{};
         for (int mi = 0; mi < M; mi++) {
@@ -353,6 +362,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
             float* p_row = a32 + (size_t)mi * K;
             for (int k = 0; k < K; k++) p_row[k] = bf16::bf16_to_fp32(a_row[k]);
         }
+        if (a32_out) *a32_out = a32;
         if (_a32p) {
             static thread_local uint64_t l_ns = 0, l_n = 0;
             l_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -369,6 +379,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                         (double)l_ns / (double)l_n / 1e3, (double)tot / 1e6);
             }
         }
+        }   // end else (a32_in == nullptr)
         // E2M1 -> BF16 byte LUTs (same values as packed4::E2M1, APACHE-2.0 ktransformers).
         alignas(16) static constexpr uint8_t fp4_bf16_lo[16] = {
             0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
@@ -1055,10 +1066,13 @@ struct Packed4WeightTraitsBase
         const float gs = w13_gs ? w13_gs[eid] : 1.0f;
         // both_buf rows are strided by n2; indices [n0,n1) = gate chunk and
         // [inter+n0, inter+n1) = up chunk, both over ALL me rows at once.
+        float* a32_reuse = nullptr;       // 【轮 85】让 up 复用 gate 已经转好的激活
         packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, base, LUT, sbase, gs, both_buf,
-                                            me, n2, hidden, groupN, groupK, n0, n1, 0, rowmap);
+                                            me, n2, hidden, groupN, groupK, n0, n1, 0, rowmap,
+                                            nullptr, &a32_reuse);
         packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, base, LUT, sbase, gs, both_buf,
-                                            me, n2, hidden, groupN, groupK, inter + n0, inter + n1, 0, rowmap);
+                                            me, n2, hidden, groupN, groupK, inter + n0, inter + n1, 0, rowmap,
+                                            a32_reuse, nullptr);
     }
 
     static void down_slice_batch_impl(int me, const uint16_t* actg, const void* w2, const void* w2_g,
