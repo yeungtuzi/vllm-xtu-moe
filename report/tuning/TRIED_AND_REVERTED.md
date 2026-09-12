@@ -576,3 +576,13 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 | R88 | draft 3 层常驻 + KV 4 GiB 但 maxlen 仍 262144 | **失败原因是配置校验而非内存**:`7.19 GiB KV needed > 4.0 GiB`。**改 KV 必须同步改 maxlen**(29.4 KB/token 硬绑定)。不要把它当成"显存不足"记 |
 
 | R89 | TP=2 + 11 个目标层常驻(预算 18 GB) | **推理时 OOM**:`Triton Error [CUDA]: out of memory`(engine 在第一个请求上死)。固定 7.1 + KV 8 + 17.5 = 32.6 GiB/卡 ⇒ 留给 Triton 预填充内核/autotune 的 <7 GiB 不够。**Triton 工作区是常驻层数的实际上限**(TP=2/maxlen262144 下约 8-9 层) |
+
+## R90. TP=2 长上下文(32K)后 `persistent_topk` 非法访存致 EngineCore 死亡
+- **配置**:TP=2 + 8 常驻层 + V1 runner + execute-timeout 3600,`max_num_batched_tokens=8192`。
+- **现象**:32K tokens 预填充(客户端 TTFT 36.1 s)之后,Worker_TP0 在
+  `sparse_attn_indexer → persistent_topk` 抛
+  `occupancy query failed: an illegal memory access was encountered`,
+  紧接着 EngineCore 因 dequeue 超时 `RuntimeError: cancelled`,服务端 500,引擎退出。
+- **不是**:Triton workspace OOM(R89 的那种)、也不是显存不足(GPU 0/1 = 38.2/40 GiB,无 OOM 报错)。
+- **状态**:**未解决**,已列入下一轮第一优先级;在定位前,**不要把 32K 以上长预填充当成可用能力**,
+  也不要把它写进交付配置。

@@ -4936,3 +4936,48 @@ VLLM_USE_V2_MODEL_RUNNER=0 \
 1. 补测 TP=2 的 `[gp-h2d] per_layer`(多跑几轮 32K,或看打印条件),确认 H2D 是否已是瓶颈;
 2. 若 H2D 仍是瓶颈 ⇒ 扫 `XIAOTU_MOE_PREFETCH_SLOTS`(2→3/4)与 `XIAOTU_GPU_PREFETCH_AHEAD`;
 3. 顺带核对 `_resident` 为真的层是否会**打断下一层的预取**(8 个常驻层可能造成 8 次流水线排空)。
+
+## 167. 第 116 轮:**§166 的 1053 t/s 是被污染的错数**;热态 TP=2 预填充 8192=1934 t/s、32768=908 t/s(超线性);32K 后 `persistent_topk` 非法访存崩溃
+
+### (a) §166 的数字作废
+- 原报"32768 = 1053 t/s":那次是**首次推理**,日志 06:30:58 有两条
+  `WARNING jit_monitor.py: Triton kernel JIT compilation during inference: ComputePrefillMetadataKernel /
+  BuildPrefillChunkMetadataKernel. This causes a latency spike` ⇒ **首轮包含运行期 JIT/autotune**,不是稳态。
+- §166 引用的"引擎窗口 3276.9 t/s"**也不可信**:`loggers.py` 的窗口吞吐用"两次 logging 调用之间的
+  实际 elapsed"作分母,长请求把 logging 调用推迟时,分子是几十秒累计的 token、分母只有部分时间
+  ⇒ **长请求突发时该指标会高估**。同一次运行里 8192 那轮窗口值是 409.7 t/s,而客户端实测 1934 t/s,
+  相差 4.7×,可证该指标在此场景不可用作分母口径。**结论:预填充速率一律以客户端 TTFT 为准。**
+
+### (b) 热态实测(客户端 TTFT,同窗口连发)
+| 请求 | TTFT | 速率 |
+|---|---|---|
+| 8192 tokens | 4235 ms | **1934 t/s** |
+| 32768 tokens | 36075 ms | **908 t/s** |
+⇒ 32768/8192 = **4× token 但 8.5× 时间**,**超线性**。DMA 模型预测 32K 应为 4×2.63 s = 10.5 s,
+实测 36.1 s ⇒ 有 **~25 s 无法用专家权重 DMA 解释**,必须另找(Triton chunked-prefill 元数据、
+稀疏 indexer 的 O(n²) 项、或每块重复的固定开销)。
+
+### (c) DMA 模型(TP=2,已与硬件吻合,作为后续判据)
+- 每 rank 每层常驻规模:`1.59 GiB / 128 experts = 12.7 MB/expert`(即**每 rank 持有 128 个完整 expert**)。
+- `[gp-h2d] per_layer=75.3 / 79.3 ms` ⇒ 1.61 GB / 75.3 ms = **21.4 GB/s**(PCIe Gen4 x16 实测上限量级)。
+- 35 非常驻层 × 4 块 × 75.3 ms = **10.5 s**;8192 一块 = **2.63 s** vs 实测 4.24 s ⇒ 8192 档
+  **≈62% 被 DMA 解释**,重叠(`hybrid_model.py:857` + side stream)**确实在生效**。
+  ⇒ **预填充的主杠杆是"减少要搬的 expert 字节数"**(常驻层数 / 权重位宽),不是核函数调优。
+
+### (d) **新失败模式:`persistent_topk` 非法访存(与之前的 Triton OOM 不同)**
+```
+Worker_TP0 ... RuntimeError: launch_persistent_topk, /workspace/csrc/libtorch_stable/topk.cu:107,
+  persistent_topk occupancy query failed: an illegal memory access was encountered
+```
+调用栈:`layer → attn → _sparse_indexer_and_attn → indexer_op → sparse_attn_indexer → persistent_topk`。
+- 发生在 32K 预填充之后(06:35:44),随后 EngineCore 因 dequeue 超时报 `RuntimeError: cancelled`(次生)。
+- `occupancy query` 里的 illegal access 通常是**粘性 CUDA 错误**:真正的越界写发生在**更早的某个核**,
+  在这里的同步点才暴露 ⇒ 不能只盯 topk,必须查 32K 路径上**前面**写显存的核
+  (首选嫌疑:常驻层的预取/`PrefetchSlot` 环、Triton chunked-prefill 元数据核)。
+- 这直接威胁 **1M 上下文可用**这一条目标,必须先定性。
+
+### 下一轮(待办,优先级最高)
+1. 重启后 **resident=0** 跑同一 32K 请求:若仍崩 ⇒ 主line 稀疏 indexer/长上下文自身的问题;
+   若不崩 ⇒ **常驻层预取路径在长上下文下越界**,那把 `XIAOTU_MOE_PREFETCH_SLOTS`/`_resident` 作为嫌疑点。
+2. `CUDA_LAUNCH_BLOCKING=1`(或 `XIAOTU_GP_TIMING` 加同步点)定位**首个**越界核。
+3. 查为什么 32K 比 DMA 模型慢 3.4×(先量化 chunked-prefill 每块固定开销)。
