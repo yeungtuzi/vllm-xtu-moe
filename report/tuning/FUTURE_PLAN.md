@@ -80,3 +80,23 @@
 建议 `_toks = max(EP_SHM_TOKENS, gp_min-1)`(gp_min>0 时)并加一次 warning;
 **纯 CPU 模式(gp_min=0)不应按 8192 预分配**(stride 134 MB × 43 层 × 2 rank ≈ 11.5 GB /dev/shm),
 回退即正确(引擎 `binding.cpp:440 if (bytes <= ep->capacity)` + `hybrid_model.py:983` 双门禁)。
+
+### P0 更新(第 120 轮末,方向已换)
+**已否证的假设增至 6 个**:①Triton OOM/常驻(R91);②常驻是预填充杠杆(R91);
+③我的热路径埋点(R93);④EP shm 双 barrier(R121);⑤陈旧 `node_base_` 读(R94);
+⑥"递减被世代守卫跳过"(**§179**:`skipped_dec` 读数为 1/0,与缺口不匹配)。
+**同时确认两个"基线噪声"**:`miss=1` 与 `abandoned = #workers(=120)` —— 都**不是**丢票证据,
+不得再据此改代码(NOTES §174b/§179b)。
+
+**当前唯一真信号**:`exec` 的缺口。`diag2_a2` 的 `total=128 / exec=126 / rem=2`
+⇒ 2 个被计入的任务被领走后**既没执行、也没走到任何 break**
+⇒ 持票 worker **卡在任务体 `sf_(...)` 内,或阻塞在 re-anchor 的 `work_mtx_` 上**。
+⇒ **不要再查票据/世代/递减协议**,改查任务体里会长时间阻塞的东西。
+
+**下一轮具体三步(按成本排序)**:
+1. **最便宜判别实验**:`XIAOTU_MOE_THREADS=120 → 32`,跑同一复现序列。
+   若是 GIL/锁竞争 ⇒ 触发概率显著变化;若是纯越界/计算错 ⇒ 不变。
+2. **直接证据**:在任务体入口/出口各加一个计数器(`entered`/`left`),看门狗 dump 里打印
+   两者之差 = "进了没出"的 worker 数,把 §179(d) 的推断变成事实。
+3. 若指向 GIL:检查 CPU MoE shard 回调是否在持 GIL 的情况下做长耗时操作,
+   以及主线程(torch/采样)是否有长时间持 GIL 的段落。
