@@ -5568,3 +5568,45 @@ std::lock_guard<std::mutex> lk(work_mtx_);   // ← 这条路径上唯一可能�
    再取 `work_mtx_` 的路径)是否存在**锁序反转**(`done_mtx_` ↔ `work_mtx_`)。
 4. 备选(与锁无关的可能):该 worker 被**长期抢占**(120 线程 + OMP 48 + 其它进程),
    ⇒ 用 `XIAOTU_MOE_THREADS=32` 做判别实验:触发概率显著下降即为此因。
+
+## 183. 锁图审计:`work_mtx_` 无嵌套、不是死锁;但发现 **flat 路径同型缺陷**(我上一轮只修了分片路径)
+
+### (a) 锁图(全部 `work_mtx_`/`done_mtx_` 持有者)
+| 位置 | 持锁 | 说明 |
+|---|---|---|
+| :432 | `call_mtx_` | 整个调用串行化 |
+| :439 / :663 | `work_mtx_` | flat 发布 / 分片发布 |
+| :487 / :707 | `done_mtx_` + `done_cv_.wait_until` | 调用方等待(等待时释放) |
+| :904 | `work_mtx_` + `cv_.wait` | worker 外层 anchor(等待时释放) |
+| :977 / :1018 | `done_mtx_` | 递减到 1 后 notify |
+| :991 / :1058 | `work_mtx_` | 分片 re-anchor / flat re-anchor |
+**结论:`work_mtx_` 与 `done_mtx_` 从未嵌套持有**(每个 `lock_guard` 都在独立作用域内),
+⇒ **§182c 的"`work_mtx_` 长期持有/锁序反转"假设不成立**。锁本身是干净的。
+(`:1038-1040` 的注释还专门解释了"必须持 `done_mtx_` 才能 notify"以避免丢唤醒 —— 作者已处理过这一层。)
+
+### (b) 但审计暴露了**两处真实缺陷**(都在 **flat** 路径,我上一轮没改)
+1. **`:1044-1048`**:与模式 A 完全同型的"领票后世代守卫"——
+   ```cpp
+   if (current_gen_.load(std::memory_order_acquire) != gen) continue;  // 跳过递减!
+   if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) { ...notify... }
+   ```
+   票据已从 `counter_` 领走,世代前进就 **`continue` 且不递减** ⇒ flat 调用方永不归零。
+2. **`:1072-1076`**:活调用是分片时,worker 把已领的 **flat 票据丢弃**(`break` 去重新 arm),
+   **不递减**。
+⇒ 这两处都会产生"`remaining_` 少减一次"的 hang,只是报在 **flat** 看门狗上。
+**必须与模式 A 同法修复**(按世代奇偶分桶 + 领票即必减),否则交付版仍会在 flat 路径上挂死。
+
+### (c) 关于模式 B(分片)的残留谜题:下一步用**直接计数**收口,不再猜
+已知:分片调用 `total=128 / exec=127 / entered=127 / left=127 / abandoned=120(基线)`,
+且锁已排除、任务体已排除。⇒ 那张在范围内的票消失在
+`fetch_add`(:939)与 `entered_++`(:958)之间的**某个分支**里。
+**下一步加一个计数器就能收口**(纯诊断,不改控制流):
+```cpp
+// :941 拿到 g 之后、进入 fast path 时:
+if (loc < nj) inrange_.fetch_add(1, relaxed);     // 本代"范围内"的票被领走
+```
+看门狗时比较 `inrange_` vs `entered_`:
+- `inrange_ == entered_ + 1` ⇒ 确实有一张范围内的票在 fast path 内消失(那就要看
+  `diag_active()` 分支与 `sf_` 之间的东西);
+- `inrange_ == entered_` ⇒ 那张票**根本没被领**(= 票号区间与实际 job 数不一致,
+  即 `node_base_`/`node_nj_` 的发布与 worker 的读之间有**撕裂**),这会把矛头转向发布时序。
