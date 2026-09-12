@@ -4722,3 +4722,27 @@ KV 已按 8 GiB 分配(291,535 token),随后
    但需先确认 draft 前向实际用到哪几个(若三个都用,只常驻一个只是部分收益);
 2. 或者 **KV 降到 2 GiB** + 三个 draft 层全常驻(14.2+9.57+2 = 25.8 GiB,余 ~13 GiB);
 3. 两者都不行 ⇒ 记入 `FUTURE_PLAN.md`,等 TP=2 修好(每卡 1.59 GiB/层)再谈。
+
+## 160. 第 107 轮:**KV 每 token 核准**(解决目标里标注的 29.5 vs 60 KiB 分歧)+ draft 常驻第 3 次尝试
+
+### 【权威核准】fp8_ds_mla = **29.4 KB/token**(不是 60 KiB)
+vLLM 的配置校验直接给出:
+```
+ValueError: To serve at least one request with the model's max seq len (262144),
+7.19 GiB KV cache is needed, which is larger than the available KV cache memory (4.0 GiB)
+```
+⇒ **7.19 GiB ÷ 262144 = 29.4 KB/token** —— 与 `scripts/serve_prod_8070.sh` 注释里的 **29.5 KB/token 一致**;
+**旧文档的 60 KiB/token 是错的**(目标文本里标注的疑问到此解决)。
+⇒ 1M 上下文 = 1,048,576 × 29.4 KB = **≈29.4 GiB** ⇒ **必须 TP=2**(2×40 GB 装得下 KV + 权重),
+这与 serve 脚本的判断一致。
+⇒ 也意味着 **KV 与 maxlen 是强绑定的**:`maxlen=262144` 要求 KV ≥ **7.19 GiB**;
+若要把 KV 压到 4 GiB,必须把 maxlen 降到 **≤131072**(本文档下一节)。
+
+### draft 常驻的失败链(现在完全清楚)
+| 尝试 | 配置 | 失败原因 |
+|---|---|---|
+| 1 | draft 3 层 + **KV 8 GiB** + maxlen 262144 | 校验通过,但**预热/autotune `Triton Error [CUDA]: out of memory`**(固定 14.2 + 8 + 9.57 = 31.8,余量不够) |
+| 2 | draft 3 层 + **KV 4 GiB** + maxlen 262144 | **不是内存问题**:`ValueError: ... 7.19 GiB KV needed > 4.0 GiB available`(maxlen 未同步下调) |
+| 3 | draft 3 层 + KV 4 GiB + **maxlen 131072** | 进行中(账:14.2+4+9.57 = 27.8 GiB,余 ~11.7) |
+
+⇒ 教训:**改 KV 必须同步改 maxlen**(它俩由 29.4 KB/token 硬绑定),否则报的是"看起来像内存"的校验错。
