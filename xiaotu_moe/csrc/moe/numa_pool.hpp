@@ -708,6 +708,8 @@ public:
             left_.store(0);            // diag reset per call
             inrange_.store(0);         // diag reset per call
             inrange2_.store(0);        // diag reset per call
+            snap_retry_.store(0);      // diag reset per call
+            snap_mismatch_.store(0);   // diag reset per call
             current_gen_.store(gen, std::memory_order_release);       // 偶数:就绪
         }
         cv_.notify_all();
@@ -733,10 +735,11 @@ public:
                         shard_exec_.load());
                 fprintf(stderr, "  [判据] abandoned=%ld underflow=%ld  "
                         "entered=%ld left=%ld inrange=%ld inrange2=%ld  "
-                        "⇒ 若 inrange+inrange2 < total 则**有票从未被领**(发布/读取残余)\n",
+                        "snap_retry=%ld snap_mismatch=%ld\n",
                         abandoned_.load(), underflow_.load(),
                         entered_.load(), left_.load(),
-                        inrange_.load(), inrange2_.load());
+                        inrange_.load(), inrange2_.load(),
+                        snap_retry_.load(), snap_mismatch_.load());
                 for (int n = 0; n < (int)node_nj_.size(); ++n) {
                     long done = (long)node_ticket_[n].v.load() - (long)node_base_[n];
                     fprintf(stderr, "  node %d: jobs=%zu pulled=%ld\n", n, node_nj_[n], done);
@@ -969,11 +972,13 @@ private:
                         size_t base2 = 0, nj2 = 0; uint64_t g2 = 0;
                         for (;;) {
                             g2 = current_gen_.load(std::memory_order_acquire);
-                            if (g2 & 1) continue;            // 奇数=发布中 ⇒ 自旋(此时不领票,不会丢)
+                            if (g2 & 1) { snap_retry_.fetch_add(1, std::memory_order_relaxed); continue; }            // 奇数=发布中 ⇒ 自旋(此时不领票,不会丢)
                             base2 = node_base_[myn];
                             nj2 = node_nj_[myn];
                             if (current_gen_.load(std::memory_order_acquire) == g2) break;  // 一致快照
+                            snap_retry_.fetch_add(1, std::memory_order_relaxed);          // 复读不一致 ⇒ 重试
                         }
+                        if (g2 != gen) snap_mismatch_.fetch_add(1, std::memory_order_relaxed);
                         size_t t = node_ticket_[myn].v.fetch_add(1, std::memory_order_relaxed);
                         uint64_t g = current_gen_.load(std::memory_order_acquire);
                         if (g == gen && g2 == gen) {
@@ -1259,6 +1264,12 @@ private:
     //   两和 == total  ⇒ 票都被领且都执行了(问题在递减);
     //   两和 <  total  ⇒ **有票从未被领** ⇒ 发布/读取仍有残余(与 §184 同型)。
     std::atomic<long> inrange2_{0};
+    // 【第 135 轮·只读诊断】快照自旋的流量。用于回答 §197 的遗留问题:
+    // 那张票是否卡在"快照反复重试、始终不满足 g2 == 缓存 gen"的路径上。
+    //   snap_retry_    : 快照循环重试次数(奇数代 / 复读不一致)
+    //   snap_mismatch_ : 快照成功但 g2 != worker 缓存的 gen(⇒ 走 re-anchor)
+    std::atomic<long> snap_retry_{0};
+    std::atomic<long> snap_mismatch_{0};
     static constexpr size_t kMaxNodeShards = 128;       // ample for any EPYC topology
     // 【轮 76】每个 node 的票号计数器**各自独占一条 cacheline**。原来 8 个计数器挤在
     // 同一条线上,120 个 worker 的 fetch_add 让这条线在 core 之间来回弹(伪共享),
