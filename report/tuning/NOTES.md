@@ -4906,3 +4906,33 @@ VLLM_USE_V2_MODEL_RUNNER=0 \
 2. 对照参考配置的 `LVLLM_GPU_PREFETCH_WINDOW=1` 与 `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024`
    (我方 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384`);
 3. 若重叠生效 ⇒ 再把常驻层数在"Triton 工作区"允许范围内调回 8-9 层,复核 1500。
+
+## 166. 第 115 轮:TP=2 预填充 32768 = **1053 t/s**(追平 SM80 参考);重叠代码已存在,H2D 分量待测
+
+### 本轮实测(TP=2 + 8 常驻层 + V1 runner + execute-timeout 3600)
+| 口径 | TP=1 | **TP=2** | 参考 |
+|---|---|---|---|
+| 预填充 8192 | 701 t/s | **1248 t/s**(8 常驻层) | — |
+| **预填充 32768** | 728 t/s | **1053 t/s** | **SM80(3090×2)= 1060 @32768** |
+⇒ **里程碑:32768 口径已追平 SM80 参考(1053 vs 1060)**,距离 1500 还差 **42%**(在 32768 口径上)。
+(8192 口径 1248,距 1500 差 20%。)
+
+### 重叠:**代码里已经实现且默认开启**
+- `hybrid_model.py:857-859`:"Overlap: kick off the NEXT layer's H2D before doing this layer's
+  kernels, so the DMA runs concurrently with the tensor cores." ⇒ `_ov = (not _resident) and
+  XIAOTU_GPU_PREFETCH_AHEAD(默认"1") == "1"`;
+- `gpu_prefill.py:726` 注释:"a dedicated side stream; the compute stream only waits on the
+  slot's ready" ⇒ **有专用 side stream + `PrefetchSlot`**;ring 深度 `max(2, XIAOTU_MOE_PREFETCH_SLOTS)`。
+⇒ 所以 §165 里"没有重叠"的判断**需要修正**:重叠机制是在的,只是**效果待确认**
+(8 个常驻层只带来 +7.7%,而它们占 18.6% 的层数 ⇒ 说明 H2D 在 TP=2 下**已不是主导项**,
+或重叠已经在生效、常驻层的边际收益因此变小)。
+
+### 本轮的分段(host 侧)
+`[gp-timing] seg=4.7-5.4ms rest=0.35-0.40ms host_total=5.1-5.8ms`(TP=1 的 seg 是 10.03ms)
+⇒ **TP=2 下主机侧分段成本几乎减半**。但 **`[gp-h2d]` 行未出现**(打印条件需要更多层调用),
+⇒ **TP=2 的每层 H2D 时间仍是未知数**,这是下一轮要先补的关键测量。
+
+### 下一轮
+1. 补测 TP=2 的 `[gp-h2d] per_layer`(多跑几轮 32K,或看打印条件),确认 H2D 是否已是瓶颈;
+2. 若 H2D 仍是瓶颈 ⇒ 扫 `XIAOTU_MOE_PREFETCH_SLOTS`(2→3/4)与 `XIAOTU_GPU_PREFETCH_AHEAD`;
+3. 顺带核对 `_resident` 为真的层是否会**打断下一层的预取**(8 个常驻层可能造成 8 次流水线排空)。
