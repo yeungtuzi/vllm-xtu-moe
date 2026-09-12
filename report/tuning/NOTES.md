@@ -5224,3 +5224,64 @@ R92 正确保留的部分:①负值事件说明该埋点设计本身不可用;�
 1. 把 `SHARD-JOBDIAG` 搬进 `late` 分支(abort 前),拿到 `dup/miss`;
 2. `XIAOTU_MOE_EP_SHM=0` 复现序列(最便宜的判别实验,一次加载);
 3. 定位后修 + 跑 `scripts/check_engine_aligned.sh` 数值门禁(R55)。
+
+## 174. 第 121 轮:**bug 机制定位** —— 票据已领、减量被世代守卫跳过;`EP_SHM=0` 假设被否证
+
+### (a) 否证:`EP_SHM` 不是根因
+`XIAOTU_MOE_EP_SHM=0`(跨 rank 归约从 /dev/shm 双 barrier 退回 NCCL)后跑同一序列:
+```
+#1 len=8192  mt=1  ok  6093ms
+#2 len=8192  mt=8  ok  6794ms
+#3 len=32768 mt=1  ok 28129ms      ← 比 shm 版快(28.1s vs 36.1s)
+#4 len=512   mt=32 ok 83942ms      ← 84 秒!
+#5 len=8192  mt=1  **FAIL** HTTP 500
+```
+⇒ **仍然崩,`EP_SHM` 假设否证**(已排除一条)。注意 #2 从 90212ms 降到 6794ms、
+#3 也变快 —— 说明 shm 路径**确实有额外开销/退化**,但**不是死锁根源**。
+
+### (b) 诊断读数:`miss` 是基线噪声,**真正的判据是 `exec` vs `rem`**
+`XIAOTU_MOE_POOL_TRACE=1` 打开后:
+```
+SHARD-JOBDIAG gen=544 total=128 exec=128 dup=0 miss=1     ← 健康调用也 miss=1!
+SHARD-JOBDIAG gen=574 total=128 exec=128 dup=0 miss=1
+SHARD-JOBDIAG gen=652 total=480 exec=480 dup=0 miss=1
+WATCHDOG(sharded) gen=2826 total=256 **rem=1 exec=256**    ← 崩溃
+```
+⇒ **`miss=1` 在健康调用上恒为 1** ⇒ `shard_cnt_` 诊断计数器有 0/1 基线偏差
+(某个 slot 天然为 0),**不能**当作"丢任务"的证据。而 `SHARD-JOBDIAG` 行本身只会在
+**成功**分支打印,所以那三行恰恰证明这些调用是好的。
+⇒ **唯一可靠判据**:看门狗行的 `exec` 与 `rem` 的关系 —— 本次 `exec=256=total` 而 `rem=1`。
+
+### (c) **机制**(代码定位,`numa_pool.hpp:938-996`)
+```cpp
+size_t t = node_ticket_[myn].v.fetch_add(1, relaxed);   // 939: 先领票据(单调计数)
+size_t loc = t - base;
+uint64_t g = current_gen_.load(acquire);                // 941
+if (g == gen) {                                          // 942: 快路径
+    if (loc >= nj) break;
+    if (sf_) sf_(sc_, myn, loc);                         // 949: 执行任务
+    shard_exec_.fetch_add(1, relaxed);                   // 950: exec++
+    if (current_gen_.load(acquire) == gen &&             // 956: **再次**读世代
+        remaining_.fetch_sub(1, acq_rel) == 1) notify;   // 957: 递减
+    continue;
+}
+```
+**竞态**:票据在 939 领取(从第 G 代的 `node_ticket_` 区间),而减量在 956 处**再次**检查世代。
+只要在这个窗口里世代前进,减量就被**静默跳过** —— 但该票据所属的 G 代调用方**早已把它计入
+`total`**。⇒ G 的 `remaining_` 少减 1,永远到不了 0 ⇒ 看门狗 ⇒ `abort()`。
+这精确解释了实测签名 **`exec == total` 但 `rem == 1`**(每个任务都执行了,唯独少一次递减)。
+注:963-996 的"re-anchor"分支是同一个洞的第二处(988 行 `break` 同样会**丢弃已领票据**,
+与 963 行注释"NEVER abandon the consumed ticket"自相矛盾)。
+
+### (d) 修复方向(下一轮实现 + 过数值门禁)
+按**世代奇偶**分桶计数,让迟到 worker 的递减**永远落到它所属的那一代**,而不是靠"再读一次世代"来决定是否递减:
+```cpp
+std::atomic<size_t> remaining_[2];          // 代替单个 remaining_
+// 调用方:publish 时 remaining_[gen & 1].store(total)
+// worker :执行后无条件 remaining_[gen_consumed & 1].fetch_sub(1)
+// 调用方:等 remaining_[gen & 1] == 0
+```
+这样"领票 ⇒ 必减"成为不变式,`exec` 与递减严格配对;968/988 的 re-anchor 分支也不再需要
+靠"丢弃票据"来避免污染下一代。
+**修完必须跑 `scripts/check_engine_aligned.sh` 数值门禁(R55)**,并重跑本轮的复现序列
+(判据:`exec==total && rem==0` 且 6 轮 24 个请求全过)。
