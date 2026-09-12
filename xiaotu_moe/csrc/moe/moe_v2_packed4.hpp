@@ -291,46 +291,60 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
             const uint8_t* Sbytes16 = static_cast<const uint8_t*>(S);
             const float* Sflt16 = static_cast<const float*>(S);
             const int gcount = K / 32;
-            for (int j = n0; j < n1; ++j) {
-                const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
-                const int srow16 = (j / gn) * kb_stride16;
-                for (int m0 = 0; m0 < M; m0 += 8) {
-                    const int mr = std::min(8, M - m0);
-                    __m512 acc[8];
-                    for (int r = 0; r < mr; ++r) acc[r] = _mm512_setzero_ps();
+            // 【轮 94】加 NR 列分块。原结构是 GEMV(列在最外层):每个 (列, k 组) 只有 mr 条
+            // 独立累加链,无法掩盖 vdpbf16ps 的延迟(Zen4 上该指令延迟约 4-5 周期)——
+            // 这才是 R65"bf16 点积更慢"的真正原因,不是 bf16 本身。
+            // 改成 acc[MR][NR] 后独立链变成 MR×NR 条。寄存器预算:
+            // acc[4][4]=16 + av[4]=4 + wz/sv/t=3 ⇒ 23 zmm ✓(MR=4/NR=8 会到 39,溢出)。
+            static constexpr int MRb = 4, NRb = 4;
+            for (int j0 = n0; j0 < n1; j0 += NRb) {
+                const int nj = std::min(NRb, n1 - j0);
+                for (int m0 = 0; m0 < M; m0 += MRb) {
+                    const int mr = std::min(MRb, M - m0);
+                    __m512 acc[MRb][NRb];
+                    for (int r = 0; r < mr; ++r)
+                        for (int jj = 0; jj < nj; ++jj) acc[r][jj] = _mm512_setzero_ps();
                     for (int g = 0; g < gcount; ++g) {
-                        const __m128i raw = _mm_loadu_si128((const __m128i*)(b_row + (size_t)g * 16));
-                        const __m128i lo = _mm_and_si128(raw, nm16);
-                        const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), nm16);
-                        const __m128i sl = _mm_unpacklo_epi8(lo, hi);
-                        const __m128i sh = _mm_unpackhi_epi8(lo, hi);
-                        const __m256i sel = _mm256_inserti128_si256(
-                            _mm256_castsi128_si256(sl), sh, 1);
-                        const __m256i bl = _mm256_shuffle_epi8(llo16, sel);
-                        const __m256i bh = _mm256_shuffle_epi8(lhi16, sel);
-                        const __m256i ul = _mm256_unpacklo_epi8(bl, bh);
-                        const __m256i uh = _mm256_unpackhi_epi8(bl, bh);
-                        const __m256i wa = _mm256_inserti128_si256(
-                            _mm256_castsi128_si256(_mm256_extracti128_si256(ul, 0)),
-                            _mm256_extracti128_si256(uh, 0), 1);
-                        const __m256i wb = _mm256_inserti128_si256(
-                            _mm256_castsi128_si256(_mm256_extracti128_si256(ul, 1)),
-                            _mm256_extracti128_si256(uh, 1), 1);
-                        const __m512i wz = _mm512_inserti64x4(
-                            _mm512_castsi256_si512(wa), wb, 1);
-                        const float sc = E8M0 ? e8m0_table()[Sbytes16[srow16 + g]]
-                                              : Sflt16[srow16 + g];
-                        const __m512 sv = _mm512_set1_ps(sc);
-                        for (int r = 0; r < mr; ++r) {
-                            const __m512i av = _mm512_loadu_si512(
+                        __m512i av[MRb];          // 激活每 (组) 只载一次,被 NR 列复用
+                        for (int r = 0; r < mr; ++r)
+                            av[r] = _mm512_loadu_si512(
                                 (const void*)(arow_at(m0 + r) + (size_t)g * 32));
-                            const __m512 t = _mm512_dpbf16_ps(
-                                _mm512_setzero_ps(), (__m512bh)wz, (__m512bh)av);
-                            acc[r] = _mm512_fmadd_ps(t, sv, acc[r]);
+                        for (int jj = 0; jj < nj; ++jj) {
+                            const int j = j0 + jj;
+                            const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
+                            const int srow16 = (j / gn) * kb_stride16;
+                            const __m128i raw = _mm_loadu_si128((const __m128i*)(b_row + (size_t)g * 16));
+                            const __m128i lo = _mm_and_si128(raw, nm16);
+                            const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), nm16);
+                            const __m128i sl = _mm_unpacklo_epi8(lo, hi);
+                            const __m128i sh = _mm_unpackhi_epi8(lo, hi);
+                            const __m256i sel = _mm256_inserti128_si256(
+                                _mm256_castsi128_si256(sl), sh, 1);
+                            const __m256i bl = _mm256_shuffle_epi8(llo16, sel);
+                            const __m256i bh = _mm256_shuffle_epi8(lhi16, sel);
+                            const __m256i ul = _mm256_unpacklo_epi8(bl, bh);
+                            const __m256i uh = _mm256_unpackhi_epi8(bl, bh);
+                            const __m256i wa = _mm256_inserti128_si256(
+                                _mm256_castsi128_si256(_mm256_extracti128_si256(ul, 0)),
+                                _mm256_extracti128_si256(uh, 0), 1);
+                            const __m256i wb = _mm256_inserti128_si256(
+                                _mm256_castsi128_si256(_mm256_extracti128_si256(ul, 1)),
+                                _mm256_extracti128_si256(uh, 1), 1);
+                            const __m512i wz = _mm512_inserti64x4(
+                                _mm512_castsi256_si512(wa), wb, 1);
+                            const float sc = E8M0 ? e8m0_table()[Sbytes16[srow16 + g]]
+                                                  : Sflt16[srow16 + g];
+                            const __m512 sv = _mm512_set1_ps(sc);
+                            for (int r = 0; r < mr; ++r) {
+                                const __m512 t = _mm512_dpbf16_ps(
+                                    _mm512_setzero_ps(), (__m512bh)wz, (__m512bh)av[r]);
+                                acc[r][jj] = _mm512_fmadd_ps(t, sv, acc[r][jj]);
+                            }
                         }
                     }
                     for (int r = 0; r < mr; ++r)
-                        C[(size_t)(m0 + r) * N + j] = hsum512(acc[r]) * global_scale;
+                        for (int jj = 0; jj < nj; ++jj)
+                            C[(size_t)(m0 + r) * N + j0 + jj] = hsum512(acc[r][jj]) * global_scale;
                 }
             }
             if (bp_on) {
