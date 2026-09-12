@@ -5190,3 +5190,37 @@ R92 正确保留的部分:①负值事件说明该埋点设计本身不可用;�
    - `miss==0, dup==0` ⇒ 某个分片**卡死在内核里**(重点看 FAST_FP4/`moe_v2_packed4`
      的段循环对空段/异常 `seg_start` 的处理,以及 `XIAOTU_MOE_EP_SHM` 的跨 rank 双屏障)。
 2. 修复后**重跑数值门禁** `scripts/check_engine_aligned.sh`(R55:动同步/内核必须过)。
+
+### 173. 第 120 轮(续):`XIAOTU_MOE_POOL_TRACE=1` + `SHARD_WD=60` 复现 —— **`rem=2`**,分片卡在任务体内部
+
+复现序列(TP=2,纯交付配置,仅加诊断 env):
+```
+#1 len=8192  mt=1   ok  6133ms
+#2 len=8192  mt=8   ok 90212ms     ← **一个 8-token 解码请求跑了 90 秒**
+#3 len=32768 mt=1   **FAIL** HTTP 500
+[pool] WATCHDOG(sharded) gen=1324 total=128 rem=2 exec=126
+```
+**三条新信息**:
+1. **`rem=2`(上一次 r121 是 `rem=1`)** ⇒ 漏掉的任务数**会变**,不是"某一个固定的 decrement 漏掉"
+   那种确定性 bug,而是**有分片卡在任务体内部**(卡住的 worker 数可变)。
+2. **90 秒的 8-token 解码请求** ⇒ 在 `abort()` 之前引擎已经**严重退化**,不是"突然死"。
+   这也解释了 32K 预填充测出的"超线性变慢"(§167)很可能**部分是**这个退化,而非真实算力。
+3. `SHARD-JOBDIAG`(dup/miss)**没有打印** —— 因为它在 `numa_pool.hpp:723` 的成功分支里,
+   而 watchdog 走 `713-722` 的 `late` 分支并直接 `abort()`。**要拿到 dup/miss 必须把
+   JOBDIAG 打印搬进 late 分支(abort 之前)** —— 这是下一轮第一件事(纯诊断改动,不改语义)。
+
+### 头号嫌疑:**跨 rank 的 EP 共享内存双 barrier 死锁**(TP=2 特有)
+- 该故障**只在 TP=2 出现过**;TP=1 在 item 1 的长跑里是稳定的。
+- `scripts/tune_serve.sh:132-140` 早已记录过同类现象:"被 kill 掉的 TP>=2 进程会在
+  `/dev/shm` 留下 `xiaotu_ep_L*_<hidden>_<tokens>_<world>.bin`,里面存着**双 barrier 的世代计数**,
+  attach 到状态错乱的旧文件后两个 rank 的世代对不上 ⇒ **永久互等**"。
+  ⇒ 现在看到的很可能是**同类世代不匹配,但是在活进程之间发生**(不是残留文件)。
+- `rem=2` 也吻合:两个 rank 各有分片卡在 barrier 上,双方互等 ⇒ 两个任务永不完成。
+- 判据:在 `numa_pool.hpp` 的 EP barrier 段加"等 barrier 超时即打印双方世代计数"的埋点;
+  或先做**最便宜的判别实验** —— `XIAOTU_MOE_EP_SHM=0`(改用非共享内存的跨 rank 路径)
+  跑同一复现序列,若不再卡 ⇒ 直接锁定 EP barrier。
+
+### 下一轮顺序
+1. 把 `SHARD-JOBDIAG` 搬进 `late` 分支(abort 前),拿到 `dup/miss`;
+2. `XIAOTU_MOE_EP_SHM=0` 复现序列(最便宜的判别实验,一次加载);
+3. 定位后修 + 跑 `scripts/check_engine_aligned.sh` 数值门禁(R55)。
