@@ -46,3 +46,37 @@
 多列 × 多行**。在 `[N][K/2]` 布局下做不到(列间相隔 K/2 字节),需要 K-major 权重
 (插件侧 `gpu_prefill._kmajor_bytes` 已有同一份张量)+ 列 lane 内核。§136 的 op 账说明:
 **只有当 `me`(每专家行数)足够大时它才划算**,而基准口径 me=3-4 ⇒ 预期收益 ≤1.2×。
+
+---
+
+## P0(阻塞项·用户 2026-09-12 指定)引擎"请求几次就 abort"必须修掉
+
+**为什么是 P0**:它使 item 2 的任何"达标"声明都缺一个必要条件 —— 引擎必须在一段**持续负载**
+内存活。当前没有任何一次 TP=2 会话撑过一次完整压测。
+
+**故障链**(已定位,见 NOTES §172-§175):
+分片池有任务永不完成(`remaining_` 停 1/2)→ `numa_pool.hpp:713` 看门狗(默认 300s,
+`XIAOTU_MOE_SHARD_WD` 可调)打印 dump 后 **`abort()`** → worker SIGABRT(无 traceback)
+→ `VllmWorker-N died unexpectedly (exit code: None)` → shm 读端 cancel
+→ `RuntimeError: cancelled` → HTTP 500。
+
+**已否证的假设(不要重复)**:①Triton OOM/常驻层(R91 撤回);②常驻层是预填充杠杆(R91);
+③我的热路径埋点导致卡死(R93 更正);④`XIAOTU_MOE_EP_SHM` 的 /dev/shm 双 barrier(R121 否证);
+⑤陈旧 `node_base_` 读(R94 否证)。**另:`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` 与该故障无关
+(R120 更正:`cancelled` 是次生症状)**。
+
+**下一步(已验证手段)**:`XIAOTU_MOE_POOL_TRACE=1 XIAOTU_MOE_SHARD_WD=60` +
+已埋好的两个**纯诊断**计数器(不改控制流):
+- `abandoned_`:三处 `break`(`:943`/`:981`/`:988`)丢弃已领票据时自增;
+- `skipped_dec_`:两处世代守卫为假导致递减被跳过时自增。
+看门狗 dump 里谁非零即定位真正路径,**先拿读数再改控制流**(这是第 122 轮用一次白烧换来的规矩)。
+
+**完成判据(四件都要)**:①看门狗不再出现;②复现序列 24 个请求全过;
+③`scripts/check_engine_aligned.sh` 数值门禁通过(R55);④**一次 `C=8/N=32` 持续压测跑完并给出持续吞吐**。
+
+**另有一条独立的小问题(仅性能,非正确性)**:`hybrid_model.py:736-738` 的注释断言
+"取 `max(预分配, 阈值)`",实现却只取 `XIAOTU_MOE_EP_SHM_TOKENS`(默认 1024)
+⇒ GPU 阈值 >1025 时 CPU 通路会**静默**走 NCCL 回退(正确但慢、无日志)。
+建议 `_toks = max(EP_SHM_TOKENS, gp_min-1)`(gp_min>0 时)并加一次 warning;
+**纯 CPU 模式(gp_min=0)不应按 8192 预分配**(stride 134 MB × 43 层 × 2 rank ≈ 11.5 GB /dev/shm),
+回退即正确(引擎 `binding.cpp:440 if (bytes <= ep->capacity)` + `hybrid_model.py:983` 双门禁)。
