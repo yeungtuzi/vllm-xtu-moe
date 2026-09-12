@@ -5532,3 +5532,39 @@ dump 里的 `skipped_dec=0` **没有信息量**。⇒ 下一轮必须把它换�
    (`binding.cpp:446-456` 的 `while (h->gen.load()==gen) yield()`)、`work_mtx_`/`done_mtx_`、
    以及**回调进 Python 争 GIL**这三处;
 4. 修好后判据(四项,不可省):连续 3 次会话 24 请求全过 + 无看门狗 + 数值门禁 + `C=8/N=32` 持续压测。
+
+## 182. **直接证据**:没有任何 worker 卡在任务体里 ⇒ 阻塞点在 `sf_()` **之前**的 re-anchor 路径(更正 §181b)
+
+### (a) 读数(带 `entered_`/`left_` 计数器的版本)
+```
+会话1: #1 8192/mt1 ok 6105ms → #2 8192/mt8 ok 89763ms(停顿) → #3 FAIL
+会话2: #1 8192/mt1 FAIL(服务进程已死)
+WATCHDOG(sharded) gen=1378 total=128 rem=1 exec=127
+判据] abandoned=120 underflow=0  entered=127 left=127
+node 0..7: jobs=16 pulled=31
+```
+### (b) 结论:**任务体是干净的**,阻塞点在它**之前**
+- `entered == left == 127` ⇒ **凡进入 `sf_()` 的 worker 全部返回了**,**没有**"进了没出"的 worker
+  ⇒ **更正 §181(b)**:"持票 worker 卡在任务体 `sf_()` 里"是**错的**。
+- `exec=127 = entered` ⇒ 执行计数与入口计数自洽。
+- `abandoned=120` = **基线值**(= 线程数,§179b 已三次确认)⇒ 那张被计入的票
+  **没有走任何 `break` 路径**(否则 abandoned 会是 121)。
+- 算术自洽:`total=128`,128 张在范围内的票被领走,只执行了 127 次
+  ⇒ **第 128 张票的领票者在到达 `entered_++` 之前就停住了**。
+
+### (c) 那么它停在哪?`fetch_add` 与 `entered_++` 之间**唯一会阻塞的构造**是 re-anchor 分支的
+```cpp
+// numa_pool.hpp ~:984
+std::lock_guard<std::mutex> lk(work_mtx_);   // ← 这条路径上唯一可能长时间阻塞的点
+```
+⇒ **头号嫌疑:`work_mtx_` 被长期持有 / 锁序问题**(而不是任务体、不是票据协议、不是世代守卫)。
+`underflow=0` 同时说明**没有多减/重复减**,分桶计数本身是健康的。
+
+### (d) 下一步(直接、便宜)
+1. 加 `reanchor_in_`/`reanchor_out_` 计数器,包住 re-anchor 分支(与 `entered_` 同一手法);
+   若看门狗时 `reanchor_in - reanchor_out == 1` ⇒ 就锁定在这个分支里。
+2. 再在其中细分:分别统计"进 `work_mtx_` 前/后" ⇒ 直接判定是不是锁。
+3. 若确认是锁:检查 `work_mtx_` 的所有持有者(发布块、re-anchor 块、以及任何持 `done_mtx_`
+   再取 `work_mtx_` 的路径)是否存在**锁序反转**(`done_mtx_` ↔ `work_mtx_`)。
+4. 备选(与锁无关的可能):该 worker 被**长期抢占**(120 线程 + OMP 48 + 其它进程),
+   ⇒ 用 `XIAOTU_MOE_THREADS=32` 做判别实验:触发概率显著下降即为此因。

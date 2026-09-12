@@ -696,7 +696,10 @@ public:
             remaining_sh_[sh_slot(gen)].store(total);   // 【模式A修】分片专用分桶倒计时
             shard_exec_.store(0);      // diag reset per call
             abandoned_.store(0);       // diag reset per call
-            skipped_dec_.store(0);     // diag reset per call
+            skipped_dec_.store(0);     // (已失效)diag reset per call
+            underflow_.store(0);       // diag reset per call
+            entered_.store(0);         // diag reset per call
+            left_.store(0);            // diag reset per call
             current_gen_.store(gen, std::memory_order_release);       // 偶数:就绪
         }
         cv_.notify_all();
@@ -720,9 +723,10 @@ public:
                         (unsigned long long)current_gen_.load(), total,
                         remaining_sh_[_gslot].load(),
                         shard_exec_.load());
-                fprintf(stderr, "  [判据] abandoned=%ld skipped_dec=%ld  "
-                        "(非零者即丢票/跳过递减的真正路径)\n",
-                        abandoned_.load(), skipped_dec_.load());
+                fprintf(stderr, "  [判据] abandoned=%ld underflow=%ld  "
+                        "entered=%ld left=%ld  ⇒ entered-left = 卡在任务体里的 worker 数\n",
+                        abandoned_.load(), underflow_.load(),
+                        entered_.load(), left_.load());
                 for (int n = 0; n < (int)node_nj_.size(); ++n) {
                     long done = (long)node_ticket_[n].v.load() - (long)node_base_[n];
                     fprintf(stderr, "  node %d: jobs=%zu pulled=%ld\n", n, node_nj_[n], done);
@@ -955,13 +959,19 @@ private:
                                     &shard_cnt_[(size_t)myn * kShardDiagStride + loc],
                                     1u, __ATOMIC_RELAXED);
                             }
-                            if (sf_) sf_(sc_, (size_t)myn, loc);
+                            if (sf_) {
+                                entered_.fetch_add(1, std::memory_order_relaxed);
+                                sf_(sc_, (size_t)myn, loc);
+                                left_.fetch_add(1, std::memory_order_relaxed);
+                            }
                             shard_exec_.fetch_add(1, std::memory_order_relaxed);
                             // 【模式A修】无条件递减到**本代自己的桶**。
                             // 旧代码是 `if (current_gen_ == gen && remaining_.fetch_sub(..))`,
                             // 守卫为假时递减被静默跳过 ⇒ 调用方永不归零(实测 skipped_dec==缺口)。
                             // 分桶后迟到递减只影响自己那代,不会污染下一代 ⇒ 守卫可安全删除。
                             // skipped_dec_ 保留为**不变式检查**:修好后应恒为 0,非 0 即新 bug。
+                            if (remaining_sh_[sh_slot(gen)].load(std::memory_order_relaxed) == 0)
+                                underflow_.fetch_add(1, std::memory_order_relaxed);
                             if (remaining_sh_[sh_slot(gen)].fetch_sub(
                                     1, std::memory_order_acq_rel) == 1) {
                                 std::lock_guard<std::mutex> gl(done_mtx_);
@@ -996,7 +1006,11 @@ private:
                         base = nb; nj = nnj;
                         loc = t - base;
                         if (loc >= nj) { abandoned_.fetch_add(1, std::memory_order_relaxed); break; }  // beyond live range -> re-arm outer wait
-                        if (sf_) sf_(sc_, (size_t)myn, loc);
+                        if (sf_) {
+                            entered_.fetch_add(1, std::memory_order_relaxed);
+                            sf_(sc_, (size_t)myn, loc);
+                            left_.fetch_add(1, std::memory_order_relaxed);
+                        }
                         shard_exec_.fetch_add(1, std::memory_order_relaxed);
                         // 【模式A修】同 fast path:无条件递减到本代自己的桶(见上)。
                         if (remaining_sh_[sh_slot(gen)].fetch_sub(
@@ -1190,7 +1204,15 @@ private:
     // 崩溃签名是 exec==total 而 rem==1/2,而每个 exec 后都紧跟一个带守卫的递减
     // ⇒ 必然有一处 break 丢弃了已领票据,或有一处守卫把递减跳过了。谁非零即定位。
     std::atomic<long> abandoned_{0};                    // diag: 已领票后在 break 处被丢弃
-    std::atomic<long> skipped_dec_{0};                  // diag: 执行了但世代守卫为假,递减被跳过
+    // 【第 122 轮·修埋点】`skipped_dec_` 已失效:第 121 轮删世代守卫时把它的自增一并删了,
+    // 于是它结构上恒为 0、再无信息量。换成真正的不变式检查 `underflow_`:递减前桶值已是 0
+    // ⇒ 说明发生了"多减/重复减"(那会让调用方提前归零)。
+    std::atomic<long> skipped_dec_{0};                  // (已失效,保留仅为兼容 dump 字段)
+    std::atomic<long> underflow_{0};                    // diag: 递减前桶值已为 0(多减/重复减)
+    // 【第 122 轮·模式 B 直接证据】任务体入口/出口计数。若某 worker 领了票却卡在
+    // `sf_(...)` 里面,看门狗触发时 `entered - left` 就等于"进了没出"的 worker 数。
+    std::atomic<long> entered_{0};
+    std::atomic<long> left_{0};
     static constexpr size_t kMaxNodeShards = 128;       // ample for any EPYC topology
     // 【轮 76】每个 node 的票号计数器**各自独占一条 cacheline**。原来 8 个计数器挤在
     // 同一条线上,120 个 worker 的 fetch_add 让这条线在 core 之间来回弹(伪共享),
