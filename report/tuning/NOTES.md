@@ -5750,3 +5750,54 @@ for (;;) {
 ② 判据行 `inrange == entered == total && rem == 0`;
 ③ `scripts/check_engine_aligned.sh` 数值门禁(R55);
 ④ 一次 `C=8/N=32` 持续压测跑完并给出持续吞吐。
+
+## 188. **我的第 127 轮修复本身引入了一条丢票路径** —— 记录并给出正确结构
+
+### (a) 实测(与 §187 的修复对照)
+```
+WATCHDOG(sharded) total=128 rem=1 exec=127
+判据] abandoned=120 underflow=0  entered=127 left=127 **inrange=126**
+```
+- 修复**前**(§186):`inrange == entered == 479 < total = 480`(全部走快路径);
+- 修复**后**:`inrange = 126 < entered = 127`(有 1 次走 re-anchor),
+  但**总数仍是 127 < 128** ⇒ **失败依旧,并且我新增了一条丢票路径**。
+- 停滞与失败位置完全没变(`#16 512/mt32 = 85747ms` 停顿 → `#17 FAIL`)。
+
+### (b) 我犯的错
+我把 seqlock 的"复读校验"写成了:
+```cpp
+size_t t = node_ticket_[myn].v.fetch_add(1, relaxed);   // ← 票已经领走
+uint64_t g = current_gen_.load(acquire);
+if (g == gen) {
+    base = node_base_[myn]; nj = node_nj_[myn];
+    if (current_gen_.load(acquire) != gen) continue;    // ← 直接 continue = 静默丢弃这张票!
+```
+**"校验失败就 `continue`"在领票之后是不可接受的** —— 票据由 `fetch_add` 唯一领取,
+丢弃它就等于 `remaining_` 少减一次。**这正是我这十几轮一直在修的那一类缺陷。**
+
+### (c) 正确结构(下一轮实现,顺序必须反过来:**先取一致快照,再领票**)
+```cpp
+for (;;) {
+    // ---- 1) 读端 seqlock:先拿到一致快照(**此时还不领票**) ----
+    size_t base2, nj2; uint64_t g2;
+    for (;;) {
+        g2 = current_gen_.load(std::memory_order_acquire);
+        if (g2 & 1) continue;                       // 发布中 ⇒ 自旋(不领票,不会丢)
+        base2 = node_base_[myn]; nj2 = node_nj_[myn];
+        if (current_gen_.load(std::memory_order_acquire) == g2) break;   // 一致
+    }
+    // ---- 2) 快照一致后才领票 ----
+    size_t t = node_ticket_[myn].v.fetch_add(1, std::memory_order_relaxed);
+    // ---- 3) 用快照判定;若世代已变,交给既有的 re-anchor 分支处理(它会按活代重建 base/nj) ----
+    ...
+}
+```
+关键不变式:**`fetch_add` 领票之后,这张票必须被执行+递减,或交给 re-anchor 分支按其活代
+重新归属 —— 任何情况下都不允许"领了票直接 continue/break 走掉"。**
+(`:943`/`:988` 的 `abandoned_` 分支还需再核:它们也在领票后 break,
+但那条路径上票据**本就不属于本代**(loc >= nj),所以是允许的 —— 前提是 `base` 取自**一致快照**,
+而这一点只有 (c) 的结构才能保证。)
+
+### (d) 当前树状态
+`numa_pool.hpp` 含第 127 轮改动(已知不完整,且新增 `continue` 丢票点),`.so` 与该源码一致。
+**下一轮第一件事:按 (c) 重写该段 + 重编译 + 四项验证。**
