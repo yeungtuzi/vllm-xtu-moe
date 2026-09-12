@@ -6770,3 +6770,34 @@ sanitizer 每次尝试的加载约 **45 分钟**(每 shard 59s vs 正常 17s),�
 3. **只对"解码阶段"插桩**:先让服务正常加载完,再启动 sanitizer? —— **不可行**,
    sanitizer 必须在进程启动时介入。所以只能靠 1/2 这类过滤。
 ⇒ **若本轮没抓到,下一轮先用 `--launch-skip` 或 `--kernel-name` 过滤,避免每轮 45 分钟。**
+
+## 215. **`compute-sanitizer` 在这套栈上不可用**:48 个错误全是 error 209(无可用内核镜像)
+
+### (a) 实际错误类别(不是越界)
+```
+24 × cudaErrorNoKernelImageForDevice (error 209)
+     "no kernel image is available for execution on the device"  on cudaFuncGetAttributes
+24 × 同上                                                      on cudaGetLastError
+ 1 × Target application returned an error     ⇒ ERROR SUMMARY: 48 errors
+```
+- **完全没有** `Invalid __global` / `out-of-bounds` —— 我们要找的越界**一条都没有**;
+- 48 条全是 **error 209**:sanitizer 拿不到某些内核的**可插桩镜像** ⇒ **那些内核在 sanitizer 下
+  根本没跑起来**。
+
+### (b) 结论:sanitizer 路线**失效**
+两次 45 分钟加载换来的不是"定位",而是"工具跑不动这套栈"。原因很可能有二(可并存):
+1. **Triton JIT 内核**是在运行时才编译出来的,sanitizer 启动时没有它们的镜像;
+2. **预编译扩展**(`libtorch_stable`,里面有 `persistent_topk` 等)按特定 compute capability 编译,
+   sanitizer 需要能匹配的镜像。
+⇒ **`--launch-skip`/`--kernel-name` 也救不了**(问题不是"监控量太大",而是"根本没有镜像")。
+
+### (c) 立即转向:**组件二分**(有了快速复现器,这条路现在很便宜)
+§212 的猛打脚本让故障**十几请求必现**,于是"关掉某个组件看故障是否消失"从"要等上百请求"
+变成了**每轮十几分钟就能出结论**。按价值排序:
+1. **最大价值:关掉 xiaotu 插件**(或等价地让 CPU 通路不参与),用同一猛打脚本跑:
+   - 若**仍复现** ⇒ **故障在上游**,与我方插件无关 ⇒ 直接影响交付结论
+     (而且"1M 上下文可用"这一目标的威胁来自上游,需要单独说明);
+   - 若**不复现** ⇒ 回到我方插件里二分(CPU 引擎 / GPU 预填充 / EP 归约 / 常驻层)。
+2. 关掉 GPU 预填充路径(阈值设很大)⇒ 验证"我方 GPU 路径是否参与";
+3. 关掉 EP(`XIAOTU_MOE_EP=0`,已知它会大幅变慢,但作为**判别**可用)。
+**注意**:每项都要用**猛打脚本**(而不是混合序列),否则又会掉回"等偶发"。
