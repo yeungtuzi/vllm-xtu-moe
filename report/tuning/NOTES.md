@@ -4357,3 +4357,25 @@ TP=1 下 `XIAOTU_MOE_RESIDENT_BUDGET_GB` 之前只给了 12 GB(≈3.7 层);GPU0 
 下一轮第一件事:等它就绪后测 **预填充(L=32768,C=1,TTFT→t/s)/ C=1 解码 / C=2 吞吐**;
 并生成缺失的数据集(`report/tuning/datasets/` 现有 32/128/512/1024/4096,**缺 8192 与 32768**,
 用 `LENS="8192 32768" N=8 scripts/make_nat_dataset.py` 生成)。
+
+## 146. 第 97 轮:配置矩阵 —— **本会话所有带 `--enforce-eager` 的启动都失败,所有成功的都没带**
+
+### 成功的(本会话验证过两次)
+`TP=1 + 无常驻层 + CUDA graph(不加 --enforce-eager)+ KV 8 GiB + maxlen 262144` ⇒ 276-282 s 就绪,
+TPOT 56.9-57.8 ms(r74/r75 实测)。
+
+### 失败的(全部带 EAGER)
+| # | 配置 | 现象 |
+|---|---|---|
+| 1 | TP=2 + CUDA graph(无 EAGER) | KV 分配后 worker 不消费 shm 广播 ⇒ 预热卡死,RPC 317 s 超时 |
+| 2 | TP=2 + 常驻 0-5 + **EAGER** | worker 在禁用 torch.compile 后**静默原生崩溃**;`XIAOTU_MOE_EP=0` 不修复 |
+| 3 | TP=1 + 常驻 0-5 + budget12 + **EAGER** | `Engine core initialization failed`(放下 3 层后崩) |
+| 4 | TP=1 + 常驻 0-9 + budget24 + **EAGER** | GPU OOM(7 层 = 22.31 GiB 时还要 2 GiB) |
+| 5 | TP=1 + 常驻 0-9 + budget20 + **EAGER** | `torch_call_dispatcher("aten::empty")` 失败(6 层 = 19.1 GiB,余量够) |
+
+⇒ **规律`:--enforce-eager` 是共同因子**;而 #1 说明 CUDA graph 在 **TP=2** 下也有问题(预热卡死)。
+⇒ 下一轮纪律:**变量一次只加一个** —— 基线(TP=1 + graph + 无常驻)→ 只加常驻层 → 再单独试 EAGER;
+每步都先用 `scripts/check_engine_aligned.sh` 之外的服务端探针确认能起来并测 C=1/C=2。
+
+### 副产:显存"精确账"(见 §145)与数据集补齐
+- 数据集已补齐:`report/tuning/datasets/nat8192.jsonl`、`nat32768.jsonl`(精确 8192/32768 token)。
