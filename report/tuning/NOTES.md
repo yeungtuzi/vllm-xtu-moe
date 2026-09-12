@@ -5858,3 +5858,46 @@ else { ...re-anchor 分支(按活代重新归属这张票)... }
 - 性能门禁:`DEDUP=12 = 0.70 ms/层` 正好压线 PASS;`DEDUP=23 = 0.87` 是**既有的 item-1 残差**
   (用户已于第 96 轮结案并移入 FUTURE_PLAN,不作为当前优先项)。
   注:此测量是在服务端占用 120 线程的同时跑的,数字偏保守。
+
+## 190. 持续压测(C=8/N=32)**未通过**:flat 路径第三个缺陷 ⇒ 并发下仍丢一次递减
+
+### (a) 实测
+```
+TAG=sustained_c8_n32: completed=8 failed=24 duration=324.5s out_tok_per_s=3.78
+                      mean_ttft=3091ms mean_tpot=141.4ms
+服务端: [pool] WATCHDOG fired: gen=161236 n=8 start=960104 end=960112
+        counter=960232 remaining=1 current_gen=161236 dropped=0
+客户端: EngineDeadError(多次)→ 500
+```
+- `n=8`(C=8 每步 8 token)、`counter - end = 960232 - 960112 = 120` = **线程数基线**、
+  `remaining=1` ⇒ **flat 路径少一次递减**;
+- ⇒ 我第 126 轮对 flat 的两处修复(`:1044` 去守卫 + `:1072` 丢弃前补递减)**不够**,
+  flat 路径还有**第三处**丢票点。
+- 注意 `dropped=0`:flat 自己的丢票计数没涨,所以不是 `:1034` 的 `if (i >= n) break` 那一处
+  (那里会记 dropped)。
+
+### (b) 头号嫌疑:**flat 发布与分片发布有同一个缺陷**(我在 §186 错误地排除了它)
+```cpp
+:445   n_ = n;                                  // ← **写在奇数 store 之前!**
+:446   worker_limit_...
+:447   sharded_call_ = 0;
+:473   current_gen_.store(gen - 1, release);    // 奇数:发布中
+:474   start_ = counter_.load();
+:475   remaining_.store(n);
+:478   current_gen_.store(gen, release);        // 偶数:就绪
+```
+**`n_` 与 `worker_limit_`/`sharded_call_` 都在窗口之外。** 我在 §186 里因为
+"flat 读者在 `work_mtx_` 下取快照"而排除了它 —— 但**并发下(batch 大小逐步变化)**
+仍可能让某个 worker 以旧的 `start` 配上新的 `n`(或反之)做 `i = t - start` 判定,
+从而把一张**属于本代**的票判成越界/空洞而丢掉。
+⇒ **修法与分片 §184 完全相同:把 `n_`/`worker_limit_`/`sharded_call_` 的写入移进
+"奇数 store → 偶数 store"的窗口内**,并检查 flat 快路径所用 `start`/`n` 的一致性来源。
+
+### (c) 现状小结(判据)
+| 判据 | 结果 |
+|---|---|
+| ① 连续 3 次会话 24 请求全过、无看门狗 | ✅ 通过(72/72) |
+| ② `inrange==entered==total && rem==0` | ✅ 通过(无看门狗即无违约) |
+| ③ 数值门禁 `check_engine_aligned.sh` | ✅ 通过(OK=7) |
+| ④ `C=8/N=32` 持续压测跑完 | ❌ **未通过**(24/32 失败,flat 看门狗) |
+⇒ **分片路径已修好(顺序负载下完全稳定),flat 路径仍需一轮同法修复。**
