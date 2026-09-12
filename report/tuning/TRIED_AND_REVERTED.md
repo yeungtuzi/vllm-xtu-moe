@@ -519,3 +519,10 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 | 日期 | 改动 | 依据 |
 |---|---|---|
 | 2026-xx | R56(奇偶 seqlock 成功保留)、R57(gather 切段);NOTES §115 | 第 69 轮 |
+
+| R58 | 把 ExpBuf 缓冲区的 `resize(need)` 改成 `capacity()<need ? reserve(need)`(只用 `.data()`) | **已回退(算错)**。对拍 0 OK。虽然 grep 在 `moe_v2.hpp` 里只看到 `.data()` 用法,但确实存在未定位的 `size()` 依赖。**第二次踩同一个坑(R42 首次)** —— 再试前必须先全文定位 `ExpBuf` 各缓冲区的 `size()/end()/begin()` 使用点。当前 `resize` 的 24-34 µs 成本保留待修 |
+| R59 | 手设 `XIAOTU_MOE_SHARDSPLIT=32` 想减少锁争用 | **不要用**。0→0.81、16→0.78(自动值)、32→0.96 ms ⇒ 32 明显更差;自动值已近最优 |
+
+| 日期 | 改动 | 依据 |
+|---|---|---|
+| 2026-xx | R58(reserve 替换已回退)、R59(SHARDSPLIT 大值更差);NOTES §116(提前预取 0.78→0.76-0.77) | 第 70 轮 |
