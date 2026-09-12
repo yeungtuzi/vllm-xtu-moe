@@ -35,14 +35,25 @@ echo "   OK=$NOK BAD=$NBAD (me=1 的 BAD 是既有的 NR=8 fp32 重结合偏差,
 # me=2/3/混合/4..7 必须全 OK(共 7 项)
 if [ "${NOK:-0}" -lt 7 ]; then echo "   !! 数值门禁未通过(需 7 OK)"; FAIL=1; else echo "   数值门禁通过"; fi
 
-echo "== [2/2] 性能门禁 bench_engine_ab.py (DEDUP=12, 阈值 ${THRESH} ms/层) =="
-MS=$(ENG=xiaotu XIAOTU_MOE_THREADS=120 XIAOTU_LAYER1_NPZ="$NPZ" BS=6 DEDUP=12 REP="$REP" \
-     timeout 600 "$PY" "$ROOT/scripts/bench_engine_ab.py" 2>&1 \
-     | grep -E '^ +6 ' | tail -1 | awk '{print $2}')
-echo "   实测 ${MS:-?} ms/层"
-if [ -z "${MS:-}" ]; then echo "   !! 未取到结果"; FAIL=1
-elif awk "BEGIN{exit !($MS <= $THRESH)}"; then echo "   性能门禁通过(<= $THRESH)"
-else echo "   !! 性能门禁未通过(> $THRESH)"; FAIL=1; fi
+echo "== [2/2] 性能门禁 bench_engine_ab.py (阈值 ${THRESH} ms/层;每线程目标 2.2 GB/s) =="
+# 每个 (列, k 组) 的专家权重字节:gate+up = 2*I*H/2、down = H*I/2 ⇒ 每专家 12.58 MB(I=2048,H=4096)
+PER_EXP_MB=12.58
+for D in 12 23; do
+  OUT=$(ENG=xiaotu XIAOTU_MOE_THREADS=120 XIAOTU_MOE_PROFILE=1 XIAOTU_LAYER1_NPZ="$NPZ" \
+        BS=6 DEDUP="$D" REP="$REP" timeout 600 "$PY" "$ROOT/scripts/bench_engine_ab.py" 2>&1)
+  MS=$(echo "$OUT" | grep -E '^ +6 ' | tail -1 | awk '{print $2}')
+  NA=$(echo "$OUT" | grep -aoE 'na=[0-9]+' | tail -1 | cut -d= -f2)
+  if [ -z "${MS:-}" ] || [ -z "${NA:-}" ]; then echo "   !! DEDUP=$D 未取到结果(ms=${MS:-?} na=${NA:-?})"; FAIL=1; continue; fi
+  PT=$(awk -v na="$NA" -v ms="$MS" 'BEGIN{printf "%.2f", na*12.58/(ms*120)}')
+  AGG=$(awk -v na="$NA" -v ms="$MS" 'BEGIN{printf "%.0f", na*12.58/ms}')
+  MSOK=$(awk -v ms="$MS" -v th="$THRESH" 'BEGIN{print (ms<=th)?"PASS":"FAIL"}')
+  PTOK=$(awk -v pt="$PT" 'BEGIN{print (pt>=2.2)?"PASS":"WARN"}')
+  printf '   DEDUP=%-3s na=%-3s %s ms/层  聚合 %s GB/s  每线程 %s GB/s  ms=%s per-thread=%s\n' \
+         "$D" "$NA" "$MS" "$AGG" "$PT" "$MSOK" "$PTOK"
+  # ms 条款是硬门禁;每线程条款只告警:它在 DEDUP=12 这个"L3 驻留/每 CCD 交付"口径上受硬件限制
+  # (见 NOTES §130/§133),而在服务端真实形状(na≈32)已达 2.9 GB/s·线程。
+  [ "$MSOK" = "PASS" ] || FAIL=1
+done
 
 [ "$FAIL" = 0 ] && echo "== 全部门禁通过 ==" || echo "== 有门禁未通过 =="
 exit "$FAIL"
