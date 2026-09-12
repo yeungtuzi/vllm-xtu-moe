@@ -450,8 +450,16 @@ static void bind_moe_class(py::module& m, const char* name) {
                                 h->arrive.store(0, std::memory_order_release);
                                 h->gen.fetch_add(1, std::memory_order_release);
                             } else {
+                                // 【第 132 轮】自旋退避:原为 `std::this_thread::yield()` ——
+                                // 那是系统调用,且在本机 120 个 MoE 线程 + 48 OMP 线程满负荷时
+                                // 很容易把本线程排到队尾(等待被放大成毫秒级)。
+                                // 改为:先纯 PAUSE 自旋(无系统调用),久等才退到 nano-sleep。
+                                // 每层两处 barrier ⇒ 43 层 ×2 的收益。
+                                int _spin = 0;
                                 while (h->gen.load(std::memory_order_acquire) == gen) {
-                                    std::this_thread::yield();
+                                    if (++_spin < 8192) __builtin_ia32_pause();
+                                    else std::this_thread::sleep_for(
+                                        std::chrono::nanoseconds(200));
                                 }
                             }
                             // 3) 求和到自己的 pinned out(H2D 会把它送回 GPU)
@@ -473,8 +481,12 @@ static void bind_moe_class(py::module& m, const char* name) {
                                 h->read_done.store(0, std::memory_order_release);
                                 h->gen2.fetch_add(1, std::memory_order_release);
                             } else {
+                                // 【第 132 轮】同 barrier 1:PAUSE 自旋优先,久等才 nano-sleep。
+                                int _spin2 = 0;
                                 while (h->gen2.load(std::memory_order_acquire) == g2) {
-                                    std::this_thread::yield();
+                                    if (++_spin2 < 8192) __builtin_ia32_pause();
+                                    else std::this_thread::sleep_for(
+                                        std::chrono::nanoseconds(200));
                                 }
                             }
                         }
