@@ -442,10 +442,12 @@ public:
             // 白构造一个 std::function(可能堆分配)并持 work_mtx_。保留成员仅为兼容注释。
             pub_flat_ = &flat_thunk<F>; pub_flat_ctx_ = (void*)&fn;
             pub_shard_ = nullptr; pub_shard_ctx_ = nullptr;
-            n_ = n;
-            worker_limit_.store(limit >= nt_ ? 0 : limit, std::memory_order_relaxed);
-            sharded_call_ = 0;   // this is a flat call: task_ is valid, so reset
-                                 // any stale sharded marker so late workers anchor flat.
+            // 【第 129 轮修】`n_`/`worker_limit_`/`sharded_call_` 原**写在这里**(奇数 store
+            // 之前),与分片发布(§184)是同一个缺陷:字段写在发布窗口之外 ⇒ 读者可能以
+            // 旧 `start` 配新 `n` 做 `i = t - start` 判定,把属于本代的票判成越界/空洞而丢掉
+            // ⇒ remaining_ 少减一次。实测(§190):并发压测
+            // `WATCHDOG fired: n=8 start=960104 end=960112 counter=960232 remaining=1`。
+            // 现已把这几个字段移到下面的"奇数→偶数"窗口内。
             // MONOTONIC ticket counter (never reset). Each call occupies the
             // ticket range [start_, start_+n). Workers bound to THIS call compute
             // i = ticket - start_ and only run for i in [0,n); any ticket beyond
@@ -472,6 +474,10 @@ public:
             gen = current_gen_.load(std::memory_order_relaxed) + 2;   // 下一个偶数代
             current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
             start_ = counter_.load();
+            n_ = n;
+            worker_limit_.store(limit >= nt_ ? 0 : limit, std::memory_order_relaxed);
+            sharded_call_ = 0;   // this is a flat call: task_ is valid, so reset
+                                 // any stale sharded marker so late workers anchor flat.
             remaining_.store(n);      // outstanding work items in this call
             // diagnostic processed-bitset for this call (only when debug/trace on)
             if (diag_active()) proc_vec_.assign(n, 0);
