@@ -570,3 +570,5 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 | R85 | 启用 `XIAOTU_MOE_DPBF16=1` 作为默认路径 | **不能启用**:精度门禁 me=2 用例 max_rel 8.42e-3 > 项目门限 2e-3(其余用例都 OK)。列分块改善不了该精度问题。保持 fp32 为默认 |
 
 | R86 | draft 上 GPU(`XIAOTU_MOE_RESIDENT_DRAFT=1` + `GPU_RESIDENT_LAYERS=43-45`)配 KV 8 GiB | **配置需调小才可用**。draft 3 层共 9.57 GiB + KV 8 GiB + 固定 14.2 GiB = 31.8/39.5 GiB ⇒ 预热阶段 `Triton Error [CUDA]: out of memory`。**不是方向错,是 KV 与常驻层抢显存**;已改为 KV 4 GiB 重试(进行中) |
+
+| R87 | draft 3 层常驻 + KV 4 GiB | **仍失败**:`Engine core initialization failed`(预热阶段,无显式 OOM)。两次尝试合起来的结论:**单卡 39.5 GiB 装不下「固定 14.2 + draft 3 层 9.57 + KV + Triton 工作区」**。下一步应改为**只常驻 1 层**(需先确认 MTP 真实层号)或 KV 2 GiB,或等 TP=2 修好 |
