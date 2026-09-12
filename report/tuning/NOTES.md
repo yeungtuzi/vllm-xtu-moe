@@ -5147,3 +5147,46 @@ status, result = mq.dequeue(timeout=dequeue_timeout)
 ### (c) 顺带核准:TP=2 启动偶发失败**不是**用户环境变更引起的
 "静默原则已暂停"意味着可以自由并行占用本机,但**同一对 GPU 无法并行跑两个 TP=2 实例**
 (每个实例占 26 GiB/40 GiB)⇒ 加速手段只能是"减少重启次数 + 一次测更多",即 (b)。
+
+## 172. 第 120 轮(续):**真正的根因** —— 分片池漏一个任务(`rem=1`)→ 300s 看门狗 `abort()` → worker 原生死亡
+
+### (a) 完整死亡链(已读代码 + 两次实测复现)
+```
+numa_pool.hpp:709-712  分片调用等 done_cv_,条件是 remaining_==0
+numa_pool.hpp:713-721  等不到(dsec 默认 300s,XIAOTU_MOE_SHARD_WD 可覆盖)
+                       ⇒ 打印 [pool] WATCHDOG(sharded) + 每节点 jobs/pulled ⇒ **abort()**
+⇒ worker 被 SIGABRT 杀死(无 Python traceback)
+⇒ 日志: Worker proc VllmWorker-N died unexpectedly (exit code: None)
+⇒ shm 广播写端关闭 ⇒ EngineCore 读端被 cancel ⇒ RuntimeError: cancelled ⇒ HTTP 500
+```
+**这解释了此前所有互不相干的"崩溃"**:启动阶段偶发失败(r120)、32K 崩溃(R90/R91)、
+以及我误判的埋点崩溃(R92)——**同一条链**,只是延迟不同。
+
+### (b) 两次看门狗 dump(全节点 pulled 相同且都远超 jobs)
+| 运行 | 配置 | dump |
+|---|---|---|
+| r121_a1 | **纯交付配置:无常驻、无任何埋点** | `gen=1162 total=128 rem=1 exec=127`;`node 0..7: jobs=16 pulled=31` |
+| r119 | 常驻=0 + 我的(已回退)埋点 | `gen=650 total=256 rem=1 exec=256`;`node 0..7: jobs=32 pulled=47` |
+⇒ **`exec = total-1`**:一个分片被**领取后从未跑完**;`pulled` 每节点完全相同且 ≈2×jobs
+⇒ 不是"某个 NUMA 节点异常",而是**所有节点对称地各领两份**、恰好漏一个。
+⇒ **`XIAOTU_MOE_POOL_TRACE=1` 会打印 `SHARD-JOBDIAG ... dup=/miss=`**,这正是区分
+"任务被漏(池的票据/世代 bug)"还是"任务卡死在内核里"的判据;`XIAOTU_MOE_SHARD_WD=60`
+可把 300s 缩短到 60s 加快复现。
+
+### (c) 【更正 R92】池卡死**不是**我的埋点造成的
+r121 在**完全无埋点、无常驻层**的交付配置下复现同一 dump ⇒ R92 里
+"我在热路径插同步埋点导致池卡死"的归因**错了**(埋点大概只是改变了时序、提高了触发概率)。
+R92 正确保留的部分:①负值事件说明该埋点设计本身不可用;②**不要**在热路径做同步埋点。
+⇒ 结论改写:**埋点放大了症状,但病在生产代码里**。
+
+### (d) 这是 item 2 的**头号阻塞**,优先于任何吞吐优化
+一个会每几次请求就 `abort()` 的引擎没有交付价值;而且它污染了此前所有吞吐数字的可信区间
+(不确定某个数字是在"快要 abort"的状态下测的)。**在修掉 (a) 之前,不应宣称任何配置达标。**
+
+### 下一轮(第一优先,已就绪的手段)
+1. `XIAOTU_MOE_POOL_TRACE=1 XIAOTU_MOE_SHARD_WD=60` 启动,复现并读 `dup/miss`:
+   - `miss>0` ⇒ 池的**票据/世代**bug(重点看 `node_base_`/`node_ticket_` 的奇偶 seqlock
+     与"stale worker 掉出"路径是否**漏减 `remaining_`**);
+   - `miss==0, dup==0` ⇒ 某个分片**卡死在内核里**(重点看 FAST_FP4/`moe_v2_packed4`
+     的段循环对空段/异常 `seg_start` 的处理,以及 `XIAOTU_MOE_EP_SHM` 的跨 rank 双屏障)。
+2. 修复后**重跑数值门禁** `scripts/check_engine_aligned.sh`(R55:动同步/内核必须过)。
