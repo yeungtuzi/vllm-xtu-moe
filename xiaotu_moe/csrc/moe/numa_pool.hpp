@@ -1236,7 +1236,7 @@ private:
 
     std::function<void(size_t, size_t)> sharded_task_;  // fn(node, local)
     int sharded_call_ = 0;                              // #nodes if current call is sharded
-    std::atomic<long> shard_exec_{0};                   // diag: actual stask executions
+    alignas(64) std::atomic<long> shard_exec_{0};                   // diag: actual stask executions
     // 【第 123 轮修·模式 A】分片路径按**世代奇偶**分桶的倒计时。
     // 原来分片路径与 flat 路径共用 `remaining_`,且在递减处加了"再读一次 current_gen_"的守卫
     // —— 守卫为假时递减被**静默跳过**,而该票据所属代的调用方**已把它计入 total**
@@ -1247,41 +1247,41 @@ private:
     // 桶复用安全性:g+4 的 store(total) 只在 g+2 归零后才执行,而 g 代的递减在 g+2 归零前
     // 必已全部完成(g+2 的发布以 g 归零为前提)⇒ 复用安全。票据由 fetch_add 唯一领取 ⇒ 不漏减不多减。
     // 注意 `gen` 恒为**偶数**(就绪态),所以槽位取 (gen>>1)&1,**不能**用 gen&1(恒 0)。
-    std::atomic<size_t> remaining_sh_[2] = {};
+    alignas(64) std::atomic<size_t> remaining_sh_[2] = {};
     static int sh_slot(uint64_t gen) { return (int)((gen >> 1) & 1ULL); }
     // 【第 123 轮纯诊断】不动任何控制流,只计数,用来区分"丢票"与"递减被世代守卫跳过"。
     // 崩溃签名是 exec==total 而 rem==1/2,而每个 exec 后都紧跟一个带守卫的递减
     // ⇒ 必然有一处 break 丢弃了已领票据,或有一处守卫把递减跳过了。谁非零即定位。
-    std::atomic<long> abandoned_{0};                    // diag: 已领票后在 break 处被丢弃
+    alignas(64) std::atomic<long> abandoned_{0};                    // diag: 已领票后在 break 处被丢弃
     // 【第 122 轮·修埋点】`skipped_dec_` 已失效:第 121 轮删世代守卫时把它的自增一并删了,
     // 于是它结构上恒为 0、再无信息量。换成真正的不变式检查 `underflow_`:递减前桶值已是 0
     // ⇒ 说明发生了"多减/重复减"(那会让调用方提前归零)。
     std::atomic<long> skipped_dec_{0};                  // (已失效,保留仅为兼容 dump 字段)
-    std::atomic<long> underflow_{0};                    // diag: 递减前桶值已为 0(多减/重复减)
+    alignas(64) std::atomic<long> underflow_{0};                    // diag: 递减前桶值已为 0(多减/重复减)
     // 【第 122 轮·模式 B 直接证据】任务体入口/出口计数。若某 worker 领了票却卡在
     // `sf_(...)` 里面,看门狗触发时 `entered - left` 就等于"进了没出"的 worker 数。
-    std::atomic<long> entered_{0};
-    std::atomic<long> left_{0};
+    alignas(64) std::atomic<long> entered_{0};
+    alignas(64) std::atomic<long> left_{0};
     // 【第 124 轮】"本代范围内"的票被领走的次数。与 `entered_` 比较即可二分:
     //   inrange == entered + 1 ⇒ 有一张范围内的票在 fast path 内消失了(继续查分支内);
     //   inrange == entered     ⇒ 那张票**根本没被领** ⇒ node_base_/node_nj_ 发布与 worker
     //                            读取之间撕裂(票号区间与实际 job 数不一致)。
-    std::atomic<long> inrange_{0};
+    alignas(64) std::atomic<long> inrange_{0};
     // 【第 133 轮】re-anchor 分支里"范围内"的票(与快路径的 `inrange_` 分开计)。
     // 这样 `inrange_ + inrange2_` 与 `total` 一比即可判定丢票性质:
     //   两和 == total  ⇒ 票都被领且都执行了(问题在递减);
     //   两和 <  total  ⇒ **有票从未被领** ⇒ 发布/读取仍有残余(与 §184 同型)。
-    std::atomic<long> inrange2_{0};
+    alignas(64) std::atomic<long> inrange2_{0};
     // 【第 135 轮·只读诊断】快照自旋的流量。用于回答 §197 的遗留问题:
     // 那张票是否卡在"快照反复重试、始终不满足 g2 == 缓存 gen"的路径上。
     //   snap_retry_    : 快照循环重试次数(奇数代 / 复读不一致)
     //   snap_mismatch_ : 快照成功但 g2 != worker 缓存的 gen(⇒ 走 re-anchor)
-    std::atomic<long> snap_retry_{0};
-    std::atomic<long> snap_mismatch_{0};
+    alignas(64) std::atomic<long> snap_retry_{0};
+    alignas(64) std::atomic<long> snap_mismatch_{0};
     // 【第 138 轮·无损账】领票后**立刻**自增。此后无论走哪条分支都必须恰好一次计入
     // inrange_/inrange2_/abandoned_ 之一 ⇒ `issued - inrange - inrange2 - abandoned`
     // 就是"领了票却没有被分类"的票数(健康态应为 0)。用于回答:那张票到底去哪了。
-    std::atomic<long> issued_{0};
+    alignas(64) std::atomic<long> issued_{0};
     static constexpr size_t kMaxNodeShards = 128;       // ample for any EPYC topology
     // 【轮 76】每个 node 的票号计数器**各自独占一条 cacheline**。原来 8 个计数器挤在
     // 同一条线上,120 个 worker 的 fetch_add 让这条线在 core 之间来回弹(伪共享),
