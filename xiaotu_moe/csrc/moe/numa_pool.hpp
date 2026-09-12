@@ -756,12 +756,16 @@ public:
                         else if (c > 1) ++dup;
                     }
                 }
-                if (dup || miss) {
-                    fprintf(stderr,
-                            "[pool] SHARD-JOBDIAG gen=%llu total=%zu exec=%ld dup=%zu miss=%zu\n",
-                            (unsigned long long)current_gen_.load(), total,
-                            shard_exec_.load(), dup, miss);
-                }
+                // 【第 137 轮】原来只在 `dup || miss` 时才打印 ⇒ **健康调用从不打印**,
+                // 于是"`abandoned` 的基线"从未被观测过(§199c:我此前只见过**崩溃态**的值,
+                // 把它当成了基线)。现在**总是打印**,并加上 abandoned/inrange/inrange2
+                // ⇒ 可以直接读健康态的收敛基线,把 §199(c) 的二选一变成事实。
+                fprintf(stderr,
+                        "[pool] SHARD-JOBDIAG gen=%llu total=%zu exec=%ld dup=%zu miss=%zu "
+                        "abandoned=%ld inrange=%ld inrange2=%ld\n",
+                        (unsigned long long)current_gen_.load(), total,
+                        shard_exec_.load(), dup, miss,
+                        abandoned_.load(), inrange_.load(), inrange2_.load());
             }
         }
         // NOTE: deliberately do NOT clear sharded_call_ here. A worker whose wake
