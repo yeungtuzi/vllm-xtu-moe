@@ -375,8 +375,8 @@ public:
         worker_gen_.reset(new std::atomic<uint64_t>[nt_]);
         for (size_t w = 0; w < nt_; ++w) worker_gen_[w].store(0);
         worker_node_.assign(nt_, 0);
-        node_ticket_.reset(new std::atomic<size_t>[kMaxNodeShards]);
-        for (size_t n = 0; n < kMaxNodeShards; ++n) node_ticket_[n].store(0);
+        node_ticket_.reset(new PaddedTicket[kMaxNodeShards]);
+        for (size_t n = 0; n < kMaxNodeShards; ++n) node_ticket_[n].v.store(0);
         static StackDumperRegistrar registrar;  // SIGUSR2 native-stack dump
         const char* sp = std::getenv("XIAOTU_MOE_SPIN_IDLE_US");
         if (sp) { long v = std::atol(sp); if (v >= 0) spin_idle_us_.store((uint64_t)v); }
@@ -692,7 +692,7 @@ public:
             uint64_t gen = current_gen_.load(std::memory_order_relaxed) + 2;
             current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
             for (int n = 0; n < nnodes; ++n)
-                node_base_[n] = node_ticket_[n].load(std::memory_order_relaxed);
+                node_base_[n] = node_ticket_[n].v.load(std::memory_order_relaxed);
             remaining_.store(total);
             shard_exec_.store(0);      // diag reset per call
             current_gen_.store(gen, std::memory_order_release);       // 偶数:就绪
@@ -715,7 +715,7 @@ public:
                         (unsigned long long)current_gen_.load(), total, remaining_.load(),
                         shard_exec_.load());
                 for (int n = 0; n < (int)node_nj_.size(); ++n) {
-                    long done = (long)node_ticket_[n].load() - (long)node_base_[n];
+                    long done = (long)node_ticket_[n].v.load() - (long)node_base_[n];
                     fprintf(stderr, "  node %d: jobs=%zu pulled=%ld\n", n, node_nj_[n], done);
                 }
                 abort();
@@ -936,7 +936,7 @@ private:
                 if (myn >= 0 && myn < sharded_call_) {
                     size_t base = node_base_[myn], nj = node_nj_[myn];
                     for (;;) {
-                        size_t t = node_ticket_[myn].fetch_add(1, std::memory_order_relaxed);
+                        size_t t = node_ticket_[myn].v.fetch_add(1, std::memory_order_relaxed);
                         size_t loc = t - base;
                         uint64_t g = current_gen_.load(std::memory_order_acquire);
                         if (g == gen) {
@@ -1109,10 +1109,10 @@ private:
     std::mutex call_mtx_;  // serializes parallel_for entry (shared-pool safety)
     std::function<void(size_t)> task_;
     size_t n_;
-    std::atomic<size_t> counter_;
+    alignas(64) std::atomic<size_t> counter_;
     size_t start_ = 0;                 // first ticket index of current call (monotonic)
-    std::atomic<size_t> remaining_;  // outstanding work items in current call (countdown barrier)
-    std::atomic<uint64_t> current_gen_;
+    alignas(64) std::atomic<size_t> remaining_;  // outstanding work items in current call (countdown barrier)
+    alignas(64) std::atomic<uint64_t> current_gen_;
     // Hot-restart spin budget (us). While a new parallel_for generation arrives
     // within this window (decode hot path), workers stay awake spinning on the
     // generation counter and the caller spin-waits completion, avoiding the
@@ -1164,7 +1164,14 @@ private:
     int sharded_call_ = 0;                              // #nodes if current call is sharded
     std::atomic<long> shard_exec_{0};                   // diag: actual stask executions
     static constexpr size_t kMaxNodeShards = 128;       // ample for any EPYC topology
-    std::unique_ptr<std::atomic<size_t>[]> node_ticket_;  // per-node monotonic counters
+    // 【轮 76】每个 node 的票号计数器**各自独占一条 cacheline**。原来 8 个计数器挤在
+    // 同一条线上,120 个 worker 的 fetch_add 让这条线在 core 之间来回弹(伪共享),
+    // 是去锁后每个并行区仍剩 ~17 µs 固定成本的主要嫌疑。纯布局改动,零语义变化。
+    struct alignas(64) PaddedTicket {
+        std::atomic<size_t> v{0};
+        char _pad[64 - sizeof(std::atomic<size_t>)];
+    };
+    std::unique_ptr<PaddedTicket[]> node_ticket_;  // per-node monotonic counters (padded)
     std::vector<size_t> node_base_;                     // per-node first ticket this call
     std::vector<size_t> node_nj_;                       // per-node job count this call
 };
