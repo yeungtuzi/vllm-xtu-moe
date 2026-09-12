@@ -707,6 +707,7 @@ public:
             entered_.store(0);         // diag reset per call
             left_.store(0);            // diag reset per call
             inrange_.store(0);         // diag reset per call
+            inrange2_.store(0);        // diag reset per call
             current_gen_.store(gen, std::memory_order_release);       // 偶数:就绪
         }
         cv_.notify_all();
@@ -731,11 +732,11 @@ public:
                         remaining_sh_[_gslot].load(),
                         shard_exec_.load());
                 fprintf(stderr, "  [判据] abandoned=%ld underflow=%ld  "
-                        "entered=%ld left=%ld inrange=%ld\n"
-                        "         (entered-left>0=卡在任务体; inrange-entered=1=票在fast path内消失;"
-                        " inrange==entered=票根本没被领⇒发布撕裂)\n",
+                        "entered=%ld left=%ld inrange=%ld inrange2=%ld  "
+                        "⇒ 若 inrange+inrange2 < total 则**有票从未被领**(发布/读取残余)\n",
                         abandoned_.load(), underflow_.load(),
-                        entered_.load(), left_.load(), inrange_.load());
+                        entered_.load(), left_.load(),
+                        inrange_.load(), inrange2_.load());
                 for (int n = 0; n < (int)node_nj_.size(); ++n) {
                     long done = (long)node_ticket_[n].v.load() - (long)node_base_[n];
                     fprintf(stderr, "  node %d: jobs=%zu pulled=%ld\n", n, node_nj_[n], done);
@@ -1033,6 +1034,7 @@ private:
                         base = nb; nj = nnj;
                         loc = t - base;
                         if (loc >= nj) { abandoned_.fetch_add(1, std::memory_order_relaxed); break; }  // beyond live range -> re-arm outer wait
+                        inrange2_.fetch_add(1, std::memory_order_relaxed);   // diag: re-anchor 分支的范围内票
                         if (sf_) {
                             entered_.fetch_add(1, std::memory_order_relaxed);
                             sf_(sc_, (size_t)myn, loc);
@@ -1252,6 +1254,11 @@ private:
     //   inrange == entered     ⇒ 那张票**根本没被领** ⇒ node_base_/node_nj_ 发布与 worker
     //                            读取之间撕裂(票号区间与实际 job 数不一致)。
     std::atomic<long> inrange_{0};
+    // 【第 133 轮】re-anchor 分支里"范围内"的票(与快路径的 `inrange_` 分开计)。
+    // 这样 `inrange_ + inrange2_` 与 `total` 一比即可判定丢票性质:
+    //   两和 == total  ⇒ 票都被领且都执行了(问题在递减);
+    //   两和 <  total  ⇒ **有票从未被领** ⇒ 发布/读取仍有残余(与 §184 同型)。
+    std::atomic<long> inrange2_{0};
     static constexpr size_t kMaxNodeShards = 128;       // ample for any EPYC topology
     // 【轮 76】每个 node 的票号计数器**各自独占一条 cacheline**。原来 8 个计数器挤在
     // 同一条线上,120 个 worker 的 fetch_add 让这条线在 core 之间来回弹(伪共享),

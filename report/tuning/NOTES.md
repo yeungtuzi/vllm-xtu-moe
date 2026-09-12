@@ -6076,3 +6076,44 @@ died unexpectedly (exit code: None)
 `binding.cpp` 的 EP 两处 barrier 自旋由 `std::this_thread::yield()`(系统调用,在 120 个
 MoE 线程满负荷时容易被排到队尾)改为 **PAUSE 自旋优先、久等才 nano-sleep**。
 目标:压缩 §194 量出的 0.45 ms/层归约成本。**已编译,但因 (a) 的启动失败尚未测到数据。**
+
+## 196. **判据定死**:`inrange+inrange2 = 127 < total = 128` ⇒ 一张票**从未被领**;机制 = 发布时"占位"不是原子的
+
+### (a) 读数(第 133 轮,带 `inrange2_`)
+```
+WATCHDOG(sharded) gen=19438 total=128 rem=1 exec=127
+判据] abandoned=120 underflow=0 entered=127 left=127 inrange=126 inrange2=1
+⇒ inrange + inrange2 = **127 < total = 128**
+```
+- 快路径领到 126 张、re-anchor 分支领到 1 张,合计 **127**;
+- 而倒计时按 **128** 计 ⇒ **第 128 张票从未被任何 worker 看成"范围内"**;
+- `abandoned=120` 仍是基线 ⇒ 那张票也没被当越界票丢弃;
+⇒ 与 §188 的"领了又丢"**无关**,是**发布出来的区间本身就少了一张**。
+
+### (b) 机制:发布时的"占位"用的是 `v.load()`,不是原子预留
+```cpp
+// numa_pool.hpp(分片发布,窗口内)
+node_base_[n] = node_ticket_[n].v.load(std::memory_order_relaxed);   // ← 只是**读**
+```
+而 `node_ticket_[n]` 是**单调、永不重置**的计数器,worker 用 `fetch_add` 领票。
+**上一代的滞留 worker 会持续 `fetch_add`**。于是:
+1. 发布者读到 `base = node_ticket_[n].v` = X,宣布"本次调用拥有 `[X, X+nj)`";
+2. 一个滞留 worker 紧接着 `fetch_add` 拿到 **X** —— 但这张票在它眼里属于**旧代**
+   (它按旧代范围判定,可能直接丢弃/或交给 re-anchor);
+3. ⇒ **新调用实际只剩 nj−1 张票可用**(X 被旧代 worker 拿走了),
+   而 `total` 里仍然算了 nj 张 ⇒ **少一张** ⇒ 倒计时永不归零。
+seqlock 保护的是**字段**(base/nj 的一致性),但**保护不了票据计数器** ——
+`v.load()` 与 worker 的 `fetch_add` 之间存在真实的竞争窗口。
+
+### (c) 正确修法(下一轮)
+**要让"本次调用的票据区间"与票据计数器上的领取原子化**:发布者应**预留**而不是只读:
+```cpp
+node_base_[n] = node_ticket_[n].v.fetch_add(nj);   // 原子预留 [base, base+nj)
+```
+这样没有任何其他 worker 能从 `fetch_add` 拿到这个区间内的票;
+worker 的领票则改为按**每次调用的局部索引**分配(例如 `shard_idx_[n].fetch_add(1)`,
+在发布窗口内重置),并用 `loc < nj` 判定;滞留 worker 仍靠"活代校验 + 每个调用独立的索引"
+被安全地挡在外面。
+注意:轮 68 曾因"每次调用重置计数器"而出现"陈旧票别名到新调用"的事故
+(`numa_pool.hpp` 里那条注释)⇒ **重置局部索引必须同时保留活代校验**,
+不能退回当时的写法。这条改动**需要先想清楚再动**,不能直接照抄。
