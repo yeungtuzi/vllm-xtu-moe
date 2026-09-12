@@ -437,7 +437,9 @@ public:
         uint64_t gen;
         {
             std::lock_guard<std::mutex> lk(work_mtx_);
-            task_ = std::function<void(size_t)>(fn);  // type-erased copy(仅保留给兼容/诊断)
+            // 【轮 68】删除 `task_ = std::function<void(size_t)>(fn);`:全文检查确认 task_
+            // **只被赋值、从未被读取**(worker 走 pub_flat_/pub_shard_ 裸函数指针),每次调用
+            // 白构造一个 std::function(可能堆分配)并持 work_mtx_。保留成员仅为兼容注释。
             pub_flat_ = &flat_thunk<F>; pub_flat_ctx_ = (void*)&fn;
             pub_shard_ = nullptr; pub_shard_ctx_ = nullptr;
             n_ = n;
@@ -653,7 +655,7 @@ public:
             std::lock_guard<std::mutex> lk(work_mtx_);
             node_base_.resize((size_t)nnodes);
             node_nj_.resize((size_t)nnodes);
-            sharded_task_ = std::function<void(size_t, size_t)>(fn);
+            // 【轮 68】同 parallel_for_impl:sharded_task_ 也从未被读取,删除其构造。
             pub_shard_ = &shard_thunk<F>; pub_shard_ctx_ = (void*)&fn;
             pub_flat_ = nullptr; pub_flat_ctx_ = nullptr;
             // A sharded call has no flat task: clear it so a worker that somehow
