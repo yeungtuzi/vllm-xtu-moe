@@ -6758,3 +6758,15 @@ SERVE_WRAP="/usr/local/cuda/bin/compute-sanitizer --tool memcheck --target-proce
 然后读 sanitizer 的输出(stderr,会进 vLLM 日志)⇒ 直接得到**越界的内核名 + 行号**。
 **注意**:memcheck 的 `ERROR SUMMARY` 只在**正常退出**时打印,而故障会让进程异常终止 ——
 所以要看的是**越界报告本身**(`Invalid __global` / `out-of-bounds`),不是 summary。
+
+### (e) 成本优化(第 162 轮,等待期间记录)
+sanitizer 每次尝试的加载约 **45 分钟**(每 shard 59s vs 正常 17s),因为**加载阶段的 CUDA 调用
+也被插桩了**。若第一次没抓到越界,后续每轮都要再付这笔成本。可选的降本手段:
+1. **`--launch-skip <N>`**:跳过前 N 次内核启动不插桩 ⇒ 加载阶段(占绝大多数启动数)
+   几乎不再被监控,只有后面的解码内核被检查。代价是需要猜 N(可以先跑一次带
+   `--launch-count 0` 或看日志粗估加载期的 kernel 启动数);
+2. **`--kernel-name regex:<pat>`**:只插桩名字匹配的内核。若 suspect 已收窄到某几个
+   内核(例如 `persistent_topk`、DSA indexer、MLA attention),用它可以大幅降本;
+3. **只对"解码阶段"插桩**:先让服务正常加载完,再启动 sanitizer? —— **不可行**,
+   sanitizer 必须在进程启动时介入。所以只能靠 1/2 这类过滤。
+⇒ **若本轮没抓到,下一轮先用 `--launch-skip` 或 `--kernel-name` 过滤,避免每轮 45 分钟。**
