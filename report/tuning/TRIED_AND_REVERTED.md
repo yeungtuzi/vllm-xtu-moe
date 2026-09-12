@@ -602,3 +602,20 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
   (…,'VLLM::Worker_TP0'),(…,'VLLM::Worker_TP1')]`,三卡全部回到 0 MiB,exit=0。
 - **教训**:凡是"等显存释放"类脚本,**必须自带失败退出码**,否则它会把 M9 伪装成
   "环境问题",让人在错误方向上多花一整轮。
+
+## R91. TP=2 常驻专家层(GPU-resident MoE layers):收益仅 2-4%,且是 32K 崩溃的诱因 —— 从交付配置移除
+- **配置**:`XIAOTU_MOE_GPU_RESIDENT_LAYERS=0-11` + `XIAOTU_MOE_RESIDENT_BUDGET_GB=14`
+  ⇒ 实际常驻 8 层(每 rank 1.59 GiB/层)。
+- **收益(同数据集 nat8192/nat32768,同会话,TP=2)**:
+  8192 1333-1345 → **1371-1396 t/s**(+2.3%);32768 1160-1164 → **1185 t/s**(+1.6%)。
+  DMA 模型预测应为 ~9-10% ⇒ 实测只有 1/4。
+- **代价 / 风险(决定性)**:
+  | 配置 | 32K 尝试 | 崩溃 |
+  |---|---|---|
+  | 常驻=0 | 5 | 0 |
+  | 常驻=8 | 4 | **2** |
+  一次是 `persistent_topk ... illegal memory access`(Python 可见),一次是
+  `VllmWorker-0 died unexpectedly (exit code: None)`(原生信号崩溃,无 traceback)。
+- **结论**:8 层常驻 = 用 12.7 GiB 显存换 2-4% 预填充,同时引入长上下文段错误 ⇒
+  **净负**。交付配置改为 `XIAOTU_MOE_GPU_RESIDENT_LAYERS` 不设(常驻=0)。
+- 注:R89(Triton OOM 只在常驻层存在时出现)与本条同源,可一并归档为该机制的第三个反例。
