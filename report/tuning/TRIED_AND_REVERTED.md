@@ -568,3 +568,5 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 
 | R84 | 把"减指令"当作 na=12 的杠杆(§140 的 op-bound 推论) | **部分否掉**。给 bf16 路径加列分块后它确实从 0.72-0.76 变到 0.64-0.66(证实 GEMV 是 R65 病根),但 FMA 侧减掉 1/3 的 op 只换来 3-4% ⇒ **na=12 也不是单纯 op-bound**。不要再按"数 op 数"来预测收益 |
 | R85 | 启用 `XIAOTU_MOE_DPBF16=1` 作为默认路径 | **不能启用**:精度门禁 me=2 用例 max_rel 8.42e-3 > 项目门限 2e-3(其余用例都 OK)。列分块改善不了该精度问题。保持 fp32 为默认 |
+
+| R86 | draft 上 GPU(`XIAOTU_MOE_RESIDENT_DRAFT=1` + `GPU_RESIDENT_LAYERS=43-45`)配 KV 8 GiB | **配置需调小才可用**。draft 3 层共 9.57 GiB + KV 8 GiB + 固定 14.2 GiB = 31.8/39.5 GiB ⇒ 预热阶段 `Triton Error [CUDA]: out of memory`。**不是方向错,是 KV 与常驻层抢显存**;已改为 KV 4 GiB 重试(进行中) |

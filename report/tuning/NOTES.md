@@ -4656,3 +4656,26 @@ draft 上 GPU 后,投机步的 CPU 权重流量回到"只算目标模型一次"(
 ⑥人类的硬约束(4-5 核/CCD、NUMA 分片、禁 singlecopy)反被 AI 实测验证(§125)。
 文末给出**"人给 AI 派活"的最小成本指导清单**(划界/参考数字/预期形状/架构放置/不变量/口径)
 与 **AI 侧自我约束**(清场、单变量、标注数字性质、禁跨口径、先做最便宜对照、门禁、工具化操作陷阱)。
+
+## 157. 第 103-104 轮:把 draft 放上 GPU 的第一/二次尝试(显存账)
+
+### 依据(§155)
+模型 = 43 层 + **1 层 nextn(MTP)作 draft**;插件 `hybrid_model.py:501-511` **默认把 draft 副本
+排除在 GPU 常驻外** ⇒ draft 的 MoE 跑在 CPU ⇒ 投机净亏。处方:`XIAOTU_MOE_RESIDENT_DRAFT=1`
+\+ 把 MTP 层写进 `XIAOTU_MOE_GPU_RESIDENT_LAYERS`(参考配置也是 `43-45`)。
+
+### 尝试 1(失败,已记 R86):KV 8 GiB + draft 3 层常驻
+日志确认 draft 层已进显存:`resident model.layers.43/44/45.ffn: 3.19 GiB on cuda:0`(共 **9.57 GiB**),
+KV 已按 8 GiB 分配(291,535 token),随后
+**`RuntimeError: Triton Error [CUDA]: out of memory`**(预热/autotune 阶段)。
+显存账:固定 14.2 + KV 8 + draft 9.57 = **31.8 GiB / 39.5**,余量不足以覆盖 Triton 工作区。
+
+### 尝试 2(进行中):KV 降到 4 GiB,其余不变
+`--kv-cache-memory-bytes 4294967296` + draft 3 层常驻 + budget 12 + gpu-mem-util 0.9
+⇒ 14.2 + 4 + 9.57 = 27.8 GiB,余 ~11.7 GiB。启动日志已见 3 个 draft 层常驻、**暂无 OOM**,仍在预热。
+
+### 待测(就绪后立刻做)
+1. `/metrics` 的 `spec_decode` 指标 ⇒ **接受率**(不再从 TPOT 反推);
+2. C=1 与 C=2 的 TPOT / out_tok/s;
+3. `XIAOTU_CD_TIMING` 的每层 compute/rest(看投机步的 CPU 流量是否回到"只算目标一次")。
+预期(§152 公式):draft 上 GPU 后 k=5 不再是净亏;C=1 有望回到 ≥无投机的水平并叠加接受率收益。
