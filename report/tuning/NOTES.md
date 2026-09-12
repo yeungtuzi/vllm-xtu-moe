@@ -4379,3 +4379,26 @@ TPOT 56.9-57.8 ms(r74/r75 实测)。
 
 ### 副产:显存"精确账"(见 §145)与数据集补齐
 - 数据集已补齐:`report/tuning/datasets/nat8192.jsonl`、`nat32768.jsonl`(精确 8192/32768 token)。
+
+## 147. 第 97 轮:8070 已恢复可用;两处异常待下一轮处理
+
+### 1) 8070 = 已证明可用的基线,现已 **UP**
+`TP=1 + CUDA graph(无 --enforce-eager)+ 无常驻层 + KV 8 GiB + maxlen 262144`,启动 ~4.5 min。
+
+### 2) 【红旗】同一基线,`rest` 从 0.77 → 3.2-3.6 ms/层
+新服务端 `XIAOTU_CD_TIMING=1` 输出:
+```
+layers=43 qlen=12 k=6 period=4.43ms compute=0.82ms rest=3.62ms (compute 18%, rest 82%)
+layers=43 qlen=6  k=6 period=4.54ms compute=1.30ms rest=3.24ms (compute 29%, rest 71%)
+```
+对比 §120(第 74 轮,几乎同配置):`period=2.05ms compute=1.28ms rest=0.77ms`。
+⇒ **`compute` 相当,`rest` 恶化 2.2×**。最可能是我这一轮反复起停服务/并行尝试造成的环境残差
+(残留进程、pinned 内存压力、GPU 上还有别的进程),**不一定是真回归**。
+⇒ 下一轮第一件事:**在真正干净的机器状态上(确认无残留、GPU 全 0、`rm -f /dev/shm/xiaotu_ep_*.bin`)
+重新采一次这个基线**(C=1 与 C=2),作为第二条的起跑线。
+
+### 3) 客户端工具缺依赖
+`scripts/bench_nat.sh`(走 `vllm bench serve --dataset-name custom` 读 jsonl)失败:
+`ImportError: Please install vllm[bench] for bench support`(该 env 缺 pandas)。
+⇒ 用 `scripts/tune_client.sh`(random/sharegpt 路径,不读 jsonl;第 74/75 轮已验证可用),
+或 `pip install pandas` 到 vllm-xiaotu-moe env。**下一轮开工前先修这个,否则测不出数。**
