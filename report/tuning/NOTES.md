@@ -5361,3 +5361,13 @@ std::atomic<size_t> remaining_[2];          // 代替单个 remaining_
   且声明默认 1 与 getter 默认 3 自相矛盾)⇒ **不必对齐 window 深度**;
 - 参考实现里 **MTP/draft 层无条件常驻**(`is_lk_moe_gpu_resident_layer("mtp.")` 恒 True)
   ⇒ 这是**解码/投机**的杠杆,已转入下一方案。
+
+## 177. 【更正】EP shm 容量:两道门禁都在,不存在越界;只剩一个纯性能的注释不实
+第 121 轮我向用户报告的"CPU 通路越过 EP shm stride 8 倍写入"**是错的**,已在 R95 详述。
+正确事实:
+- 引擎 `binding.cpp:437-440` `if (bytes <= ep->capacity)` —— 放不下就不进 shm barrier;
+- Python `hybrid_model.py:983` `_need_allreduce = qlen > _ep_shm_tokens` —— 超出即回退 NCCL。
+⇒ **纯 CPU 预填充(qlen 任意大)是正确的**,用户要求的"慢可以、错不行"已满足。
+唯一真实残留是 `hybrid_model.py:736-738` 注释与实现不一致(实现只取
+`XIAOTU_MOE_EP_SHM_TOKENS`,没取 `max(·, 阈值)`)⇒ GPU 阈值 >1025 时会**静默**走 NCCL 回退,
+是**性能**问题而非正确性问题。

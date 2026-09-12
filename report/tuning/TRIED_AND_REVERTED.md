@@ -664,3 +664,32 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 - **已回退**(`git checkout`),并已后台重建基线 `.so` 使源码与产物一致。
 - **教训**:在并发协议上"读起来最可疑"的那一处不一定是真凶;必须先加**计数埋点证明**
   再改(这条我在 §174(e) 已经写下,却没遵守,浪费了一次 13 分钟加载 + 一次重编译)。
+
+## R95. 【更正·我错了】"CPU 通路会越过 EP shm stride 8 倍写入" —— **不存在此越界**
+- **我的错误断言**(第 121 轮向用户报告):"CPU 通路的 EP shm 缓冲按固定
+  `XIAOTU_MOE_EP_SHM_TOKENS=1024` 分配 stride,而 `gpu_prefill_min_tokens()` 默认为 0
+  ⇒ CPU 通路会拿到 qlen 高达 8192 的批次,越过 1024-token 的 stride **8 倍**"。
+- **实际情况:有两道独立门禁,不存在越界写。**
+  1. **引擎侧**(`binding.cpp:437-440`):
+     ```cpp
+     const size_t bytes = (size_t)qlen * engine->config().hidden_size * sizeof(float);
+     if (bytes <= ep->capacity) {   // ← 只在放得下时才走 shm barrier
+     ```
+     放不下就**不进 shm 路径**(`ep->capacity = stride`,由 `configure_ep` 传入)。
+  2. **Python 侧**(`hybrid_model.py:983`):
+     ```python
+     _need_allreduce = self._ep and qlen > self._ep_shm_tokens
+     ```
+     超出容量时回退 `tensor_model_parallel_all_reduce`(NCCL)。
+  ⇒ **纯 CPU 预填充(qlen=8192)是正确的**:引擎跳过 shm、Python 做 NCCL all-reduce。
+  用户要求的"可以慢,但是不能出错"**当前已经满足**。
+- **错误性质**:我只读了 Python 侧的分配 + 注释(`hybrid_model.py:736-738`),
+  **没有检查引擎侧**就用了"8 倍越界写"这种确定性措辞,并让用户据此下了指令。
+  这是本会话第 5 个错误结论,也是**最危险的一个**(把性能问题说成了内存破坏)。
+- **仍然成立的、真实存在的小问题(仅性能,非正确性)**:
+  `hybrid_model.py:736-738` 的注释断言"取 `max(预分配, 阈值)` 即可覆盖 CPU 路径的最大 qlen",
+  但代码实际只取 `XIAOTU_MOE_EP_SHM_TOKENS`(默认 1024)。若把 GPU 阈值设到 > 1025,
+  CPU 通路就会**静默地**走 NCCL 回退 —— 正确但慢,且无任何日志提示。
+  ⇒ 建议(未实施,待用户确认):把 `_toks` 改为按 `max(EP_SHM_TOKENS, gp_min-1)` 计算
+  (gp_min>0 时),并在真正走到回退时打一次 warning。**纯 CPU 模式(gp_min=0)不应按
+  8192 预分配**(stride 134 MB × 43 层 × 2 rank ≈ 11.5 GB /dev/shm),回退即正确。
