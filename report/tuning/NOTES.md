@@ -6540,3 +6540,47 @@ repro.py 里的解码请求(`mt=8`/`mt=32`)在回退路径下要慢约 11 倍 �
 - 但**修法只能是让它正确工作**,而不是停用它。
 ⇒ 下一轮:查 `RADIX_TOPK_WORKSPACE_SIZE` 的真实需求(它是否应随 `logits.shape[1]` 缩放),
 或直接给该常量按最大上下文放大后实测(`logits.shape[1]` 最大 = max_model_len = 262144)。
+
+## 209. 决定性约束:内核**自己校验 workspace**,真凶更可能是**协作式 barrier**(`RADIX_THRESHOLD=32768`)
+
+### (a) 两条新事实(读预编译内核源码 `/tmp/vllm-pr/csrc/libtorch_stable/`)
+1. **workspace 是被校验的**:
+   ```cpp
+   STD_TORCH_CHECK(workspace.size(0) >= state_bytes,
+                   "workspace too small, need ", state_bytes, " bytes");
+   ```
+   ⇒ 若只是"1 MiB 不够",**应该报这条明确的错**,而不是 illegal memory access。
+   **我们从未见过这条消息** ⇒ §206 的"单纯 workspace 太小"假设**被削弱**。
+2. **`constexpr uint32_t RADIX_THRESHOLD = 32768;`**(`persistent_topk.cuh:36`),
+   且**协作式 spin-wait barrier 只在 `max_seq_len > RADIX_THRESHOLD` 时运行**:
+   ```cpp
+   const bool needs_cooperative = static_cast<uint32_t>(max_seq_len) > P::RADIX_THRESHOLD;
+   ...
+   // The cooperative spin-wait barrier only runs when at least one row hits
+   // the radix path (seq_len > RADIX_THRESHOLD).
+   ```
+
+### (b) 这与故障形状的关系(**关键**)
+- 按**批内真实序列长度**算,我们的 `nat8192` / `nat32768` 请求都 ≤ 32768
+  ⇒ **不该**触发协作路径;
+- 但内核收到的是 `logits.shape[1]`,而 `logits` 是按 **`max_model_len = 262144`** 定尺寸的
+  ⇒ **该值恒为 262144 > 32768** ⇒ **协作式 barrier 一直在跑**。
+- ⇒ **这正好解释了为什么 8192 上下文的请求也会出事**,以及为什么故障与"上下文长度"只是
+  间接相关(真正相关的是"是否走了这个内核",而它几乎每步都走)。
+
+### (c) 新的头号嫌疑:**协作式 grid barrier**
+它比"workspace 太小"更符合全部证据:
+- ① **30 秒停顿** —— 协作 barrier 是**自旋等待**,一旦 CTA 驻留数与网格不匹配就会长时间空转;
+- ② **illegal memory access** —— 协作路径的 `state_bytes`/状态区若在某种形状下算错,
+  越界就发生在状态区;
+- ③ **报错点飘忽** —— sticky CUDA error 在下一处同步点才暴露(与第 116 轮一致);
+- ④ **非确定性** —— 依赖 CTA 驻留/调度时序,正是随机复现的特征。
+
+### (d) 下一轮(具体)
+读 `persistent_topk.cuh` 的 **880-940 行**(barrier 实现)与**主机侧 `state_bytes` 的计算**,
+回答两个问题:
+1. 协作路径的 `state_bytes` 是否随 `max_resident_ctas` 增长(若是,1 MiB 够不够算清楚);
+2. **网格 × 占用率是否可能超过硬件驻留上限** ⇒ 协作启动失败/死锁
+   (`max_resident_ctas` 与 `hw_resident_cap` 的比较逻辑在 `topk.cu:115-125`)。
+若确认是**驻留数不匹配**,那是一个**很局部的上游修复**(钳制网格或回退非协作路径),
+而不是"放大 workspace"。
