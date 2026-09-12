@@ -4620,3 +4620,26 @@ TP=2 仍需单独二分(§146 的 5 个失败案例仍有效)。
 
 ### 要做"真的机器上限"探针,必须**同形**:同一 shard 的线程读**同一批 2 KB 行的不同列**
 (即引擎的访问模式)+ 零解码。这是下一步若再谈带宽利用率时应采用的形式。
+
+## 155. 第 102 轮:【用户点出关键】draft 在 CPU 上 —— 我方投机慢/接受率低的直接原因
+
+### 证据
+- 模型:`num_hidden_layers=43` + **`num_nextn_predict_layers=1`** ⇒ draft = **1 层 MTP**(不是独立小模型)。
+- 插件 `hybrid_model.py:501-511`:**默认把 draft 副本排除在 GPU 常驻之外**(注释的理由是省显存:
+  "常驻会把显存占用翻倍 ⇒ 常驻层数上不去");开关 `XIAOTU_MOE_RESIDENT_DRAFT=1` 才能恢复。
+⇒ **我们的 draft 层专家跑在 CPU 引擎上**:每个投机步额外走 CPU MoE ⇒
+  - 与用户生产观察(draft **90 tok/s**,显然在 GPU)相反;
+  - 解释了 §153 的两组实测:有投机 k=5 时**每步 74 ms**(vs 无投机 43 ms)、
+    且 C=2 几乎不扩展(+6%)—— 因为 draft 也按 token 数放大 CPU 权重流量。
+
+### 处方(下一轮立刻做)
+1. **把 draft 放到 GPU**:`XIAOTU_MOE_RESIDENT_DRAFT=1`(或把 MTP 层号写进
+   `XIAOTU_MOE_GPU_RESIDENT_LAYERS`)。代价:多占 ~1 层 × 3.19 GiB(TP=1)——
+   而它换来的是**投机从"净亏"变成"净赚"**,远优于"多常驻 1 个目标层(+6% rest)"。
+2. **同时把 draft 采样从 `probabilistic` 改为 greedy/低温**(接受率 26% → 目标 40-50%)。
+3. 用 `/metrics` 的 `spec_decode` 指标**直接读接受率**(不再从 TPOT 反推)。
+4. 测量口径:C=1 与 C=2 的 TPOT/out_tok/s + `XIAOTU_CD_TIMING` 的每层 compute/rest。
+
+### 预期(按 §152 的字节/token 公式)
+draft 上 GPU 后,投机步的 CPU 权重流量回到"只算目标模型一次"(qlen=1 的 43 层)而非 qlen=6 的 43 层;
+再叠加接受率 1.3→3 ⇒ **单流有望 35-40 t/s**(>30 ✅),C=2 叠加共享专家 ⇒ **聚合有望 ~70**(≥70 ✅)。
