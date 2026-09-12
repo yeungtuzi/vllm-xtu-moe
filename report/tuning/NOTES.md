@@ -6332,3 +6332,28 @@ SHARD-JOBDIAG total=384 exec=384 abandoned=120 inrange=384 inrange2=0 issued=504
    occupancy query 里才暴露);
 2. 同时把 `XIAOTU_MOE_POOL_TRACE` 关掉以减少干扰;
 3. 抓到首个内核后,再决定是 TMA/对齐问题、还是 shape 边界(空段、`seg_start` 越界)。
+
+## 203. `CUDA_LAUNCH_BLOCKING=1` **没能复现故障 B** —— 它先触发了故障 A
+
+### (a) 实测
+```
+会话1: #8 len=512 mt=32 ok **303851ms** → #9 len=8192 mt=1 FAIL;健康 000
+日志末尾: [pool] WATCHDOG ... + node 0..7: jobs=16 pulled=31   ← **故障 A**
+```
+- **303851 ms ≈ 300 s** = **看门狗的默认值**(`XIAOTU_MOE_SHARD_WD` 未设,默认 300 s;
+  本轮我只设了 `CUDA_LAUNCH_BLOCKING=1`)⇒ 这不是新故障,就是**故障 A**:池卡住 → 300 s → `abort()`。
+- ⇒ **CLB 没有复现故障 B**;它把时序整体拖慢,反而让故障 A 先到。
+
+### (b) 方法学修正(我自己的操作失误)
+上一轮我在报告里写"用 CLB 复现故障 B",但**忘了同时设 `SHARD_WD=60`**,
+于是 A 一旦触发就要等满 300 s —— 白白多花 4 分钟,并且掩盖了本轮的真实目的。
+⇒ **以后跑诊断必须把已知的"兜底超时"一并压到最小**,否则诊断会被兜底路径抢先。
+
+### (c) 下一轮(修正后的做法)
+1. **不启用 CLB**(故障 B 显然与正常时序相关,CLB 会改变它),
+   而是 `XIAOTU_MOE_POOL_TRACE=1 XIAOTU_MOE_SHARD_WD=60`(**保留 60 s 兜底**),
+   多跑会话直到抓到**无看门狗 + `CUDA error: an illegal memory access`** 那一次;
+2. 抓到后立即看它前面**最后一次成功请求的类型与耗时**(第 139 轮是
+   `8192/mt8 = 29.9 s`,正常 6.7 s ⇒ **30 秒停顿是预兆**);
+3. 若要精确定位越界内核,可在抓到之后再单独用 `compute-sanitizer --tool memcheck`
+   跑一次**同类型请求**(它比 CLB 更能指出越界的那一行,且不需要全局同步)。
