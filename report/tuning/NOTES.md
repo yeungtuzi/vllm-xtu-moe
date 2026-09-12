@@ -6380,3 +6380,34 @@ SHARD-JOBDIAG total=384 exec=384 abandoned=120 inrange=384 inrange2=0 issued=504
 故障 B 的抓取需要**更多会话**(纯等待),建议一次挂 **10 个会话**的后台任务;
 抓到后按 §203(c) 的流程:看前兆(`8192/mt8` 是否出现 30 秒级停顿)→
 再用 `compute-sanitizer --tool memcheck` 对**同类型请求**定位越界内核。
+
+## 205. **故障 B 抓到第二次,且前兆两次完全一致**:`nat8192/mt8` 的 30 秒停顿
+
+### (a) 两次故障 B 的对照
+| 轮次 | 前兆(最后一次"成功"的请求) | 正常值 | 随后 |
+|---|---|---|---|
+| §202(第 139 轮) | `len=8192 mt=8` **29964 ms** | ~6730 ms | `len=32768 mt=1` **FAIL** |
+| §205(第 142 轮) | `len=8192 mt=8` **31656 ms** | ~6730 ms | `len=32768 mt=1` **FAIL** |
+签名均为:`CUDA error: an illegal memory access was encountered`
+→ `died unexpectedly (exit code: None)` → `cancelled` → `EngineDeadError`。
+
+⇒ **前兆可复现**:一个 `nat8192 + max_tokens=8` 的解码请求**先出现 ~30 秒停顿**
+(放慢约 4.7×),**紧接着的下一个请求**触发 CUDA 越界并打死 worker。
+⇒ 这把故障 B 的触发条件收窄到了一个**很具体的形状**:`qlen=8, k=6`,
+且 KV 已有 8192 token。
+
+### (b) 关键推论:30 秒停顿与越界**同源**
+- 停顿不是"慢",而是**某个东西在等**(30 s 这个量级很像某个超时/自旋);
+- 越界很可能**不是**在触发它的那个请求里首次发生,而是**停顿期间某个内核**写坏了显存,
+  随后在下一个请求上以 sticky CUDA error 的形式暴露(与第 116 轮 `persistent_topk`
+  的 occupancy query 才报错是同一模式);
+⇒ **必须用 `compute-sanitizer` 或分段同步把"首次越界"提前到它真正发生的那个内核。**
+
+### (c) 下一轮(精确定位)
+1. **`compute-sanitizer --tool memcheck`** 跑同一序列(nat8192/mt8 → nat32768/mt1);
+   它会直接报出**越界的内核名与行号**,而不是等到下一个请求才以 sticky error 暴露;
+   代价是极慢(可能 10-50×),但只需跑到越界发生即可;
+2. 若 sanitizer 太慢,退一步:**只在 GPU 预填充路径上分段加 `torch.cuda.synchronize()`**
+   (注意:不能在热路径常开 —— R92 的教训;只作为一次性诊断,并在同一次运行里不启用其他埋点);
+3. 同时注意:**30 秒这个数字本身值得查** —— 是否有某个 30 s 的超时/重试常量
+   (例如 NCCL 或某个 barrier 的 timeout)在停顿期间把状态搞坏。
