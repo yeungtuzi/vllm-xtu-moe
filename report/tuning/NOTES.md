@@ -4818,3 +4818,17 @@ spec_decode_num_accepted_tokens_per_pos_total{position="1"} =  58
 2. 在 V1 runner 下逐个加回:**① 投机 → ② draft 3 子模块常驻 → ③ 目标层常驻 → ④ CUDA graph**;
 3. 若 V1 下 TP=2 全部可用 ⇒ 把 `VLLM_USE_V2_MODEL_RUNNER=0` 写进交付配置,并记入
    `TRIED_AND_REVERTED.md`(V2 runner 在 TP=2 下不可用)。
+
+### §163 续(第 112 轮):V1-runner 的 TP=2 仍在正常推进
+| 阶段 | V2 runner | **V1 runner(`VLLM_USE_V2_MODEL_RUNNER=0`)** |
+|---|---|---|
+| 权重加载 | 完成 | **完成**(GPU0/1 各 22.2 GiB) |
+| KV 分配 | 完成(291,535 token) | **完成**(291,535 token) |
+| 预热/模型初始化 | **原生崩溃(静默)** | **无崩溃,已持续 ~10+ min,仍在初始化** |
+⇒ 目前证据一致指向 **V2 model runner 是 TP=2 崩溃的原因**;只差"最终到达 READY"这一步确认。
+
+**待办**(下一轮第一件事):
+1. 等它 REDDY ⇒ 立刻测 **预填充 8192/32768 + C=1/C=2 解码 + `[gp-h2d]`/`cd-timing`**,拿 TP=2 的基线;
+2. V1 下逐个加回:**① 投机 → ② draft 3 子模块常驻(4.77 GiB/卡)→ ③ 目标层常驻(每卡 1.59 GiB)→ ④ CUDA graph**;
+3. 若 TP=2 在 V1 下全通 ⇒ 交付配置加 `VLLM_USE_V2_MODEL_RUNNER=0`,并把"V2 runner 在 TP=2 不可用"记入 `TRIED_AND_REVERTED.md`;
+4. 预期收益(§161 的账):预填充 H2D 144.7 → ~72 ms/层;draft 3 子模块可常驻;1M KV 29.4 GiB 可容纳。
