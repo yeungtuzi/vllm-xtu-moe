@@ -6181,3 +6181,41 @@ WATCHDOG(sharded) gen=46226 total=128 rem=1 exec=127
 **注意这已经不是"票据协议"问题,而是"worker 参与/唤醒"问题** —— 前几轮修的三处
 (发布顺序、读端 seqlock、flat 守卫)依然是真实的修复(它们确实消灭了大部分失败),
 但**残余的这一张票属于另一类原因**。
+
+## 199. 【更正 §198】**票全发出去了**;问题回到"`abandoned` 的基线到底是多少"
+
+### (a) 每节点 pulled(上一轮 dump 里本来就有,我漏看了)
+```
+node 0: jobs=16 pulled=31      node 4: jobs=16 pulled=31
+node 1: jobs=16 pulled=31      node 5: jobs=16 pulled=31
+node 2: jobs=16 pulled=31      node 6: jobs=16 pulled=31
+node 3: jobs=16 pulled=31      node 7: jobs=16 pulled=31
+```
+`8 × 31 = 248` = **128 任务 + 120** ⇒ 与"每 worker 每代多领一次"的预期**完全一致**。
+⇒ **§198(c) 的"整整少一张票被发出 / 有一个 worker 没参与"是错的**,已更正。
+
+### (b) 真正的不一致:`248 发出` vs `247 分类`
+```
+发出     = 248   (由各节点 pulled 直接给出)
+分类     = inrange(127) + abandoned(120) = 247
+```
+⇒ **有一张票被领走之后,既没被算作 in-range、也没被算作 abandoned。**
+
+### (c) 最可能的解释:**`abandoned` 的基线不是 120,而是 119**
+我在 §179(b) 判定"`abandoned ≡ 线程数(120)` 是基线",依据是**三次 dump** —— 但
+**那三次全都是崩溃时的 dump**!我**从未在健康调用上测过这个基线**。若真实基线是 119
+(例如 `worker_limit_` 的 stride 过滤使某个 worker 从不领票,或多线程边界效应),
+那么观测到的 `abandoned=120` 就**恰好是那多出来的一次** ——
+**那张"丢掉的"票其实是走进了 abandon 路径**,而不是中间消失。
+
+### (d) 下一步:**在成功路径上打印这些计数器**,把基线测出来
+现在的 `SHARD-JOBDIAG`(成功分支,`:735` 一带)只打印 `total/exec/dup/miss`,
+**不含 `abandoned`/`inrange`/`inrange2`**。而**基线只能在健康调用上测**。
+⇒ 改法(纯诊断):把那三个计数器加进 `SHARD-JOBDIAG` 的成功打印;
+然后跑一段健康负载,读**稳定收敛的基线值**:
+- 若健康时 `abandoned ≡ 119`、`inrange ≡ total` ⇒ 基线 119,
+  那么崩溃时 `abandoned=120 且 inrange=127(=total-1)` ⇒ **那张票走进了 abandon**,
+  矛头转向"为什么本代有一张票被判越界"(即区间少一张,**回到 §196 的原子预留**);
+- 若健康时 `abandoned ≡ 120`、`inrange ≡ total` ⇒ 基线 120,则那张票确实是"领了没分类",
+  需要继续找那条路径。
+**这一步不需要改控制流,且能把 (c) 的二选一变成事实。**
