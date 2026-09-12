@@ -6292,3 +6292,43 @@ SHARD-JOBDIAG total=384 exec=384 abandoned=120 inrange=384 inrange2=0 issued=504
 | `unclassified = 0` 且 `inrange = total-1` | 那张票**被算进了 abandoned** ⇒ **发布出来的区间本身少一张** ⇒ 回到 §196 的原子预留修法 |
 ⇒ 做法:用当前版本**多跑几个会话**(每会话 24 请求),直到抓到一个 `WATCHDOG(sharded)`,
 读它的 `判据` 行即可定论。**这是纯观察,不需要改代码。**
+
+## 202. **第二种独立故障**:CUDA illegal memory access(与线程池无关)
+
+### (a) 读数(第 139 轮,同一版本连跑 4 个会话)
+```
+会话1 通过(24/24)  会话2 通过(24/24)  会话3 通过(24/24)
+会话4: #14 len=8192 mt=8 ok **29964ms**(30 秒停顿) → #15 **FAIL**
+      日志: **无任何 WATCHDOG**
+      `CUDA error: an illegal memory access was encountered`
+      → `Worker proc ... died unexpectedly (exit code: None)`
+      → `RuntimeError: cancelled` → `EngineDeadError` → HTTP 500
+```
+- **没有看门狗** ⇒ **不是**我一直在追的"池丢票"那一类;
+- **`CUDA error: an illegal memory access`** ⇒ GPU 侧访存越界,worker 原生死亡。
+- 这与第 116 轮**最早**看到的那条签名相同
+  (`persistent_topk occupancy query failed: an illegal memory access was encountered`,
+  R90)—— 也就是说:**从一开始就存在两种独立故障,而我在第 120-138 轮把全部注意力
+  放在了线程池那一类上**(它确实是真的、也确实被大幅修好),但**这一类从未被处理过**。
+
+### (b) 两种故障的判别(一眼可分)
+| 故障 | 日志特征 | 我的处理 |
+|---|---|---|
+| **A. 池丢票** | `[pool] WATCHDOG(sharded/flat)` → `abort()` | 已修三处(§184/§189/§190),复发率大幅下降 |
+| **B. GPU 访存越界** | **无看门狗**;`CUDA error: an illegal memory access`;`died unexpectedly (exit code: None)` | **从未处理** |
+
+### (c) 故障 B 的线索
+- 前面紧跟一次 **30 秒停顿**(`8192/mt8` 正常应为 ~6.7 s)⇒ 停顿与越界可能同源
+  (例如某个内核在长上下文/特定形状下越界,随后暴露);
+- 历史线索:第 116 轮在 **32K 预填充之后**出现 `persistent_topk` 的 illegal access,
+  且该调用点在 `sparse_attn_indexer` 的 **decode 分支**;
+- 我方嫌疑点仍是**GPU 预填充路径**(`gpu_prefill.py` 的 `PrefetchSlot` 环、Triton 预填充内核)
+  与**常驻层**(§167 R89:常驻层存在时的 Triton OOM)——
+  但注意本版**常驻=0**也出现了,所以不能只怪常驻。
+
+### (d) 下一轮
+1. **先用 `CUDA_LAUNCH_BLOCKING=1` 复现一次**,让越界在**首次发生的内核**处立刻报错
+   (默认是异步的,报错点往往不是真凶 —— 第 116 轮那次就是在 `persistent_topk` 的
+   occupancy query 里才暴露);
+2. 同时把 `XIAOTU_MOE_POOL_TRACE` 关掉以减少干扰;
+3. 抓到首个内核后,再决定是 TMA/对齐问题、还是 shape 边界(空段、`seg_start` 越界)。
