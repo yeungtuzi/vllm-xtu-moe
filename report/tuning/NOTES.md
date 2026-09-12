@@ -4746,3 +4746,34 @@ ValueError: To serve at least one request with the model's max seq len (262144),
 | 3 | draft 3 层 + KV 4 GiB + **maxlen 131072** | 进行中(账:14.2+4+9.57 = 27.8 GiB,余 ~11.7) |
 
 ⇒ 教训:**改 KV 必须同步改 maxlen**(它俩由 29.4 KB/token 硬绑定),否则报的是"看起来像内存"的校验错。
+
+## 161. 第 108-109 轮:1 个 draft 子模块常驻 = **零收益**;接受率画像曝光;TP=2 成为三条目标的共同前置
+
+### 实测(8070:TP=1 + 1 个 draft 子模块常驻 + KV 8 GiB + spec k=5 + maxlen 262144)
+- 显存:**GPU0 = 25.25 GiB**,与预测(14.2 固定 + 8 KV + 3.19 draft = 25.4)吻合 ⇒ **不再 OOM**;
+- **C=1 TPOT = 57.3 ms(17.5 t/s)** vs 不常驻 draft 的 **57.4 ms** ⇒ **零收益**;
+- C=2:TPOT 99.1 ms(10.1 t/s/请求),out_tok/s 13.16;
+- `cd-timing`:`period 1.84-1.90ms(compute 0.99-1.03 + rest 0.85-0.87)` —— 与"draft 不常驻"时几乎一样。
+
+⇒ **§155 的假设需要修正**:把 draft 的**部分** MoE 放上 GPU **没有兑现收益**。
+两个可能:(a) 真正吃 CPU 的是**另外两个 draft 子模块**(43 不够,要 43-45 全上);或
+(b) draft 的 MoE 本来就不是主要成本(投机的主要开销在**验证步本身按 6 个 token 放大权重流量**,
+即 §152 的 13.3 GB/token 效应)。**要区分它们,必须在 TP=2 下做"43-45 全常驻"**(TP=1 装不下,§160)。
+
+### 【接受率画像】从 `/metrics` 直接读到(不再反推)
+```
+spec_decode_num_accepted_tokens_total = 332
+spec_decode_num_accepted_tokens_per_pos_total{position="0"} = 246
+spec_decode_num_accepted_tokens_per_pos_total{position="1"} =  58
+```
+⇒ **第 1 个 draft token 接受率很高,之后断崖**:pos1/pos0 = **23.6%**。
+这解释了为何"平均只接受 ~1.3 个/步",而生产是 40-50%/平均 3 个 ⇒ **我们的 MTP 草稿在第 2 位之后基本不被接受**。
+
+### 【关键结论】TP=2 现在是**三条目标的共同前置**
+| 目标 | 为什么必须 TP=2 |
+|---|---|
+| **预填充 ≥1500** | TP=1 的 H2D = **144.7 ms/层**(搬 3.2 GB,22 GB/s = PCIe 墙);TP=2 每 rank 只搬 1.6 GB ⇒ **~72 ms/层**(§150) |
+| **解码(投机)** | 每卡每常驻层 **1.59 GiB**(TP=1 是 3.19)⇒ **draft 的 3 个子模块(9.57 GiB)在 TP=1 装不下,TP=2 只要 4.77 GiB/卡** ⇒ 可在 KV 与目标层之外放下 |
+| **1M 上下文** | KV = **29.4 GiB**(29.4 KB/token,§160)⇒ 单卡 40 GB 装不下,必须 TP=2 |
+⇒ **修好 TP=2 是第二条的单一最高优先级**;它的失败模式已记录(§146:关 EAGER 预热 shm 卡死;
+开 EAGER worker 静默原生崩溃;关常驻层也复现 ⇒ 不是常驻层独因)。
