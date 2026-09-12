@@ -1038,14 +1038,13 @@ private:
                     if (i >= n) break;   // true future-gap -> safe lock-free drop
                     if (lf_) lf_(lc_, i);
                     if (diag_active()) proc_vec_[i] = 1;
-                    // Last worker to reach 0 notifies the completion condvar.
-                    // It must hold done_mtx_ (the same mutex the caller's
-                    // predicate-wait runs under) so the notify can never fall in
-                    // the caller's pred-check -> condvar-wait window (lost wakeup).
-                    // Guard on the live generation: a late decrement for a call
-                    // whose barrier already returned must not hit the next call's
-                    // countdown.
-                    if (current_gen_.load(std::memory_order_acquire) != gen) continue;
+                    // 【第 126 轮修】原为 `if (current_gen_ != gen) continue;` —— 世代前进就
+                    // **跳过递减**,而票已经从 counter_ 领走 ⇒ flat 调用方永远等不到 0
+                    // (实测:`WATCHDOG fired: gen=35800 n=2 start=43431 end=43433
+                    //  counter=43553 remaining=1 dropped=0`,即 2 个任务只减了 1 次)。
+                    // 安全性论证:调用方只有在 remaining_==0 之后才会发布下一代并 store 新的 n,
+                    // 因此只要本票还没递减,调用方必然仍在等待、remaining_ 仍是本代的值
+                    // ⇒ **无条件递减不会污染下一代**,守卫是多余且有害的。
                     if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         std::lock_guard<std::mutex> gl(done_mtx_);
                         done_cv_.notify_all();
@@ -1076,6 +1075,14 @@ private:
                     if (live_sharded) {
                         my_last_gen = ng;
                         worker_gen_[w].store(ng, std::memory_order_release);
+                        // 【第 126 轮修】票已经从 counter_ 领走(本代的),这里若直接 break
+                        // 就会**丢掉一次递减** ⇒ 本代 remaining_ 永不归零。
+                        // 必须先把本代的那一次递减补上,再回去重新 arm。
+                        // (这是 §183b 记录的第二处同型缺陷。)
+                        if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                            std::lock_guard<std::mutex> gl(done_mtx_);
+                            done_cv_.notify_all();
+                        }
                         break;
                     }
                     gen = ng;

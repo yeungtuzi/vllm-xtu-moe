@@ -5680,3 +5680,45 @@ WATCHDOG(sharded) gen=3936 total=128 rem=1 exec=127
 ### (c) 为什么 flat 路径这次才暴露
 flat 池只在**非分片调用**上使用(小批次/解码等,本例 `n=2`)。此前分片 bug 每次都先炸,
 把 flat 的窗口掩盖了;分片修好后,flat 成了唯一残留。
+
+## 186. 第 126 轮:flat 修复已上,但**分片同型失败复发** ⇒ 发布顺序只修了"写端",**读端仍非原子**
+
+### (a) 实测
+```
+会话1: #12..#16 ok(#16 512/mt32 **85337ms** 停顿) → #17 FAIL;会话2/3 全 FAIL(进程已死)
+[pool] WATCHDOG(sharded) gen=25900 total=480 rem=1 exec=479
+  [判据] abandoned=120 underflow=0  entered=479 left=479 inrange=479
+```
+- **`inrange == entered == 479 < total = 480`** —— 与 §184 修复**前完全同型**;
+- 本次**没有** flat 看门狗(所以 flat 那两处修复既没被证明有效,也没被否证 —— 分片先炸了);
+- 对比 §185:fixPub 那次 **24/24 全过**,这次却在第 17 个请求复发
+  ⇒ 发布顺序修复**降低了频率但没有根除**。
+
+### (b) 缺失的一半:**读端没有走 seqlock 协议**
+`:466-471` 的注释写"worker **只需接受偶数**即可"——这句话**不完整**。writer 端现在(§184 修复后)
+确实只在窗口内写字段,但 **reader 端 `:937` 仍在无同步下分两次读字段**:
+```cpp
+size_t base = node_base_[myn], nj = node_nj_[myn];   // 两次独立 load,可以跨越奇/偶窗口
+```
+标准 seqlock 读端必须是 **读 gen → 读字段 → 复读 gen → 不一致则重试**。
+现在的读端没有复读校验 ⇒ 即使 writer 端一致,reader 仍可能取到
+"新 `nj` + 旧 `base`"(或反之)⇒ 可领区间错位 ⇒ **一张票永远不被看成 in-range**
+⇒ `remaining_sh_` 停在 1 ⇒ 看门狗 `abort()`。这与实测签名精确吻合。
+
+### (c) 下一轮修法(精确、小)
+在分片 anchor 处把 `:937` 换成标准 seqlock 读:
+```cpp
+uint64_t g0, g1; size_t base, nj;
+do {
+    g0 = current_gen_.load(std::memory_order_acquire);
+    if (g0 & 1) continue;                     // 发布中 ⇒ 重试
+    nj = node_nj_[myn]; base = node_base_[myn];
+    g1 = current_gen_.load(std::memory_order_acquire);
+} while (g0 != g1);                            // 读字段期间世代变了 ⇒ 重试
+```
+并把同样的问题在 **flat 读端**(`:1058` 的 `nn = n_; ns = start_;`)一并检查
+(那里在 `work_mtx_` 下读,理论上受锁保护,需确认 `n_`/`start_` 的所有读取都在锁内)。
+
+### (d) 附带结论
+flat 的两处修复(去守卫 + 丢弃前先递减)已编译入库,但**尚未获得有效验证**
+(本轮分片先炸)。下一轮若分片修好后仍出问题,再回来看 flat。
