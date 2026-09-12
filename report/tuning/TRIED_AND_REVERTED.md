@@ -526,3 +526,5 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 | 日期 | 改动 | 依据 |
 |---|---|---|
 | 2026-xx | R58(reserve 替换已回退)、R59(SHARDSPLIT 大值更差);NOTES §116(提前预取 0.78→0.76-0.77) | 第 70 轮 |
+
+| R60 | 只增不减 resize(`if (size()<need) resize(need)`)替掉每次都 resize | **成功,已保留**。resize 24-34 → 1.4-1.5 µs、对拍 7 OK、最佳 0.75 ms。注意与 R58(reserve)的区别:`size()` 语义不变 ⇒ 不会算错。**R58 的正解就是这一条,reserve 不要再试** |

@@ -769,11 +769,19 @@ public:
         for (int e : active_) {
             ExpBuf& g = exp_[e];
             size_t me = g.ai_list.size();
-            g.xg.resize(me * (size_t)hidden);
-            g.both.resize(me * (size_t)2 * (size_t)inter);
-            g.act.resize(me * (size_t)inter);
-            g.abf16.resize(me * (size_t)inter);
-            g.down.resize(me * (size_t)hidden);
+            // 【轮 71】改成"只增不减"的 resize:原来 `resize(need)` 在路由变化使 me 在
+            // 2/3 间振荡时会先 shrink 再 grow,而**每次 grow 都零填充新元素**,实测稳定
+            // 花 24-34 µs/次(每层 ~4%)。现在 size 永远保持在历史最大值 ⇒ grow 只发生
+            // 一次,之后不再零填充。与轮 70 的 reserve 方案(R58,直接算错)的区别:
+            // 这里 `size()` 始终 ≥ need,零填充语义也完全不变,不依赖任何隐藏 size() 行为。
+            const size_t nx = me * (size_t)hidden;
+            const size_t n2 = me * (size_t)2 * (size_t)inter;
+            const size_t ni = me * (size_t)inter;
+            if (g.xg.size()    < nx) g.xg.resize(nx);
+            if (g.both.size()  < n2) g.both.resize(n2);
+            if (g.act.size()   < ni) g.act.resize(ni);
+            if (g.abf16.size() < ni) g.abf16.resize(ni);
+            if (g.down.size()  < nx) g.down.resize(nx);
         }
         // 轮 67【并行 gather】:原来是**串行 for**(见 NOTES §113)。12 个专家 x me=3 行
         // x hidden*2=8KB = 288 KB 的单线程 memcpy,把整段 DRAM 延迟暴露在关键路径上,
