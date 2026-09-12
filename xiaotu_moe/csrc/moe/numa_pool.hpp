@@ -950,12 +950,21 @@ private:
                 // ---- node-scoped single-copy sharded path: pull only from my node.
                 const int myn = worker_node_[w];
                 if (myn >= 0 && myn < sharded_call_) {
-                    size_t base = node_base_[myn], nj = node_nj_[myn];
+                    size_t base = 0, nj = 0, loc = 0;
                     for (;;) {
                         size_t t = node_ticket_[myn].v.fetch_add(1, std::memory_order_relaxed);
-                        size_t loc = t - base;
                         uint64_t g = current_gen_.load(std::memory_order_acquire);
                         if (g == gen) {
+                            // 【第 127 轮修·**读端 seqlock**】必须在**确认偶代之后**才读
+                            // base/nj,并**复读世代校验**。旧代码在进循环前一次性读
+                            // base/nj(:953),而 writer 在"奇数→偶数"窗口内改写它们(§184),
+                            // 读者可能取到"新 nj + 旧 base"(或反之)⇒ 可领区间错位
+                            // ⇒ **一张票永远不被看成 in-range** ⇒ remaining_sh_ 停在 1
+                            // ⇒ 看门狗 abort()。实测签名:inrange==entered==479 < total=480(§186)。
+                            base = node_base_[myn];
+                            nj = node_nj_[myn];
+                            if (current_gen_.load(std::memory_order_acquire) != gen) continue;
+                            loc = t - base;
                             if (loc >= nj) { abandoned_.fetch_add(1, std::memory_order_relaxed); break; }  // this node's jobs exhausted
                             inrange_.fetch_add(1, std::memory_order_relaxed);   // diag: 范围内的票被领走
                             if (diag_active() && loc < kShardDiagStride) {

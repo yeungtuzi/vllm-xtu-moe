@@ -5722,3 +5722,31 @@ do {
 ### (d) 附带结论
 flat 的两处修复(去守卫 + 丢弃前先递减)已编译入库,但**尚未获得有效验证**
 (本轮分片先炸)。下一轮若分片修好后仍出问题,再回来看 flat。
+
+## 187. 第 127 轮:补上**读端 seqlock**(`numa_pool.hpp:953`),已编译,验证进行中
+
+### 改动
+```cpp
+// 旧(:953):进循环前一次性读,无同步 —— 可跨越 writer 的奇/偶窗口
+size_t base = node_base_[myn], nj = node_nj_[myn];
+// 新:确认偶代之后才读字段,并复读世代校验
+size_t base = 0, nj = 0, loc = 0;
+for (;;) {
+    size_t t = node_ticket_[myn].v.fetch_add(1, relaxed);
+    uint64_t g = current_gen_.load(acquire);
+    if (g == gen) {
+        base = node_base_[myn];
+        nj   = node_nj_[myn];
+        if (current_gen_.load(acquire) != gen) continue;   // 读字段期间世代变了 ⇒ 重试
+        loc = t - base;
+        ...
+```
+正确性:writer 只在**奇数**窗口内写字段,因此"读前 gen 为偶数 + 读后 gen 仍为该偶数"
+⇒ 字段在读取期间不可能被改 ⇒ 得到 (base, nj) 的一致快照。
+代价:快路径每张票多一次 atomic load(可忽略)。
+
+### 验证判据(四项)
+① 连续 3 次会话 24 请求全过、**无任何 `WATCHDOG`**(含 flat 形式);
+② 判据行 `inrange == entered == total && rem == 0`;
+③ `scripts/check_engine_aligned.sh` 数值门禁(R55);
+④ 一次 `C=8/N=32` 持续压测跑完并给出持续吞吐。
