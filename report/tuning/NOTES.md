@@ -4871,3 +4871,38 @@ VLLM_USE_V2_MODEL_RUNNER=0 \
 4. 把 `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600` + `VLLM_USE_V2_MODEL_RUNNER=0` **写进交付脚本**
    (`scripts/serve_prod_8070.sh` / `tune_serve.sh`),并在 `TRIED_AND_REVERTED.md` 记:
    "V2 runner 在 TP=2 下预热不完成"与"execute-timeout 默认值必须放大"。
+
+## 165. 第 114 轮:TP=2 + 常驻层 ⇒ 预填充 **1248 t/s**;Triton 工作区成为常驻层上限;下一步靠"H2D 与内核重叠"
+
+### 实测(TP=2,V1 runner,execute-timeout 3600)
+| 配置 | 预填充 8192(C=1) |
+|---|---|
+| TP=1 | 701 t/s |
+| TP=2(无常驻) | 1159 t/s |
+| **TP=2 + 8 个目标层常驻**(预算 14 GB,每卡 8×1.59=12.7 GiB) | **1248 t/s**(TTFT 6562 ms) |
+⇒ 距 **1500** 还差 **20%**。
+
+### 常驻层的上限被 **Triton 工作区**卡住(不是显存总量)
+- 预算 18 GB(**11 层**/卡 = 17.5 GiB):固定 7.1 + KV 8 + 17.5 ≈ **32.6 GiB/卡** ⇒ **推理时**
+  `RuntimeError: Triton Error [CUDA]: out of memory`(engine 在**第一个请求**上死,R89);
+- 预算 14 GB(**8 层** = 12.7 GiB)⇒ 27.8 GiB/卡,**正常**(无 OOM),1248 t/s。
+⇒ 与 TP=1 的经验一致:**Triton 预填充内核/autotune 需要 >7 GiB 的可用工作区**;
+在 maxlen=262144(KV 硬下限 7.19 GiB)下,TP=2 每卡**常驻层数的实际上限约 8-9 层**。
+
+### 关键判断:剩下的 20% 不在"常驻层数",而在 **H2D 与内核是否重叠**
+按当前分量(TP=2):每层 ≈ H2D ~72 + 内核 ~58 + 主机 seg ~10 ≈ **140 ms**(串行);
+1248 t/s 对应每层 ~131 ms,与"完全串行"吻合 ⇒ **H2D 没有与内核重叠**。
+若做到重叠(预取下一层权重的同时算本层),每层应降到 **~max(72, 68) ≈ 75 ms**
+⇒ 43 层 ≈ 3.2 s ⇒ **~2500 t/s**(远超 1500)。
+而插件里**正是有这两个旋钮且从未在本配置下扫过**:
+`XIAOTU_MOE_PREFETCH_SLOTS`(ring 深度,§R20 只测过 TP=1 且当时是正确性 bug)、
+`XIAOTU_GPU_PREFETCH_AHEAD`(`hybrid_model.py:860`,
+`_ov = (not _resident) and os.environ.get("XIAOTU_GPU_PREFETCH_AHEAD", "1") == "1"` ——
+注意它**在 `_resident` 为真时被短路**,而我们刚开了 8 层常驻!)。
+
+### 下一步(下一轮,按杠杆)
+1. **扫 `XIAOTU_GPU_PREFETCH_AHEAD` / `XIAOTU_MOE_PREFETCH_SLOTS`**(在当前 TP=2+8 常驻下)
+   —— 目标是让 H2D 与内核重叠;注意上面那行短路逻辑可能让常驻层反而**关掉了预取**,要单独确认;
+2. 对照参考配置的 `LVLLM_GPU_PREFETCH_WINDOW=1` 与 `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024`
+   (我方 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384`);
+3. 若重叠生效 ⇒ 再把常驻层数在"Triton 工作区"允许范围内调回 8-9 层,复核 1500。

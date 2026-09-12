@@ -574,3 +574,5 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 | R87 | draft 3 层常驻 + KV 4 GiB | **仍失败**:`Engine core initialization failed`(预热阶段,无显式 OOM)。两次尝试合起来的结论:**单卡 39.5 GiB 装不下「固定 14.2 + draft 3 层 9.57 + KV + Triton 工作区」**。下一步应改为**只常驻 1 层**(需先确认 MTP 真实层号)或 KV 2 GiB,或等 TP=2 修好 |
 
 | R88 | draft 3 层常驻 + KV 4 GiB 但 maxlen 仍 262144 | **失败原因是配置校验而非内存**:`7.19 GiB KV needed > 4.0 GiB`。**改 KV 必须同步改 maxlen**(29.4 KB/token 硬绑定)。不要把它当成"显存不足"记 |
+
+| R89 | TP=2 + 11 个目标层常驻(预算 18 GB) | **推理时 OOM**:`Triton Error [CUDA]: out of memory`(engine 在第一个请求上死)。固定 7.1 + KV 8 + 17.5 = 32.6 GiB/卡 ⇒ 留给 Triton 预填充内核/autotune 的 <7 GiB 不够。**Triton 工作区是常驻层数的实际上限**(TP=2/maxlen262144 下约 8-9 层) |
