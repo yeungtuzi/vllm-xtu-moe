@@ -68,9 +68,13 @@ ENV=/home/user/anaconda3/envs/lkxtu TAG=win TP=2 GPU_UTIL=0.80 MAXLEN=1048576 \
   我们的**每 token 引擎成本更好**(V=6.45 vs 8.84),但**每步固定开销几乎翻倍**
   (F=30.9 ms vs 16.5 ms)。`XIAOTU_CD_TIMING` 拆出每层 `rest` 0.53-0.66 ms,
   参考的等价值 ≈0.3 ms ⇒ **每层 ~0.3 ms × 43 ≈ 13 ms/token** 就是要追回的部分。
-* **投机不是优化点**:一步要验证 `num_seqs×(1+spec)` 个 token,而这些 token 全落在 CPU MoE 上
-  ⇒ 每接受一个 token 的 CPU 工作量 = (1+spec)/接受长度 ≈ 2.4×,结构性亏损(参考引擎更差:5.18)。
-  用户记忆中的 "80-90 tok/s" 已确认是 `SpecDecoding metrics` 里的
+* **投机是"接受率决定盈亏",不是结构性亏损**(更正 NOTES §304/§305 → §306):
+  盈亏平衡 **接受长度 ≥3**(spec=5 需 >2.9,spec=3 需 >2.5)。同机实测:
+  自由文本 2.1-2.75 ⇒ 亏(9.8-11.8 t/s);**代码 3.56 ⇒ 1.22×;数列 6.00 ⇒ 1.64×**。
+  作者基准表的 +35~81%(3090×2:26→35~47 t/s)与我们在可预测任务上的实测同量级 ✅
+  (他们的数字都在 input=32768 下测,但长上下文不是我们这边的主因:1K→32K 端到端 11.4→11.8 几乎不变)。
+  用户记忆里的 "80-90 tok/s" 已确认是 `SpecDecoding metrics` 的
   `Drafted/Accepted throughput` 字段,不是端到端速率。
+  ⇒ **可预测任务(代码/数字/模板化输出)应开 `SPEC=auto`;自由文本默认 `SPEC=0`。**
 * **下一步(按性价比)**:①staging 与计算重叠(第二流 + event 双缓冲)②3 次 D2H 合成 1 次
   ③用常驻线程 + event 替换 `cudaLaunchHostFunc` ④再用 KV 换若干常驻层。
