@@ -9757,3 +9757,63 @@ envs.py(lk 段)    : 完全一致 ✅   ← 含 is_lk_moe_mtp_layer / is_lk_moe_
 ①上游 base 版本(与我们无关);②AutoAWQ 的 CPU 常驻支持;③文档/测试。
 ⇒ 因此**不做无意义的基座 rebase**(那会把 DS-V4 模型支持从 SM89 fork 挪到主线,风险大收益零),
 只要在**行为上**与最新版对齐即可 —— 已用上面三处 diff 证明对齐。
+
+---
+
+## 293. 🎉 **作者配方全参数 + 草稿常驻 GPU + CUDA 图 = 移植路径首次全绿**(`lkport28graph`)
+
+### (a) 配置(逐条 = 作者推荐 + 我们的两条硬约束)
+
+```
+TP=2  GPUS=0,1  GPU_UTIL=0.80  MAXLEN=1048576  SEQS=2  MBT=8192
+MINBATCH=1024  PREFETCH=1  THREADS=48  **EAGER=0(开图)**  SPEC=auto
+⇒ 自动识别 dspark;草稿层 43-45 常驻 GPU(`resident='43-45'`,5.34 GiB/rank)
+环境变量与作者配方逐条一致(LVLLM_MOE_NUMA_ENABLED=1 / LK_THREADS=48 / OMP=1 /
+LK_THREAD_BINDING=CPU_CORE / PREFETCH_WINDOW=1 / PREFILL_MIN_BATCH_SIZE=1024 / LK_POWER_SAVING=1)
+```
+
+### (b) 启动:图的捕获**修好了**(引擎侧改动见 §c)
+
+```
+Model loading took 11.39 GiB /rank(目标 6.22 + 草稿 5.34)✅
+layer model.layers.43/44/45.ffn.experts [GPU](两个 rank 各 3 层)✅
+Capturing draft step for DSpark speculator...
+Capturing dspark CUDA graphs (FULL): 100%|██████████| 2/2 ✅   ← 上一轮(R103)在这里挂掉
+init engine (profile, create kv cache, warmup model) took 245.77 s
+Application startup complete ✅
+Available KV cache memory: 13.14 GiB → GPU KV cache size: 1,940,458 tokens
+Maximum concurrency for 1,048,576 tokens per request: 1.85x   ← 1M 上下文这次真的开起来了
+```
+
+### (c) 修法(引擎侧,`xiaotu_moe/csrc/python_binding/binding.cpp`,属我们自有部件)
+
+lk 链**从不调用** `prepare_decode_buffers`(它的 `_initialize_cuda_graph_buffers()` 只设
+`cuda_graphs`/`output_gpu`),所以 pinned 解码缓冲是**第一次 `cpu_decode` 时惰性分配**的;
+若那一次落在捕获区内,`cudaHostAlloc` 会让整段 capture 作废(`cudaErrorStreamCaptureInvalidated`,R103)。
+改动两条:
+1. **引擎构造时就预分配**(`kDecodeTokenFloor = 64` token,≈1.5 MB/引擎锁页内存);
+   并在 `cpu_decode` 里:捕获期若仍需扩容,**报错并跳过**而不是 `cudaHostAlloc`(绝不静默写越界);
+2. 顺手加了一道护栏:lk 的 `RoutedExperts.output_gpu` 是**全层共享**的 `(max_num_seqs, hidden)`,
+   投机解码一步的 token 数可能超过它 ⇒ 检查 `out_gpu.shape[0] >= qlen`,不满足就报错跳过
+   (把可能的**越界写显存**变成一条明确日志)。
+   数值无回归:`test_block23_equiv.py` 仍是文档基线 `OK=7 BAD=1(me=1 max_rel=1.873e-02)`。
+
+### (d) 实测(本配置,`SEQS=2` 所以只测 C=1/C=2)
+
+| 项 | 数值 |
+|---|---|
+| 解码 C=1 | **2.21 t/s**(单流),TPOT **438.31 ms** |
+| 解码 C=2 | 单流 1.53 / **聚合 3.18 t/s**,TPOT 567.46 ms |
+| 投机接受率(日志 `SpecDecoding metrics`) | **平均接受长度 2.53 / 2.88 / 3.50**,逐位接受率 0.65–0.82 |
+| 起草吞吐 | 8.5–9.0 drafted tokens/s;接受 2.6–4.5 accepted tokens/s |
+
+### (e) 怎么读这组数
+
+* **正面**:作者配方 + 投机 + 图 + 草稿全程 GPU,**功能全绿**;1M 上下文的 KV(13.14 GiB /
+  194 万 token)也首次落地;接受率 2.5–3.5 说明草稿质量可用。
+* **负面**:C=1 只有 2.21 t/s,比 **TP=1 的 7.89 t/s**(lkport22,gpu_prefill、无投机)差 3.6×,
+  也比 TP=2 无投机的 3.50 t/s(lkport16)差 —— **TP=2 的跨 socket 归约(每层自旋 barrier)
+  仍是最大瓶颈**(见 NOTES §289 的历史结论),投机省下的步数抵不过每步的通信开销。
+* ⇒ 下一步要做的是"**TP=1 + 投机 + 草稿常驻**"(`GPU_UTIL≈0.87`,`FORCE_DRAFT=1`)与
+  "TP=1 无投机"的同机对比,把"投机到底赚不赚"钉死;以及把 TP=2 的归约做便宜(消除每层
+  cross-socket 自旋)后再看 TP=2。

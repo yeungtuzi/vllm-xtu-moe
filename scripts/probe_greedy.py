@@ -24,7 +24,11 @@ for p in prompts:
         headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=900) as r:
         d = json.load(r)
-    res[p["id"]] = {"text": d["choices"][0]["message"]["content"],
+    _m = d["choices"][0]["message"]
+    # 开了 thinking 时,前若干 token 会进 `reasoning` 字段(max_tokens 小的时候 content 会是 None)
+    _txt = _m.get("content") or _m.get("reasoning") or ""
+    res[p["id"]] = {"text": _txt,
+                    "finish_reason": d["choices"][0].get("finish_reason"),
                     "usage": d.get("usage")}
     print(f"[{p['id']}] {res[p['id']]['text']!r}", flush=True)
 json.dump(res, open(out_path, "w"), ensure_ascii=False, indent=1)
