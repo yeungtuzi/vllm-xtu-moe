@@ -542,6 +542,10 @@ static void bind_moe_class(py::module& m, const char* name) {
                     return e ? std::atoi(e) : 43;
                 }();
                 static double sum_compute = 0, sum_period = 0, sum_wait = 0;
+                // EP(跨 rank 归约)是 compute 的一部分,单独拆出来看它占多少:
+                // TP=1 时 ep 恒为 0,所以"TP=1 vs TP=2 的 ep 差"就是这个归约的净成本。
+                static double sum_ep = 0;
+                double ep_ms_last = 0.0;
                 static int n = 0;
                 static auto last_cb = std::chrono::steady_clock::now();
                 auto t_cb = std::chrono::steady_clock::now();
@@ -555,6 +559,7 @@ static void bind_moe_class(py::module& m, const char* name) {
                         auto it = g_ep_state.find(engine);
                         if (it != g_ep_state.end()) ep = it->second.get();
                     }
+                    auto t_ep0 = std::chrono::steady_clock::now();
                     if (ep && ep->hdr && ep->world > 1) {
                         const size_t bytes = (size_t)qlen * (size_t)engine->config().hidden_size
                                              * sizeof(float);
@@ -612,6 +617,8 @@ static void bind_moe_class(py::module& m, const char* name) {
                             }
                         }
                     }
+                    auto t_ep1 = std::chrono::steady_clock::now();
+                    ep_ms_last = std::chrono::duration<double, std::milli>(t_ep1 - t_ep0).count();
                 }
                 if (timing) {
                     auto t_end = std::chrono::steady_clock::now();
@@ -623,18 +630,20 @@ static void bind_moe_class(py::module& m, const char* name) {
                     sum_compute += compute_ms;
                     sum_period += period_ms;
                     sum_wait += period_ms - compute_ms;
+                    sum_ep += ep_ms_last;
                     if (++n % every == 0) {
                         fprintf(stderr,
                                 "[cd-timing] layers=%d qlen=%d k=%d "
-                                "period=%.2fms compute=%.2fms rest=%.2fms "
+                                "period=%.2fms compute=%.2fms(engine=%.2f ep=%.2f) rest=%.2fms "
                                 "(compute %.0f%%, rest %.0f%%)\n",
                                 every, qlen, k,
                                 sum_period / every, sum_compute / every,
+                                (sum_compute - sum_ep) / every, sum_ep / every,
                                 sum_wait / every,
                                 100.0 * sum_compute / std::max(1e-9, sum_period),
                                 100.0 * sum_wait / std::max(1e-9, sum_period));
                         fflush(stderr);
-                        sum_compute = sum_period = sum_wait = 0.0;
+                        sum_compute = sum_period = sum_wait = sum_ep = 0.0;
                     }
                 }
             };
