@@ -79,6 +79,16 @@ fi
   date -Is
 } > "$OUTDIR/$TAG.env"
 
+# 等显存真正释放:上一轮被 kill 的 worker 还会占着显存几秒~几十秒,不等就会撞上
+# "Free memory ... less than desired GPU memory utilization"(M9,已踩过两次)。
+for _g in $(echo "$GPUS" | tr ',' ' '); do
+  for _i in $(seq 1 60); do
+    _used=$(nvidia-smi --id="$_g" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+    [ -n "$_used" ] && [ "$_used" -lt 1024 ] && break
+    sleep 5
+  done
+done
+
 cd /tmp   # neutral CWD: see comment above
 export PATH="$ENV/bin:$PATH"   # ninja/flashinfer JIT need to be visible to workers
 export CUDA_VISIBLE_DEVICES="$GPUS"
