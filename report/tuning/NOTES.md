@@ -8055,3 +8055,41 @@ mtp.0.<rest>  →  model.layers.43.mtp_block.<rest>
 1. **主线原生 MTP + 拒绝采样**即可用(不用自己做起草/验证);
 2. 再用**参考同构的路由规则**(§251)把 `layers.43` 钉在 GPU ⇒ **起草不经过 CPU**;
 3. "开投机 ≥100 t/s" 与 "单流 >30" 同时具备结构基础。
+
+## 254. 🔴 **架构级根因(用户指的正是这里)**:参考有**专用的 DeepSeek-V4 模型实现**,我们走的是通用 MTP
+
+### (a) 决定性搜索:谁声明了 `hc_attn_base` / `hc_ffn_base`?
+```
+✅ Lvllmds4-x/vllm/models/deepseek_v4/nvidia/model.py     ← 参考的**专用 DeepSeek-V4 实现**
+✅ Lvllmds4-x/vllm/models/deepseek_v4/{xpu,amd}/model.py
+⚠️ mainline:  vllm/models/deepseek_v4/xpu/model.py         ← 只有 XPU
+⚠️ mainline:  vllm/models/glm5next/nvidia/model.py
+```
+⇒ **参考把 DeepSeek-V4 放在自己的模型包 `vllm/models/deepseek_v4/` 里(含 nvidia 变体)**,
+由它来处理 checkpoint 的 `mtp.0.*` + `hc_*`;
+而**我方路径走的是通用实现** `vllm/model_executor/models/deepseek_mtp.py`
+(其 MTP 层只有 `enorm/hnorm/eh_proj/shared_head/mtp_block`,**没有 `hc_*`**)。
+
+### (b) 两个引擎的 `DeepSeekMTP` 层结构**完全一致**(都是通用那套)
+| | enorm | hnorm | eh_proj | shared_head | mtp_block | `hc_*` |
+|---|---|---|---|---|---|---|
+| mainline | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Lvllmds4-x | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+⇒ ⇒ **`hc_*` 不属于通用 MTP 类** ⇒ 走通用 MTP 路径**必然 KeyError**(§252 实测),
+  这不是"名字映射"能解决的(结构就不同)。
+
+### (c) 所以真正的结论(与用户此前两次提示一致)
+1. vLLM **上游原生支持 MTP**(#用户第一句),但**要用对的那套实现**;
+2. **哪套实现对,由"checkpoint 的权重布局"决定**:
+   DeepSeek-V4-Flash 的 MTP 是 `mtp.0.*` + `hc_*` ⇒ **对应参考的
+   `vllm/models/deepseek_v4/nvidia/model.py`**,而不是通用 `deepseek_mtp.py`;
+3. 参考的路由规则 `is_lk_moe_mtp_layer(name)=name.startswith("mtp.")`
+   **正是为这套专用实现写的** —— 它知道 MTP 模块的 prefix 就是 `mtp`。
+
+### (d) 下一步(方向已明确,且是"逐条映射"的正路)
+**逐条比对参考的 `vllm/models/deepseek_v4/nvidia/model.py`**:
+1. 它怎么**构建/加载** MTP 块(`mtp.0.*` + `hc_*` 的属性名);
+2. 它怎么**路由 MoE**(与 `is_lk_moe_*` 那套规则怎么配合);
+3. 它与 mainline 的 `model_executor/models/deepseek_v4*` 差多少 ——
+   若差异可控,**把这条实现接到我方引擎上**;若差异大,就明确记录"需要移植专用模型实现"的量级。
+⇒ 这一步**纯读代码、零加载**,而且直接对准"开投机 ≥100 t/s"的结构性前提。
