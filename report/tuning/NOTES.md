@@ -7541,3 +7541,29 @@ accepted_per_pos: pos0=37  pos1=24  pos2=11  pos3=4
 3. **降低引擎在小批量下的固定开销**:线程池 spawn/join 与 barrier 次数(lk 只有 0.66 ms/层
    端到端,说明它的固定开销极小);
 4. `publish_settle` 的缓解照旧保留(它已解决稳定性,且代价可忽略)。
+
+## 239. 修复已实施:shm 文件名加入**模型实例判别**(针对 §236/§238 确认的 draft bug)
+
+### (a) 改动(纯 Python,无需重编译)
+`vllm_xiaotu_moe/hybrid_model.py`:
+1. 新增**独立**的实例计数(不与 `_is_duplicate_model_instance` 的 `seen` 共用 —— 后者
+   只在常驻层路径上被调用,不能直接复用):
+   ```python
+   _SHM_INSTANCE = {"seen": {}}
+   def _shm_instance_tag(prefix: str) -> str:
+       n = _SHM_INSTANCE["seen"].get(prefix, 0)
+       _SHM_INSTANCE["seen"][prefix] = n + 1
+       return "T" if n == 0 else f"D{n}"
+   ```
+2. `_ep_shm_attach(..., instance_tag="T")`,文件名改为:
+   ```python
+   path = f"/dev/shm/xiaotu_ep_L{layer_idx}_{instance_tag}_{hidden}_{tokens}_{world}.bin"
+   ```
+3. 调用处传入 `_shm_instance_tag(self.prefix)`。
+⇒ 目标模型各层用 `T`、draft 各层用 `D1` ⇒ **两份 barrier 与两块部分和区域彻底分离**。
+(启动脚本里的 `rm -f /dev/shm/xiaotu_ep_*.bin` 通配仍然覆盖新文件名。)
+
+### (b) 判据(用**默认** `EP_SHM=1`,即修复后的真实交付路径)
+- ✅ **成功**:position-0 接受率回到 **~70%**(对照:`EP_SHM=0` 时 72.5%;修复前仅 26%);
+- ❌ **失败**:接受率仍 ~26% ⇒ 说明 shm 隔离不是(唯一)原因,需回到"验算/采样"一侧。
+- 同时看 C=1 单流是否从 6.30 升上来(修复前 < 不开投机的 10.76)。

@@ -147,7 +147,23 @@ def ep_shm_enabled() -> bool:
 _EP_SHM_FDS: list = []   # 保持 mmap/fd 存活
 
 
-def _ep_shm_attach(layer_idx: int, tokens: int, hidden: int, world: int):
+# 【第 193 轮·修 draft 计算 bug】shm 文件名必须区分**模型实例**。
+# 背景:vLLM 的 DSpark 起草模型是目标模型的**又一份完整实例,层名(prefix)相同**
+# ⇒ 只用 layer_idx 命名会让"目标第 L 层"和"draft 第 L 层"共用同一个 barrier 头与
+# 同一块部分和区域 ⇒ 两套调用序列交织推进世代、互相覆写 ⇒ **draft 的 MoE 算错**
+# ⇒ 接受率塌陷(实测 position-0: 26% vs 修好后的 72.5%,见 NOTES §236/§238)。
+# 这里用一个**独立**的计数(不碰 _is_duplicate_model_instance 的 seen,避免互相干扰)。
+_SHM_INSTANCE: dict = {"seen": {}}
+
+
+def _shm_instance_tag(prefix: str) -> str:
+    n = _SHM_INSTANCE["seen"].get(prefix, 0)
+    _SHM_INSTANCE["seen"][prefix] = n + 1
+    return "T" if n == 0 else f"D{n}"
+
+
+def _ep_shm_attach(layer_idx: int, tokens: int, hidden: int, world: int,
+                   instance_tag: str = "T"):
     """为某一层创建/打开跨 rank 共享的归约缓冲,返回 (mmap, stride_bytes)。
 
     布局:[Header 128B][rank0 部分和 stride B][rank1 部分和 stride B ...]
@@ -158,7 +174,8 @@ def _ep_shm_attach(layer_idx: int, tokens: int, hidden: int, world: int):
 
     stride = (tokens * hidden * 4 + 63) // 64 * 64
     total = 128 + stride * world
-    path = f"/dev/shm/xiaotu_ep_L{layer_idx}_{hidden}_{tokens}_{world}.bin"
+    path = (f"/dev/shm/xiaotu_ep_L{layer_idx}_{instance_tag}"
+            f"_{hidden}_{tokens}_{world}.bin")
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         os.ftruncate(fd, total)
@@ -738,7 +755,8 @@ class CpuXiaotuMoE(nn.Module):
             _toks = int(os.environ.get("XIAOTU_MOE_EP_SHM_TOKENS", "1024"))
             if _world > 1:
                 _mm, _stride = _ep_shm_attach(
-                    extract_layer_index(self.prefix), _toks, self.hidden_size, _world
+                    extract_layer_index(self.prefix), _toks, self.hidden_size, _world,
+                    _shm_instance_tag(self.prefix),
                 )
                 self.engine.configure_ep(_rank, _world, _mm, _stride)
                 self._ep_shm_tokens = _toks
