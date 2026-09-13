@@ -36,6 +36,7 @@ GPU_UTIL="${GPU_UTIL:-0.90}"
 THREADS="${THREADS:-48}"          # lk 生产是每卡 48(LK_THREADS)
 MINBATCH="${MINBATCH:-1024}"      # lk 生产同值:开 GPU prefill
 SPEC_ON="${SPEC:-0}"
+EAGER="${EAGER:-0}"   # 1 = 加 --enforce-eager(避开 lk 的 _cpu_prefill 在捕获期同步的问题)
 
 OUTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/report/tuning/logs"
 mkdir -p "$OUTDIR"
@@ -64,13 +65,16 @@ ARGS=(
   --default-chat-template-kwargs '{"enable_thinking": true}'
   --disable-custom-all-reduce
 )
+if [ "$EAGER" = "1" ]; then
+  ARGS+=(--enforce-eager)
+fi
 if [ "$SPEC_ON" = "1" ]; then
   ARGS+=(--speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}')
 fi
 
 {
   echo "tag=$TAG port=$PORT tp=$TP gpus=$GPUS maxlen=$MAXLEN seqs=$SEQS mbt=$MBT"
-  echo "gpu_util=$GPU_UTIL threads=$THREADS minbatch=$MINBATCH spec=$SPEC_ON"
+  echo "gpu_util=$GPU_UTIL threads=$THREADS minbatch=$MINBATCH spec=$SPEC_ON eager=$EAGER"
   echo "env=$ENV"
   date -Is
 } > "$OUTDIR/$TAG.env"
