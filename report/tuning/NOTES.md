@@ -9251,3 +9251,45 @@ envs.py:  is_gpu_prefill_layer = use_gpu_prefill and not resident and not mtp
    这修掉了"lk 链下引擎完全不做部分和合并"的正确性缺口;
 2. **默认线程 = 120**(而不是 `hardware_concurrency()`=192),并接受 `LK_THREADS`;
    本条来自用户提醒的"每 CCD 4-5 核",也解释了移植后只有 1.62 t/s 的一部分原因。
+
+## 282. 🔴 移植版 gpu_prefill 失败的**确切原因**(与参考逐行对照得到)
+
+### (a) 参考 vs 移植的**唯一实质差异**(同一时刻的两个对照)
+| 运行 | env / vLLM 文件 | 引擎 | TP | MINBATCH | 结果 |
+|---|---|---|---|---|---|
+| `refctl2` | `lvllmds4-x` **原版** | **lk_moe**(专有) | 1 | **1024** | ✅ **74.97 s 就绪**,43 层 `[CPU]`,MARLIN 已选 |
+| `lkport12` | `lkxtu` **移植版** | `xiaotu_moe` | 1 | **1024** | ❌ `assert self.moe_kernel is not None` |
+
+同一几何、同一 fork、同一参数 ⇒ 差异只能来自"那两个被移植的文件"。逐行对照后找到:
+```python
+# 参考 env(refctl2 能跑)                   # 移植版(来自 Lvllmds4-x 的**未提交工作区**)
+elif is_gpu_prefill_layer and ...:         elif is_gpu_prefill_layer and ...:
+    fused_out = self.routed_experts            fused_out = self.routed_experts
+        ._gpu_prefill(...)                          .forward_monolithic(...)   # 或 forward_modular
+```
+* 参考走 **lk 自己的 GPU prefill**:`routed_experts._gpu_prefill` → `lk_moe.gpu_prefill(
+  x_ptr, out_ptr, ids_ptr, wts_ptr, qlen, k)` —— **由引擎内部流式把该层权重搬上 GPU 再算**,
+  **不需要 `moe_kernel`**;
+* 移植版改成了 vLLM **标准 GPU MoE**(`forward_monolithic/forward_modular`),那条路需要
+  `moe_kernel`;而混合模式下专家权重在 **CPU** 上 ⇒ 见 (b)。
+⇒ **这不是我们引入的,是 `Lvllmds4-x` 工作区里那份未提交改动引入的**(它偏离了 lk 原版)。
+
+### (b) 我按 (a) 试的"一行修正"失败,并给出了**决定性证据**
+把 `mxfp4.py` 的 early-return 改成"gpu_prefill 层也建 kernel":
+```
+NotImplementedError: Could not run '_C::gptq_marlin_repack' with arguments from the 'CPU' backend.
+```
+⇒ **混合模式下权重就在 CPU**,MARLIN 重打包需要 CUDA ⇒ 这条"走标准 GPU MoE"的路在混合模式下
+**根本走不通**。已回退该行。
+⇒ 结论:**必须让引擎提供 `gpu_prefill(...)`**(lk 的 ABI),而不能把 gpu_prefill 转给 vLLM 标准路径。
+
+### (c) 这件事**我们的历史记录里早有答案**
+`NOTES §1587`:`gpu_prefill.gpu_moe_layer()` 的做法就是"**每层把该层专家权重经 PCIe 流进显存再算**",
+`gpu_prefill.py` 里还有 side stream + `PrefetchSlot`;`§5093` 甚至说我们的做法"**在机制上比参考更完整**"。
+⇒ 所以缺的不是算法,而是**把这份已有的 Python/Triton 实现暴露成引擎的 `gpu_prefill` 入口**
+(lk 的 `_gpu_prefill` 直接 `self.lk_moe.gpu_prefill(...)`,签名
+`(x_ptr, out_ptr, ids_ptr, wts_ptr, qlen, k)`)。这是**移植的最后一块**。
+
+### (d) 已回退
+1. `mxfp4.py` 恢复参考原样(已自检 `is_gpu_prefill_layer` 不再出现在该文件);
+2. 下一步应把 `moe_runner.py` 也恢复成参考的 `_gpu_prefill(...)` 写法,并给引擎补 `gpu_prefill`。
