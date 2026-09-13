@@ -9446,3 +9446,48 @@ clamped_ = (swiglu_limit_ > 0.f || swiglu_alpha_ != 1.f || swiglu_beta_ != 0.f);
    并把 `moe_runner.py` 恢复成参考原版的 `_gpu_prefill(...)` 调用。
    **这不是自研新功能,而是把我们自己的现成实现接到 lk 的 ABI 上**;
 3. `XIAOTU_MOE_DPBF16=1` 收掉 `me=1` 的残差。
+
+## 287. TP=2 + auto-EP 归约:初始化正确、**没有死锁**(中间证据)
+
+`lkport16` = `TP=2 / MINBATCH=0 / EAGER=1 / THREADS=48`(新引擎:auto-EP + 夹紧修复)
+```
+auto EP shm 计数 = 86(43 层 × 2 rank 都调用了 auto_ep_setup)
+/dev/shm/xiaotu_ep_auto_*.bin = 43 个(每层一个、两 rank **同名共享**)✅
+86 个引擎建成;GPU KV cache 45,640 tokens
+VLLM::Worker_TP0 = 1801% CPU / 106 线程
+VLLM::Worker_TP1 = 1801% CPU / 104 线程      ← **两个 rank 都在算,不是卡在 barrier**
+```
+⇒ 最关键的一点先成立:**我新写的 engine 内 `/dev/shm` 归约在两个 rank 上配对成功、
+没有互等**。这修掉了 §279 那个"lk 链下引擎完全不做部分和合并"的正确性缺口。
+
+剩下要等的只是启动 warmup 的 8192-token **CPU** prefill(TP=2 下更慢,每个 rank 都要算全部
+256 个专家的一半 intermediate)。这也再次说明:**`MINBATCH=0` 只适合做验证,不是交付配置**,
+真正的 prefill 性能必须靠 `gpu_prefill`(见 §286(d))。
+
+## 288. ✅ TP=2 + auto-EP:**正确性通过**;⚠️ 但**跨 rank 归约太贵** ⇒ 当前 TP=1 更快
+
+### (a) 正确性(lkport16,TP=2 / MINBATCH=0 / EAGER=1 / THREADS=48)
+```
+Q1 "The capital of France is" → " Paris. The capital of Spain is Madrid. The capital of Italy is Rome."  ✅
+Q2 "1, 2, 3, 4,"              → " 5, 6, 7,"                                                              ✅
+Q3 "def fibonacci(n):"        → "if n <= 0: return 0"  (2/2 逐字一致)                                     ✅
+```
+⇒ **我新写的 engine 内 `/dev/shm` 跨 rank 归约,数值上是正确的** —— §279 那个
+"lk 链下引擎完全不做部分和合并"的缺口**已闭环**。
+
+### (b) 但速度反而更慢
+| 配置 | C=1 | C=2 聚合 | C=4 聚合 | TPOT(C=1) |
+|---|---|---|---|---|
+| **TP=1**(lkport15) | **8.25** | 13.09 | — | 113.81 ms |
+| **TP=2**(lkport16) | 3.50 | 5.54 | 8.46 | 277.04 ms |
+⇒ TP=2 **慢 2.4 倍**。原因很清楚:每个 rank 只算"每专家一半 intermediate"(FLOPs 减半),
+但**每层都要做一次跨进程归约**(两个自旋 barrier + 部分和相加,43 层/步 ⇒ 43 次)。
+两个 rank 分处**不同 socket**,共享内存 barrier 的缓存行在 socket 间弹跳 ⇒ 比省下的 FLOPs 更贵。
+(这也解释了为什么 lk 生产要 `LK_THREAD_BINDING=CPU_CORE` + NUMA interleave 那一套。)
+
+### (c) 结论与取舍
+1. **移植目标已达成**:lk 全套编排 + 我们的引擎,TP=1/TP=2 都能起来、输出正确;
+2. **当前最优配置是 TP=1**(8.25 t/s);TP=2 需要先把跨 rank 归约做便宜(减少 barrier 次数 /
+   降低跨 socket 争用),否则得不偿失;
+3. **prefill 仍被 `MINBATCH=0` 限制**(CPU prefill,8192 token 要十几分钟)⇒
+   要谈预填充性能与 1M 上下文,必须接上 `gpu_prefill`(§286d)。
