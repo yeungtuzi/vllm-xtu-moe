@@ -46,7 +46,8 @@ DRAFT_RESIDENT="${DRAFT_RESIDENT:-1}"  # 1=草稿层强制常驻 GPU(用户硬�
 FORCE_DRAFT="${FORCE_DRAFT:-0}"        # 1=跳过显存护栏(明知偏紧仍要开草稿),会打印警告
 EXTRA_ENV="${EXTRA_ENV:-}"             # 额外环境变量透传给服务进程,如 EXTRA_ENV="XIAOTU_CD_TIMING=1"
 # 投机解码参数:**默认取作者 config.yaml 的值**(num 3 / greedy);可用 SPEC_JSON 覆盖
-SPEC_JSON="${SPEC_JSON:-{\"method\":\"dspark\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"greedy\"}}"
+DEFAULT_SPEC_JSON='{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"greedy"}'
+SPEC_JSON="${SPEC_JSON:-$DEFAULT_SPEC_JSON}"   # 注意:不要把 JSON 直接写进 ${VAR:-...},bash 会多吐一个 }
 MODEL_EST_GIB="${MODEL_EST_GIB:-auto}"  # 目标模型 GPU 占用估值(auto: 按实测 TP=1→11 / TP=2→7)
 LK_BUF_GIB="${LK_BUF_GIB:-6}"           # lk 引擎在 GPU 的缓冲 + decode/gpu_prefill 暂存(实测≈5.3)
 WARMUP_GIB="${WARMUP_GIB:-3}"           # 预热/首次分配的余量(实测 0.90 时因一笔 2 GiB 分配 OOM)
