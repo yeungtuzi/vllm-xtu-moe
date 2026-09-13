@@ -8890,3 +8890,244 @@ D2H/CPU/H2D"),但同时满足两条约束**:
 (§246c 的假设成立;每层 compute ≈ 0.95 + 0.23×qlen)。要投机转正,必须先把**每层随 qlen 的
 增量**压下去 —— 这与"单流 12.97 → 30"是同一件事。
 (用户要求"draft 永远在 GPU"已实现并生效:`reserved 4.78 GiB for 3 GPU-resident draft layer(s)`。)
+
+## 271. 版本普查(用户第 210 轮要求)与 rebase 结果
+
+| 项目 | 本地 | 上游最新 | 落后 | 处置 |
+|---|---|---|---|---|
+| `guqiong96/Lvllm` | `lvllm-v2.3.11` | **`lvllm-v2.4.0`**(origin/main `ea439b178a`) | **20650 提交** | 记为"主线分支的最新 lk 集成",本次不直接使用(见下) |
+| `guqiong96/Lvllmds4-x` | `b7f99cdc1` | `a9f97ec09` | **1**(仅删 Dependabot) | ✅ **已 rebase**,并把端口改动提交为 `faf95dd5b` |
+| `guqiong96/Lvllmds4`(SM120) | 未 clone | tag 全是 `sm120-pr-41834-stable-preview-*`,最新 `20260804` | — | 与 A100(SM80)无关,跳过 |
+| `guqiong96/lktransformers` | `0123706` | `0123706` | 0 | 已最新 |
+| `vllm-project/vllm`(我们的 fork 基座) | `6c73b08` | fetch 中(仓库巨大) | 待定 | §272 处理 |
+| `lk-moe`(PyPI) | — | `2.4.3`(2026-09-10) | — | **Proprietary**,不采用 |
+
+### (a) 为什么移植基座选 `Lvllmds4-x` 而不是 `Lvllm` v2.4.0
+`Lvllm` 的 README 自述其定位是**通用 MoE**(Qwen3 / GLM / MiniMax / Kimi)且"随 vllm 发版同步、
+只保留 lk_moe 那一层的最小 diff";而我们的模型是 **DeepSeek-V4-Flash + A100(SM80)**,
+DeepSeek-V4 的 SM80/SM89 支持在 **`Lvllmds4-x`**(基座 `yhfgyyf/vllm-deepseek-v4-sm89`)里。
+⇒ **`Lvllmds4-x` 同时具备"DeepSeek-V4 SM80 支持 + lk 全套编排"**,正是本次要的基座。
+
+### (b) `Lvllmds4-x` 的 vLLM 侧集成 = **两个文件**(已在 `faf95dd5b` 固化)
+`routed_experts.py`(92 行改动)+ `runner/moe_runner.py`(30 行改动),内容仅两类:
+1. `import lk_moe` → `import xiaotu_moe`、`lk_moe.MOE_*` → `xiaotu_moe.MOE_*`;
+2. `clean_weights_after_loading` 给 gpu_prefill 层加一条 early-return。
+**其余全是 lk 在里层的实现**(`_cpu_decode/_cpu_prefill/_gpu_prefill/should_use_gpu_prefill/
+_initialize_cuda_graph_buffers/process_weights_after_loading` 等,共约 580 行,
+已随该 fork 的历史提交存在,**不需要移植**)。
+
+### (c) 结论:移植 = **让 `Lvllmds4-x` 跑起来 + 挂上我们的引擎**,而不是把 580 行抄进我们那个
+已分叉的 fork(那会引入两棵 vLLM 之间的版本漂移,而且等于手搓)。
+阻塞点已定位:**ABI 不匹配** —— 我们的 `xiaotu_moe` 扩展编译于
+torch 2.13 / py3.12.14(`vllm-xiaotu-moe` env),而 `lvllmds4-x` env 是 torch 2.11 / py3.12.11
+⇒ **必须在 lk 的 env 里重新编译我们的引擎**(编译我们自己的引擎不属于"生造轮子")。
+
+## 272. 【移植完成度】lk 全套编排链 + 我们的 xiaotu_moe 引擎**已跑通到"建完 86 个引擎"**;剩一个配置矛盾
+
+### (a) 移植做了什么(零新增功能)
+1. 基座 `Lvllmds4-x` rebase 到 `origin/main`(`a9f97ec09`),把它的 vLLM 侧端口
+   (`lk_moe` → `xiaotu_moe` 机械改名,2 个文件)提交为 `faf95dd5b`;
+2. 新建 conda env **`lkxtu`**(`lvllmds4-x` env 的干净克隆,py3.12.11/torch2.11/vllm2.3.11),
+   * 把上面 2 个文件覆盖进它的 site-packages/vllm(实测:env 里原文件与 checkout 的**移植前**版本
+     逐字节一致,差异恰好 92/30 行 = 端口本身);
+   * `pip install xiaotu-moe`(我们的引擎,Apache-2.0);
+   * **卸载 `lk_moe` 2.4.2(专有)**,以确保跑起来用的只能是我们的引擎;
+3. 启动脚本 `scripts/serve_lk_port.sh`:启动参数逐条照搬 lk 生产 `process_data/scripts/dsv4.sh`。
+   * 必须用 `python -m vllm.entrypoints.openai.api_server`(`lkxtu/bin/vllm` 是指向旧 env 的符号链接);
+   * 必须显式 `--model`(裸位置参数会被当成 `model_tag`,`--model` 仍为空 ⇒ HF 离线解析报错);
+   * 必须从**中立 CWD** 启动(在本仓目录下,`*.egg-info` 会被当成已安装发行版 ⇒ vLLM 加载我们的
+     OOT 插件,而那是给主线 fork 写的、在 lk fork 上 import 失败)。
+
+### (b) 实测进展(有日志为证)
+```
+routed_experts.py:39  lk_moe module is available, lk::MOE implementation will be used
+core.py:114           Initializing a V1 LLM engine (v2.3.11) … enforce_eager=False
+numa_utils.py:492     Enabling NUMA interleave override when LVLLM_MOE_NUMA_ENABLED=1 …
+86 条 "Initialized lk_moe with 256 experts for layer model.layers.N.ffn.experts [CPU]"
+```
+⇒ **43 层 × 2 rank 的引擎全部建成**,而且当时 `lk_moe` 已卸载 ⇒ **跑的就是 `xiaotu_moe`**。
+
+### (c) 🔴 卡住的一步:**lk 的 `gpu_prefill` 与它的量化方法自相矛盾**(不是我引入的)
+```
+vllm/model_executor/layers/quantization/mxfp4.py:745
+    def process_weights_after_loading(self, layer):
+        if isinstance(layer, RoutedExperts) and not layer.is_gpu_resident_layer:
+            return                       # ← 非"常驻"层**不建 moe_kernel**
+```
+而 `envs.py` 的路由是:
+```
+is_lk_moe_use_gpu_prefill() = LVLLM_GPU_PREFILL_MIN_BATCH_SIZE > 0        # 我设了 1024 ⇒ True
+is_lk_moe_gpu_prefill_layer(name) = use_gpu_prefill and not resident and not mtp
+is_lk_moe_gpu_resident_layer(name) = … if LVLLM_GPU_RESIDENT_MOE_LAYERS 为空 ⇒ **False**
+```
+⇒ 在 `LVLLM_GPU_RESIDENT_MOE_LAYERS` **未设**时:所有层既"非常驻"又"是 gpu_prefill 层",
+于是 prefill 走 `forward_modular` → `mxfp4.py:809 assert self.moe_kernel is not None` **失败**
+(实测:profile_run 的 8192 批量触发)。`mxfp4.py:745` 在 checkout 与 env 中**完全一致**,
+即这是 lk 自身的配置矛盾,不是移植引入的。
+
+### (d) 本轮的处置(纯配置,不改代码)
+先按 `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0` 关掉 gpu_prefill 跑 `lkport3`:
+此时所有层都是 `is_lk_moe_cpu_layer` ⇒ runner 直接走 `_cpu_decode`(捕获期)/`_cpu_prefill`,
+**不需要 `moe_kernel`**,与 lk 的设计自洽。先拿到"正确性 + 解码速度"的基线,
+再单独研究 gpu_prefill(需要 `LVLLM_GPU_RESIDENT_MOE_LAYERS` 与内核构建的关系)。
+
+## 273. 移植后启动链路的三道坎(都靠**配置/环境**,没有改一行 vLLM 代码)
+
+| # | 现象 | 根因 | 处置 |
+|---|---|---|---|
+| 1 | `LocalEntryNotFoundError: Cannot find an appropriate cached snapshot folder` | `python -m vllm.entrypoints.openai.api_server` 把裸位置参数解析成 **`model_tag`**,`--model` 仍为空 ⇒ HF 离线解析去 `snapshot_download` | 显式 `--model "$CKPT"` |
+| 2 | `Failed to load plugin vllm_xiaotu_moe … No module named 'vllm.models.deepseek_v4.common.mm_preprocess'` | 从**本仓目录**启动时 `*.egg-info` 被当成已安装发行版 ⇒ vLLM 加载了我们的 OOT 插件(那是给主线 fork 写的) | 从**中立 CWD**(`/tmp`)启动 |
+| 3 | `[Errno 2] No such file or directory: 'ninja'` | worker 里 FlashInfer/Triton JIT 需要 ninja,而 `python -m` 启动时没把 env 的 `bin` 放进 PATH | `export PATH="$ENV/bin:$PATH"`(参考副本脚本 `serve_lk_replica.sh` 早有同样一行) |
+
+另:`lkxtu/bin/vllm` 是 `cp -a` 留下的**指向旧 env 的符号链接**,所以必须用
+`python -m vllm.entrypoints.openai.api_server` 启动。
+
+## 274. 🔴 第四道坎:lk 的 `_cpu_prefill` 在**捕获期**被选中 ⇒ 捕获作废
+
+```
+moe_runner.py:564-585(分派)
+    if is_gpu_resident_layer:        forward_monolithic      # GPU
+    elif is_current_stream_capturing(): _cpu_decode          # ← 捕获期本应走这条
+    elif is_gpu_prefill_layer and should_use_gpu_prefill(...): forward_monolithic
+    else:                            _cpu_prefill            # ← 实际走了这条
+_mcpu_prefill 里: torch.cuda.current_stream().synchronize()
+→ torch.AcceleratorError: CUDA error: operation not permitted when stream is capturing
+   (cudaErrorStreamCaptureUnsupported) → cudaErrorStreamCaptureInvalidated → EngineCore 死
+```
+发生位置:`core.py:261 _initialize_kv_caches → abstract.py:147 determine_available_memory`
+(worker 侧栈顶是 `vllm/compilation/breakable_cudagraph.py:383 _capture`)。
+⇒ **`torch.cuda.is_current_stream_capturing()` 在这次捕获里返回了 False**,而
+`current_stream().synchronize()` 却报"stream is capturing"
+——两者矛盾,说明这套 fork 的 breakable-cudagraph **内存剖析**路径与 lk 的分派判据不一致。
+(对照:参考日志 `silent_t120cg_server.log` 里同样的 FULL_DECODE_ONLY + 43 层 CPU MoE 是**成功**的,
+但它 `'mode': CompilationMode.NONE` 且是 TP=1;我们这台是 TP=2。此差异待查。)
+
+**处置(纯配置)**:加 `EAGER=1`(`--enforce-eager`)先拿到可用基线。
+依据:我们自己实测 cudagraph 只值 **+3.7%**(§259),所以先用 eager 把"正确性 + 速度"测出来,
+再回头单独解决捕获期分派。(`lkport5` = `MINBATCH=0 EAGER=1`。)
+
+## 275. ✅✅ **决定性对照:参考 env 本身用同一配置也报同一个错** ⇒ 失败**不是移植引入的**
+
+用**同一个** `scripts/serve_lk_port.sh`、**同一套参数**(TP=2 / maxlen 262144 / gpu_util 0.90 /
+MINBATCH=0 / EAGER=1),分别跑两个 env:
+
+| env | vLLM 侧 | 引擎 | 结果 |
+|---|---|---|---|
+| `lkxtu`(我们的移植) | `Lvllmds4-x` 的两个文件(`import xiaotu_moe`) | `xiaotu_moe`(lk_moe 已卸载) | 建完 86 个引擎 → `_initialize_kv_caches` 失败 |
+| `lvllmds4-x`(**参考原始**) | 原始文件(`import lk_moe`) | `lk_moe` 2.4.2(专有) | 建完 86 个引擎 → **完全相同的错误** |
+
+两者报的都是:
+```
+RuntimeError: Worker failed with error
+  'torch_call_dispatcher("aten::new_empty", "", stack.data(), TORCH_ABI_VERSION)
+   API call failed at /home/guqiong/.conda/envs/Lvllm-ds4/lib/…/torch/csrc/stable/ops.h, line 933'
+```
+⇒ **我们的移植与参考在这一点上行为完全一致**,该失败**不是**移植/改名/引擎替换造成的,
+而是 `Lvllmds4-x` 这套 fork 在我的**这组启动参数**下的问题(报错里出现的是**编译机**的
+torch 头文件路径,指向 torch stable-ABI 的 `aten::new_empty` 调用)。
+
+### 意义
+1. **移植的正确性得到强证据**:同样的输入 ⇒ 同样(坏)的输出,说明我没有引入新问题;
+2. 需要修的是**参数/几何**,而不是代码 —— 参考在本机**跑通过**的配置是
+   `silent_t120cg_server.log` 那组:**TP=1 / max_model_len=8192 / gpu_memory_utilization=0.62 /
+   `cudagraph_mode=FULL_DECODE_ONLY` / prefix caching on / KV `fp8_ds_mla` / max_num_seqs=8**
+   (`'mode': CompilationMode.NONE`,`cudagraph_capture_sizes=[1,2,4,8,16]`)。
+⇒ `lkport6` 就用**那组几何**跑我们的移植(TP=1、单卡 GPU2、maxlen 8192、util 0.62、
+MINBATCH=0、不 eager),目的是先拿到一个"能跑"的基线,再逐个放开维度找断点。
+
+## 276. 逐个放开维度找断点(移植后的启动矩阵)
+
+| 运行 | env | TP | maxlen | util | eager | MINBATCH | 结果 |
+|---|---|---|---|---|---|---|---|
+| lkport2 | lkxtu | 2 | 262144 | 0.90 | 0 | 1024 | ❌ `moe_kernel is None`(gpu_prefill 与量化方法矛盾,§272c) |
+| lkport3/4 | lkxtu | 2 | 262144 | 0.90 | 0 | **0** | ❌ `_cpu_prefill` 在 `breakable_cudagraph` 捕获期同步 |
+| lkport5 | lkxtu | 2 | 262144 | 0.90 | **1** | 0 | ❌ `aten::new_empty` stable-ABI 失败(KV 初始化阶段) |
+| refctl1 | **lvllmds4-x(参考)** | 2 | 262144 | 0.90 | 1 | 0 | ❌ **与 lkport5 逐字相同的错** ⇒ 非移植问题 |
+| lkport6 | lkxtu | **1** | 8192 | 0.62 | 0 | 0 | ✅ **越过了 KV 初始化**(说明 lkport5/refctl1 的 `aten::new_empty` 是 TP=2 特有) → ❌ 但卡在捕获期 `_cpu_prefill` 同步 |
+| lkport7 | lkxtu | 1 | 8192 | 0.62 | **1** | 0 | 进行中 |
+
+⇒ 两条独立的阻塞:
+1. **TP=2 + 该参数组** ⇒ KV 初始化阶段 `aten::new_empty`(参考也复现 ⇒ fork/参数问题);
+2. **不 eager** ⇒ `breakable_cudagraph` 捕获期内分派选中 `_cpu_prefill`(它会 `synchronize()`)
+   ⇒ 捕获作废。两次都发生在
+   `v1/worker/gpu_model_runner.py:_warmup_and_capture → _dummy_run → breakable_cudagraph._capture`。
+
+⇒ `lkport7`(TP=1 + eager)用来验证"这两条都绕开时能否起来",拿到第一个可用基线。
+
+## 277. 🎉 **移植成功:lk 全套编排链 + 开源 `xiaotu_moe` 引擎已经在服务** —— 并做了正确性/速度首测
+
+### (a) 可用配置(`lkport7`)
+```
+env = lkxtu(lvllmds4-x 的克隆 + Lvllmds4-x 的两个端口文件 + pip install xiaotu-moe;lk_moe 已卸载)
+TP=1 / max_model_len=8192 / gpu_memory_utilization=0.62 / max_num_seqs=8 /
+MBT=8192 / kv=fp8_ds_mla / prefix caching on / LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0 / --enforce-eager
+```
+```
+routed_experts.py:39   lk_moe module is available, lk::MOE implementation will be used
+43 × "Initialized lk_moe with 256 experts for layer model.layers.N.ffn.experts [CPU]"
+kv_cache_utils.py:2078 GPU KV cache size: 34,118 tokens
+api_server             Application startup complete.   → GET /v1/models 200
+```
+⇒ **lk 的编排(routed_experts + moe_runner 四路分派)+ 我们的引擎,端到端跑通。**
+
+### (b) 正确性(首测)
+| 检查 | 结果 |
+|---|---|
+| 常识续写 | `"The capital of France is"` → `" Paris. The capital of Spain is Madrid. The capital of Italy is Rome."` ✅ |
+| 计数 | `"1, 2, 3, 4,"` → `" 5, 6, 7, 8, 9,"` ✅ |
+| 贪心可复现 | ❌ **两次 greedy `temperature=0` 输出在中途分叉** |
+⇒ 输出语义正确,**但 greedy 不是逐位可复现**。最可能是 **CPU 引擎多线程浮点归约顺序不稳定**
+(256 专家 / 48~120 线程,分块数与活跃专家数相关)。这是**需要单独定位的正确性问题**
+(也是 `XIAOTU_VERIFY_LAYER` 数值门禁该覆盖的项),不能当成"小事"。
+
+### (c) 速度(首测,**未调优几何**,只证明链路通)
+| 并发 | 单流 t/s | 聚合 t/s | TPOT ms |
+|---|---|---|---|
+| C=1 | 1.62 | 1.62 | 578.51 |
+| C=2 | 2.78 | 5.61 | 327.83 |
+| C=4 | 2.22 | 8.92 | 379.17 |
+慢的原因都是**已知的配置项**,不是移植缺陷:TP=1(每 rank 256 专家、无专家切分)、
+`LK_THREADS=48`(lk 生产是每卡 48,单卡下偏少)、`--enforce-eager`、且 `MINBATCH=0`(关掉 GPU prefill)。
+⇒ 下一步:`lkport8` = **TP=2 + eager + MINBATCH=0 + LK_THREADS=120 + maxlen 8192**(验证 TP=2 能否绕开
+`aten::new_empty`),拿到可与主线基线(11-13 t/s)和参考(26 t/s)对比的数。
+
+## 278. TP=2 移植版**启动成功但解码会挂**:与"60 秒 shm 广播超时"同一个老问题
+
+### (a) 事实
+`lkport8` = `TP=2 / maxlen 8192 / util 0.62 / MINBATCH=0 / EAGER=1 / LK_THREADS=120`
+```
+GPU KV cache size: 45,640 tokens            ← 越过了 §275 的 aten::new_empty(那是 maxlen=262144/util=0.90 特有)
+Application startup complete.  health=200
+```
+但实测:
+| 并发 | 单流 t/s | 聚合 t/s | TPOT ms |
+|---|---|---|---|
+| C=1 | **0.08** | 0.08 | **12806** |
+| C=2 | ❌ 两个请求都失败(HTTPError) | — | — |
+日志:
+```
+shm_broadcast.py:705  No available shared memory broadcast block found in 60 seconds.
+                      This typically happens when some processes are hanging …
+Initialized lk_moe with 256 experts for layer model.layers.0.ffn.experts [CPU]   ← 两个 rank **都是 256**
+```
+⇒ **TP=2 时两个 rank 都持有全部 256 个专家**(lk 的 `_get_processes_info()` 在非 EP 下返回
+`(tp_size, tp_rank, dev)` ⇒ 引擎 `num_processes=2`),于是引擎内部要做 2 路跨进程归约;
+而实测两 rank 没能对齐 ⇒ 一个 rank 卡在引擎的 barrier 里 ⇒ vLLM 的 shm 广播 60 s 超时。
+
+### (b) 这与我们的主线插件踩过的是**同一类**问题
+`tune_serve.sh` 里那条"必做清理"就是为它写的:
+```
+# 被 kill 掉的 TP>=2 进程会在 /dev/shm 留下 xiaotu_ep_L*_*.bin(双 barrier 的世代计数);
+# 新进程 attach 到状态错乱的旧文件后,两个 rank 的世代对不上 ⇒ 永久互等,
+# 表现为 vLLM 的 shm_broadcast: No available shared memory broadcast block found in 60 seconds
+```
+我们的 `serve_lk_port.sh` 已经 `rm -f /dev/shm/xiaotu_ep_*.bin`,但**lk 这套用的是引擎自己的
+命名/世代**,而且**两个 rank 都算全量专家却仍走 2 路归约**这一点本身就是可疑的
+(要么该按专家切分、要么该关掉归约)。
+
+### (c) 结论与下一步
+1. **移植本身已完成且可用**:TP=1 路径(`lkport7`)端到端跑通、输出语义正确;
+2. **TP=2 需要单独对齐跨 rank 归约** —— 这是 `xiaotu_moe` 引擎与 lk `_get_processes_info`
+   约定之间的交互,属于"引擎接入"层,不是 vLLM 侧移植的问题;
+3. 在此之前,**性能对比仍应以我们主线 OOT 路径的实测为准**(预填充 5263 t/s @8192、
+   C=1 12.97 t/s、C=8 聚合 60.80),因为那是唯一同时具备正确性与速度的配置。
