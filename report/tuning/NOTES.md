@@ -8015,3 +8015,43 @@ is_lk_moe_mtp_layer(name) = name.startswith("mtp.")
 1. 起草 = **1 层**(不再是整模型拷贝);
 2. 用**参考同构的路由规则**把这一层钉在 GPU(§251)⇒ 起草**完全不经过 CPU**;
 3. 于是"**开投机 ≥100 t/s**"与"**单流 >30**"两个目标同时具备正确的结构基础。
+
+## 253. 比对结果(目标要求 (1)):`mtp.` 命名是**我方引擎与 checkpoint 的版本差异**
+
+### (a) 参考 `Lvllmds4-x` 的 MTP 模型结构(与主线**同构**)
+```python
+# Lvllmds4-x/vllm/model_executor/models/deepseek_mtp.py:127-131
+self.mtp_start_layer_idx = config.num_hidden_layers       # = 43
+self.num_mtp_layers      = config.num_nextn_predict_layers # = 1
+prefix = maybe_prefix(prefix, "head") / 由父模块注册
+```
+⇒ 索引约定与主线一致;**但它的模块 prefix 由父模块注册,最终是 `mtp`** ——
+证据就是它的路由规则 `is_lk_moe_mtp_layer(name) = name.startswith("mtp.")`,
+以及 checkpoint 里权重名 `mtp.0.*`(两者一致 ⇒ **参考引擎能原生加载**)。
+
+### (b) 参考里"`mtp.` → `model.`"的先例(说明这类改名是常规做法)
+```python
+# Lvllmds4-x/vllm/model_executor/models/exaone4_5_mtp.py:198-199
+if name.startswith("mtp."):
+    name = name.replace("mtp.", "model.")
+```
+⇒ **把 `mtp.` 映射成模型主干命名,在参考里是有先例的标准做法。**
+
+### (c) 结论:差异是**命名约定**,不是架构设计
+| | MTP 权重命名 | 能否原生加载 |
+|---|---|---|
+| checkpoint(DeepSeek-V4-Flash) | `mtp.0.*` | — |
+| 参考引擎(`Lvllmds4-x`) | 期望/使用 `mtp.*` | ✅ |
+| **我方引擎(主线 vLLM)** | 期望 `model.layers.43.mtp_block.*` | ❌ KeyError |
+
+### (d) 因此修法明确(与参考先例一致)
+在**加载期做一次名字映射**(与 `exaone4_5_mtp.py` 同法):
+```
+mtp.0.<rest>  →  model.layers.43.mtp_block.<rest>
+```
+需要确认目标命名里 `mtp_block` 内部的子路径对应关系(下一轮核对
+`deepseek_mtp.py` 里 `DeepSeekMultiTokenPredictorLayer` 的属性名与 checkpoint 的 `mtp.0.*` 子键)。
+映射完成后:
+1. **主线原生 MTP + 拒绝采样**即可用(不用自己做起草/验证);
+2. 再用**参考同构的路由规则**(§251)把 `layers.43` 钉在 GPU ⇒ **起草不经过 CPU**;
+3. "开投机 ≥100 t/s" 与 "单流 >30" 同时具备结构基础。
