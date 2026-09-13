@@ -9208,3 +9208,46 @@ size_t nt = hw > 0 ? std::min<size_t>((size_t)hw, (size_t)120) : 1;   // 默认 
 if (XIAOTU_MOE_THREADS) nt = ...;        // 引擎自己的旋钮优先
 else if (LK_THREADS)    nt = ...;        // 接受 lk 链的旋钮
 ```
+
+## 281. ⚠️ 重大发现:`MINBATCH=0`(关 gpu_prefill)是**不可用**的配置 —— 但开它又撞上 lk 自身的矛盾
+
+### (a) `lkport9`(TP=2 + auto-EP 归约 + MINBATCH=0 + eager)的"挂住"其实是**在算**
+```
+[xiaotu/engine] auto EP shm /xiaotu_ep_auto_0_2_4096_8192.bin: rank 0/2 stride=134217728 tokens=8192
+[xiaotu/engine] auto EP shm /xiaotu_ep_auto_0_2_4096_8192.bin: rank 1/2 stride=134217728 tokens=8192
+86 个引擎 / GPU KV cache 45,640 tokens
+core.py:379 GPU KV cache size: 45,640 tokens
+kernel_warmup.py:441 Warming up DeepSeek V4 sparse MLA attention for mixed tokens=16, prefill tokens=8192
+shm_broadcast.py:705 No available shared memory broadcast block found in 60 seconds  ×5
+```
+判定:**不是死锁** —— `top` 显示两个 worker 各 **2373% / 2345% CPU**,13 分钟墙钟内累计
+**222 CPU-分钟**;GPU 利用率 0%。也就是说 vLLM 的**启动 warmup 会做一次 8192 token 的 prefill**,
+而 `MINBATCH=0` 把**所有** prefill 都压到 CPU 引擎 ⇒ 这一步要跑**几十分钟到几小时**。
+⇒ `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0` 只是"让服务能起来"的临时招,**不可用**。
+
+### (b) 于是必须解决 lk 自身的 `gpu_prefill` ↔ `moe_kernel` 矛盾(§272c)
+```
+quantization/mxfp4.py:745   def process_weights_after_loading(self, layer):
+                                if ... and not layer.is_gpu_resident_layer: return   # 只给"常驻层"建 kernel
+fused_moe/runner/moe_runner.py   elif is_gpu_prefill_layer and should_use_gpu_prefill(...):
+                                     forward_monolithic(...)   # 需要 moe_kernel
+envs.py:  is_gpu_prefill_layer = use_gpu_prefill and not resident and not mtp
+```
+⇒ 只要 `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE>0`,**每个非常驻层都被判为 gpu_prefill 层**,
+而它们**没有** `moe_kernel` ⇒ `assert self.moe_kernel is not None` 必然失败。
+`mxfp4.py:745` 在 checkout 与参考 env 里**逐字一致** ⇒ 这是 lk 代码自身的矛盾,
+不是我们移植引入的。
+
+### (c) 因此下一步是**对照实验**:参考 env 自己用 `MINBATCH=1024` 能不能起来?
+`refctl2` = `ENV=lvllmds4-x`(原版文件 + 专有 lk_moe)/ TP=1 / maxlen 8192 / util 0.62 /
+`MINBATCH=1024` / EAGER=1 / THREADS=48。
+* 若参考**也**失败 ⇒ 说明 `dsv4.sh` 那套参数在本机根本不是能跑的配置,
+  需要找参考**真正**跑通过的参数组合(日志里那几组是 TP=1/maxlen 8192/util 0.62);
+* 若参考**成功** ⇒ 说明 `moe_kernel` 在参考里是有的,差异在**我们替换的引擎**或某个 env,继续二分。
+
+### (d) 本轮的引擎侧进展(与上面独立,已提交 `8637c27`)
+1. **自建跨 rank 归约**:两个 rank 现在会打开**同名** shm
+   (`/xiaotu_ep_auto_0_2_4096_8192.bin`,rank 0/2 与 1/2 都出现)⇒ 命名对齐成功;
+   这修掉了"lk 链下引擎完全不做部分和合并"的正确性缺口;
+2. **默认线程 = 120**(而不是 `hardware_concurrency()`=192),并接受 `LK_THREADS`;
+   本条来自用户提醒的"每 CCD 4-5 核",也解释了移植后只有 1.62 t/s 的一部分原因。
