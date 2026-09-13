@@ -697,6 +697,19 @@ public:
             // 实测证据(NOTES §184):inrange=entered=127 < total=128,
             // 即 worker 眼里"范围内"的票只有 127 张,而倒计时按 128 计。
             // 注意 node_base_ 必须**仍**在奇数 store 之后读(陈旧票要落在 base 之前)。
+            // 【第 184 轮·修复尝试:发布前有界自旋】
+            // 根因方向(§228):故障发生在"发布者推进到下一代时,还有 worker 处在上一代的某个状态"。
+            // 这里在推进代数前插入**有界**自旋,给上一代的 worker 一个"回到循环顶部"的机会。
+            // 有界 ⇒ **不可能死锁**(这正是它相对"精确握手"的优势);
+            // XIAOTU_MOE_PUBLISH_SETTLE=<iters> 可调整(0 = 关闭,默认 2000)。
+            {
+                static const int settle_iters = [] {
+                    const char* e = std::getenv("XIAOTU_MOE_PUBLISH_SETTLE");
+                    if (e == nullptr) return 2000;
+                    return std::atoi(e);
+                }();
+                for (int _i = 0; _i < settle_iters; ++_i) __builtin_ia32_pause();
+            }
             uint64_t gen = current_gen_.load(std::memory_order_relaxed) + 2;
             current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
             total = 0;
