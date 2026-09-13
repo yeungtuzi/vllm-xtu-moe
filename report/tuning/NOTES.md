@@ -9611,3 +9611,98 @@ mtp.0.ffn.experts             resident=True  cpu=False gpuprefill=False
 顺序安全性已核实:dspark 草稿在 `v1/worker/gpu/model_runner.py:284`(V2 runner 的 `load_model` 内)加载,
 **早于** `initialize_kv_cache`(`:395`)与 `profile_run`(`:633`)⇒ 常驻草稿显存会被 profile 计入,
 KV cache 自动缩小,不会偷预算(护栏再兜一层)。
+
+---
+
+## 291. 【第 211 轮·用户提供的参考】**作者推荐的 lvllmds4-x 运行参数(存档,优化时对照)**
+
+用户原话:「我之前使用 lvllmds4-x(lvllm 为 ds-v4-flash 和 sm80 特化的版本),按照作者建议的
+运行参数供你参考」+「你可以记下来,万一碰到什么需要优化的地方可以参考」。
+以下**逐字存档**(模型路径与端口保持原样):
+
+```bash
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREADS=48 \
+OMP_NUM_THREADS=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024 \
+LK_POWER_SAVING=1 \
+FLASHINFER_DISABLE_VERSION_CHECK=1 \
+vllm serve /home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master \
+  --host 0.0.0.0 \
+  --port 8070 \
+  --tensor-parallel-size 2 \
+  --max-model-len 1048576 \
+  --gpu-memory-utilization 0.80 \
+  --trust-remote-code \
+  --served-model-name DeepSeek-V4-Flash-0731 \
+  --compilation_config.cudagraph_mode FULL_DECODE_ONLY \
+  --enable-prefix-caching \
+  --enable-chunked-prefill \
+  --max-num-batched-tokens 8192 \
+  --dtype bfloat16 \
+  --max-num-seqs 2 \
+  --enable-auto-tool-choice \
+  --kv-cache-dtype fp8_ds_mla \
+  --tokenizer-mode deepseek_v4 \
+  --tool-call-parser deepseek_v4 \
+  --reasoning-parser deepseek_v4 \
+  --default-chat-template-kwargs '{"enable_thinking": true}' \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' \
+  --disable-custom-all-reduce
+```
+
+### 要点(与我们脚本的差异,留作优化清单)
+
+| 项 | 作者值 | 我们脚本默认 | 备注 |
+|---|---|---|---|
+| `LVLLM_GPU_PREFETCH_WINDOW` | **1** | 2(本轮一度改 3) | README 说「一般预取 1~2 层即可」,**以作者值 1 为准**(已回改) |
+| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | **不设** | 自动填草稿层号 | 作者不必填是因为他接受草稿落在 CPU?见下方派发分析;我们的硬约束要求草稿在 GPU,故自动填 |
+| `--tensor-parallel-size` | **2** | 2 | 一致 |
+| `--max-model-len` | **1048576** | 262144 | 作者直接上 1M;我们没测过 1M |
+| `--gpu-memory-utilization` | **0.80** | 0.90 | 作者留了余量(给 KV/草稿) |
+| `--max-num-seqs` | **2** | 8 | 推理延迟导向 |
+| `--max-num-batched-tokens` | 8192 | 8192 | 一致 |
+| `--enforce-eager` | **无**(开图) | 我们有开关 | 作者跑 `FULL_DECODE_ONLY` 图 |
+| 其余环境变量 | 与我们的脚本**逐条一致** | — | `THREADS=48 / OMP=1 / BINDING=CPU_CORE / MIN_BATCH=1024 / LK_POWER_SAVING=1` |
+
+### 为什么作者不设常驻、而我们必须设(派发源码,`runner/moe_runner.py:557-609`)
+
+非驻留层(即 `is_gpu_resident_layer=False`)的派发是**四选一**:
+
+```python
+if is_monolithic:
+    if is_gpu_resident_layer:                      forward_monolithic   # GPU:原生 vLLM MoE
+    elif torch.cuda.is_current_stream_capturing(): _cpu_decode          # CPU(捕获/回放时)
+    elif is_gpu_prefill_layer and should_use_gpu_prefill(x): _gpu_prefill  # GPU:权重流式
+    else:                                          _cpu_prefill          # CPU
+```
+
+⇒ 作者参数下(`MIN_BATCH=1024`、无驻留清单),草稿层是 **GPU 预填充层**:
+预填充(≥1024 token)走 `_gpu_prefill`(**GPU** 算、权重从 CPU 流式),
+而**解码时批量小 → 落 `_cpu_prefill`(CPU 算)**,图模式下则走 `_cpu_decode`。
+即作者配置里草稿解码**在 CPU**;这与用户硬约束"draft 永远在 GPU"冲突,
+所以我们用 lk 自己的 `LVLLM_GPU_RESIDENT_MOE_LAYERS` 把 43-45 标常驻
+(常驻层在 `quantization/mxfp4.py:548` 拿 CUDA 权重 → `forward_monolithic` → 原生 GPU MoE)。
+
+**已实测确认(lkport25spec,TP=1/util0.90/SPEC=1/EAGER=1/PREFETCH=2)**:
+```
+layer model.layers.43.ffn.experts [GPU]
+layer model.layers.44.ffn.experts [GPU]
+layer model.layers.45.ffn.experts [GPU]
+合计 43×[CPU](目标层) + 3×[GPU](草稿层)
+```
+
+### 优化清单(用作者参数时值得试的对照)
+
+0. **`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` 拐点(用户第 211 轮补充)**:我们此前实测
+   **批量 > 384 时开 GPU prefill 即有收益**,而作者配方给的是 **1024** ⇒
+   ⇒ 值得扫 `384 / 512 / 768 / 1024` 找拐点(脚本里就是 `MINBATCH=`,默认跟作者 1024;
+   注意它同时决定 `_gpu_prefill` 的触发与 `get_max_num_group_batch_size()` 的 group 上限)。
+1. `PREFETCH=1`(作者)vs 2/3 —— 预填充固定开销;
+2. `GPU_UTIL=0.80` + `MAXLEN=1048576`(作者)vs 我们测过的 8192/262144 —— 1M 上下文从未实测;
+3. `SEQS=2`(作者)vs 8 —— 延迟导向;
+4. **draft 是否常驻**的取舍:常驻 = 满足硬约束、草稿全程 GPU,代价是 TP=1 约 **10.12 GiB/rank**、
+   TP=2 约 **5.34 GiB/rank** 的 KV 预算(1M 上下文下这笔预算很关键);
+   可用 `DRAFT_RESIDENT=0` 完全复刻作者配方做 A/B。
