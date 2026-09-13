@@ -9491,3 +9491,47 @@ Q3 "def fibonacci(n):"        → "if n <= 0: return 0"  (2/2 逐字一致)     
    降低跨 socket 争用),否则得不偿失;
 3. **prefill 仍被 `MINBATCH=0` 限制**(CPU prefill,8192 token 要十几分钟)⇒
    要谈预填充性能与 1M 上下文,必须接上 `gpu_prefill`(§286d)。
+
+## 289. 🎉🎉 **gpu_prefill 接入成功**:lk 的 `_gpu_prefill` 现在跑在**我们的** GPU 实现上
+
+### (a) 做法(全部是"复用",没有新算法)
+1. **恢复参考原版**:把 `Lvllmds4-x` 工作区那两处偏离改回参考写法 ——
+   `routed_experts.py` 重新有 `_gpu_prefill`, `moe_runner.py` 的 gpu_prefill 分支重新调它。
+   两个文件现在与参考**逐字一致**(只做了机械改名:`import lk_moe`→`import xiaotu_moe`、
+   `lk_moe.MOE*`→`xiaotu_moe.MOE*`;**`is_lk_moe_*` 等函数名一律不动** —— 上一轮我用
+   `s/lk_moe/xiaotu_moe/g` 全局替换,把函数名也改了,导致 `from vllm.envs import is_xiaotu_moe_*`
+   导入失败;这是本轮踩的坑,记下来)。
+2. **把已有的 `gpu_prefill.py`(970 行 / 5 个 Triton kernel)搬进引擎包**;
+3. 新增 `xiaotu_moe/gpu_prefill_bridge.py`:给引擎类包一层,只**新增** `gpu_prefill(...)`,
+   其余属性经 `__getattr__` 原样转发(ABI 不变)。桥把 lk 传进来的
+   **device 裸指针**用 `__cuda_array_interface__` 零拷贝包成 torch 张量,
+   再调 `gpu_moe_layer(...)`。
+
+### (b) 桥必须解决的三个坑(都实测踩到并修好)
+| # | 现象 | 原因与修法 |
+|---|---|---|
+| 1 | `TypeError: can't convert np.ndarray of type numpy.void` | bf16 没有 numpy 等价 dtype(`"<V2"`→void)⇒ 按 `"<u2"` 建张量再 `.view(torch.bfloat16)` |
+| 2 | `AttributeError: 'numpy.ndarray' object has no attribute 'untyped_storage'` | `gpu_prefill._pinned()` 需要 **torch** 张量(要 `untyped_storage()` 做锁页缓存)⇒ 权重视图改用 `torch.frombuffer` |
+| 3 | **原生崩溃**(栈上全是 `Py_BytesMain` 之类的裸帧) | **必须在构造期就把权重复制出来**:vLLM 随后 `clean_weights_after_loading` 会删掉 CPU 层的 `w13_weight/w2_weight`,底层页被回收 ⇒ 之前捕获的指针**悬空**。引擎 C++ 侧本来就做了同样的快照(`moe_v2.hpp` "COPY the weight blocks"),桥在 Python 侧也做一份(惰性就太晚) |
+
+### (c) 实测(`lkport22`:TP=1 / `MINBATCH=1024` / eager / THREADS=48)
+```
+Application startup complete(启动**不再**被 CPU prefill 拖住)✅
+GPU KV cache size: 24,493 tokens(比 MINBATCH=0 的 34,118 少 —— gpu_prefill 要 staging 显存)
+正确性:Q1/Q2/Q3 全部正确且与之前一致 ✅
+预填充(客户端 TTFT):
+  len= 1024  TTFT= 9647 ms   prefill= 106 t/s
+  len= 4096  TTFT=12826 ms   prefill= 319 t/s
+  (len=8192 请求被拒:8192 prompt + 1 token > max_model_len=8192,与实现无关)
+```
+### (d) 数字怎么读
+* **不再是 CPU 慢爬**:以前 8192 token 的 CPU prefill 要**十几分钟**,现在 4096 token 只要 12.8 s ✅
+* 但 **106-319 t/s** 远低于我方主线路径的 **1337 t/s @8192**(NOTES §261):
+  拟合边际吞吐 ≈ **960 t/s**,而**固定开销 ≈ 6.4 s**。
+* 固定开销的物理来源与我们历史记录一致(§69):**每层权重流式 H2D**
+  (43 层 ×1.6 GB ≈ 69 GB,PCIe ~20 GB/s ≈ 3.4 s)+ 每层 Triton 预填充内核(~54 ms ×43 ≈ 2.3 s)。
+* **⇒ 差距在"没有做重叠"**:主线路径用了 `_start_pinned_prebuild` + side stream + `PrefetchSlot`
+  (NOTES §5093 说这套"机制上比参考更完整"),而**桥现在是逐层同步调用 `gpu_moe_layer(slot=None)`**,
+  H2D 与计算没有重叠。lk 生产正是用 `LVLLM_GPU_PREFETCH_WINDOW=1` 来重叠的。
+⇒ **下一步(明确且是复用)**:在桥里实现 **prefetch window = 1**(用我们已有的
+  `prefetch_layer`/`PrefetchSlot`:本层计算时预取下一层权重),把这 6.4 s 固定开销压下去。
