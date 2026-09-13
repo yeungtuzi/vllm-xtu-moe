@@ -857,3 +857,28 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 - **处置/规矩(加到操作纪律)**:模型加载/预热期间**只做轻量工作**(读日志、写文档、git),
   不要在同一个 box 上跑 `test_block23_equiv.py` / 多引擎对拍 / 大内存基准。
   真要跑对拍,等 __serve 起来并测完__再跑,或者明确分时。
+
+## R105. rank 切分第一版:worker 的 node id 用**真实** node ⇒ 分片路径死等 → worker 静默死亡
+- **做法(第一版)**:按 rank 把核表与权重分片切开(`NumaWorkPool(rank,world)`,
+  `nshard_=nodes/world`,`rank_node_base_` 用于 `mbind`),直接上 TP=2 实测。
+- **结果**:`Model loading took 6.22 GiB` 正常、进入图捕获后卡住,随后
+  `Worker proc VllmWorker-0 died unexpectedly` → `RuntimeError: cancelled`。
+  日志里**引擎自己的看门狗**给出了铁证:
+  ```
+  [pool] WATCHDOG(sharded) gen=2 total=192 rem=96 exec=96
+    [判据] abandoned=48 underflow=0 entered=96 left=96 inrange=96 ...
+    node 0: jobs=48 pulled=72
+    node 1: jobs=48 pulled=72
+    node 2: jobs=48 pulled=0
+    node 3: jobs=48 pulled=0
+  ```
+- **根因**:`numa_pool.hpp:1029` 的判据是 `worker_node_[w] < sharded_call_`,而
+  `worker_node_` 当时取的是**真实** NUMA node id。rank1 的 worker 在 node 4-7,
+  而 `sharded_call_ = nshard_ = 4` ⇒ **一个 shard 都不拉** ⇒ 分片任务永远做不完。
+  (rank0 的 node 0-3 恰好落在 `0..3` 内,所以它把 96 个活里的 72 个抢着做了、
+  24 个抢不到 node2/3 的活 —— 与看门狗数字完全对上。)
+- **处置**:把 `worker_node_` 与 `node_present_` 都改成**相对 shard 下标**
+  (`topo_.cpu_node[cpu] - rank_node0_`),与 job 的 shard 标签口径统一;
+  `world<=1` 时 `rank_node0_=0`,行为与以前逐位相同。第二版见 `lkport35tp2rank2`。
+- **教训**:分片调度里"node 身份"必须与"shard 标签"同口径 —— 一个是物理拓扑、
+  一个是任务编号,混用就会静默死锁;引擎自带的 WATCHDOG 打印是这次能 5 分钟定位的关键。
