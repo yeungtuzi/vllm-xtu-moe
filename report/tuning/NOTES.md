@@ -10040,9 +10040,19 @@ TP=2 时每个 rank **只算一半专家**(128 vs 256),compute 反而慢 **14×*
 * 用户的 lk 参考是 4 卡(每步 GPU 部分被摊 4 份),`T_1` 更小 ⇒ 同样的接受率下投机才划算;
   而且作者 config.yaml 用的是 `num_speculative_tokens: 3`(**不是 5**)+ `draft_sample_method: greedy`。
 
-### (c) 处置
+### (c) 处置与验证结果(作者参数 3/greedy,`lkport38tp2spec3`)
 
-1. 启动脚本的投机参数**改成作者的值**(`num_speculative_tokens=3`,`draft_sample_method=greedy`,
-   可用 `SPEC_JSON=` 覆盖),跑 `lkport38tp2spec3` 验证接受率与净收益是否翻转;
+启动脚本已把投机参数改成**作者 config.yaml 的值**(`num_speculative_tokens=3`、`draft_sample_method=greedy`,
+可用 `SPEC_JSON=` 覆盖)。实测:
+
+| 投机参数 | C=1 | C=2 聚合 | C=4 聚合 | 接受长度 |
+|---|---|---|---|---|
+| **不投机**(图,`lkport36`) | **20.06** | **33.17** | 30.36 | — |
+| 5 / probabilistic(`lkport37`) | 9.68 | 13.03 | 13.20 | 2.48-2.75 |
+| **3 / greedy**(作者值,`lkport38`) | **11.60** | 16.21 | 19.64 | **2.10** |
+
+⇒ 作者参数确实**比 5/probabilistic 好**(11.60 > 9.68),但**仍然是净亏**(11.60 < 20.06)。
+盈亏平衡点:4 token/步下需要接受长度 ≥ **3.03**,实测只有 2.10;
+(5 token/步下需 ≥3.2,实测 2.48-2.75。)
 2. 在结论里明确写:**2 卡上"不投机"是当前更快的部署选择**(C=1 20.06 / C=2 33.17 t/s),
    投机只在"接受长度 ≥3.2"或"每 token 基准成本更低(更多卡/更小模型)"时才值得开。
