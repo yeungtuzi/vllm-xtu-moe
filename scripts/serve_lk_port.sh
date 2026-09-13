@@ -14,9 +14,10 @@
 # `python -m vllm.entrypoints.openai.api_server` 启动,不能调 `vllm`。
 #
 # 用法:
-#   bash scripts/serve_lk_port.sh                 # **默认**:自动识别 ckpt 形态(本 ckpt = dspark)
-#   SPEC=1 bash scripts/serve_lk_port.sh          # 强制开 dspark5(lk 生产同款)
-#   SPEC=0 bash scripts/serve_lk_port.sh          # 强制关(无投机干净基线)
+#   bash scripts/serve_lk_port.sh                 # **默认:不投机**(两卡实测最快)
+#   SPEC=auto bash scripts/serve_lk_port.sh       # 自动识别 ckpt 形态(本 ckpt=dspark)并开投机
+#   SPEC=1 bash scripts/serve_lk_port.sh          # 强制开(投机参数取 SPEC_JSON,默认=作者 3/greedy)
+#   SPEC=auto SPEC_JSON='{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' ...
 #   TAG=xxx PORT=8070 THREADS=48 ... bash scripts/serve_lk_port.sh
 #
 # License: Apache-2.0
@@ -36,7 +37,8 @@ MBT="${MBT:-8192}"
 GPU_UTIL="${GPU_UTIL:-0.90}"
 THREADS="${THREADS:-48}"          # lk 生产是每卡 48(LK_THREADS)
 MINBATCH="${MINBATCH:-1024}"      # lk 生产同值:开 GPU prefill
-SPEC="${SPEC:-auto}"   # auto(默认)= 从 ckpt 自带 config/张量自动识别形态;1=强制开;0=强制关
+SPEC="${SPEC:-0}"      # **默认 0 = 不投机**(实测最快:TP=2 图 C=1 20.06 vs 投机 11.60 t/s,见 NOTES §298)
+                       # auto = 从 ckpt config/张量自动识别 dspark 并把草稿钉在 GPU;1 = 强制开
 EAGER="${EAGER:-0}"   # 1 = 加 --enforce-eager(避开 lk 的 _cpu_prefill 在捕获期同步的问题)
 PREFETCH="${PREFETCH:-1}"        # GPU 预取窗口;**作者推荐值 1**(README:一般预取 1~2 层)
 RESIDENT="${RESIDENT:-}"         # 额外常驻 GPU 的 MoE 层,如 "0-9";这里只填开关,不改代码
