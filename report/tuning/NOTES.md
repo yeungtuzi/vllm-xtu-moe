@@ -9963,3 +9963,18 @@ lk 的 headline 数字来自 `tensor-parallel-size: 4`(作者 config.yaml 就是
 2. `nshard_ = numa_node_count()/world`,`rank_node_base_ = rank*(nodes/world)`,
    `shard_region(..., rank_node_base_ + n, ...)` ⇒ 每个 rank 的权重只落在自己的 node 上;
 3. `shared_numa_pool(rank, world)`:引擎构造时用 `cfg.process_id/num_processes` 首次初始化。
+
+### (e) 【铁证】TP=2 的 `compute` 是 TP=1 的 **14 倍**(不是 barrier,是抢核/抢内存)
+
+同一台机器、同一份引擎、同配置(只差 TP),`XIAOTU_CD_TIMING=1` 每层实测:
+
+| | qlen=1 period | **compute** | rest | 端到端 C=1 |
+|---|---|---|---|---|
+| **TP=1**(`lkport32tp1timing`) | 1.06 ms | **0.53 ms** | 0.53 ms | 16.7-19.4 t/s |
+| **TP=2**(`lkport33tp2timing`,改前) | 8.23 ms | **7.41 ms** | 0.82 ms | 2.87 t/s |
+
+TP=2 时每个 rank **只算一半专家**(128 vs 256),compute 反而慢 **14×**;
+而 `rest`(含跨 rank 归约)**只有 0.82 ms** ⇒ **瓶颈根本不是 barrier,是 CPU 侧**:
+两个 rank 的 96 个 MoE 线程被 pin 到**同一批 48 个物理核**,且两个 rank 的权重
+都铺满**同一批 8 个 NUMA node**(互相抢带宽 + 抢 L3/TLB)。
+这与 (d) 的代码定位完全一致,已按 (d) 改法修复(`lkport34tp2rank` 正在验证)。
