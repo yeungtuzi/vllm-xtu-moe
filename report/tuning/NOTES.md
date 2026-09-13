@@ -9978,3 +9978,39 @@ TP=2 时每个 rank **只算一半专家**(128 vs 256),compute 反而慢 **14×*
 两个 rank 的 96 个 MoE 线程被 pin 到**同一批 48 个物理核**,且两个 rank 的权重
 都铺满**同一批 8 个 NUMA node**(互相抢带宽 + 抢 L3/TLB)。
 这与 (d) 的代码定位完全一致,已按 (d) 改法修复(`lkport34tp2rank` 正在验证)。
+
+---
+
+## 297. 🎉🎉🎉 **TP=2 解码的根因修好了:compute 7.41 → 0.37 ms(20×),C=1 2.87 → 20.06 t/s(7×)**
+
+### (a) 修法(引擎侧,`world>1` 才生效;TP=1 行为逐位不变)
+
+| 处 | 原来的问题 | 现在 |
+|---|---|---|
+| `NumaWorkPool::start_workers` | 每个进程都从 `cores_[0]` 开始 pin ⇒ 两个 rank 的 96 线程挤同 48 核 | 按 rank **过滤**核表(保留 slot-major/ccd-minor 交错)⇒ 每个 rank 独占自己那 1/world 份核 |
+| `worker_node_` / `node_present_` | 用**真实** NUMA node id,而分片标签是 shard 下标(0..nshard-1)⇒ rank1 的 worker 一个 shard 都不拉 | 一律改成**相对 shard 下标**(`- rank_node0_`) |
+| `nshard_` / `mbind` node | 每个 rank 都把权重铺满全部 8 个 node,互相抢带宽 | `nshard_ = nodes/world`,`node = rank_node0_ + shard` ⇒ 每个 rank 只用自己的 node |
+
+三次迭代的教训(两次死锁)见 `TRIED_AND_REVERTED` **R105/R106**:第一次是 node id 口径不一致,
+第二次是"排序后切片"破坏了核表的交错性(48 线程全压在前 2 个 node,而分片要求每个 node 都有 worker)。
+
+### (b) 实测(TCP=2 / util 0.80 / 图 / SPEC=0 / SEQS=8)
+
+| | 修前(`lkport33`) | **修后(`lkport36`)** | 变化 |
+|---|---|---|---|
+| 每层 qlen=1 period | 8.23 ms | **1.03 ms** | **8×** |
+| 每层 qlen=1 **compute** | 7.41 ms | **0.37 ms** | **20×** |
+| 每层 qlen=1 rest | 0.82 ms | 0.66 ms | — |
+| 解码 C=1 | 2.87 t/s | **20.06 t/s** | **7×** |
+| C=2 聚合 | 4.88 t/s | **33.17 t/s** | 6.8× |
+| C=4 聚合 | — | 30.36 t/s | — |
+
+**与 TP=1(19.42 / 30.69 / 38.34)对比**:C=1、C=2 已经**持平或更好**,
+而且 TP=2 才能同时装下「草稿常驻 + 13-14 GiB KV」⇒ 这是现在的最优形态。
+
+### (c) 这条修法的意义
+
+* 它把"TP=2 比 TP=1 慢 7 倍"这个**长期误判**(此前归因于"每层跨 socket barrier")
+  彻底纠正:**barrier 只占 0.66 ms 里的很小一部分,真正的凶手是两个 rank 抢核抢内存**。
+* 至此移植路径的三块拼图都到位:①编排链(与最新官方逐行一致);②引擎(捕获安全 + rank 切分);
+  ③vLLM 原生投机/图/1M 上下文。剩下的只是继续逼近 lk 的每层 0.67-0.78 ms。
