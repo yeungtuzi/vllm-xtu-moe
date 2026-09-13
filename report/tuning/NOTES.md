@@ -7772,3 +7772,49 @@ MoE 引擎 prefix 统计: 86 × "model.layers.N.ffn"   唯一层号 43,每层 "2
 在插件记录 MoE 层构建时**同时打印该层的 prefix 与所属模型实例的层数声明**;
 或直接读 `DeepSeekV4MTPModel.__init__` 里 `num_moe_layers` 的取值(打印一行即可)。
 一行日志即可定案 —— 这也符合 §243(d) 的规矩:**不要再用间接计数去推断执行结构**。
+
+## 246. **代码给出决定性答案**:MTP draft = **1 层(`model.layers.43`)**,而日志里第二份是 0..42
+### ⇒ §242(b) **很可能错了**;并给出投机净负的**更有依据的新假设**
+
+### (a) 代码事实(明确、无歧义)
+```python
+# vllm/model_executor/models/deepseek_mtp.py:140-158
+class DeepSeekMultiTokenPredictor:
+    self.mtp_start_layer_idx = config.num_hidden_layers        # = 43
+    self.num_mtp_layers      = config.num_nextn_predict_layers # 配置实测 = **1**
+    self.layers = ModuleDict({str(idx): ...(f"{prefix}.layers.{idx}")
+                              for idx in range(43, 43 + 1)})   # ⇒ **只有 layers.43**
+```
+- 模型配置:`"num_nextn_predict_layers": 1`(已实测);
+- ⇒ **MTP draft 是 1 层,层号 43**(`model.layers.43.*`),不是 43 层。
+
+### (b) 与日志的对照 ⇒ **§242(b) 很可能错了**
+- 日志(`mtpspec_a2`):86 个 MoE 引擎,**全部** `model.layers.0..42`、每层两遍,**没有一条 43**;
+- ⇒ 那"第二份 0..42 的完整拷贝" **不是 MTP 模型**(MTP 只贡献 1 层 `layers.43`);
+- ⇒ 它更可能是**我方 SPEC 配置把 `model` 指向完整模型目录**导致 vLLM 额外建的第二份完整实例
+  (与插件注释"DSpark 起草模型是目标模型的又一份完整实例"一致);
+- **但按 MTP 代码,proposer 只会执行 `layers.43`** ⇒ **§242(b)"draft 每步跑 43 层"很可能不成立**。
+- **仍需那一行执行级证据**(`[qlen]` 或打印 draft 实例的层数)才算定案 —— 我不重复上次的越界推断。
+
+### (c) 更有依据的新假设:投机净负的代价在 **verify 的 6-token 批**,不在 draft
+算一笔账(用我方实测数字):
+```
+无投机:  43 层 × 2.16 ms = 93 ms/token                       ⇒ 10.76 t/s(实测吻合)
+投机一步:draft(layers.43 一层,~0.65-2 ms)+ verify(43 层 × **6 token**)
+        若我方每层成本**随 token 数线性增长**(compute-bound):
+            43 × 6 token ≈ 6 × 93 ms = 558 ms/步 ÷ 2.95 token ≈ **5.3 t/s**
+        实测 6.30-7.11 t/s ⇒ **量级吻合**
+```
+⇒ **投机之所以亏,是因为"验证 6 个 token"在我方引擎上要花 ~6 倍的钱**;
+而 lk 之所以赚(35→50),是因为它的每层成本**由权重流量主导**(与 token 数几乎无关)——
+验证 6 个 token 的成本 ≈ 验证 1 个。
+⇒ **这与"单流 10.76 vs lk 35"是同一个根因的两种表现**:
+**我方引擎在小批量下的每层成本既含固定开销、又随 token 数线性增长,而 lk 是权重主导。**
+
+### (d) 因此下一步的杠杆被进一步收敛
+1. **让每层成本变成"权重主导"**(固定开销↓、每 token 计算↓)⇒ 同时改善**单流吞吐**
+   和**投机收益**;这正是 §238(c) 指出的方向,现在多了一条**可验证的判据**:
+   **量"qlen=1 与 qlen=6 的每层 compute 之比"** —— 若接近 6,则确认 compute-bound;
+   若接近 1,则我的假设错。
+2. 那个"第二份完整实例"虽然是死重,但要**确认它不执行**(执行级证据),再决定是否
+   从配置上避免它(例如让 draft 只加载 MTP 权重)。
