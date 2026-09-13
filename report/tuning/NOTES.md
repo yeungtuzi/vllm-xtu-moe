@@ -9366,3 +9366,83 @@ NotImplementedError: Could not run '_C::gptq_marlin_repack' with arguments from 
    —— 它能把"哪一层/哪个 block 开始偏"直接定位出来;
 3. 必要时再上 `gpu_prefill_golden.py`。
 ⇒ **正确性过关前,§283(a) 的 7.81 t/s 不能作为性能结论。**
+
+## 285. 🔴🔴 **找到并修掉了移植路径的确定性错误源:夹紧(clamp)被静默丢掉**
+
+### (a) 上游语义(逐字引用,决定了谁对谁错)
+```
+vllm/model_executor/layers/fused_moe/activation.py:122
+  """Apply MoE activation function.
+
+  ``clamp_limit``/``alpha``/``beta`` (from the quant config) drive the clamped
+  SwiGLU kernels: ``SILU`` + ``clamp_limit`` and ``SWIGLUOAI_UNINTERLEAVE`` both
+  map to ``silu_and_mul_with_clamp``. Other activations ignore them.
+  """
+```
+⇒ **夹紧是 `clamp_limit` 的属性,不是"激活族"的属性**:`activation=SILU` **+** `clamp_limit`
+就等价于 `silu_and_mul_with_clamp`。
+
+### (b) 三方的实际取值
+| | 传进来的值 | 谁决定 |
+|---|---|---|
+| **DS-V4 的真实激活** | `SiluAndMulWithClamp(swiglu_limit=10.0)`(config `swiglu_limit=10.0`) | 模型定义 |
+| **lk 编排链** | `activation_type = 0`(silu)+ `swiglu_limit = 10.0` | `routed_experts.py:156`:只有 `MoEActivation.SWIGLUOAI*` 才设 1;而 DS-V4 的 `FusedMoEFactory(...)` **不传 `activation=`** ⇒ 默认 `"silu"` ⇒ 枚举是 `SILU` |
+| **本插件(门禁路径)** | `activation_type = 1`(`1 if clamped else 0`)+ `swiglu_limit = 10.0` | `mixed_experts.py:403` |
+| **我们的引擎(改前)** | `clamped_ = (activation_type == 1) && (limit>0 \|\| alpha!=1 \|\| beta!=0)` | ⇒ **只有 activation_type==1 才夹紧** |
+
+⇒ **lk 链下 `activation_type=0` ⇒ 引擎不夹紧**,而真实模型是夹紧的 ⇒
+**系统性的数值偏差** —— 正是 §283/§284 观察到的"大部分对、偶发错、且 5/5 可复现"。
+
+### (c) 修法(1 行,按上游语义;两种约定都变对)
+```cpp
+// 改前: clamped_ = cfg_.activation_type == 1 && (...)
+clamped_ = (swiglu_limit_ > 0.f || swiglu_alpha_ != 1.f || swiglu_beta_ != 0.f);
+```
+* lk 链(`0` + limit=10)→ **夹紧** ✅
+* 本插件(`1` + limit=10)→ **夹紧** ✅(行为不变)
+* 数值门禁(`0` + limit=0)→ **不夹紧** ✅
+
+### (d) 回归:数值门禁**与历史基线一致**
+`test_block23_equiv.py` → **OK=7 BAD=1(me=1)**。
+历史记录(`NOTES §3812 / §4252 / §5852`)明确写着这是**既有偏差**:
+> "OK=7 BAD=1(**me=1 的既有 NR=8 fp32 重结合偏差**,不计入)⇒ 数值门禁通过 ✅"
+⇒ 本次改动**没有引入回归**;而且顺带确认了门禁的**预期基线就是 7 OK / 1 BAD(me=1)**。
+
+### (e) 顺带留档:如果夹紧不是全部原因,下一个嫌疑就是 `me=1`
+`me=1` 正是**解码形状**(单 token、每专家命中一次),它的既有偏差是 **max_rel 1.87e-2**。
+历史 §4218 给出现成解法:**`XIAOTU_MOE_DPBF16=1` 可把它降到 8.02e-4**(好 20 倍以上)。
+⇒ 若 `lkport15`(夹紧修复)后仍有错词,下一条就试 `XIAOTU_MOE_DPBF16=1`。
+
+## 286. ✅ 夹紧修复的端到端验证:垃圾输出消失,速度不降
+
+### (a) 前后对比(同一 prompt,`temperature=0`)
+| | `"def fibonacci(n):"` 的输出 |
+|---|---|
+| 修复前(§283/§284) | `"\n    if n <=  permute(1):\n        return n\n    else"` ← **垃圾** |
+| **修复后(lkport15)** | `"\n    if n <= 0:\n        return"` ← **合法且合理**,且 **3/3 逐字一致** |
+
+### (b) 速度(lkport15,TP=1 / eager / MINBATCH=0 / THREADS=48)
+| 并发 | 单流 t/s | 聚合 t/s | TPOT ms |
+|---|---|---|---|
+| C=1 | **8.25** | 8.25 | 113.81 |
+| C=2 | 6.54 | **13.09** | 125.19 |
+(修复前同配置:C=1 7.81 / C=2 聚合 14.07 ⇒ **在噪声范围内,没有性能代价**。)
+
+### (c) 至此移植的**正确性**状态
+* 常识/计数/代码三类 prompt 全部合理且**可复现**;
+* 数值门禁 **OK=7 BAD=1(me=1)**,与历史基线一致;
+* 遗留的已知偏差只有 **`me=1`(解码形状)的 1.87e-2**,历史 §4218 给出现成解法
+  **`XIAOTU_MOE_DPBF16=1` → 8.02e-4**。
+⇒ **移植路径现在"输出可信"了**,可以开始谈性能。
+
+### (d) 下一步(按阻塞关系排序)
+1. **TP=2 + auto-EP 归约的验证**(`lkport16`):这是我本轮唯一新增的引擎能力,
+   必须端到端验证(两个 rank 同名 shm 已确认;但归约后的**数值正确性**与吞吐还没测);
+   注意 `MINBATCH=0` 下启动 warmup 的 8192-token CPU prefill 在 TP=2 会更久(上次 13 分钟烧了
+   222 CPU-分钟还没完),启动脚本最多等 75 分钟,需要耐心;
+2. **gpu_prefill**(真正解锁 prefill 性能 + 1M 上下文):需要把**我们已有的**
+   `vllm_xiaotu_moe/gpu_prefill.py`(970 行、5 个 Triton kernel、流式权重 + side stream +
+   PrefetchSlot)暴露成引擎的 `gpu_prefill(x_ptr, out_ptr, ids_ptr, wts_ptr, qlen, k)` 入口,
+   并把 `moe_runner.py` 恢复成参考原版的 `_gpu_prefill(...)` 调用。
+   **这不是自研新功能,而是把我们自己的现成实现接到 lk 的 ABI 上**;
+3. `XIAOTU_MOE_DPBF16=1` 收掉 `me=1` 的残差。
