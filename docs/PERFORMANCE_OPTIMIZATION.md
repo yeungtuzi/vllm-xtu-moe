@@ -904,3 +904,48 @@ EAGER=0(CUDA 图)  SPEC=auto(dspark)  草稿层 43-45 常驻 GPU(5.34 GiB/rank)
    (消除每层 cross-socket 自旋 barrier,而不是换集合通信)。
 3. 图的修复(捕获前预分配 pinned 缓冲,见 `TRIED_AND_REVERTED` R103/引擎 commit)
    是**通用**收益:它同时解开了"投机 + 图"这条路。
+
+---
+
+## 【第 212 轮·重大更新】**CUDA 图把解码拉近到 lk 的 1.6-1.8×**(此前 4-15×)
+
+### 1. 关键结论:CUDA 图(`FULL_DECODE_ONLY`)是解码的最大单点收益
+
+| 配置 | C=1 | C=2 聚合 | C=4 聚合 | C=8 聚合 |
+|---|---|---|---|---|
+| TP=1,无图(`lkport22`) | 7.89 | 13.91 | 21.44 | 28.81 |
+| **TP=1,图**(`lkport30tp1graph`) | **19.42** | **30.69** | **38.34** | **45.46** |
+| 提升 | **2.46×** | 2.21× | 1.79× | 1.58× |
+| lk-moe 参考(用户给的基准) | 30-35 | — | ≈70 | — |
+
+* C=1 = 44.62 ms/token ÷ 43 层 = **1.04 ms/层**;我们的**引擎内核只有 0.40-0.51 ms/层** ⇒
+  "内核之外"的每层开销已从 2.4 ms 压到 **≈0.55 ms**。
+* **剩下的 0.55 ms/层就是下一段靶子**(D2H/H2D staging、pybind/派发、`output.to(bf16)`、
+  `nan_to_num`、TP=2 时每层跨 socket 自旋 barrier)。
+
+### 2. 前置条件(为什么以前跑不了图)
+
+lk 链**从不调用** `prepare_decode_buffers`,它的 pinned 解码缓冲是第一次 `cpu_decode` 时
+惰性分配的;一旦发生在捕获区内,`cudaHostAlloc` 就让整段 capture 作废
+(`cudaErrorStreamCaptureInvalidated`,`TRIED_AND_REVERTED` **R103**)。
+引擎侧修法(我们自有部件,`binding.cpp`):
+① 构造时按 `kDecodeTokenFloor=64` token 预分配;② 捕获期若仍需扩容则**报错跳过**而非分配;
+③ 加 `out_gpu.shape[0] >= qlen` 护栏(lk 的 `output_gpu` 是**全层共享**的 `(max_num_seqs, hidden)`,
+投机解码下可能不够)。数值无回归:`test_block23_equiv.py` = 基线 `OK=7 BAD=1`。
+
+### 3. 配合作者配方的完整战果(TP=2)
+
+`TP=2 / util 0.80 / MAXLEN=1M / SEQS=2 / 图 / dspark + 草稿常驻`(`lkport28graph`):
+每 rank 11.39 GiB,`Capturing dspark CUDA graphs (FULL) 2/2` ✅,
+KV 13.14 GiB = **1,940,458 tokens**(1M 上下文并发 1.85×),
+预填充 **982 t/s @8192 冷 / 1675 t/s @8192 热 / 1287 t/s @32768**,
+投机接受长度 **2.53-3.50**(逐位 0.65-0.82),
+C=1 2.21 t/s、C=2 聚合 3.18 t/s(**TP=2 的每层跨 socket 归约把图的好处吃掉了**)。
+
+### 4. 下一步优先级(按性价比)
+
+1. **TP=1 + 图 + 投机 + 草稿常驻**(`lkport31tp1spec`,util 0.82、MBT=1024 压缩 lk 缓冲):
+   若接受率维持 2.5-3.5,C=1 有望 19.42 → 35-50 t/s,直接摸到 lk 的投机基准;
+2. **`XIAOTU_CD_TIMING=1` 分层拆分**(launcher 已支持 `EXTRA_ENV=`),定位剩下 0.55 ms/层;
+3. **TP=2 的归约改造**(把每层 cross-socket 自旋改成批量合并/就近),让 TP=2 也能吃到图的好处;
+4. 单卡 KV 与投机的取舍已量化:草稿常驻要 10.12 GiB(TP=1),关掉它 KV 翻 ~3 倍。
