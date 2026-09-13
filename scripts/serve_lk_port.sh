@@ -76,6 +76,7 @@ fi
 } > "$OUTDIR/$TAG.env"
 
 cd /tmp   # neutral CWD: see comment above
+export PATH="$ENV/bin:$PATH"   # ninja/flashinfer JIT need to be visible to workers
 export CUDA_VISIBLE_DEVICES="$GPUS"
 nohup env \
   LVLLM_MOE_NUMA_ENABLED=1 \
