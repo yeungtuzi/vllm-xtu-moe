@@ -211,6 +211,34 @@ bool auto_ep_setup(const void* key, const MOEConfigV2& cfg) {
 std::mutex g_cd_mtx;
 std::unordered_map<const void*, std::unique_ptr<CpuDecodeState>> g_cd_state;
 
+// ---- 解码 pinned 缓冲的"捕获前预分配"(2026-09-13,R103)--------------------
+// 背景:lk 链**从不调用** prepare_decode_buffers(`routed_experts.py:1694`
+// `_initialize_cuda_graph_buffers()` 只设 `cuda_graphs`/`RoutedExperts.output_gpu`),
+// 而它的 `_cpu_decode`(`routed_experts.py:1708`)直接把 stream 交给引擎。
+// 于是 pinned 缓冲会在**第一次 cpu_decode** 时惰性分配 —— 若那一次(或之后某次更大的
+// batch)落在 CUDA graph 捕获区内,`cudaHostAlloc` 会让整段捕获作废(实测
+// `cudaErrorStreamCaptureInvalidated`,见 TRIED_AND_REVERTED R103)。
+// 对策:引擎一造好就按"解码 token 上限"预分配一次,之后捕获期永不再分配。
+// 成本:每引擎 ≈1.5 MB 锁页内存(64 token × H=4096: hidden 0.5MB + out 1MB)。
+static constexpr int kDecodeTokenFloor = 64;
+
+static void prealloc_decode_buffers(const void* key, const MOEConfigV2& cfg) {
+    const int H = cfg.hidden_size;
+    const int K = cfg.top_k;
+    if (H <= 0 || K <= 0) return;
+    int tok = kDecodeTokenFloor;
+    if (cfg.max_batch_size > 0) tok = std::min(tok, cfg.max_batch_size);
+    tok = std::max(tok, 1);
+    std::lock_guard<std::mutex> lg(g_cd_mtx);
+    auto& st = g_cd_state[key];
+    if (!st) st = std::make_unique<CpuDecodeState>();
+    st->ensure_buffers((size_t)tok * H * sizeof(uint16_t),
+                       (size_t)tok * K * sizeof(uint32_t),
+                       (size_t)tok * K * sizeof(float),
+                       (size_t)tok * H * sizeof(float), false);
+}
+
+
 // ---- SIGSEGV diagnostics (debug build): print faulting addr + stack ----
 namespace {
 struct sigaction g_prev_segv {};
@@ -295,6 +323,8 @@ static void bind_moe_class(py::module& m, const char* name) {
                              static_cast<const float*>(as_ptr(w2_global)));
             // lk 链只给 num_processes/process_id:引擎自建跨 rank 归约(见 auto_ep_setup)
             auto_ep_setup((const void*)p, cfg);
+            // 必须在任何 CUDA graph 捕获之前把解码 pinned 缓冲开好(R103)。
+            prealloc_decode_buffers((const void*)p, cfg);
             return p;
         }), py::arg("cfg"), py::arg("w13_weight"), py::arg("w2_weight"),
             py::arg("w13_scale") = py::int_(0), py::arg("w2_scale") = py::int_(0),
@@ -380,6 +410,24 @@ static void bind_moe_class(py::module& m, const char* name) {
             const auto* wts_dev = as_f32(weights);
             float* outg_dev = as_f32m(out_gpu);
 
+            // lk 的 `RoutedExperts.output_gpu` 是**全层共享**的 `(max_num_seqs, hidden)`
+            // 缓冲(`routed_experts.py:1700`);投机解码时一步要验证的 token 数可达
+            // `num_seqs × (1 + num_spec_tokens)` > `max_num_seqs` ⇒ 直接写会**越界写显存**。
+            // 这里显式检查:宁可少算这层并大声报错,也不要静默写坏设备内存。
+            try {
+                py::tuple shp = out_gpu.attr("shape");
+                const size_t rows = shp.size() > 0 ? py::cast<size_t>(shp[0]) : 0;
+                if (rows < (size_t)qlen) {
+                    fprintf(stderr,
+                            "[cd] ERROR: out_gpu rows=%zu < qlen=%d (lk 的 output_gpu 按 "
+                            "max_num_seqs 开;投机解码下需按 token 数开)-> skip layer\n",
+                            rows, qlen);
+                    return;
+                }
+            } catch (...) {
+                // 形状拿不到就不拦(旧调用方可能传入裸指针包装)
+            }
+
             const size_t nh = (size_t)qlen * H * sizeof(uint16_t);
             const size_t ni = (size_t)qlen * top_k * sizeof(uint32_t);
             const size_t nw = (size_t)qlen * top_k * sizeof(float);
@@ -396,14 +444,22 @@ static void bind_moe_class(py::module& m, const char* name) {
             auto& st = g_cd_state[&self];
             if (!st) st = std::make_unique<CpuDecodeState>();
             if (st->ensure_buffers(nh, ni, nw, no, capturing)) {
+                if (capturing) {
+                    // 预分配(kDecodeTokenFloor)之后不该再走到这里;真走到说明解码
+                    // batch 超过了预分配上限。**绝不能在捕获区里 cudaHostAlloc**
+                    // (会让整段 capture 作废):明确报错并跳过本次写入,而不是写越界。
+                    fprintf(stderr,
+                            "[cd] ERROR: pinned decode buffers too small during CUDA graph "
+                            "capture (qlen=%d > prealloc %d tokens); skipping this layer's "
+                            "CPU decode. Raise kDecodeTokenFloor.\n",
+                            qlen, kDecodeTokenFloor);
+                    return;
+                }
                 // 重新分配了 pinned 缓冲:旧的缓冲可能还有 pending 的回调在读,
                 // 先排空该 stream 再继续(只在缓冲区增长时发生,稳态下不会触发)。
-                // 捕获期间改用"退役不释放",不做同步。
-                if (!capturing) {
-                    cudaError_t es = cudaStreamSynchronize(s);
-                    if (es != cudaSuccess)
-                        fprintf(stderr, "[cd] streamSync err=%s\n", cudaGetErrorString(es));
-                }
+                cudaError_t es = cudaStreamSynchronize(s);
+                if (es != cudaSuccess)
+                    fprintf(stderr, "[cd] streamSync err=%s\n", cudaGetErrorString(es));
             }
 
             st->stream = s;
