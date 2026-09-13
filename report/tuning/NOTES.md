@@ -9293,3 +9293,41 @@ NotImplementedError: Could not run '_C::gptq_marlin_repack' with arguments from 
 ### (d) 已回退
 1. `mxfp4.py` 恢复参考原样(已自检 `is_gpu_prefill_layer` 不再出现在该文件);
 2. 下一步应把 `moe_runner.py` 也恢复成参考的 `_gpu_prefill(...)` 写法,并给引擎补 `gpu_prefill`。
+
+## 283. ✅ 线程修复立竿见影(+4.8×),❌ 但**移植路径的输出还不可信**
+
+### (a) 性能:同一配置,只改了"默认/接受 LK_THREADS"(§280 的两处引擎改动)
+| 运行 | 配置 | C=1 单流 | C=2 聚合 |
+|---|---|---|---|
+| lkport7(旧引擎,线程数退到 `hardware_concurrency()`=**192**) | TP=1 / MINBATCH=0 / eager | 1.62 t/s | 5.61 |
+| **lkport14(新引擎,`LK_THREADS=48` 生效)** | 同上 | **7.81 t/s**(TPOT 118.49 ms) | **14.07** |
+⇒ **+4.8×**,而且这正好印证用户提醒的"**每 CCD 4-5 核**"是本机第一性能旋钮:
+192 线程 = 8 核/CCD 直接跑出甜蜜点。§280 的默认值修正(120)与 `LK_THREADS` 回退是**必须的**。
+
+### (b) 但正确性不过关(必须在谈性能之前解决)
+| 检查 | 结果 |
+|---|---|
+| `"The capital of France is"` | ✅ `" Paris. The capital of Spain is Madrid. The capital of Italy is Rome."` |
+| `"1, 2, 3, 4,"` | ✅ `" 5, 6, 7, 8, 9, 10, 11"` |
+| `"def fibonacci(n):"` | ❌ `"\n    if n <=  permute(1):\n        return n\n    else"` — **`permute(1)` 是垃圾**,应为 `1` |
+| greedy 两次是否逐位一致 | ❌ 不一致(§277 已记) |
+⇒ **语义级错误 + 不可复现** ⇒ 典型的**并发竞态/归约错乱**特征,不是精度问题。
+
+### (c) 已排除的候选(逐条查过,都对)
+* `groupN/groupK`:`_get_quant_params` 算出 **1/32**,与我方门禁路径一致 ✅
+* `group_max_len`:`min(4096, max_nbt)+128` = 4096+128,与插件一致 ✅
+* `swiglu_limit`:**配置里是 10.0**,且 `DeepseekV4MoE.swiglu_limit = config.swiglu_limit`(model.py:500)
+  → `FusedMoEFactory(swiglu_limit=…)`(554/647)→ `RoutedExperts`(122/326)→
+  `lk_moe_config.swiglu_limit`(有 `if … is not None` 保护)⇒ **clamp 应该已设** ✅
+* `intermediate_size = intermediate_size_per_partition`(TP=1 ⇒ 2048)✅
+
+### (d) 因此最可能的原因与下一步
+**引擎在 lk 链的调用形态/线程数下的竞态**:
+* 我们的稳定性修复(§220-era:发布顺序、读者 seqlock、`XIAOTU_MOE_PUBLISH_SETTLE`)是**在
+  120 线程 + 插件调用形态下**验证的;移植里跑的是 **48 线程 + `_cpu_prefill/_cpu_decode` 形态**;
+* 判定顺序(由易到难):
+  1. **抬到我们验证过的线程数**(`THREADS=120`)再测 Q3 —— 若恢复正常 ⇒ 与线程数/分片参与数相关;
+  2. 用交付配置的 `XIAOTU_MOE_PUBLISH_SETTLE=100 XIAOTU_MOE_SHARD_WD=60` 再测;
+  3. 仍错则用 `test_block23_equiv.py` + `gpu_prefill_golden.py` 做**数值对拍**,把范围收到单层;
+  4. 最后才是 `XIAOTU_MOE_DIAG_BARRIER` / `POOL_SLOW_MS` 这类并发诊断(注意铁律 1:诊断埋点会掩盖竞态)。
+**在正确性过关之前,§283(a) 的 7.81 t/s 只是"能跑",不能当性能结论。**
