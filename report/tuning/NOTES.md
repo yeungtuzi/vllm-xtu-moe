@@ -7601,3 +7601,50 @@ accepted_per_pos: pos0=32  pos1=23  pos2=15  pos3=8  pos4=6
 3. **120 线程池的 spawn/join**:块内固定 ~113 µs(§44 曾记录),若每个并行区都要
    唤醒/汇合 120 线程,43 层叠加就是数 ms/token。
 lk 端到端 0.66 ms/层说明**这三项在 lk 里都很小** —— 正是可攻的差距。
+
+## 241. **投机成本高的根因(用户提问引发)**:我们用 `dspark`(整模型 draft),参考用原生 MTP 头
+
+### (a) 事实链
+1. 我方 SPEC 用的是 **`"method": "dspark"`**;
+2. 插件自己的注释写明:"**DSpark 起草模型是目标模型的又一份完整实例,层名(prefix)相同**"
+   ⇒ **draft 是整个 43 层模型的第二份拷贝**,不是小 MTP 头;
+3. 插件**默认把 draft 副本排除在 GPU 常驻之外**:
+   ```python
+   self._gpu_resident = os.environ.get("XIAOTU_MOE_RESIDENT_DRAFT", "0") == "1"
+   ```
+   ⇒ 默认下 **draft 的 43 层 MoE 全走 CPU 引擎**;且 `qlen=1` 达不到 GPU 预填充阈值(384)。
+
+### (b) 于是每个投机步的真实成本
+```
+draft 起草 : 43 层 CPU MoE(qlen=1)
+verify 验证: 43 层 CPU MoE(qlen=6)
+⇒ ~2× 的 CPU MoE 工作量,换来 2.95 个 token  ⇒ 必然净负
+```
+**"成本高"不是因为生成 token 贵,而是因为起草本身就是一次完整的 CPU MoE 前向。**
+
+### (c) 参考实现为什么不贵
+- 参考的 `LVLLM_GPU_RESIDENT_MOE_LAYERS="0-13,**43-45**"` 里,43-45 **就是 draft 层且常驻显存**;
+- 参考用的是 **DeepSeek 原生 MTP 头(1 层)**,不是整模型拷贝 ⇒ 起草几乎免费 ⇒ 35 → 50 t/s。
+
+### (d) **决定性发现**:主线仓支持 `"mtp"` 方法,我们可以直接切
+`vllm/config/speculative.py` 里同时存在:
+```
+"deepseek_mtp", "mtp", ...          ← 原生 MTP 头(1 层)
+DSparkModelTypes = Literal["dspark"] ← 整模型拷贝(我们正在用的)
+:1112  if self.method == "mtp":   :1128 elif self.method == "dspark":
+```
+而且**插件本来就是为 `mtp` 写的** —— 它把 `mtp.0.*` 的 3 个子模块映射到层号 43/44/45,
+这正好对应参考常驻列表里的 `43-45`。
+
+⇒ **正确做法(结构性、对齐参考)**:
+```python
+SPEC='{"method":"mtp","num_speculative_tokens":5,"model":".../DeepSeek-V4-Flash-0731/..."}'
+```
+draft 从 **43 层变 1 层**,且该层可以**常驻显存**(对齐参考的 `43-45`)
+⇒ 起草成本从"一次完整 CPU MoE 前向"降到"一层、且在 GPU 上"。
+
+### (e) 结论与下一步
+- **"开投机 ≥100 t/s"这条目标,靠调 k 或调采样方法是达不到的** —— 必须先换掉 proposer 的结构;
+- 下一步:**把 SPEC 换成 `method: "mtp"`** 实测(一次重启即可),预期:
+  1. 投机从净负转为净正(因为 draft 不再是 43 层 CPU MoE);
+  2. 若再把 `mtp` 那一层常驻显存(插件已有 draft 常驻开关),应进一步接近参考的 50 t/s。
