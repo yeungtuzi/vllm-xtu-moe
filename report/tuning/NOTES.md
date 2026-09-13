@@ -7932,3 +7932,49 @@ XIAOTU_MOE_RESIDENT_BUDGET_GB=<够放这一层的显存>
 我把"路由问题"误判成"建模/配置问题"**。
 ⇒ 教训:**先问"上游现成的东西是怎么工作的、我这边哪里把它接错了"**,
 而不是先假设"我得自己实现/调参"。
+
+## 251. **架构级关键差异(用户指出,已逐条核实)**:参考里 `mtp.*` **永远在 GPU**,我方会掉到 CPU
+
+### (a) 参考实现 `Lvllmds4-x` 的路由规则(原文核实)
+```python
+is_lk_moe_mtp_layer(name)       = name.startswith("mtp.")                    # 按**模块名**识别
+is_lk_moe_gpu_prefill_layer(n)  = use_gpu_prefill and not resident(n) and **not mtp(n)**
+is_lk_moe_cpu_layer(n)          = feature_on and not resident(n) and not gpu_prefill(n) and **not mtp(n)**
+is_lk_moe_gpu_resident_layer(n) = (**mtp(n) ⇒ True**) or n ∈ LVLLM_GPU_RESIDENT_MOE_LAYERS
+```
+⇒ **`mtp.*` 三个出口全被排除:不去 CPU、不走预填充流式、直接判为常驻 GPU。**
+这就是参考"加 draft 从 35 → 50"的**架构基础**:起草层的 MoE **根本不经过 CPU**。
+
+### (b) 我方插件的路由(对比)
+```python
+# hybrid_model.py
+_resident = self._gpu_resident and self._resident_slot is not None
+if _resident or (_gp_min > 0 and qlen >= _gp_min and not capturing):
+    ...GPU 通路...
+# 潜台词:否则走 CpuXiaotuMoE(CPU 引擎)
+```
+- `CpuXiaotuMoE` **全局替换** MoE ⇒ **所有层**默认都进 CPU 引擎;
+- GPU 通路只由两个条件触发:**常驻**(按层号配)或 **qlen ≥ 阈值**;
+- 而 **MTP 层 qlen=1**、又**不在常驻列表**里(`_is_duplicate_model_instance` 还默认把 draft 副本
+  **排除**在常驻之外)⇒ **MTP 的 MoE 掉进 CPU 引擎**。
+
+⇒ **两者的差异就一条:参考**按模块名 `mtp.` 强制 GPU**;我方**没有这条规则**。**
+这正是"哪些到 CPU、哪些不到"上的关键性差别 —— 也就是用户指出的那一点。
+
+### (c) 应该做的改动(小、且与参考对齐)
+在我方插件里加**与参考同构**的一条规则:
+```python
+# 伪代码:MTP 层永远走 GPU(常驻),绝不进 CPU 引擎
+_is_mtp = self.prefix.startswith("mtp.") or ("mtp_block" in self.prefix)
+if _is_mtp:
+    self._gpu_resident = True         # 强制常驻(并给它 resident slot)
+    # 绝不允许落回 CPU 引擎
+```
+并在 `gpu_resident_layers()`/常驻预算里**为 MTP 预留**这一层(它只有 1 层,代价很小),
+同时**不再默认排除**它(现有的 `XIAOTU_MOE_RESIDENT_DRAFT` 逻辑是用在"整模型 draft 副本"上的,
+与"目标自带的 1 层 MTP 头"是两回事)。
+
+### (d) 仍待解决的前置问题
+`method:"mtp"` 不传 model 的这次尝试**没起来**(日志里取不到明确的 Error 行),
+下一轮要先把它起不来的原因查清(看完整启动日志的**第一处**异常),
+再把 (c) 的路由规则加上去 —— 否则 MTP 路径本身没跑通,谈不上"让它用 GPU 算"。
