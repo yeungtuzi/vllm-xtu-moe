@@ -7826,3 +7826,43 @@ class DeepSeekMultiTokenPredictor:
 - ⇒ **两项待测证据仍然没拿到**(①`[qlen]` 执行级 ②`qlen=1` vs `qlen=6` 的 compute 比);
 - **下一轮第一件事**:先 `scripts/kill_serve.sh`(它会硬校验显存归零),确认三卡 0 MiB 后再启动,
   并**看清启动报错的原始行**(不要跳过)。
+
+## 248. **`method:"mtp"` 加载失败的真实原因**(并解释了为什么当初用 `dspark`)
+
+### (a) 根因(报错第一行,不是最后一行)
+```
+Error: 'model.layers.43.mtp_block.main_norm.weight'
+RuntimeError: Engine core initialization failed
+```
+⇒ 用 `method:"mtp"` 时,vLLM 期望从 `speculative_config.model` 加载
+**`model.layers.43.mtp_block.*`** 这组权重名,但**加载不到**。
+
+### (b) 这条线索解释了整件事的来龙去脉
+1. **MTP 是结构上正确的做法**:1 层(`layers.43`)、可常驻显存(参考的 `43-45`)、起草几乎免费;
+2. 但我方在 `mtp` 下**加载失败**(缺 `mtp_block` 权重名);
+3. ⇒ 很可能因此**退回了 `dspark`** —— 而 `dspark` 会构造**第二份完整模型**(§242 的 92 个引擎/46 层),
+   于是起草变得极其昂贵、投机净负。
+4. ⇒ **这就是"lk 加 draft 能到 50,我方反而更慢"的完整解释链**:
+   **不是 draft 设计问题,是 `mtp` 在本仓加载不了,退回了一个昂贵得多的替代方案。**
+
+### (c) 为什么 `mtp` 加载不到(待确认的两个方向)
+1. **权重名/映射**:`DeepSeekMultiTokenPredictor` 期望 `...layers.43.mtp_block.*`;
+   而**插件的 OOT override 替换了 `DeepseekV4ForCausalLM`**,可能没有为 `mtp_block` 这条路径
+   提供对应的实现/命名 ⇒ 需要在插件侧补上,或让 override 不覆盖 MTP 模型类;
+2. **权重索引**:模型目录的 safetensors 索引里是否真有 `model.layers.43.mtp_block.*`
+   这批张量(DeepSeek 官方 MTP 权重通常就在同一个 checkpoint 里)——
+   **下一轮先查这一点(免费)**:
+   ```bash
+   python3 -c "import json;d=json.load(open('<model>/model.safetensors.index.json'));
+   print([k for k in d['weight_map'] if 'mtp' in k][:8])"
+   ```
+
+### (d) 为什么这条线值得追(性价比最高)
+- 它一次性解决**两个目标**:**"开投机 ≥100 t/s"**(起草从整模型变 1 层)
+  与**"单流 >30"**(不再为每个投机步付 6 token × 43 层的验证代价);
+- 代价是**一次权重名映射的修复**,而不是结构性重写。
+
+### (e) 本轮教训(又一次是我的操作问题)
+上一轮 `ev2` 的失败是 **M9**(32.22 GiB 未释放就启动)—— 我跳过了 `kill_serve.sh` 的硬校验;
+这一轮加了校验就立刻暴露了**真正的** `mtp` 加载错误。
+⇒ **"先排除环境噪声,再看真实报错"** —— 否则一个 M9 会把真正的 bug 藏整整一轮。
