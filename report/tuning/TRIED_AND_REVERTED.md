@@ -746,3 +746,18 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 - 注:`scripts/kill_serve.sh` 早已用"读 /proc/<pid>/cmdline 的 argv[0]"避开了这个问题,
   **清理由它负责的进程时应当只用它**;`pkill -f` 只用于它管不到的东西(如 sanitizer),
   并且必须带括号保护。
+
+## R99. draft/speculator 与目标模型**共用 EP shm barrier**(已修,已验证)
+- **现象**:投机解码净负(position-0 接受率仅 ~26%,而训练良好的 draft 应 60~80%);
+  用户在本机实测 lk_moe 加 draft 能到 50 t/s ⇒ **draft 在这台机器上本可用**。
+- **根因**:`_ep_shm_attach` 只用 `layer_idx` 命名 shm 文件,而 vLLM 的 DSpark 起草模型是
+  目标模型的**又一份完整实例、层名(prefix)相同**(插件自己的注释就这么写的)⇒
+  **目标第 L 层与 draft 第 L 层共用同一个 barrier 头与同一块部分和区域** ⇒
+  两套调用序列交织推进世代、互相覆写部分和 ⇒ **draft 的 MoE 算错**。
+  主模型的**输出质量**看不出来(验算把错的 draft 拒掉),只表现为**变慢**。
+- **修复**:shm 文件名加入模型实例判别(`_shm_instance_tag`:目标 `T` / draft `D1`…),
+  独立计数以免与 `_is_duplicate_model_instance` 的 `seen` 互相干扰。
+- **验证(默认 `EP_SHM=1`)**:position-0 接受率 **26% → 74.4%**,每步接受 1.3 → **1.95** token,
+  C=1 单流 6.30 → **7.11 t/s**,与 `EP_SHM=0` 上界(72.5%)一致。
+- **注**:投机仍未转正(7.11 < 不开投机 10.76),原因是**每层固定开销**导致
+  "6 个 token 花 6 倍的钱" —— 见 §240(b),那是下一场仗。
