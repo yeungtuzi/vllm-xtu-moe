@@ -10157,3 +10157,31 @@ TP=2 时每个 rank **只算一半专家**(128 vs 256),compute 反而慢 **14×*
   而 `XIAOTU_CD_TIMING` 显示每层 `compute` 是 0.37-0.53 ms ⇒ 若能被线程数拉低,
   就是最直接、最便宜的收益。
 * **待验证**:同配置 `THREADS=96`(必要时 120)重测 `compute`/`rest` 与 C=1/2/4。
+
+---
+
+## 301. 【第 213 轮·投机解码为什么只有 9.7 t/s 的头号解释】**dspark 的运行缓冲/掩码是按 `max_num_batched_tokens` 开的**
+
+用户质疑得对:草稿**不是**小模型 —— DSpark 草稿 = **3 个完整 DS-V4 MoE 层**
+(`mtp.0/1/2`,每层 1536 个专家张量,TP=1 合计 10.12 GiB MXFP4,TP=2 5.34 GiB/rank),
+但它全程在 GPU 上跑,合理成本应该只有目标模型一步的 ~7%,**不该比 CPU 路径慢**。
+
+代码找到了:
+```
+vllm/v1/worker/gpu/spec_decode/speculator.py:83
+    self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
+```
+草稿侧的**工作缓冲、非因果掩码、padding、循环上界**全都按 `max_num_tokens` 开:
+
+* `speculator.py:56/138/282` 用 `self.max_num_tokens` 开 hidden/索引缓冲;
+* `speculator.py:472 / 510`:`for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):`
+  —— **每一步都要走到 `max_num_tokens`**。
+
+⇒ 我们的所有投机实测都用 **`MBT=8192`**;而作者 config.yaml 用的是 **`max_num_batched_tokens: 256`**
+(且 `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024 > 256` ⇒ 他那份配置里 gpu_prefill 根本不会触发)。
+**这正好能解释"投机比不投机还慢 2×"** —— 每一步草稿侧都在为 8192 个 token 的规模买单。
+
+**验证计划**(决定性、且不需要改代码):
+1. 参考引擎 + 同配置(**MBT=8192**)的投机 —— 正在跑(`lkref_spec2`):
+   若**它也慢到 ~10 t/s**,说明这是 vLLM 侧 + MBT 配置的问题,**与我们的引擎无关**;
+2. 再把 **MBT 降到 256/512** 重测两边 —— 预期投机吞吐跳回 40-90 t/s(与用户记忆的 80-90 一致)。
