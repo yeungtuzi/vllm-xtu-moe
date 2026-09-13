@@ -43,7 +43,7 @@ LOG="$OUTDIR/$TAG.log"
 rm -f /dev/shm/xiaotu_ep_*.bin 2>/dev/null || true
 
 ARGS=(
-  "$CKPT"
+  --model "$CKPT"
   --host 0.0.0.0 --port "$PORT"
   --tensor-parallel-size "$TP"
   --max-model-len "$MAXLEN"
@@ -75,7 +75,7 @@ fi
   date -Is
 } > "$OUTDIR/$TAG.env"
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd /tmp   # neutral CWD: see comment above
 export CUDA_VISIBLE_DEVICES="$GPUS"
 nohup env \
   LVLLM_MOE_NUMA_ENABLED=1 \
