@@ -347,8 +347,18 @@ public:
         swiglu_limit_ = cfg_.swiglu_limit > 0.f ? cfg_.swiglu_limit : 0.f;
         swiglu_alpha_ = cfg_.swiglu_alpha != 0.f ? cfg_.swiglu_alpha : 1.f;
         swiglu_beta_  = cfg_.swiglu_beta;
-        clamped_ = cfg_.activation_type == 1 &&
-                   (swiglu_limit_ > 0.f || swiglu_alpha_ != 1.f || swiglu_beta_ != 0.f);
+        // 【2026-09-13 修正·与上游/ lk 语义对齐】
+        // 上游把"夹紧的 SwiGLU"表达为 **`MoEActivation.SILU` + 独立的 `clamp_limit`**
+        // (见 vllm/.../fused_moe/activation.py:122 "SwiGLU kernels: SILU + clamp_limit …"),
+        // 也就是说**夹紧是 `clamp_limit` 的属性,不是激活族的属性**。
+        // 我们原来要求 `activation_type == 1` 才夹紧,于是 lk 的编排链
+        // (`activation_type = 0`(silu)+ `swiglu_limit = 10`)会**静默丢掉夹紧**
+        // ⇒ 端到端出现"大部分对、偶发错"的稳定偏差(实测 NOTES §283/§284)。
+        // 现在改为:只要给了 limit / alpha / beta 就夹紧,两种约定都对:
+        //   lk 链  : activation_type=0 + limit=10   → 夹紧 ✅
+        //   本插件 : activation_type=1 + limit=10   → 夹紧 ✅(行为不变)
+        //   数值门禁: activation_type=0 + limit=0    → 不夹紧 ✅(门禁仍通过)
+        clamped_ = (swiglu_limit_ > 0.f || swiglu_alpha_ != 1.f || swiglu_beta_ != 0.f);
 
         // COPY the weight blocks into engine-owned buffers. The fork hands us
         // pointers into the vLLM parameter tensors (self.w13_weight etc.), but
