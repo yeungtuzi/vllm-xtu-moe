@@ -9942,3 +9942,24 @@ lk 的 headline 数字来自 `tensor-parallel-size: 4`(作者 config.yaml 就是
    已接近单 socket 带宽上限;**想再快就要提高带宽利用率**(多 NUMA 就近、
    专家权重按 CCD 亲和放置)或**提高批量**(C≥4 时每 token 摊薄到 0.35 ms/层,这就是
    C=4 聚合能到 38 t/s 的原因)。
+
+### (d) 【第 212 轮·TP=2 解码慢的头号嫌疑已定位到代码】两个 rank 抢同一批物理核 + 同一批 NUMA node
+
+读代码发现(不是猜):
+
+* `numa_pool.hpp::start_workers()` 按 **slot-major/ccd-minor** 建全局核表,
+  然后 `pin_to(cores_[w % cores_.size()])` —— **每个进程都从 `cores_[0]` 开始**,
+  **完全没有 rank/world 概念**。⇒ TP=2 时两个 rank 各 48 个 MoE 线程
+  (`LK_THREADS=48`)**挤在同一批 48 个物理核上**,96 线程抢 48 核。
+* 权重分片 `nshard_ = numa_node_count()`(=8)也是**每个 rank 都铺满 8 个 node**
+  (`shard_region(..., node=n, ...)` + `mbind` 到 node n)⇒ 两个 rank 的专家权重
+  互相抢同一批 node 的带宽。
+* 这与实测吻合:TP=1 每层 1.06 ms(compute 0.53),而 TP=2 端到端 C=1 只有 3.50 t/s
+  (≈6.6 ms/层)、TP=2+投机+图 只有 2.21 t/s(≈10.5 ms/层)——**不是算得慢,是在抢**。
+
+**改法(已实现,engine 侧,只在 `world>1` 时生效,TP=1 行为逐位不变)**:
+1. `NumaWorkPool(n, rank, world)`:建好核表后按 rank 切成 `world` 份
+   (先按 cpu 编号排序 ⇒ 天然对应 NUMA 子集),每个 rank 只 pin 自己那份;
+2. `nshard_ = numa_node_count()/world`,`rank_node_base_ = rank*(nodes/world)`,
+   `shard_region(..., rank_node_base_ + n, ...)` ⇒ 每个 rank 的权重只落在自己的 node 上;
+3. `shared_numa_pool(rank, world)`:引擎构造时用 `cfg.process_id/num_processes` 首次初始化。

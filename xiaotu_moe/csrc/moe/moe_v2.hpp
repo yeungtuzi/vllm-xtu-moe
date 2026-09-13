@@ -333,7 +333,7 @@ public:
                     const void* w13, const void* w2,
                     const void* w13_g, const void* w2_g,
                     const float* w13_gs = nullptr, const float* w2_gs = nullptr)
-        : cfg_(cfg), pool_(shared_numa_pool()) {
+        : cfg_(cfg), pool_(shared_numa_pool(cfg.process_id, cfg.num_processes)) {
         // Validate minimal dims so we never divide by zero downstream.
         if (cfg_.expert_num <= 0 || cfg_.top_k <= 0 ||
             cfg_.hidden_size <= 0 || cfg_.intermediate_size <= 0)
@@ -402,7 +402,12 @@ public:
         bool sharded_ok = false;
         if constexpr (wt::kNParallel) {
             if (std::getenv("XIAOTU_MOE_NOSHARD") == nullptr) {
-                nshard_ = numa_node_count();
+                // 【第 212 轮】多 rank 同机:分片数与 node 基址都按 rank 切开,
+                // 让 rank r 的 1/world 权重落在它自己那 1/world 个 NUMA node 上
+                // (与 numa_pool 的核表切分一致)。world<=1 时行为与以前完全一致。
+                const int _world = std::max(1, cfg_.num_processes);
+                rank_node_base_ = std::max(0, cfg_.process_id) * (numa_node_count() / _world);
+                nshard_ = std::max(1, numa_node_count() / _world);
                 // XIAOTU_MOE_NSHARD=N 覆盖分片数。本机 NPS=4 ⇒ numa_node_count()=8,
                 // 但 ACPI 距离矩阵显示**同 socket 内 10/12/12/12、跨 socket 32**:
                 // 真正的局部性边界是 socket,不是 NUMA node。NPS=1(BIOS)时
@@ -1118,6 +1123,9 @@ private:
     // whole machine (vs 2x with per-socket replication). Scales stay as one full
     // copy (tiny, indexed by absolute row).
     int nshard_ = 0;
+    // 多 rank 同机时本 rank 的 NUMA node 起点(node = rank_node_base_ + shard 下标),
+    // 与 numa_pool 的核表切分保持同一套划分。
+    int rank_node_base_ = 0;
     std::vector<void*> shard_owned_;
     std::vector<const uint8_t*> w13_shard_;
     std::vector<const uint8_t*> w2_shard_;
@@ -1247,7 +1255,7 @@ private:
         for (int n = 0; n < NS; ++n) {
             const size_t rs = (size_t)n * I / NS, re = (size_t)(n + 1) * I / NS;
             const size_t cbytes = (re - rs) * rowbytes;
-            void* p = shard_region(total, n, s, [&](uint8_t* d, const uint8_t* srcx, size_t) {
+            void* p = shard_region(total, rank_node_base_ + n, s, [&](uint8_t* d, const uint8_t* srcx, size_t) {
                 for (size_t e = 0; e < E; ++e) {
                     const size_t eb = e * stride;
                     std::memcpy(d + eb + rs * rowbytes, srcx + eb + rs * rowbytes, cbytes);         // gate
@@ -1277,7 +1285,7 @@ private:
         for (int n = 0; n < NS; ++n) {
             const size_t rs = (size_t)n * H / NS, re = (size_t)(n + 1) * H / NS;
             const size_t cbytes = (re - rs) * rowbytes;
-            void* p = shard_region(total, n, s, [&](uint8_t* d, const uint8_t* srcx, size_t) {
+            void* p = shard_region(total, rank_node_base_ + n, s, [&](uint8_t* d, const uint8_t* srcx, size_t) {
                 for (size_t e = 0; e < E; ++e) {
                     const size_t eb = e * stride;
                     std::memcpy(d + eb + rs * rowbytes, srcx + eb + rs * rowbytes, cbytes);

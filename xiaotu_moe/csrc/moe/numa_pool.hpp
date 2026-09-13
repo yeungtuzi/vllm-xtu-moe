@@ -367,9 +367,10 @@ inline void* numa_alloc_onnode(size_t bytes, int node) {
 // ---------------------------------------------------------------------------
 class NumaWorkPool {
 public:
-    explicit NumaWorkPool(size_t n = 0)
+    explicit NumaWorkPool(size_t n = 0, int rank = 0, int world = 1)
         : nt_(n == 0 ? default_threads() : n), stop_(false),
-          current_gen_(0), counter_(0), remaining_(0), n_(0) {
+          current_gen_(0), counter_(0), remaining_(0), n_(0),
+          rank_(rank), world_(world) {
         // per-worker completion slots kept only for diagnostics; the completion
         // barrier no longer waits on them (see parallel_for).
         worker_gen_.reset(new std::atomic<uint64_t>[nt_]);
@@ -884,6 +885,19 @@ private:
         if (cores_.empty()) {
             for (int c = 0; c < (int)nt_; ++c) cores_.push_back(c);
         }
+        // 【第 212 轮·TP=2 解码慢的头号嫌疑】多 rank 同机时把核表(以及下面的 node
+        // 集合)按 rank 切成 world 份。原先两个 rank 都从 `cores_[0]` 开始 round-robin
+        // pin(见下方),⇒ 2*48=96 个 MoE 线程挤在同一批 48 个物理核上互相抢核,
+        // 而且两个 rank 的专家权重都铺满全部 8 个 NUMA node、互相抢带宽。
+        // 切分后 rank r 只用第 r 份核(按 cpu 编号=node 编号排序 ⇒ 天然是自己的
+        // NUMA 子集),引擎侧的分片数同步切成 1/world(见 moe_v2.hpp 的 nshard_)。
+        // TP=1(world_<=1)时**完全不改变行为**。
+        if (world_ > 1 && cores_.size() >= (size_t)world_ * 2) {
+            std::sort(cores_.begin(), cores_.end());
+            const size_t per = cores_.size() / (size_t)world_;
+            const size_t b = (size_t)rank_ * per;
+            cores_ = std::vector<int>(cores_.begin() + b, cores_.begin() + b + per);
+        }
         // Record which NUMA nodes at least one worker is pinned to (used to
         // validate node-scoped sharding: every sharded node must have a worker).
         node_present_ = 0;
@@ -1208,6 +1222,8 @@ private:
     }
 
     size_t nt_;
+    int rank_ = 0;      // 本进程在该机上的 rank(TP/EP),用于核表切分
+    int world_ = 1;     // 同机 rank 总数
     NumaTopology topo_;
     std::vector<int> cores_;
 
@@ -1355,8 +1371,10 @@ private:
 // one-time construction; the worker count is set by XIAOTU_MOE_THREADS (or the
 // hardware concurrency) exactly once.
 // ---------------------------------------------------------------------------
-inline NumaWorkPool& shared_numa_pool() {
-    static NumaWorkPool pool;
+// 首次调用决定 pool 的 rank/world(引擎构造时传入 cfg.process_id/num_processes);
+// 之后同进程内所有引擎共用这一个 pool。
+inline NumaWorkPool& shared_numa_pool(int rank = 0, int world = 1) {
+    static NumaWorkPool pool(0, rank, world);
     return pool;
 }
 
