@@ -302,3 +302,32 @@ https://pypi.org/project/lk-moe/     License: Proprietary
 | `vllm/envs.py` | `LVLLM_*` 旋钮 + `is_lk_moe_feature_enabled / _use_gpu_prefill / _mtp_layer / _gpu_prefill_layer / _cpu_layer / _gpu_resident_layer` | `LVLLM_` → `VLLM_XIAOTU_` |
 | `fused_moe/routed_experts.py` | `is_*` 三个标志、`should_use_gpu_prefill`、`_cpu_decode`、`_cpu_prefill`、`clean_weights_after_loading`、`_initialize_cuda_graph_buffers` | `lk_moe` → `xiaotu_moe` |
 | `fused_moe/runner/moe_runner.py` | 4 路分派(resident / 捕获期 `_cpu_decode` / `gpu_prefill` / `cpu_prefill`) | 同上 |
+
+## 10. 【第 211 轮·代码审计】**DS-V4 的 draft(MTP / DSpark)在上游是怎么处理的**
+
+结论:**全部是"权重命名与加载"的处理,没有任何"专家放哪张卡"的逻辑**——设备放置是 lk 的职责,
+而 lk 只用两个开关(见 `report/tuning/NOTES.md` §290)。逐处源码:
+
+| 位置 | 作用 |
+|---|---|
+| `config/speculative.py:326-338` | `model_type == "deepseek_v4"` → 改写成 `deepseek_mtp`,`architectures=["DeepSeekV4MTPModel"]`,`n_predict = num_nextn_predict_layers`(**=1**) |
+| `config/speculative.py:810-820` | `method == "dspark"`:复用完整 V4 config,`architectures=["DSparkDraftModel"]` |
+| `model_executor/models/registry.py:631` | `DeepSeekV4MTPModel` → `vllm.models.deepseek_v4.DeepSeekV4MTP`(`nvidia/mtp.py:265`) |
+| `model_executor/models/registry.py:614` | `DSparkDraftModel` → `vllm.models.deepseek_v4.DSparkDeepseekV4ForCausalLM`(`nvidia/dspark.py:306`) |
+| `nvidia/model.py:1250` | target 的 `WeightsMapper`:`"mtp." -> "model.mtp."` |
+| `nvidia/model.py:1387/1390` | target **跳过**所有 `mtp.*` 权重(`skip_weight_name_before_load` / `AutoWeightsLoader(skip_substrs=["mtp."])`),留给草稿 |
+| `nvidia/model.py:1379` | `get_mtp_target_hidden_states()`:给草稿喂 target 的 hc_head 前残差流 |
+| `nvidia/mtp.py:198` | MTP 层键 = `layers.{num_hidden_layers + i}`(=43/44/45),**不是** `mtp.*` |
+| `nvidia/mtp.py:368-373` | 权重名 `mtp.{i}.` → `model.layers.{num_hidden_layers+i}.` 重映射 |
+| `nvidia/mtp.py:494-524` | 再把 block 张量插到 `.mtp_block.` 之下;head 类张量提到 model 级 |
+| `nvidia/dspark.py:132` | draft 层前缀 = `layers.{num_hidden_layers + i}`(=43/44/45) |
+| `nvidia/dspark.py:502` | `_remap_dspark_name`:`mtp.{i}.` → `model.layers.{i}.`(**ModuleList 下标**,参数名口径) |
+| `v1/worker/gpu_model_runner.py:596` | `use_dspark()` 在 V1 runner 里直接 `raise`:**dspark 必须用 V2 runner**(`v1/worker/gpu/model_runner.py`) |
+| `v1/worker/gpu/model_runner.py:284,395,633` | draft 在 `load_model` 内加载 → 再 `initialize_kv_cache` → 再 `profile_run`(常驻显存会被 profile 计入) |
+
+由此得到对本仓库的两条硬结论:
+1. `is_lk_moe_mtp_layer()` 的 `mtp.` 前缀规则**对 DS-V4 草稿永不命中**(上游 DS-V4 的 mtp/dspark 都把层建在 `model.layers.43+`),
+   它实际服务于"目标模型内嵌 `mtp.` 模块"的架构(qwen3_5 / mimo_v2 / minimax_m3 等);
+2. 想让草稿常驻 GPU,**唯一符合"复用优先"的做法**就是设置 lk 现成开关
+   `LVLLM_GPU_RESIDENT_MOE_LAYERS`(常驻层由 `quantization/mxfp4.py:548` 决定拿 CUDA 权重),
+   不新增任何 vLLM 代码 —— 已实现在 `scripts/serve_lk_port.sh`。

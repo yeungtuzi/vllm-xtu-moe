@@ -114,6 +114,12 @@ def _dev_tensor(ptr: int, shape, dtype, device):
     return t.to(device) if t.device != device else t
 
 
+# 引擎按构造顺序登记 —— lk 的链逐层构造,所以这个顺序就是层顺序;
+# 桥靠它实现 **prefetch window = 1**(本层计算时预取下一层权重,对应 lk 的
+# `LVLLM_GPU_PREFETCH_WINDOW=1`)。
+_ENGINES: list = []
+
+
 def wrap_engine_class(native_cls, kind: str):
     """把原生引擎类包一层:加 `gpu_prefill`,其余属性原样转发。"""
 
@@ -131,6 +137,10 @@ def wrap_engine_class(native_cls, kind: str):
             # (实测 lkport21:栈上全是 Py_BytesMain 之类的裸帧)。我们引擎的 C++ 侧早就在
             # 构造期快照过一份(见 moe_v2.hpp 的 "COPY the weight blocks" 注释);这里为
             # GPU prefill 也做同样的事,只是把副本放在 Python 侧(惰性就会太晚)。
+            self._idx = len(_ENGINES)
+            _ENGINES.append(self)
+            self._slot = None            # 上一层为本层预取好的设备槽
+            self._km = None              # K-major 锁页缓存(惰性)
             if os.environ.get("XIAOTU_GPUPREFILL_WCOPY", "1") == "1":
                 try:
                     self._warr = tuple(_cpu_view(int(p), sh)
@@ -157,6 +167,31 @@ def wrap_engine_class(native_cls, kind: str):
                                    for p, s in zip(self._wptrs, self._shapes()))
             return self._warr
 
+        def _kmajor(self):
+            """本层权重的 K-major 锁页副本(缓存;`prefetch_layer` 要求这种输入)。"""
+            if self._km is None:
+                from .gpu_prefill import _pinned_kmajor
+                w13, w2, s13, s2 = self._weights()
+                self._km = (_pinned_kmajor(w13), _pinned_kmajor(s13),
+                            _pinned_kmajor(w2), _pinned_kmajor(s2))
+            return self._km
+
+        def prefetch(self, device):
+            """异步发起本层权重的 H2D(由上一层调用 ⇒ 与本层计算重叠)。
+
+            即 lk 的 `LVLLM_GPU_PREFETCH_WINDOW=1` 语义。关:`XIAOTU_GPUPREFILL_WINDOW=0`。
+            """
+            if os.environ.get("XIAOTU_GPUPREFILL_WINDOW", "1") == "0":
+                return
+            if self._slot is not None:
+                return
+            try:
+                from .gpu_prefill import prefetch_layer
+                a, b, c, d = self._kmajor()
+                self._slot = prefetch_layer(a, b, c, d, device)
+            except Exception:  # noqa: BLE001  显存不够等 ⇒ 退回逐层同步 H2D
+                self._slot = None
+
         def gpu_prefill(self, x_ptr, out_ptr, ids_ptr, wts_ptr, qlen, k, stream=0):
             """lk ABI:大 prefill 的 GPU 路径(权重按层流式 H2D + Triton 分组 GEMM)。
 
@@ -182,8 +217,13 @@ def wrap_engine_class(native_cls, kind: str):
             if ctx is not None:
                 ctx.__enter__()
             try:
+                # 用上一层为本层预取好的槽(没有就同步 H2D),并顺手预取下一层,
+                # 让它的 H2D 与本层内核重叠 —— 这就是把 6.4 s 固定开销压下去的关键。
+                slot, self._slot = self._slot, None
+                if self._idx + 1 < len(_ENGINES):
+                    _ENGINES[self._idx + 1].prefetch(dev)
                 y = gpu_moe_layer(x, ids, wts, w13, s13, w2, s2,
-                                  H=H, I=I, K=k, device=dev)
+                                  H=H, I=I, K=k, device=dev, slot=slot)
                 out.copy_(y.to(torch.bfloat16))
             finally:
                 if ctx is not None:

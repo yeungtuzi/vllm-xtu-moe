@@ -9535,3 +9535,79 @@ GPU KV cache size: 24,493 tokens(比 MINBATCH=0 的 34,118 少 —— gpu_prefil
   H2D 与计算没有重叠。lk 生产正是用 `LVLLM_GPU_PREFETCH_WINDOW=1` 来重叠的。
 ⇒ **下一步(明确且是复用)**:在桥里实现 **prefetch window = 1**(用我们已有的
   `prefetch_layer`/`PrefetchSlot`:本层计算时预取下一层权重),把这 6.4 s 固定开销压下去。
+
+---
+
+## 290. 【第 211 轮·用户追问】**DS-V4 的草稿到底走 mtp 还是 dspark?lk 默认把草稿放哪?**
+
+### (a) 结论一:本 ckpt 只能走 **dspark**,mtp 权重根本不存在
+
+上游 vLLM **两条路都实现了**,但需要**不同的权重**;判据是张量本身(实测 `model.safetensors.index.json`):
+
+| 路径 | 上游实现 | 需要的张量 | 本 ckpt |
+|---|---|---|---|
+| `method:"mtp"` | `config/speculative.py:326-338`(`deepseek_v4`→`deepseek_mtp`,arch `DeepSeekV4MTPModel`)→ `models/deepseek_v4/nvidia/mtp.py:265 DeepSeekV4MTP`;层数 = `config.num_nextn_predict_layers` | `e_proj`(`mtp.py:89`)、`h_proj`(`:103`)、`shared_head`(`:122`)、`enorm/hnorm` | **0 个** |
+| `method:"dspark"` | `speculative.py:810-820`(复用完整 V4 config,arch `DSparkDraftModel`)→ `nvidia/dspark.py:306 DSparkDeepseekV4ForCausalLM`;层数 = `n_mtp_layers or 3`(`dspark.py:108`) | `main_proj`(2)/`main_norm`(1)/`hc_attn_*`+`hc_ffn_*`(各 3)/`markov_head`(2)/`confidence_head`(1) | **全在** |
+
+* `num_nextn_predict_layers=1` **只是 mtp 路径读的字段**,dspark 完全不读它;ckpt 里 `mtp.0/1/2`
+  三块各含 **1536 个专家张量**(= 256 专家 × 6)→ **3 个完整 MoE 解码层**,不是"一层"。
+  用户记忆里的"1 层"= 经典 MTP 的 `num_nextn_predict_layers=1`,与本 ckpt 无关。
+* lk 作者自己的 commit `92c9b76bb` 附带的 `config.yaml` 用的正是
+  `speculative-config: '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"greedy"}'`。
+* ⇒ 之前"`method:"mtp"` 永久放弃"的结论**在这个 ckpt 上正确**,但要修正表述:
+  不是 DS-V4 不用 mtp,而是**这份 DSpark ckpt 没有 mtp 权重**。
+
+### (b) 结论二:lk **没有**任何"草稿默认常驻 GPU"的默认值
+
+`vllm/envs.py:2262-2299` 全函数读完,`is_lk_moe_gpu_resident_layer()` 只有三个来源:
+1. `LVLLM_MOE_NUMA_ENABLED=0`(特征关闭)→ 全部 True;
+2. `layer_name.startswith("mtp.")`;
+3. 层号 ∈ `LVLLM_GPU_RESIDENT_MOE_LAYERS`(**默认空**)。
+没有 DS-V4/dspark 专门分支,也没有硬编码 `0,41-43`。官方 README_cn.md 参数表同样写
+`LVLLM_GPU_RESIDENT_MOE_LAYERS` 默认值「无」,示例 `0-1,33-34`;且 `LVLLM_MOE_NUMA_ENABLED` 默认 `0`。
+专有 wheel `lk_moe` 2.4.2 里只有引擎 `.so` + `_dynamic_loader.py`,**没有任何编排逻辑**。
+
+在 lkxtu env 里直接调判定函数(NUMA=1, MINBATCH=1024)的实测:
+
+```
+model.layers.3.ffn.experts    resident=False cpu=False gpuprefill=True
+model.layers.43.ffn.experts   resident=False cpu=False gpuprefill=True   ← 草稿第 0 层
+model.layers.44.ffn.experts   resident=False cpu=False gpuprefill=True
+model.layers.45.ffn.experts   resident=False cpu=False gpuprefill=True
+mtp.0.ffn.experts             resident=True  cpu=False gpuprefill=False
+```
+
+⇒ **lk 默认把 dspark 草稿当"GPU 预填充层"**:预填充走 `_gpu_prefill`(GPU),
+**解码回 `_cpu_decode`(CPU)** —— 违反用户硬约束。
+
+`mtp.` 这条规则真正服务的是**目标模型内嵌 mtp 模块**的架构(`qwen3_5.py:321`、`mimo_v2.py:274`、
+`minimax_m3` 等模块名里真有 `mtp.` 前缀);DS-V4 的 mtp/dspark **都把草稿层建在
+`model.layers.{num_hidden_layers+i}`**(`mtp.py:198`、`dspark.py:132`),`mtp.{i}.*` 只出现在
+**权重名/mapper** 里(`model.py:1250`、`mtp.py:368-373`、`dspark.py:502`)⇒ 这条规则在 DS-V4 上**永不命中**。
+
+用户观察到的"没设置也在 GPU"最可能的解释:当时 `LVLLM_MOE_NUMA_ENABLED` 未开(默认 0)
+⇒ 整个混合推理关闭 ⇒ 所有层(含草稿)本来就在 GPU(等于原版 vLLM)。
+
+### (c) 结论三:upstream 对 DS-V4 的"特别处理"全在**权重/请求路径**,没有一处是设备放置
+
+`speculative.py:326-338`(v4→mtp arch + `n_predict`)、`:810-820`(dspark 复用 config)、
+`nvidia/model.py:1250`(`"mtp."→"model.mtp."` mapper)、`:1387/1390`(target `skip_substrs=["mtp."]`)、
+`nvidia/model.py:1379 get_mtp_target_hidden_states()`、`nvidia/mtp.py:198/368-373/494-524`
+(`mtp.{i}`→`model.layers.{43+i}` 再插 `.mtp_block`)、`nvidia/dspark.py:132/502`、
+`v1/worker/gpu_model_runner.py:596`(**dspark 必须用 V2 runner**)。上游两个专家放置机制
+(PR #56118 `VLLM_EXPERTS_LOAD_DEVICE=cpu`、PR #37190 LFRU cache)与 lk 无关,lk 也没用。
+
+### (d) 因此的实现(纯复用 lk 现成开关,**零新增 vLLM 代码**)
+
+`scripts/serve_lk_port.sh`:
+* SPEC=1 时用 python 读 ckpt config 算出草稿层号(`num_hidden_layers` + `n_mtp_layers or 3` = `43-45`),
+  并进 `LVLLM_GPU_RESIDENT_MOE_LAYERS`;常驻层在 `quantization/mxfp4.py:548` 得到 **CUDA** 权重、
+  走 vLLM 原生 GPU MoE(`forward_monolithic`),永不进 CPU、也不进 `_gpu_prefill`。
+* **显存护栏**(用户约束):按 ckpt 张量真实字节算草稿占用(TP=1 **10.12 GiB**/rank,TP=2 **5.34**)——
+  逐 shard 读 safetensors header、专家按 TP 切分;`util×显存 − 12(模型) − 草稿 < 8 GiB` 时
+  **禁用 draft 并打 WARNING**。
+* prefetch window 改为可调(`PREFETCH`,README 建议 1-2,代码默认 3)。
+
+顺序安全性已核实:dspark 草稿在 `v1/worker/gpu/model_runner.py:284`(V2 runner 的 `load_model` 内)加载,
+**早于** `initialize_kv_cache`(`:395`)与 `profile_run`(`:633`)⇒ 常驻草稿显存会被 profile 计入,
+KV cache 自动缩小,不会偷预算(护栏再兜一层)。
