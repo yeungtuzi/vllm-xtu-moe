@@ -804,10 +804,24 @@ public:
         // parallel_for clears sharded_call_=0 when it dispatches (task_ is valid).
     }
 
-    static size_t default_threads() {        unsigned hw = std::thread::hardware_concurrency();
-        size_t nt = hw > 0 ? (size_t)hw : 1;
+    static size_t default_threads() {
+        unsigned hw = std::thread::hardware_concurrency();
+        // 【默认值 = 我们调过的最优值】本机 24 CCD × 8 核,实测**每 CCD 4-5 核**
+        // (合计 96-120)才能把 DDR5 通道跑满,再加核只增竞争(NOTES §44 +
+        // start_workers() 的 CCD-first 带宽实验)。故**默认 120**,而不是
+        // hardware_concurrency()=192 —— 后者直接跑出甜蜜点。
+        size_t nt = hw > 0 ? std::min<size_t>((size_t)hw, (size_t)120) : 1;
+        // 线程数是**带宽**的旋钮:本机 24 CCD × 8 核,实测每 CCD 4-5 核
+        // (合计 96-120)才能把 DDR5 通道跑满,再加核只增竞争(见 NOTES §44 与
+        // 本文件 start_workers() 里 CCD-first 排序的带宽实验注释)。
+        // `XIAOTU_MOE_THREADS` 是本引擎自己的旋钮;**同时接受 lk 的 `LK_THREADS`**,
+        // 因为 lk 的编排链(routed_experts/moe_runner)只设 LK_THREADS ——
+        // 不认它的话引擎会退到 hardware_concurrency()=192,直接跑出甜蜜点。
         if (const char* e = std::getenv("XIAOTU_MOE_THREADS")) {
             long v = std::atol(e);
+            if (v > 0) nt = (size_t)v;
+        } else if (const char* e2 = std::getenv("LK_THREADS")) {
+            long v = std::atol(e2);
             if (v > 0) nt = (size_t)v;
         }
         return nt;

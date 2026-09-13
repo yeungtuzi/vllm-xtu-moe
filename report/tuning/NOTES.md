@@ -9188,3 +9188,23 @@ binding.cpp:121      // 注释:参考实现也是把 num_processes=ep_size 交�
 * 保留 `configure_ep` 作为显式覆盖(主线插件仍用它,行为不变)。
 构建:`xiaotu-moe/scripts/build_variants.sh`(g++ 多 ISA 变体,分钟级);装进 `lkxtu` 后重测 TP=2。
 ⇒ 这是**引擎接入层**的缺口(我们的组件),不是 vLLM 侧移植的问题;vLLM 侧的移植已确认与参考一致。
+
+## 280. 用户提醒的三条**必须继承的经验**(已核对本引擎确实都实现了)
+
+| 经验 | 本引擎里的实现 | 备注 |
+|---|---|---|
+| **每 CCD 4-5 核才能跑满带宽**(24 CCD ⇒ 96-120 总线程) | `numa_pool.hpp:start_workers()` 用 **CCD-first / slot-major** 顺序排核:`cores_ = [ccd0.cpu0, ccd1.cpu0, …, ccd23.cpu0, ccd0.cpu1, …]`,即"先每个 CCD 一个线程,再填第二个";注释里写明单 CCD 吃不满 IOD 的 DDR5 通道(1 CCD ~30 GB/s → 12 CCD ~70-80 GB/s) | ✅ |
+| **NUMA 节点切分任务、只读写本地内存**(NPS=1 vs NPS=4 的访存距离差异) | 权重按 NUMA node 分片(`nshard_ = numa_node_count() = 8`),每个 node 的 worker 只读写本 node 那份,`MPOL_BIND` 页本地;node 间只交换很小的激活切片/部分和 | ✅ |
+| **gpu_prefill 的 2 槽 ping/pong 提升 prefill** | 插件 `gpu_prefill.py` 的 ping-pong staging(每层 ~2 GiB),`XIAOTU_GPU_PREFETCH_AHEAD`;在 lk 链下对应 `LVLLM_GPU_PREFETCH_WINDOW=1` | ✅(但 lk 链走的是 vLLM 标准 GPU MoE,见 §272c) |
+
+### ⚠️ 本轮发现的一个**真问题(已修)**:默认线程数跑出了甜蜜点
+`default_threads()` 原来在未设 `XIAOTU_MOE_THREADS` 时退到 `hardware_concurrency()` = **192**
+(= 8 核/CCD,超出 4-5 核/CCD 的甜蜜点)。而 **lk 的编排链只设 `LK_THREADS`**,我们的引擎
+**根本没读它**(grep 证实 `LK_THREADS` 只出现在注释里)⇒ **移植后的 port 一直跑在 192 线程**,
+这很可能就是 lkport7 只有 1.62 t/s 的主因之一。
+**修法(按用户"未指定时默认用我们的最优参数")**:
+```cpp
+size_t nt = hw > 0 ? std::min<size_t>((size_t)hw, (size_t)120) : 1;   // 默认 120
+if (XIAOTU_MOE_THREADS) nt = ...;        // 引擎自己的旋钮优先
+else if (LK_THREADS)    nt = ...;        // 接受 lk 链的旋钮
+```

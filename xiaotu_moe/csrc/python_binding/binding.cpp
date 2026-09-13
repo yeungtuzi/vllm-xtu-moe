@@ -23,6 +23,9 @@
 #define _GNU_SOURCE
 #include <ucontext.h>
 #include <sys/ucontext.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <cuda_runtime.h>
 #if defined(__AVX512F__)
@@ -143,6 +146,65 @@ struct EpShmState {
 std::mutex g_ep_mtx;
 std::unordered_map<const void*, std::unique_ptr<EpShmState>> g_ep_state;
 
+// ---- 自建跨 rank 归约:mkl 的编排链只给 num_processes/process_id,不调 configure_ep ----
+// lk 的 vLLM 侧(`routed_experts.py:_process_mxfp4`)把
+//   num_processes = tp_size, process_id = tp_rank, intermediate_size = 每卡一半
+// 交给引擎,而 `cpu_decode/cpu_prefill` 的签名里**没有**归约参数 ⇒ **部分和合并由引擎
+// 自己负责**(专有 lk_moe 的二进制里确实用了 `shm_open`)。我们此前只在插件显式调用
+// `configure_ep()` 时才建归约,所以走 lk 链时**根本没有归约**。
+// 这里按 lk 的做法自行建立:两个 rank 以**相同顺序**构造同样的引擎,故用"构造序号"
+// 命名即可对齐;文件名以 `xiaotu_ep_` 开头,沿用启动脚本里的 `rm -f /dev/shm/xiaotu_ep_*.bin`。
+namespace {
+std::atomic<int> g_auto_ep_seq{0};
+
+bool auto_ep_setup(const void* key, const MOEConfigV2& cfg) {
+    if (cfg.num_processes <= 1) return false;
+    const int world = cfg.num_processes;
+    const int rank = cfg.process_id;
+    if (rank < 0 || rank >= world) return false;
+    const int H = cfg.hidden_size;
+    const int tokens = cfg.max_batch_size > 0 ? cfg.max_batch_size : 1;
+    if (H <= 0) return false;
+    const size_t stride =
+        ((size_t)tokens * (size_t)H * sizeof(float) + 63) / 64 * 64;
+    const size_t total = ((sizeof(EpShmHeader) + stride * (size_t)world) + 63) / 64 * 64;
+
+    const int seq = g_auto_ep_seq.fetch_add(1);   // 两 rank 构造顺序一致 ⇒ 同名
+    char name[160];
+    std::snprintf(name, sizeof(name), "/xiaotu_ep_auto_%d_%d_%d_%d.bin",
+                  seq, world, H, tokens);
+
+    int fd = ::shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    bool created = (fd >= 0);
+    if (fd < 0) fd = ::shm_open(name, O_RDWR, 0600);
+    if (fd < 0) return false;
+    if (created && ::ftruncate(fd, (off_t)total) != 0) { ::close(fd); return false; }
+    void* base = ::mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (base == MAP_FAILED) return false;
+    if (created) std::memset(base, 0, sizeof(EpShmHeader));
+
+    EpShmHeader* hdr = reinterpret_cast<EpShmHeader*>(base);
+    hdr->world = world;
+
+    std::lock_guard<std::mutex> lg(g_ep_mtx);
+    auto& ep = g_ep_state[key];
+    if (!ep) ep = std::make_unique<EpShmState>();
+    ep->hdr = hdr;
+    ep->parts = reinterpret_cast<char*>(base) + sizeof(EpShmHeader);
+    ep->world = world;
+    ep->rank = rank;
+    ep->capacity = stride;
+    ep->partial_copy =
+        (float*)std::aligned_alloc(64, (stride + 63) / 64 * 64);
+    std::fprintf(stderr,
+                 "[xiaotu/engine] auto EP shm %s: rank %d/%d stride=%zu tokens=%d\n",
+                 name, rank, world, stride, tokens);
+    std::fflush(stderr);
+    return true;
+}
+}  // namespace
+
 // Map engine pointer -> its pinned buffers / host-fn context. Keyed by the
 // MOE* identity; every MOE instance across every type has a unique address, so
 // sharing one map across all template instantiations is safe.
@@ -228,9 +290,12 @@ static void bind_moe_class(py::module& m, const char* name) {
                          py::object w13, py::object w2,
                          py::object w13_g, py::object w2_g,
                          py::object w13_global, py::object w2_global) {
-            return new MOE(cfg, as_ptr(w13), as_ptr(w2), as_ptr(w13_g), as_ptr(w2_g),
-                           static_cast<const float*>(as_ptr(w13_global)),
-                           static_cast<const float*>(as_ptr(w2_global)));
+            MOE* p = new MOE(cfg, as_ptr(w13), as_ptr(w2), as_ptr(w13_g), as_ptr(w2_g),
+                             static_cast<const float*>(as_ptr(w13_global)),
+                             static_cast<const float*>(as_ptr(w2_global)));
+            // lk 链只给 num_processes/process_id:引擎自建跨 rank 归约(见 auto_ep_setup)
+            auto_ep_setup((const void*)p, cfg);
+            return p;
         }), py::arg("cfg"), py::arg("w13_weight"), py::arg("w2_weight"),
             py::arg("w13_scale") = py::int_(0), py::arg("w2_scale") = py::int_(0),
             py::arg("w13_global_scale") = py::int_(0), py::arg("w2_global_scale") = py::int_(0))
