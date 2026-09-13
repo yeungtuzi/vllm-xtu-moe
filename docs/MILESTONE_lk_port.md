@@ -54,12 +54,23 @@ ENV=/home/user/anaconda3/envs/lkxtu TAG=win TP=2 GPU_UTIL=0.80 MAXLEN=1048576 \
 
 ## 6. 尚未达成(等用户指令,已存档 `report/tuning/FUTURE_PLAN.md`)
 
-**lk-moe 在同一台服务器上的解码基准是单流 30-35、投机 ≈50、C=4 ≈70 t/s**;
-我们目前单流 20.29(不投机)、C=2 聚合 34.29。差距 1.6-1.7×,正在按下面顺序定位:
+**同机同配置、只换引擎的对照已完成**(2026-09-13,`lkref_tp2` vs `lkport39win`):
 
-1. **同机同配置、只换引擎**(参考 env `lvllmds4-x` 里仍是原版专有 `lk_moe` 2.4.2)——
-   这一次对照能直接判定差距在"我们的引擎 in-service 行为"还是"配置/编排参数";
-2. 若在引擎:对照 `compute`/`rest` 拆分,优先看 ①线程数与绑定(每 rank 只用了 48/96 核)
-   ②EP 归约(每层一次跨进程 shm barrier,参考实现是在引擎内部合并)③pinned staging 拷贝;
-3. 若在配置:按 lk README 试 `LVLLM_GPU_RESIDENT_MOE_LAYERS`(用 KV 换常驻层)、
-   `PREFETCH`/`MBT`/`THREADS` 的扫描。
+| | 参考 lk_moe | ours |
+|---|---|---|
+| 不投机 C=1 | 20.48 t/s(TPOT **25.36 ms**) | 20.29 t/s(TPOT 37.33 ms) |
+| 不投机 C=2 聚合 | **52.71** | 34.29 |
+| 不投机 C=4 聚合 | **66.10** | ~30-38 |
+| 投机 C=1(5/probabilistic) | 5.18 | **9.68** |
+| 预填充 8192 冷 / 32768 | 883 / 828 | **982 / 1287** |
+
+* ⇒ **差距 100% 在引擎的每层 marshalling**,不在编排/参数/卡数:把 TPOT 按 `F + C·V` 拟合,
+  我们的**每 token 引擎成本更好**(V=6.45 vs 8.84),但**每步固定开销几乎翻倍**
+  (F=30.9 ms vs 16.5 ms)。`XIAOTU_CD_TIMING` 拆出每层 `rest` 0.53-0.66 ms,
+  参考的等价值 ≈0.3 ms ⇒ **每层 ~0.3 ms × 43 ≈ 13 ms/token** 就是要追回的部分。
+* **投机不是优化点**:一步要验证 `num_seqs×(1+spec)` 个 token,而这些 token 全落在 CPU MoE 上
+  ⇒ 每接受一个 token 的 CPU 工作量 = (1+spec)/接受长度 ≈ 2.4×,结构性亏损(参考引擎更差:5.18)。
+  用户记忆中的 "80-90 tok/s" 已确认是 `SpecDecoding metrics` 里的
+  `Drafted/Accepted throughput` 字段,不是端到端速率。
+* **下一步(按性价比)**:①staging 与计算重叠(第二流 + event 双缓冲)②3 次 D2H 合成 1 次
+  ③用常驻线程 + event 替换 `cudaLaunchHostFunc` ④再用 KV 换若干常驻层。
