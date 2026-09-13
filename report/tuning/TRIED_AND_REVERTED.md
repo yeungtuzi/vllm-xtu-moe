@@ -810,3 +810,38 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
   ②**回到作者配方的 TP=2 / `GPU_UTIL=0.80`**(草稿只 5.34 GiB/rank),见 `lkport26spec`。
 - **教训**:显存护栏必须把"KV 划分之后才分配的第三方缓冲"算进去;只按
   `util×显存 − 模型 − 草稿` 估账会低估 8-9 GiB。
+
+## R103. 作者配方原样(图模式 `EAGER=0`)+ 投机解码 ⇒ 捕获失败(`cudaErrorStreamCaptureInvalidated`)
+- **做法**:完全照作者配方跑(`TP=2 / GPU_UTIL=0.80 / MAXLEN=1048576 / SEQS=2 / PREFETCH=1 /
+  **不加 `--enforce-eager`** / `SPEC=auto` ⇒ dspark + 草稿常驻 43-45`),tag `lkport26spec`。
+- **结果**:权重与 KV 都成功(`Model loading took 11.39 GiB`/rank = 目标 6.22 + 草稿 5.34 ✅),
+  卡在 **CUDA graph 捕获**:
+  ```
+  forward_fn(CUDAGraphMode.NONE) → model(...) → layer(...) → self.ffn(x, input_ids)
+    → fused_out = self.routed_experts._cpu_decode(...)
+    → cuda_graph.capture_end()
+  torch.AcceleratorError: CUDA error: operation failed due to a previous error during capture
+  (cudaErrorStreamCaptureInvalidated)
+  ```
+  ⇒ `RuntimeError: Engine core initialization failed`。
+- **定位**:失败点就在 **lk 的 `_cpu_decode`**(CPU 目标层,43 层)被放进捕获区时。
+  lk 的 `_cpu_decode` 本身没有同步(`routed_experts.py:1708`,只把 `current_stream().cuda_stream`
+  传给引擎),所以违规发生在**我方引擎的 `cpu_decode` 内部**。
+- **已排查**:引擎确实*有*捕获安全路径(`binding.cpp:50-90` 注释 + `cudaLaunchHostFunc` at `:585`,
+  且 `cudaStreamIsCapturing` 分支 at `:388`)。但 `CpuDecodeState::ensure_buffers(..., retire=true)`
+  在**捕获期间**若缓冲不够,仍会执行 `cudaHostAlloc`(`binding.cpp:100`)——**捕获区内分配显存/锁页内存是非法操作**,
+  足以让 `capture_end` 报 `cudaErrorStreamCaptureInvalidated`。
+- **最可能的触发条件(强怀疑,待证)**:lk 的图缓冲是按**序列数**而非**token 数**预分配的 ——
+  `RoutedExperts._initialize_cuda_graph_buffers()`(`routed_experts.py:1694-1706`)把**全层共享**的
+  `RoutedExperts.output_gpu` 开成 `(max_num_seqs, hidden)`;而投机解码的一步里
+  目标模型要验证的 token 数 ≈ `num_seqs × (num_spec_tokens + 1)`(本次 2×6=12 > 2),
+  于是 `ensure_buffers` 在捕获期增长 ⇒ 非法分配 ⇒ 捕获作废。
+- **处置**:本轮先用 **`EAGER=1`**(我们移植时一贯的可用配置)拿到作者配方的其余全部参数
+  (`lkport27spec`),不在这一步卡住;图模式留给下一步(见"下一步"栏)。
+- **下一步(明确)**:
+  1. 让引擎的 pinned 缓冲**一次开够**(`prepare_decode_buffers(max_qlen, top_k)` 里按
+     `max_qlen × (1 + num_spec_tokens)` 或再乘一个安全系数分配),并保证**捕获期间 `ensure_buffers` 永不分配**
+     (不够就用预先开好的最大 scratch,或直接报错而不是 `cudaHostAlloc`);
+  2. 同时核对 lk 的 `output_gpu`(`(max_num_seqs, hidden)`,**全层共享**)在投机解码下是否越界:
+     若目标验证批 = `seqs×(spec+1)`,则它必须按 **token** 数开,而不是序列数;
+  3. 改完用 `EAGER=0` 重测(图模式对解码吞吐通常是 1.3-2×,值得修)。
