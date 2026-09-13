@@ -9331,3 +9331,38 @@ NotImplementedError: Could not run '_C::gptq_marlin_repack' with arguments from 
   3. 仍错则用 `test_block23_equiv.py` + `gpu_prefill_golden.py` 做**数值对拍**,把范围收到单层;
   4. 最后才是 `XIAOTU_MOE_DIAG_BARRIER` / `POOL_SLOW_MS` 这类并发诊断(注意铁律 1:诊断埋点会掩盖竞态)。
 **在正确性过关之前,§283(a) 的 7.81 t/s 只是"能跑",不能当性能结论。**
+
+## 284. 决定性判定:那个错误**完全可以复现**(5/5 逐字相同)⇒ **不是竞态,是系统性数值/公式差异**
+
+```
+"def fibonacci(n):" × 5 次(temperature=0,无 seed):
+  '\n    if n <=  permute(1):'   ← 5 次**逐字相同**
+```
+⇒ **推翻了 §283(d) 的"竞态"假设**(按证据撤回)。既然稳定复现,只能是:
+**某个参数/公式与门禁路径不一致**,或**引擎在某个分支上算错**。
+
+### 已排除(逐条查证,值都对)
+| 项 | lk 链的值 | 我方门禁路径 | 判定 |
+|---|---|---|---|
+| `groupN/groupK` | `_get_quant_params` → 1/32 | 1/32 | ✅ 一致 |
+| `group_max_len` | `min(4096,max_nbt)+128` | 4096+128 | ✅ 一致 |
+| `swiglu_limit` | config=10.0,`model.py:500→554/647→RoutedExperts:122/326→cfg` | 10.0 | ✅ 已传播 |
+| `intermediate_size` | `intermediate_size_per_partition`(=2048 @TP=1) | 2048 | ✅ 一致 |
+| `expert_num` | `local_num_experts` = 256 | 256 | ✅ 一致 |
+
+### 尚未核对(**下一轮的第一件事**)
+1. **`has_gate_proj`**:lk 传 `self.has_gate_proj`,我方 `mixed_experts` 也传 `self.has_gate_proj`
+   —— 但**两者的来源属性可能不同**,需要把实际值打出来对比(布局理解错会系统性算错);
+2. **`swiglu_alpha`**:lk 是 `if self.swiglu_alpha is not None` 才设(可能为 None ⇒ 引擎默认),
+   我方门禁路径显式给了 `alpha`;DS-V4 的 `SiluAndMulWithClamp(10.0)` 是特定公式
+   ⇒ **公式/alpha 不一致会造成"大部分对、偶尔错"的稳定偏差**,与观察到的现象最吻合;
+3. **`activation_type`**:lk 传 `self.activation_type`,我方传 0 —— 需确认同一语义;
+4. `stride`/`group_min_len` 已一致(32/10)。
+
+### 下一步(按性价比)
+1. **把引擎 cfg 的生效值打出来**(在 lk 链的 `_process_mxfp4` 后加一行诊断,或让引擎在构造时打印),
+   与插件路径的 `[vllm-xtu-moe] xiaotu MOE_MXFP4 engine: … swiglu=clamp@10.0` 那行**逐字段对比**;
+2. 用 `scripts/test_block23_equiv.py`(受控 me=2/3 + numpy golden 逐元素对拍)**在端口径下**跑一遍
+   —— 它能把"哪一层/哪个 block 开始偏"直接定位出来;
+3. 必要时再上 `gpu_prefill_golden.py`。
+⇒ **正确性过关前,§283(a) 的 7.81 t/s 不能作为性能结论。**
