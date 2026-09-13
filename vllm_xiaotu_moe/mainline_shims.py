@@ -5,7 +5,12 @@
   2. oracle 必须优先选 CPU 后端(GPU 平台默认不选);
   3. CPU 后端的 AMX 重打包必须跳过(它会破坏原始权重布局,且依赖可能未编译的
      `torch.ops._C.convert_weight_packed`);
-  4. 量化方法的 `process_weights_after_loading` 必须通知 experts 后端(fp8/wna16 主线不调)。
+  4. 量化方法的 `process_weights_after_loading` 必须通知 experts 后端(fp8/wna16 主线不调);
+  5. `oracle/mxfp4.convert_weight_to_mxfp4_moe_kernel_format` 必须为 CPU 后端原样返回
+     原始权重(否则 `Mxfp4MoEMethod._setup_kernel` 直接
+     `raise ValueError("Unsupported mxfp4_backend ... CPU")`)。
+     第 5 处对应上游 PR #56118 的第三段;缺了它,**主线 RoutedExperts 路径根本起不来**
+     (实测 `lkpath1`:权重加载完后在 `process_weights_after_loading` 处失败)。
 
 这 4 处目前尚未合并进上游。为了让使用
 **只装插件就能用**,这里用 monkey-patch 提供等价行为:
@@ -228,6 +233,163 @@ def _install_prepack_shims() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# shim 5: CPU 后端跳过 mxfp4 kernel-format 转换
+#
+# 等价于上游 PR #56118 的第三处改动。上游在 `oracle/mxfp4.py` 里让
+# `select_mxfp4_moe_backend()` 直接返回 CPU 后端,并在
+# `convert_weight_to_mxfp4_moe_kernel_format()` 里为 CPU 后端原样返回原始权重:
+#   "the CPU backend is an out-of-tree engine that consumes the raw
+#    [E, 2I, H//2] / [E, H, I//2] uint8 weights and raw e8m0 scales directly,
+#    so skip the AMX prepack."
+# 主线(本仓 pin 的 commit)还没有这段,于是 `Mxfp4MoEMethod._setup_kernel`
+# 会走到 `raise ValueError("Unsupported mxfp4_backend ... Mxfp4MoeBackend.CPU")`。
+# 这里补上同样的语义。
+#
+# 注意:`quantization/mxfp4.py` 是 `from ...oracle.mxfp4 import (...)` **按名字**导入的,
+# 所以两个模块的绑定都要替换,只改 oracle 不影响调用点。
+_SHIM5_MODULES = (
+    "vllm.model_executor.layers.fused_moe.oracle.mxfp4",
+    "vllm.model_executor.layers.quantization.mxfp4",
+)
+
+
+def _install_mxfp4_cpu_convert_shim() -> list[str]:
+    applied: list[str] = []
+    for mod_name in _SHIM5_MODULES:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"skip {mod_name}: {type(exc).__name__}: {exc}")
+            continue
+        orig = getattr(mod, "convert_weight_to_mxfp4_moe_kernel_format", None)
+        if orig is None or getattr(orig, "_xtu_shim", False):
+            continue
+
+        @functools.wraps(orig)
+        def wrapper(mxfp4_backend, layer, w13_weight, w2_weight,
+                    w13_weight_scale, w2_weight_scale, w13_bias=None,
+                    w2_bias=None, *a, _orig=orig, **kw):
+            # CPU 后端 = OOT 引擎,直接吃 checkpoint 原始布局,不做任何重打包。
+            if mixed_mode_enabled() and getattr(mxfp4_backend, "name", "") == "CPU":
+                return (w13_weight, w2_weight, w13_weight_scale,
+                        w2_weight_scale, w13_bias, w2_bias)
+            return _orig(
+                mxfp4_backend, layer, w13_weight, w2_weight, w13_weight_scale,
+                w2_weight_scale, w13_bias, w2_bias, *a, **kw,
+            )
+
+        wrapper._xtu_shim = True  # type: ignore[attr-defined]
+        setattr(mod, "convert_weight_to_mxfp4_moe_kernel_format", wrapper)
+        applied.append(f"{mod_name.rsplit('.', 1)[-1]}."
+                       "convert_weight_to_mxfp4_moe_kernel_format")
+    return applied
+
+
+# ---------------------------------------------------------------------------
+# shim 6: 把 monolithic 路径丢掉的 `input_ids` 存到 layer 上
+#
+# DeepSeek-V4 的前 3 层(`config.num_hash_layers=3`)是 **hash MoE**:
+#   `DeepseekV4MoE.__init__`: `is_hash_moe = layer_idx < num_hash_layers`
+#       ⇒ `gate.tid2eid` 是路由表,`gate.e_score_correction_bias = None`
+#   `DeepseekV4MoE.forward` → `self.experts(x, router_logits=x, input_ids=input_ids)`
+# 而 hash 路由必须查表:`fused_topk_bias(..., input_tokens=input_ids,
+# hash_indices_table=...)`。链路是
+#   RoutedExperts.forward_monolithic(x, router_logits, input_ids)
+#     → quant_method.apply_monolithic(layer, x, router_logits, input_ids)   ← 收下了
+#       → moe_kernel.apply_monolithic(...)                                  ← 没有 input_ids 这个参数
+#         → fused_experts.apply(...)                                        ← 于是永远拿不到
+# 即**两端都有、中间断了**。这里在断点上把 input_ids 暂存到 layer 上,
+# 让 OOT 后端(我们的 experts)能取到,而不必改写整条调用链。
+def _patch_apply_monolithic_input_ids(cls) -> list[str]:
+    fn = cls.__dict__.get("apply_monolithic")
+    if fn is None or getattr(fn, "_xtu_ids_shim", False):
+        return []
+
+    @functools.wraps(fn)
+    def apply_monolithic(self, layer, x, router_logits, input_ids=None, *a, **kw):
+        if input_ids is not None:
+            try:
+                layer._xiaotu_input_ids = input_ids
+            except Exception:  # noqa: BLE001
+                pass
+        return fn(self, layer, x, router_logits, input_ids, *a, **kw)
+
+    apply_monolithic._xtu_ids_shim = True  # type: ignore[attr-defined]
+    cls.apply_monolithic = apply_monolithic
+    return [f"{cls.__name__}.apply_monolithic"]
+
+
+def _install_input_ids_shim() -> list[str]:
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+
+    applied = _patch_apply_monolithic_input_ids(FusedMoEMethodBase)
+    for cls in _walk_subclasses(FusedMoEMethodBase):
+        applied += _patch_apply_monolithic_input_ids(cls)
+    return applied
+
+
+# ---------------------------------------------------------------------------
+# shim 7: 把路由 extras(hash 表 / vision bias)也放到 `RoutedExperts` 上
+#
+# `FusedMoEFactory` 收下 `hash_indices_table` / `bias_vl` / `image_sentinel_lo`,
+# 但它们**只**被送进 `create_fused_moe_router()` —— 也就是跑在 runner 上的那个
+# router(modular 路径用)。`RoutedExperts.__init__` 只保存 `e_score_correction_bias`,
+# **不保存这三样**。
+# ⇒ monolithic 后端(我们的 CPU experts)自己在 `_get_router()` 里建 router 时,
+#   既拿不到 hash 表也拿不到 vision bias,于是 factory 兜底选 `FusedTopKRouter`
+#   ⇒ DeepSeek-V4 的 sqrtsoftplus 直接 `ValueError`。
+# 实测诊断行:`router=FusedTopKRouter … bias=no hash=no vl=no`(lkpath4)。
+# 这里在 factory 出口把这些 extras 补挂到 `RoutedExperts` 实例上,让
+# `mixed_experts._ROUTER_EXTRA_ATTRS` 能取到 ⇒ 选中上游的 `FusedTopKBiasRouter`。
+_ROUTER_EXTRAS = ("hash_indices_table", "bias_vl", "image_sentinel_lo")
+
+
+def _install_router_extras_shim() -> list[str]:
+    import sys
+
+    from vllm.model_executor.layers.fused_moe import layer as _layer
+
+    orig = getattr(_layer, "FusedMoEFactory", None)
+    if orig is None or getattr(orig, "_xtu_extras_shim", False):
+        return []
+
+    @functools.wraps(orig)
+    def FusedMoEFactory(*a, **kw):
+        mod = orig(*a, **kw)
+        if mixed_mode_enabled():
+            extras = {n: kw.get(n) for n in _ROUTER_EXTRAS if kw.get(n) is not None}
+            if extras:
+                try:
+                    for m in mod.modules():
+                        if type(m).__name__ == "RoutedExperts":
+                            for n, v in extras.items():
+                                if getattr(m, n, None) is None:
+                                    setattr(m, n, v)
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
+        return mod
+
+    FusedMoEFactory._xtu_extras_shim = True  # type: ignore[attr-defined]
+
+    # 定义处 + 所有**按名字导入过**它的已加载模块(DS-V4 的 model.py 就是这种)。
+    patched = ["fused_moe.layer.FusedMoEFactory"]
+    for mod_name, m in list(sys.modules.items()):
+        if m is None or m is _layer:
+            continue
+        try:
+            if getattr(m, "FusedMoEFactory", None) is orig:
+                setattr(m, "FusedMoEFactory", FusedMoEFactory)
+                patched.append(f"{mod_name}.FusedMoEFactory")
+        except Exception:  # noqa: BLE001
+            continue
+    setattr(_layer, "FusedMoEFactory", FusedMoEFactory)
+    return patched
+
+
+# ---------------------------------------------------------------------------
 def apply_mainline_shims() -> list[str]:
     """Idempotently install all shims; returns the list of things applied."""
     if not mixed_mode_enabled():
@@ -241,6 +403,9 @@ def apply_mainline_shims() -> list[str]:
         _install_quant_method_shims,
         _install_oracle_shims,
         _install_prepack_shims,
+        _install_mxfp4_cpu_convert_shim,
+        _install_input_ids_shim,
+        _install_router_extras_shim,
     ):
         try:
             applied += step()

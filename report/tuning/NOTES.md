@@ -8093,3 +8093,800 @@ mtp.0.<rest>  →  model.layers.43.mtp_block.<rest>
 3. 它与 mainline 的 `model_executor/models/deepseek_v4*` 差多少 ——
    若差异可控,**把这条实现接到我方引擎上**;若差异大,就明确记录"需要移植专用模型实现"的量级。
 ⇒ 这一步**纯读代码、零加载**,而且直接对准"开投机 ≥100 t/s"的结构性前提。
+
+## 255. 🔴🔴 **推翻 §251-§254 的前提:本 checkpoint 里根本没有 MTP 权重** —— `dspark` 才是这件 checkpoint 的原生投机路径
+
+§254 的结论("我方引擎只有 XPU、没有 nvidia 专用 DeepSeek-V4 实现,因此要移植")**是错的**:
+那次 grep 只搜了 `Lvllmds4-x/vllm/`,没搜**真正被 import 的那棵树**。本轮把三件事都做实了。
+
+### (a) 我方引擎(mainline,commit `6c73b08`)本身就有 nvidia 专用实现
+```
+vllm/models/deepseek_v4/nvidia/model.py     ← 1809+ 行,DeepseekV4ForCausalLM
+vllm/models/deepseek_v4/nvidia/mtp.py       ← 550 行,DeepSeekV4MTP
+vllm/models/deepseek_v4/nvidia/dspark.py    ← 546 行,DSparkDeepseekV4ForCausalLM
+vllm/model_executor/models/registry.py:
+    "DeepseekV4ForCausalLM": ("vllm.models.deepseek_v4", "DeepseekV4ForCausalLM")
+    "DeepSeekV4MTPModel":    ("vllm.models.deepseek_v4", "DeepSeekV4MTP")
+    "DSparkDraftModel":      ("vllm.models.deepseek_v4", "DSparkDeepseekV4ForCausalLM")
+```
+⇒ §254 的"架构级根因"不成立,**不需要移植任何东西**。
+
+### (b) `mtp.0/1/2.*` 就是 **DSpark 草稿**,不是 MTP —— 由权重清单直接证伪
+把 index.json 的 72317 个 key 按前缀统计:
+```
+top-level: embed.*, layers.{0..42}.*, norm.*, head.*, hc_head_{base,fn,scale}   ← 目标模型
+           mtp.{0,1,2}.*                                                        ← 4705 个张量
+```
+再按"通用 MTP 类的属性名"搜:
+```
+enorm 0  hnorm 0  e_proj 0  h_proj 0  eh_proj 0  shared_head 0  mtp_block 0
+markov 2 (mtp.2.markov_head.*)   confidence 1 (mtp.2.confidence_head.proj.weight)
+```
+`mtp.N` 的子模块清单(非 expert):
+```
+mtp.0: attn.* attn_norm ffn.* ffn_norm hc_attn_{base,fn,scale} hc_ffn_{base,fn,scale} main_norm main_proj
+mtp.1: 同上(无 main_*)
+mtp.2: 同上 + norm + hc_head_{base,fn,scale} + markov_head.{markov_w1,markov_w2} + confidence_head.proj
+```
+而 `nvidia/dspark.py:520-546` 的 `_remap_dspark_name` 恰好就是这张表:
+```python
+head_prefixes = ("norm.", "hc_head_fn", "hc_head_base", "hc_head_scale",
+                 "markov_head.", "confidence_head.")
+if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(head_prefixes):
+    return f"model.{rest}"          # 头部栈与上下文合并器在 model 级
+return f"model.layers.{stage}.{rest}"   # 其余是逐层 decoder block
+```
+⇒ **`mtp.{0,1,2}` = DSpark 的 3 个 block + 头部栈;checkpoint 里 MTP 权重数为 0。**
+
+### (c) 因此 `KeyError: 'model.layers.43.mtp_block.main_norm.weight'` 的机理
+`nvidia/mtp.py:386-401` 无条件把 `mtp.{i}.` 改写成 `model.layers.{43+i}.`,
+`_rewrite_spec_layer_name` 再补 `.mtp_block.` —— 于是 `mtp.0.main_norm.weight`
+变成 `model.layers.43.mtp_block.main_norm.weight`。**MTP 模块里没有 `main_norm`
+(`DeepSeekV4MultiTokenPredictorLayer` 只有 enorm/hnorm/e_proj/h_proj/hc_head_*/shared_head/mtp_block),
+而 checkpoint 里也没有 enorm/hnorm/e_proj/h_proj ⇒ 名字映射无论怎么写都救不了,
+因为权重不存在。** §252 的"方案 A 改名映射"是死路。
+
+### (d) 参考生产用的是 **dspark**,而且草稿权重"就在目标 checkpoint 里"
+`/home/user/lvllm/process_data/scripts/dsv4.sh` = **本机 lk 生产启动脚本**,逐字:
+```
+LVLLM_MOE_NUMA_ENABLED=1 LK_THREADS=48 OMP_NUM_THREADS=1 LK_THREAD_BINDING=CPU_CORE \
+LVLLM_GPU_PREFETCH_WINDOW=1 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024 LK_POWER_SAVING=1 \
+vllm serve <ckpt> --tensor-parallel-size 2 --max-model-len 1048576 \
+  --gpu-memory-utilization 0.80 --trust-remote-code \
+  --compilation_config.cudagraph_mode FULL_DECODE_ONLY \
+  --enable-prefix-caching --enable-chunked-prefill --max-num-batched-tokens 8192 \
+  --dtype bfloat16 --max-num-seqs 2 --enable-auto-tool-choice \
+  --kv-cache-dtype fp8_ds_mla --tokenizer-mode deepseek_v4 \
+  --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4 \
+  --default-chat-template-kwargs '{"enable_thinking": true}' \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' \
+  --disable-custom-all-reduce
+```
+**注意:`--speculative-config` 里没有 `model` 键。** 主线对此的处理
+(`vllm/config/speculative.py:1129-1136`)正是:"DeepSeek DSpark can ship the weights
+inside the target checkpoint" ⇒ `self.model = target_model_config.model`,并把
+draft 的 architecture 强制成 `DSparkDraftModel`(`spec.py:1391-1398`)。
+⇒ **草稿 = 同一份 checkpoint 里的 `mtp.0/1/2` 三个 block(不是整模型拷贝)**;
+这解释了此前观察到的"46 unique layers"(43 目标 + 3 草稿),先前"整模型拷贝"是过度推断。
+
+### (e) ⚠️ 本机 lk 生产里**没有** `LVLLM_GPU_RESIDENT_MOE_LAYERS`
+`dsv4.sh` 的 env 只有 NUMA/THREADS/BINDING/PREFETCH_WINDOW/PREFILL_MIN_BATCH/POWER_SAVING。
+`LVLLM_GPU_RESIDENT_MOE_LAYERS="0-13,43-45"` 是**目标文本里 PRO 6000 那台**的做法。
+⇒ 用户在本机量到的 单流30/聚合70/(带draft)50 是**全部 43 层走 CPU MoE** 拿到的,
+⇒ **差距不在"常驻专家层",而在下面这四条编排差异**(逐条对照我方 `serve_prod_8070.sh`):
+
+| 旋钮 | lk 本机生产 `dsv4.sh` | 我方 `serve_prod_8070.sh MODE=1m` | 备注 |
+|---|---|---|---|
+| cudagraph | **`FULL_DECODE_ONLY`** | **`EAGER=1`(enforce-eager)** | 我方脚本自注:"CUDA graph 下草稿捕获会崩 ⇒ 强制 eager,单路延迟 +43%" |
+| spec | dspark5 probabilistic,**无 model 键** | dspark4,**带 `"model": CKPT`** | 前者草稿=3 block;后者路径未验证 |
+| prefix caching | `--enable-prefix-caching` | `--no-enable-prefix-caching`(tune_serve 写死) | 影响预填充/TTFT |
+| chunked prefill | `--enable-chunked-prefill` | 未传 | 影响预填充/长请求 |
+| custom all-reduce | **`--disable-custom-all-reduce`** | 未传(实测走 CUSTOM+PYNCCL) | 2 rank PCIe |
+| threads | `LK_THREADS=48`(每卡) + `OMP_NUM_THREADS=1` + `LK_THREAD_BINDING=CPU_CORE` | `THREADS=96 OMP=48`(TP2 共 192 线程) | 我方超订 |
+| gpu prefill 阈值 | `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024` | `PREFILL_MIN=384` | 预填充项(已结案) |
+| prefetch window | `LVLLM_GPU_PREFETCH_WINDOW=1` | `XIAOTU_GPU_PREFETCH_AHEAD=1`(默认) | 疑似对应 |
+
+### (f) 本轮据此锁定的**头号嫌疑:`rest` 里的 eager 开销**
+已有量化:`compute` 0.61-1.34 ms/层(CPU MoE 内核,与 lk 同量级),
+`rest` 0.72-1.82 ms/层 —— **`rest` 就是全部差距**。lk 的每层**总**时间 ≈ 0.66-0.78 ms
+(30-35 t/s ÷ 43 层),也就是说 **lk 的"attention+DMA+同步"整段 ≈ 我方 CPU 内核一段**。
+在 `rest` 的候选成分里,`--enforce-eager` 是唯一一个"参考明确关掉、我方明确打开"的。
+⇒ **本轮 E1**:除"EAGER=0 + `FULL_DECODE_ONLY` + dspark 不带 model + `--disable-custom-all-reduce`"
+之外,其余保持我方已知能起的几何(KV 8 GiB / maxlen 262144 / 96+48 线程),
+并开 `XIAOTU_MOE_CD_TIMING=1` 取每层 compute/rest。
+
+### (g) 本轮新得的铁律
+> **铁律 7:比对"参考实现"时,必须先确定"参考实现"指的是哪一棵被 import 的树、
+> 以及它跑的是哪条权重布局;否则会把"命名/布局不匹配"误判成"架构缺失"。**
+> §254 就是因为 grep 范围少了一棵树,得出"需要移植 1400 行"的错误结论。
+
+## 256. 🔑🔑 **真正的参考实现是 conda env 里的 vLLM 2.3.11,不是 `Lvllmds4-x/` 目录** —— 并由此找到 CPU MoE 与 CUDA graph 共存的机制
+
+### (a) 先确认"哪棵树被 import"(铁律 7 的第一次实战)
+```
+$ /home/user/anaconda3/envs/lvllmds4-x/bin/python -c "import vllm;print(vllm.__file__, vllm.__version__)"
+/home/user/anaconda3/envs/lvllmds4-x/lib/python3.12/site-packages/vllm/__init__.py  2.3.11
+```
+⇒ **`Lvllmds4-x/` 只是一份旧的工作副本;lk 生产跑的是 site-packages 里的 vLLM 2.3.11。**
+§253/§254 里"参考的 mtp.py 与主线同构"之类的结论都基于那份旧副本 ⇒ 一律作废。
+本机 lk 生产的完整启动命令是 `process_data/scripts/dsv4.sh`(见 §255(d)),日志在
+`process_data/logs/`。
+
+### (b) 决定性日志:`silent_t120cg_server.log`(v2.3.11)证明 **43 层 CPU MoE + FULL_DECODE_ONLY 是可以共存的**
+```
+'cudagraph_mode': <CUDAGraphMode.FULL_DECODE_ONLY: (2, 0)>, 'cudagraph_capture_sizes': [1,2,4,8,16]
+Initialized lk_moe with 256 experts for layer model.layers.0.ffn.experts [CPU]   ← ×43
+Initialized lk_moe with 256 experts for layer model.layers.42.ffn.experts [CPU]
+Capturing CUDA graphs (decode, FULL): 100%|██████████| 4/4 [00:01<00:00, 3.40it/s]
+Graph capturing finished in 2 secs, took 0.14 GiB
+```
+⇒ **43/43 层专家在 CPU 上,而 graph 捕获成功。** 这就把"CPU 引擎 ⇒ 只能 eager"
+这个我方长期前提直接推翻了。
+
+### (c) 机制:CPU MoE 通过 **`cudaLaunchHostFunc` 宿主回调节点**进入 CUDA graph
+参考 2.3.11 的 `routed_experts.py:1708 _cpu_decode` 与我方旧副本**完全不同**:
+```python
+# 参考 2.3.11(site-packages)
+def _cpu_decode(self, hidden_states, topk_weights, topk_ids):
+    stream_ptr = torch.cuda.current_stream().cuda_stream
+    self.lk_moe.cpu_decode(stream_ptr, hidden_states.size(0), self.top_k,
+                           hidden_states.data_ptr(), topk_ids.data_ptr(),
+                           topk_weights.data_ptr(),
+                           RoutedExperts.output_gpu.data_ptr())   # ← 固定的输出缓冲
+    output = RoutedExperts.output_gpu[:hidden_states.size(0)]
+    ...
+```
+- 整个"GPU→pinned host → **CPU 算** → pinned host→固定 device 缓冲"是**一次 C++ 调用**,
+  内部用 **`cudaMemcpyAsync`(D2H)+ `cudaLaunchHostFunc`(CPU 计算)+ `cudaMemcpyAsync`(H2D)**;
+- 捕获时这三个成为 **graph 节点**;每次 replay 时那个 host 回调**在当次输入上重跑 CPU 计算**;
+- 输出写进**预分配的固定缓冲** `RoutedExperts.output_gpu`(地址稳定);
+- **没有任何 Python 级 `synchronize()` / 动态分配** ⇒ 完全 capture-safe。
+- 分派(`moe_runner.py:561-606`,2.3.11):
+  ```python
+  if is_gpu_resident_layer:            forward_monolithic / forward_modular   # GPU
+  elif torch.cuda.is_current_stream_capturing():  _cpu_decode                  # ← 捕获中
+  elif is_gpu_prefill_layer and should_use_gpu_prefill(...):  _gpu_prefill
+  else:                                _cpu_prefill                            # eager 长 prefill
+  ```
+- 这与我的实测一致:**`synchronize()` 在捕获中必然报
+  `cudaErrorStreamCaptureUnsupported`**(本轮已单独验证),所以"旧副本式"的 `_cpu_decode`
+  绝不可能被捕获 —— 参考是靠 host-func 节点绕开的。
+
+### (d) ⚠️ 我方引擎**已经实现了同一个机制**(不是缺失,是①没被验证、②被错误的结论封存)
+`xiaotu_moe/csrc/python_binding/binding.cpp:47-63, 520-538`:
+```
+// ---- capture-safe cpu_decode (mirrors lk_moe) ----
+// ... async D2H to pinned host, forward_many on CPU inside a cudaLaunchHostFunc
+// node, async H2D back to a stable device buffer ...
+cudaLaunchHostFunc(s, st->host_fn, call);
+cudaMemcpyAsync(st->outg, st->out, st->out_bytes, cudaMemcpyHostToDevice, s);
+```
+`CpuDecodeState` 持持久 pinned 缓冲 + `retired` 列表(捕获期间不 `cudaFreeHost`)。
+插件侧 `hybrid_model.py:973` 确实调用 `self.engine.cpu_decode(stream.cuda_stream, ...)`,
+注释也写着"engine.cpu_decode 内部 D2H->CPU forward_many->H2D"。
+
+⇒ **所以 `--enforce-eager` 的依据("CUDA graph 下草稿捕获会崩")来自 2026-09-03 的
+`process_data/logs/serve_xiaotu_dsv4.log`:**
+```
+torch.AcceleratorError: CUDA error: operation not permitted when stream is capturing
+  (cudaErrorStreamCaptureUnsupported)
+```
+**但那次走的是旧插件路径 `model.py:697 _forward_fused_moe`**(同一调用栈),
+即**在 `cpu_decode`(capture-safe)落地之前**的版本。
+⇒ "CUDA graph 与 DSpark 不兼容 ⇒ enforce-eager" 这条结论**很可能已经过期**,
+它被写进 `docs/PERFORMANCE_OPTIMIZATION.md` §16.2 和 `serve_prod_8070.sh` 的注释后,
+**再没有人重新测过** ⇒ 这就是"单路延迟 +43%"那个自述损失的来源。
+
+### (e) 本轮 E1 就是去证伪这条陈旧结论
+`EAGER=0` + `--compilation_config.cudagraph_mode FULL_DECODE_ONLY` + dspark5(无 model 键)
++ `--disable-custom-all-reduce`,其余保持我方已知能起的几何;
+开 `XIAOTU_MOE_CD_TIMING=1` 取每层 compute/rest。
+- 若捕获成功且每层 `rest` 显著下降 ⇒ **`rest` 的主因就是 eager**,并且"开投机 ≥100 t/s"
+  与"单流 >30"同时具备结构基础(草稿也走同一条 host-func 路径)。
+- 若仍在某处报 `cudaErrorStreamCaptureUnsupported` ⇒ 顺着栈顶找到**唯一**残留的
+  Python 级同步点(候选:`h_bf16 = hidden_states.to(...)`、`torch.where`、EP 分支、
+  `_maybe_profile_decode`),把它改成引擎内 host-func 的等价物。
+
+### (f) 本轮新铁律
+> **铁律 8:写过文档的结论会"封存"一项能力。凡是"X 与 Y 不兼容"这类结论,
+> 必须记录它测的是哪个 commit/哪条代码路径;代码路径变了就必须重测。**
+> (本例:结论基于旧 `_forward_fused_moe` 路径,而 capture-safe 的 `cpu_decode`
+> 后来已经落地,结论却仍在生效并持续支付 +43% 的代价。)
+
+## 257. ✅ **"CPU MoE + CUDA graph"在我方引擎里既 capture-safe 又逐位正确** —— 实证,不是推断
+
+§256 只证明了机制**存在**。本轮做了两个**独立的 GPU 级实验**(与 vLLM 解耦,秒级),
+把"能不能用"变成"已验证":
+
+### (a) 捕获回归(已有脚本)`scripts/engine_graph_test.py`
+```
+[eager] ok, out.sum=151276791092677181440.000000
+[capture] ok
+[replay 0] identical=True  max|Δ|=0.000e+00
+[replay 1] identical=True  max|Δ|=0.000e+00
+[PASS] graph capture + 2 replays identical to eager
+```
+⇒ 引擎 binding 的 `cpu_decode` 在 `torch.cuda.graph()` 里**捕获成功**,replay 无 CUDA 错误。
+
+### (b) ⚠️ (a) 对"回调是否重算"**没有区分力** —— 陈旧结果同样会 == eager(输入没变)
+所以本轮新写了 `scripts/engine_graph_replay_inputs_test.py`:**每次 replay 前原地改写
+`hid/ids/wts` 输入缓冲**,再取一次**同输入的 eager 调用**做参考,逐一比对:
+```
+[capture] ok
+[sanity] same-input replay identical=True
+[round 0 seed=100] replay==eager:True  replay==capture-time:False  max|d|=0.000e+00
+[round 1 seed=101] replay==eager:True  replay==capture-time:False  max|d|=0.000e+00
+[round 2 seed=102] replay==eager:True  replay==capture-time:False  max|d|=0.000e+00
+[PASS] host 回调每次 replay 都用当前输入重算 CPU MoE
+```
+⇒ **`cudaLaunchHostFunc` 宿主回调在每次 replay 时都用当次输入重跑 CPU MoE,
+结果与 eager 逐位一致,且不等于捕获时的结果。**
+⇒ `FULL_DECODE_ONLY` + 43 层 CPU 专家**在数值上是安全的**(不是"能跑但会算错")。
+
+### (c) 因此 `--enforce-eager` 的唯一理由已被清除
+| 事实 | 状态 |
+|---|---|
+| 引擎 `cpu_decode` capture-safe(host-func 节点) | ✅ 已实现(binding.cpp:47-63/520-538) |
+| 插件在 CPU 路径调用它(`hybrid_model.py:973`) | ✅ 已接线 |
+| 捕获 + replay 数值正确 | ✅ 本轮两脚本实证 |
+| `--enforce-eager` 的理由(`cudaErrorStreamCaptureUnsupported`) | ❌ **来自 2026-09-03 的旧插件路径 `_forward_fused_moe`**,已过期 |
+⇒ 剩下**唯一**的未知是:整模型 forward 里除了 MoE 之外,是否还有别的 Python 级同步点
+(`h_bf16 = hidden_states.to(...)`、`torch.where`、EP 分支、`_maybe_profile_decode`、
+shared_experts)。本轮 E1(mir1)就是端到端回答它。
+
+## 258. 🎉 **mir1:E1 成功 —— `FULL_DECODE_ONLY` + 43 层 CPU MoE + DSpark 端到端跑起来了**(本项首次)
+
+### (a) 启动事实(此前被认为是"不可能"的组合)
+```
+EAGER=0, --compilation_config.cudagraph_mode FULL_DECODE_ONLY, --disable-custom-all-reduce
+SPEC={"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}   # 无 model 键
+'cudagraph_capture_sizes': [1, 2, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96]
+DSpark draft model loaded: 97 params
+Capturing CUDA graphs (FULL): 100%|██████████| 7/7       ← 含 "Capturing model for DSpark speculator..."
+Graph capturing finished in 5 secs, took 0.41 GiB
+GET /v1/models 200 OK
+```
+⇒ **捕获成功、草稿也捕获成功、服务就绪。**
+`--enforce-eager` 的存在理由(`cudaErrorStreamCaptureUnsupported`,2026-09-03 旧路径)
+在本轮被彻底证伪:capture-safe 的 host-func 路径 + 插件接线已经就位(§256/§257)。
+
+### (b) 实测数字(mir1:TP2 / KV 8 GiB / maxlen 262144 / THREADS=96 / **EP 默认开** / 投机 k=5)
+| 项 | 数值 |
+|---|---|
+| 预填充 8192 | 1027 / 1089 t/s |
+| 预填充 32768 | 1075 t/s |
+| 解码 C=1 单流 | **6.43 t/s**(TPOT 150.62 ms) |
+| 解码 C=2 聚合 | 11.91 t/s |
+| 解码 C=3 聚合 | 12.42 t/s |
+
+### (c) ⚠️ 本轮**不能**据此判定 cudagraph 的收益 —— 三个混淆变量
+1. **投机是开的**(k=5):C=1 时每步 6 个 token,§246(c) 已算出"验证 6 token 要花约 6 倍的钱";
+   所以 6.43 t/s 是"带投机"的数,不能与"无投机 10.76"直接比;
+2. **EP 实际是开的**:`tune_serve.sh` 的 `EP=0` 只控制 `--enable-expert-parallel`,
+   插件自己的 EP 由 `XIAOTU_MOE_EP` 控制且**默认 `"1"`(开)**(`hybrid_model.py:203`)。
+   日志证实:`[xiaotu] EP model.layers.36.ffn: rank 0/2 owns experts [0,128) of 256`。
+   而 10.76 那次基线是哪个 EP 状态**未记录** ⇒ 必须显式写死;
+3. **THREADS=96**(mir1)vs 基线的 120。
+⇒ 所以本轮 E2(`mir2`)的设计是:**只改一个变量** —— 在 mir1 基础上关掉投机、
+把 `XIAOTU_CD_TIMING` 的**变量名写对**(mir1 我误写成 `XIAOTU_MOE_CD_TIMING`,
+正确名是 `XIAOTU_CD_TIMING`,见 `binding.cpp:418`,导致 mir1 没产出分层数据),
+并把线程换成 120。
+
+### (d) 本轮教训(我的错)
+- **`XIAOTU_MOE_CD_TIMING` 不存在** —— 我按"前缀都是 XIAOTU_MOE_"的直觉拼了变量名,
+  而真正读它的地方是 `binding.cpp:418` 的 `XIAOTU_CD_TIMING`。
+  ⇒ **铁律 9:写进启动命令的每个 env 名字,必须先在源码里 grep 到唯一读取点。**
+  (症状很隐蔽:服务正常、数字正常,只是"该有的诊断输出一条都没有"。)
+
+## 259. 第 208 轮量化结果:**cudagraph 只值 +3.7%;瓶颈是"每层 compute 1.05ms + rest 0.79ms"**
+
+### (a) mir2(cudagraph / 无投机 / EP 默认开 / THREADS=120 / OMP=48)端到端
+| 并发 | 单流 t/s | 聚合 t/s | TPOT ms |
+|---|---|---|---|
+| C=1 | **11.16** | 11.16 | 87.07 |
+| C=2 | 10.66 | 21.31 | 90.09 |
+| C=4 | 8.35 | 33.38 | 105.94 |
+| C=8 | 6.62 | **52.98** | 135.77 |
+对照:eager 基线 C=1 = 10.76 t/s(TPOT 90.54)。
+⇒ **`FULL_DECODE_ONLY` 只值 +3.7%(10.76 → 11.16)。**
+⇒ §256(f) 里"eager 是 `rest` 主因"的假设 **被证伪**(见 (b))。
+
+### (b) `XIAOTU_CD_TIMING` 分层(replay 期实测,每个数都是 43 层的均值)
+| qlen | period | **compute** | **rest** |
+|---|---|---|---|
+| 1 | 1.83–1.86 | 1.04–1.07 | **0.78–0.79** |
+| 2 | 2.11–2.30 | 1.28–1.49 | 0.81–0.85 |
+| 8 | 3.06–3.80 | 2.16–2.90 | 0.87–0.92 |
+拟合 ⇒ **`compute ≈ 0.95 + 0.23·qlen`**,**`rest ≈ 0.8(const,与 qlen 基本无关)`**。
+eager 基线曾是 period 1.91–2.43 / compute 0.61–1.34 / rest 0.72–1.82。
+⇒ cudagraph 把 period 从 ~2.16 压到 ~1.85(−14%),**但 `rest` 仍是 0.79,没有塌陷**;
+⇒ **固定项(≈0.95 ms compute + 0.79 ms rest ≈ 1.75 ms/层)才是主导**,
+43 层 ⇒ 75 ms/token ⇒ 13 t/s 量级,与实测 11.16 吻合。
+
+### (c) 🔑 决定性对照:**引擎独立微基准说同一 shape 只要 0.39 ms/层**
+用 `scripts/bench_cpu_engine.py`(真权重、单进程、DEDUP=12、B=1、无 GPU 加载,秒级):
+```
+THREADS   48     60     96    120    168
+B=1     0.51   0.53   0.39   0.39   0.40   ms/层
+B=2     0.85   0.86   0.56   0.52   0.50
+B=6     1.27   1.27   0.80   0.75   0.70
+```
+⇒ **单引擎 B=1 = 0.39 ms/层 ⇒ 43 层 = 16.7 ms ⇒ 理论上限 60 t/s。**
+而**服务内 compute = 1.05 ms/层 = 微基准的 2.7×**。
+⇒ **服务内那 0.66 ms/层 的差额,就是本轮最明确的、尚未解释的浪费。**
+
+### (d) 已排除的三个候选(同样用免加载的微基准)
+| 候选 | 实验 | 结果 |
+|---|---|---|
+| 多实例内存放置 | `NENGINES=43 ROUNDROBIN=0` vs `NENGINES=1` | **0.37 vs 0.39**(无差别)⇒ 排除 |
+| 两进程超订(TP2:240 线程 / 192 核) | 两进程各 `THREADS=120` 并行 | 0.82/0.86 vs 单进程 0.83 ⇒ **排除** |
+| 线程数不足 | THREADS 扫描(上表) | ≥96 即饱和;48 只慢 30% ⇒ 不是主因 |
+⇒ **剩下唯一未被排除的是"43 个引擎轮流调用"本身**:
+```
+NENGINES=43 ROUNDROBIN=1(每层一个引擎,与服务同形)
+REP=43  : B=1 → 2.82 ms/层   (每引擎只被调 1 次 = 冷启动)
+REP=129 : B=1 → 1.20 ms/层
+REP=258 : B=1 → 0.82 ms/层   (每引擎 6 次,仍在下降)
+```
+⇒ 引擎的**每实例持久 scratch**(`moe_v2.hpp:1312-1322` 的 `exp_`/`active_`/`count_`/
+`inst_idx_`/`exp_off_`/`act_scratch_`…)在 43 个实例上被反复"换出" ⇒ 需要一个
+**进程级共享 scratch**(层是串行执行的,现成 `mtx_` 已能保护)才可能把这一项拉回 0.4。
+⇒ 注意 `NumaWorkPool` **已经是进程级共享**的(`moe_v2.hpp:1331-1333`),
+   所以"共享化"这条路在本项目里已有先例。
+
+### (e) 因此本轮之后的两个主攻方向(有量化依据)
+1. **服务内 compute 1.05 → ~0.4**:进程级共享 scratch(§259d);
+2. **rest 0.79 → ?** 必须**先测出它的成分**再动手。mir3 就是为此:
+   开 `XIAOTU_TORCH_PROFILE_DECODE` 拿 kernel 表,并**扫上下文长度**
+   (32 vs 16384 token):若 `rest` 随上下文增长 ⇒ 是注意力内核;
+   若恒定 ⇒ 是 D2H/H2D + host-func 节点派发延迟。
+   (顺带用 C=5 —— 5 不在 capture_sizes 里 —— 验证 graph 是否真的被分派。)
+
+## 260. ⚠️ **torch profiler 与 `FULL_DECODE_ONLY` 互斥** —— 分层诊断只能放在引擎 host 回调里
+
+### (a) 现象
+`mir3 = mir2 + XIAOTU_TORCH_PROFILE_DECODE=/tmp/decprof.json`,启动在
+`compile_or_warm_up_model`(即 graph 捕获)阶段失败:
+```
+Worker failed with error 'CUDA error: operation failed due to a previous error during capture
+  (cudaErrorStreamCaptureInvalidated)'
+```
+日志里紧邻的是 `SyncActivityProfilerHandler.cpp: profiler_start / profiler_stop`。
+
+### (b) 机理
+`hybrid_model.py:248 _maybe_profile_decode()` 在**第一次** MoE forward 时惰性
+`torch.profiler.profile(...).__enter__()`;而第一次 forward 发生在**捕获期**
+(vLLM 的 warmup/capture dummy run)⇒ profiler 启动时的
+`cudaStreamSynchronize/cudaDeviceSynchronize` 落在捕获区内 ⇒ 捕获作废。
+⇒ **不是引擎的问题,是 profiler 的问题。**
+
+### (c) 推广(很重要,以后不要再踩)
+**在 `FULL_DECODE_ONLY` 下,任何在 forward 里做 GPU→CPU 同步的调试开关都会破坏捕获。**
+已知会同步的开关:`XIAOTU_TORCH_PROFILE*`、`XIAOTU_DEBUG_L1`(`.item()`/`.cpu().tolist()`)、
+`XIAOTU_TIMING`(Python `perf_counter` 不破坏捕获,但在 replay 期根本不执行 ⇒ 数值无意义)。
+⇒ **分层时间的唯一可用埋点在 `binding.cpp` 的 host 回调内(`XIAOTU_CD_TIMING`)** ——
+它每次 replay 都真跑,且零同步。这条与铁律 1(结论只在零埋点配置下成立)是同一枚硬币的两面:
+**捕获改变了"哪些埋点还有意义"**。
+
+### (d) 已记入 `TRIED_AND_REVERTED.md`(R101)。
+
+## 261. 🎉🎉 **GPU 常驻专家层第一次真正生效:预填充 8192 = 5263 t/s(4~5 倍),解码 C=1 +16%**
+
+### (a) mir4 配置(相对 mir2 只加两个 env)
+```
+XIAOTU_MOE_GPU_RESIDENT_LAYERS=0-9      # 10 层
+XIAOTU_MOE_RESIDENT_BUDGET_GB=17
+其余同 mir2:EAGER=0 / FULL_DECODE_ONLY / 无投机 / EP 默认开 / THREADS=120 / KV 8 GiB / maxlen 262144
+```
+启动日志逐层确认常驻(每层 1.59 GiB/卡,tp=2 ⇒ experts=128):
+```
+[xiaotu] GPU-resident model.layers.0.ffn: 1.59 GiB on cuda:0 (tp=2, experts=128)
+... 到 model.layers.9.ffn(合计 15.90 GiB / 预算 17.0 GiB)
+```
+
+### (b) 解码对比(同一几何,唯一差别是 10 层常驻)
+| 并发 | mir2(0 层常驻) | **mir4(10 层常驻)** | 变化 |
+|---|---|---|---|
+| C=1 单流 | 11.16 t/s(TPOT 87.07 ms) | **12.97 t/s(TPOT 74.35 ms)** | **+16%** |
+| C=2 聚合 | 21.31 | **23.39** | +10% |
+| C=4 聚合 | 33.38 | **44.44** | **+33%** |
+| C=8 聚合 | 52.98 | **60.80** | **+15%** |
+⇒ **每层常驻化省下 (87.07−74.35)/10 = 1.27 ms/层**(CPU 层约 1.84 ms/层 ⇒ 常驻层约 0.57 ms/层,≈3.2×)。
+⇒ 这是"GPU 常驻专家层"这个旋钮在本项目里**第一次被实测有效**(此前 `ab_resident.txt` 只有预填充口径,
+且当时被判为"上不去/不划算")。
+
+### (c) 🔴🔴 **预填充:8192 = 5263 t/s**(客户端 TTFT 口径)
+```
+len=  8192 TTFT= 1556ms  rate= 5263 t/s
+```
+对照:此前最好成绩(无投机、eager、非常驻)是 1337–1396 t/s;lk 本机生产约 1060@32768。
+⇒ **常驻专家层把预填充抬高 4~5 倍** —— 因为常驻层在 prefill 时**不再流式 H2D 权重**
+(原本每层 1.6 GB 走 PCIe,是 §69 认定的预填充第一瓶颈)。
+**注意:预填充已在第 ~123 轮由用户结案,但 5263 远超目标 1500,应上报。**
+
+### (d) 那次 8192 之后的 500 **不是**池稳定性 bug,是 **CUDA OOM**
+```
+torch.OutOfMemoryError: Tried to allocate 1024.00 MiB. GPU 0 ... 809.50 MiB is free
+  at vllm_xiaotu_moe/gpu_prefill.py:862  w13_t = _kmajor_bytes(_pinned(w13).to(device, non_blocking=True))
+```
+机制:10 层常驻占 15.9 GiB + KV 8 GiB + 非专家权重 ⇒ `--gpu-memory-utilization 0.90`
+只剩 809 MiB,而 GPU-prefill 的 K-major staging 要 1024 MiB ⇒ OOM ⇒ worker 死 ⇒ HTTP 500。
+⇒ **必须把"常驻层数"与"prefill staging 头寸"一起算预算**;这是配置问题,不是引擎缺陷。
+⇒ mir5(= mir4 但常驻 0-7、预算 14 GiB、加 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`)
+   就是按这个预算关系重排的。
+
+### (e) 对"两个目标"的新判断
+- **预填充 ≥1500**:已由常驻层**超额达成**(5263 t/s @8192)——待确认 32768 档与稳定性;
+- **解码单流 ≥30**:常驻层给了 +16%,但每层常数仍是 1.84/0.57 ms,靠常驻层数堆不出 30
+  (43 层全常驻需 68 GiB>40 GB)。⇒ 仍须解决 §259(c) 的"服务内 compute 1.05 vs 微基准 0.39"
+  和 §259(b) 的 `rest` 0.79。
+
+## 262. 【用户第 208 轮新原则】复用顺序:上游 → lvllm → 自研;并据此发现本仓有**两条重复的 DS-V4 集成路径**
+
+用户原话(要点):
+> "只要能参考和复用的功能和代码,按照 vllm upstream, lvllm 的顺序复用,
+> 只有两者都没有的情况下,才允许你按照搜索调研结果自行写代码。"
+> "仔细看看 lvllm 的实现,哪些决定了其不可能被主线接纳?如果没有这个问题,
+> 我们是不是干脆照抄 lvllm 算了?已知那个性能很好,你只要计算核心不比它慢(已经做到了)。"
+
+### (a) 查证结果:lk 的 vLLM 侧集成**只有两个文件**,而且**没有不可上游的架构**
+- `Lvllmds4-x`(=`yhfgyyf/vllm-deepseek-v4-sm89`,**SM80+ 分支,正是 A100 这一代**)
+  工作区里未提交的改动就是 lk 集成本身,内容只有两类:
+  1. `import lk_moe` → `import xiaotu_moe`、`lk_moe.MOE_*` → `xiaotu_moe.MOE_*`
+     (**说明我们的引擎与 lk 的引擎接口完全一致,可直接顶替**);
+  2. `clean_weights_after_loading` 里给 `is_gpu_prefill_layer` 加一条 early-return。
+- 该 README 给出了**同代硬件的基线**(SM80、2×3090、DDR4-3200 16ch):
+  > `Lvllmds4-x-v2.3.9 … 3090 * 2 … Prefill 1060 t/s [input 32768] | Decode 26 t/s | Spec 35~47 t/s`
+  我们的机器(2×A100、DDR5-4800 24ch)目前 C=1 只有 11.16–12.97 t/s。
+- **"不可被主线接纳"的只有一条**:依赖 PyPI 上的二进制包 **`lk_moe`**
+  (`import lk_moe` + 核心文件里按 `LVLLM_*` 环境变量分叉)。上游不会 merge 这个。
+  但**上游愿意接纳这套基础设施**:查到的上游 PR
+  [#56118](https://github.com/vllm-project/vllm/pull/56118)
+  "[MoE] add VLLM_EXPERTS_LOAD_DEVICE=cpu for GPU/CPU mixed expert placement"
+  做的正是"专家权重建在 host + 选 CPU 后端 + 跳过 AMX 重打包",
+  并**明确把真正的计算留给外部引擎**:
+  > "the CPU backend is an out-of-tree engine that consumes the raw
+  > `[E, 2I, H//2]` / `[E, H, I//2]` uint8 weights and raw e8m0 scales directly,
+  > so skip the AMX prepack."
+  —— 这段描述的就是 `xiaotu_moe` 的 ABI。
+⇒ **结论:正确形态 = 上游的槽位(PR #56118 / 我们的 `mainline_shims`)+ lvllm 的分派
+   (`routed_experts.py`/`moe_runner.py`)+ 我们自己的内核 `xiaotu_moe`。前两者都不该自研。**
+
+### (b) 本仓的重复实现(按新原则必须优先清理)
+| 路径 | 文件 | 性质 |
+|---|---|---|
+| **lk 同构** | `mixed_experts.py` + `mainline_shims.py` | 主线 `RoutedExperts` 不动,`Mxfp4MoeBackend.CPU` → `XiaotuCPUExperts*`,引擎在 `_ensure_engine` 按需构造 |
+| **自研 OOT 覆盖** | `hybrid_model.py`(1078 行) | 把 `DeepseekV4MoE` 换成 `CpuXiaotuMoE` + `ModelRegistry.register_model` 覆盖整个 arch |
+对 DS-V4 **生效的是后者**。而它存在的唯一理由(模块 docstring 自述:
+"主线把 138GB fp4 MoE 在 GPU 上 materialize")**正是上游 1.1 / 我们的 shim 1 已经解决的**。
+⇒ 按 §262(a) 的原则,应优先走 lk 同构路径,并省掉随之而来的全部
+cudagraph / prefix-cache / spec-decode 适配工作。
+
+### (c) 立的开关与本轮验证
+`hybrid_model.py:register()` 新增 `XIAOTU_OOT_OVERRIDE=0`:关掉 OOT 覆盖,
+只留 `mixed_experts` + `mainline_shims` ⇒ 纯 lk 同构路径。
+本轮 `lkpath1` 就是用它启动的(启动日志已确认三条:CPU backends → xiaotu engine /
+shims applied / OOT override DISABLED)。判据:
+1. **能否加载**:主线路径若仍在构造期 materialize 138 GB ⇒ 必须 OOM;
+2. 若能加载,`XiaotuCPUExpertsMxfp4` 是否被真正选中(`_ensure_engine` 日志);
+3. 数值与性能是否与 OOT 路径一致或更好。
+
+## 263. 走"上游槽位 + 我们内核"(lk 同构)路径时踩到的**两个真实缺口**,都已按"复用上游"修好
+
+`lkpath1`/`lkpath2` = `XIAOTU_OOT_OVERRIDE=0`,即**不用**自研 OOT 覆盖,
+让 DS-V4 走主线的 `RoutedExperts` + `XiaotuCPUExpertsMxfp4`。两次都在**权重加载完之后**
+失败,而且都是"主线这条路对 DeepSeek-V4 还不完整"的具体证据 ——
+**这正是自研 OOT 覆盖当初存在的真正原因**(而不是架构性缺陷)。
+
+### 缺口 1:`Mxfp4MoEMethod._setup_kernel` 不接受 CPU 后端(`lkpath1`)
+```
+vllm/model_executor/layers/quantization/mxfp4.py:722  _setup_kernel
+ → fused_moe/oracle/mxfp4.py:1846 convert_weight_to_mxfp4_moe_kernel_format
+ValueError: Unsupported mxfp4_backend for Mxfp4MoEMethod: Mxfp4MoeBackend.CPU.
+            Expected TRTLLM, FlashInfer CUTLASS, Triton, AITER, XPU, or emulation backend.
+```
+**根因**:上游 PR #56118 的第三段改的正是这里(CPU 后端原样返回原始权重、跳过 AMX 重打包),
+而我们 pin 的主线 commit 没有它,`mainline_shims` 也只包了
+`cpu_moe.prepare_mxfp4_moe_layer_for_cpu`(另一个函数),没包这个。
+**修法(复用上游)**:新增 **shim 5** `_install_mxfp4_cpu_convert_shim()`,
+按 PR #56118 的语义对 CPU 后端原样返回 `(w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)`。
+注意 `quantization/mxfp4.py` 是 `from ...oracle.mxfp4 import (...)` 按**名字**导入的,
+所以 oracle 和 quantization **两个模块的绑定都要替换**。
+⇒ `lkpath2` 启动日志确认:`mainline shims applied (17)`(多了这两条绑定)。
+
+### 缺口 2:CPU 后端路由不支持 `sqrtsoftplus`(`lkpath2`)
+```
+mixed_experts.py:232 _select_topk
+ → fused_moe/router/fused_moe_router.py:67 select_experts
+ → router/base_router.py:291 _select_experts
+ → router/fused_topk_router.py:165 _compute_routing → :124 fused_topk
+ValueError: Unsupported scoring function: sqrtsoftplus
+```
+**根因**(两层):
+1. 上游其实**有**支持 `sqrtsoftplus` 的 router:`FusedTopKBiasRouter`
+   (`router/fused_topk_bias_router.py`,处理 bias + sqrtsoftplus + hash 表 + vision bias),
+   这正是**我方 OOT 路径一直在用的** `fused_topk_bias`(见 `hybrid_model.py:863`);
+2. 但 `router_factory.create_fused_moe_router` 的**优先级**是
+   `GroupedTopKRouter(3) → CustomRoutingRouter(4) → **FusedTopKBiasRouter 仅当
+   `e_score_correction_bias is not None`(5)** → FusedTopKRouter(7=兜底)`。
+   DS-V4 的 config **没有** `n_group/topk_group/num_expert_group`(已实测),
+   所以分组分支不走;真正的原因是**`RoutedExperts` 没把 `e_score_correction_bias`
+   暴露成顶层属性**(DS-V4 把它放在 gate 上),于是 factory 兜底选了
+   `FusedTopKRouter`,而它没有 sqrtsoftplus。
+**修法(复用上游)**:
+- `process_weights_after_loading` 里补一段 bias 解析:按
+  `layer.e_score_correction_bias → layer.gate.e_score_correction_bias →
+  layer.gate.bias → layer.router.e_score_correction_bias` 依次找,
+  找到就喂给 factory ⇒ 自动选中上游的 `FusedTopKBiasRouter`;
+- 顺带加一行诊断:`router=<类名> scoring_func=… bias=yes/no grouped=…`;
+- **并把"静默降级成 softmax"改成直接报错** —— 那正是 `docs/UPSTREAM.md` §2.1 记的
+  "会选错专家"的隐患,不该保留。
+
+### 教训
+> **自研覆盖层的存在理由,往往是"上游某个具体缺口"而不是"架构不允许"。
+> 找缺口 → 用上游/PR 的现成改法补上 → 就能把自研层删掉。**
+> (本轮两个缺口都对应 PR #56118 的现成代码;第 3 次启动 `lkpath3` 用来验证。)
+
+## 264. 缺口 2 的真因(第 3 次启动 `lkpath3` 的实测诊断):**我们的后端声明"monolithic",而 DS-V4 是"modular"**
+
+`lkpath3` 仍然失败,但**本轮加的诊断行给出了决定性信息**:
+```
+[vllm-xtu-moe] router=FusedTopKRouter scoring_func=sqrtsoftplus top_k=6 bias=no grouped=False
+```
+⇒ factory 兜底选了不支持 sqrtsoftplus 的 `FusedTopKRouter`,而且**bias 确实找不到**
+(`process_weights_after_loading` 拿到的 `layer` 上,`e_score_correction_bias` /
+`gate.e_score_correction_bias` / `gate.bias` 全都不存在)。
+
+### (a) bias 到底在谁身上(主线源码实证)
+```
+models/deepseek_v4/nvidia/model.py:832   self.gate.e_score_correction_bias = nn.Parameter(...)
+models/deepseek_v4/nvidia/model.py:1000  topk_weights, topk_ids = fused_topk_bias(
+                                             ... e_score_correction_bias=self.gate.e_score_correction_bias.data ...)
+routed_experts.py:83/119                 RoutedExperts.__init__ 收 e_score_correction_bias,但 DS-V4 不传给它
+```
+**⇒ DeepSeek-V4 的 MoE 模块自己就把路由算完了**(用上游的 `fused_topk_bias`,天然支持
+sqrtsoftplus / bias / hash 表 / vision bias),然后把 `topk_weights, topk_ids` 交给 experts。
+这是 **modular(已路由)** 契约。
+
+### (b) 而我们的后端声明的是 monolithic
+`mixed_experts.XiaotuCPUExperts*` 继承 `mk.FusedMoEExpertsMonolithic`(`is_monolithic()=True`),
+于是 vLLM 走 `apply_monolithic`,**传进来的是 `router_logits` 而不是已算好的 topk**
+(`modular_kernel.py:1706 apply_monolithic → :1576 apply → 我们的 apply → _select_topk`),
+逼得我们必须自己重新路由 —— 于是要 bias、于是撞上 sqrtsoftplus。
+
+### (c) 正确修法(仍然是"复用上游",不是自研)
+把 `XiaotuCPUExperts*` 从 **monolithic 改成 modular**:
+- `is_monolithic()` 返回 False;
+- `apply` 改为接收主线已经算好的 `topk_weights/topk_ids`(那正是我们引擎的入参
+  `ids/weights`,比 `router_logits` 更贴合);
+- 路由完全交给上游的 `DeepseekV4MoE.forward + fused_topk_bias`(支持 sqrtsoftplus/bias/hash/vision),
+  **我们不再需要自己找 bias,也不需要 `_select_topk` 的兜底**;
+- 顺带消掉 `docs/UPSTREAM.md` §2.1 那个"硬编码 softmax 会选错专家"的隐患。
+
+### (d) 至此"主线槽位路径"的全部缺口已清点完毕(3 个,全部有明确上游改法)
+| # | 缺口 | 修法 | 状态 |
+|---|---|---|---|
+| 1 | `Mxfp4MoEMethod._setup_kernel` 不接受 CPU 后端 | 复用 PR #56118 第三段 → **shim 5** | ✅ 已修(`lkpath2` 已越过) |
+| 2 | 我们声明 monolithic ⇒ 被迫自己路由 ⇒ sqrtsoftplus 不支持 | 改为 modular,路由交给上游 `fused_topk_bias` | ⏳ 下一步 |
+| 3 | `RoutedExperts` 不持有 bias(它是 DS-V4 模块自己算的) | 由 #2 自动消解(不再需要 bias) | ⏳ 随 #2 |
+⇒ **`hybrid_model.py` 那份 1078 行自研 OOT 覆盖的存在理由,就是这 3 个缺口**;
+补完之后就能整份删掉,改为"上游槽位 + 上游路由 + 我们的内核"。
+
+## 265. 缺口 2 的**真正根因**:DeepSeek-V4 前 3 层是 **hash MoE**,而主线的 monolithic 链路**把 `input_ids` 弄丢了**
+
+### (a) 为什么 `bias=no`(配置 + 源码双证)
+```python
+# models/deepseek_v4/nvidia/model.py:812-835
+is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers     # 本 checkpoint num_hash_layers = 3
+if is_hash_moe:
+    self.gate.tid2eid = nn.Parameter(...)          # ⇒ 0/1/2 层走**查表路由**
+if topk_method == "noaux_tc" and (not is_hash_moe or vision):
+    self.gate.e_score_correction_bias = nn.Parameter(...)   # ⇒ 3..42 层走 bias
+```
+⇒ **前 3 层按设计就没有 `e_score_correction_bias`**,它们靠 `gate.tid2eid[input_ids]` 路由。
+所以我在 `lkpath3` 里看到 `bias=no` 是**预期行为,不是 bug**;第一层当然是 hash 层。
+(hash 路由要用 `fused_topk_bias(input_tokens=input_ids, hash_indices_table=...)`,
+上游 `FusedTopKBiasRouter` 支持,而且 factory 的选择条件是
+`e_score_correction_bias is not None **or** hash_indices_table is not None`。)
+
+### (b) 但 `input_ids` 到不了 experts —— 这是主线上一个**两端都有、中间断了**的缺口
+```
+models/deepseek_v4/nvidia/model.py:1038  self.experts(x, router_logits=x, input_ids=input_ids)
+   → RoutedExperts.forward_monolithic(x, router_logits, input_ids)          ✅ 有
+     → quant_method.apply_monolithic(layer, x, router_logits, input_ids)    ✅ 签名里有
+       → moe_kernel.apply_monolithic(hidden_states, w1, w2, router_logits,
+                                     activation, ..., num_expert_group,
+                                     e_score_correction_bias, routed_scaling_factor,
+                                     topk_group)                            ❌ 没有 input_ids
+         → fused_experts.apply(...)                                        ❌ 永远拿不到
+```
+即:`forward_monolithic` 收下了 `input_ids`,量化方法的 `apply_monolithic` 也声明了
+`input_ids: torch.Tensor | None = None`,**但转发时丢掉了**;而 `modular_kernel.apply_monolithic`
+根本没有这个参数。⇒ **任何 monolithic 后端都无法正确处理 DS-V4 的 hash 层。**
+
+### (c) 本轮的最小修法(shim 6,仍然"不改调用契约")
+在**断点**上把 `input_ids` 暂存到 layer,让 OOT 后端自己去取:
+```python
+# mainline_shims.py: shim 6
+def apply_monolithic(self, layer, x, router_logits, input_ids=None, *a, **kw):
+    if input_ids is not None:
+        layer._xiaotu_input_ids = input_ids
+    return fn(self, layer, x, router_logits, input_ids, *a, **kw)
+```
+对 `FusedMoEMethodBase` 及其所有子类打(共 5 处:`FusedMoEMethodBase` /
+`UnquantizedFusedMoEMethod` / `Fp8MoEMethod` / `GptOssMxfp4MoEMethod` / `Mxfp4MoEMethod`)。
+配套 `mixed_experts.apply` 读 `getattr(self._layer_ref, "_xiaotu_input_ids", None)`
+并传给 `router.select_experts(..., input_ids=...)`。
+⇒ 这样路由仍然**完全交给上游的 `FusedTopKBiasRouter`**(sqrtsoftplus + bias + hash + vision 全支持),
+我们只是把被丢掉的入参补回去。测试:`lkpath4`。
+
+### (d) 顺带把诊断行加全
+`router=<类名> scoring_func=… top_k=… bias=yes/no hash=yes/no vl=yes/no grouped=…`
+—— 一条日志就能判断"上游 router 选对了没有",不必再猜。
+
+### (e) 缺口清单更新(3 个 → 全部有着落)
+| # | 缺口 | 上游改法 | 状态 |
+|---|---|---|---|
+| 1 | `Mxfp4MoEMethod._setup_kernel` 不接受 CPU 后端 | PR #56118 第三段 | ✅ shim 5 |
+| 2 | monolithic 链路丢 `input_ids` ⇒ hash 层无法路由 | 转发 `input_ids`(上游 bug) | ✅ shim 6(本轮) |
+| 3 | factory 选不到 bias router | 只要 #2 修好 + bias/hash 能取到即可 | ✅ 随 #1/#2 消解 |
+
+## 266. ⚠️ 修正 §259(d):"43 引擎轮流调用"的惩罚是**冷启动瞬态**,不是固有成本 —— 它会收敛
+
+把 `NENGINES=43 ROUNDROBIN=1` 的 REP 一路加大(B=1, DEDUP=12, THREADS=120):
+| REP | 每引擎被调用次数 | ms/层 |
+|---|---|---|
+| 43 | 1 | 2.82 |
+| 129 | 3 | 1.20 |
+| 258 | 6 | 0.82 |
+| **516** | **12** | **0.62** |
+| **1032** | **24** | **0.51** |
+| 单引擎重复调用(§259c) | — | **0.39** |
+⇒ **单调下降并逼近单引擎值**。服务的生成过程中每个引擎被调用上百次,
+早已在收敛区内 ⇒ **"服务内 compute 1.05 vs 微基准 0.39"不能用 43 实例解释**。
+(先前我把它列为"头号嫌疑",此处按证据撤回。)
+
+### 修正后的分层账(每层,TP=2 / EP 开 / THREADS=120 / qlen=1)
+```
+引擎核心(同 shape,收敛后,无 EP、无 pinned 拷贝)      ≈ 0.40-0.51 ms   ← 与 lk 内核同量级
+service compute(cpu_decode 包装:EP 双 shm barrier　　   = 1.05 ms
+                + pinned D2H/H2D + host 回调)          ⇒ 包装/EP 约 **+0.55**
+service rest(注意力 + 拷贝 + host 节点派发)            = 0.79 ms
+--------------------------------------------------------------
+每层合计                                                ≈ 1.84 ms  → 43 层 ≈ 79 ms → 11-13 t/s
+lk 每层合计(30-35 t/s ÷ 43)                            ≈ 0.66-0.78 ms
+```
+⇒ **真正的两个缺口是"cpu_decode 包装 + EP 归约(≈0.55)"和"rest(0.79)"**,
+而**不是**计算内核 —— 内核已经同量级。
+⇒ 下一轮可直接做的判定实验:`XIAOTU_MOE_EP=0`(去掉跨 rank 归约,代价是每 rank 冗余算全量专家):
+若 `compute` 从 1.05 掉到 ~0.6,则 EP 归约就是包装开销的主体。
+
+## 267. shim 7:把路由 extras 补挂到 `RoutedExperts`(缺口 #2 最后一环)
+
+### (a) 根因(源码定位)
+```
+fused_moe/layer.py:320-322   create_fused_moe_router(..., hash_indices_table=…,
+                                                     bias_vl=…, image_sentinel_lo=…)
+fused_moe/routed_experts.py:83/119   RoutedExperts.__init__ 只收 e_score_correction_bias
+```
+⇒ 这三样**只**进"跑在 runner 上的那个 router"(modular 路径),**从不落在 `RoutedExperts` 上**。
+而 monolithic 后端要在自己的 `_get_router()` 里自建 router ⇒ `bias=no hash=no vl=no`
+⇒ factory 兜底 `FusedTopKRouter` ⇒ sqrtsoftplus `ValueError`。
+(Hash 层 0-2 的 `e_score_correction_bias` **本来是 None** —— `num_hash_layers=3`,
+`DeepseekV4MoE.__init__` 里 `is_hash_moe` 分支只给 `gate.tid2eid`。所以只看 bias 永远救不了。)
+
+### (b) 修法(shim 7)
+包住 `FusedMoEFactory`,在返回前把 `hash_indices_table`/`bias_vl`/`image_sentinel_lo`
+挂到返回模块树里的 `RoutedExperts` 实例上。**注意按名字导入的问题**:
+`vllm/models/deepseek_v4/nvidia/model.py:34` 是 `from ...fused_moe import (FusedMoEFactory, ...)`,
+所以要扫 `sys.modules` 把所有绑定过原函数的模块一起替换。实测替换到 4 处:
+```
+fused_moe.layer / vllm.model_executor.layers.fused_moe /
+vllm.models.deepseek_v4.nvidia.model / vllm.model_executor.models.deepseek_v2
+```
+⇒ `mainline shims applied (26)`。
+
+### (c) 至此走主线窗口所需的**三个缺口全部有对应修法**
+| # | 缺口 | shim |
+|---|---|---|
+| 1 | `Mxfp4MoEMethod._setup_kernel` 拒绝 CPU 后端 | shim 5 |
+| 2 | monolithic 链路丢 `input_ids`(hash 路由必需) | shim 6 |
+| 3 | hash 表/vision bias 不落在 `RoutedExperts` | shim 7 |
+验证:`lkpath5`。
+
+## 268. `lkpath5`:主线窗口路径**跑通了,但慢 2.6 倍** —— 结论:编排要复用 lvllm,不要硬套主线窗口
+
+### (a) 三个 shim 之后**确实跑通**(这是本轮的主要成果)
+```
+[vllm-xtu-moe] router=FusedTopKBiasRouter scoring_func=sqrtsoftplus hash=yes bias=no vl=no
+[vllm-xtu-moe] xiaotu MOE_MXFP4 engine: E=256 H=4096 I=1024 topk=6 group=1x32 … routing=sqrtsoftplus
+86 个引擎(43 层 × 2 rank)
+Graph capturing finished in 2 secs
+GET /v1/models 200 OK
+```
+⇒ **路由 100% 交给上游**(`FusedTopKBiasRouter` 处理 sqrtsoftplus + hash),
+我们没写一行自定义路由;权重加载也不再 OOM。**架构性目标达成。**
+
+### (b) 但性能大幅倒退
+| 配置 | C=1 单流 | 每层 compute | 每层 rest |
+|---|---|---|---|
+| **mir2(OOT 覆盖 / EP 开 / I=2048)** | **11.16 t/s** | 1.05 ms | 0.79 ms |
+| **lkpath5(主线窗口 / I=1024)** | **4.26 t/s** | **3.5–5.5 ms** | 1.9–3.9 ms |
+`C=2` 聚合也从 21.31 掉到 6.57。
+
+### (c) 为什么(机制)
+主线把 MoE 的 **intermediate 维按 TP 切分**:
+`I=1024 = moe_intermediate_size(2048) / tp_size(2)`,而且**每 rank 持有全部 256 个专家**
+(权重字节数其实一样:256×6.3MB ≈ 128×12.6MB)。
+但 ⇒ 每个 token 的 **6 个专家在两侧 rank 上都要各算一遍**(每个 rank 只有它那半 I),
+再 all-reduce;而我们的 EP 方案是"**专家**切分":每 rank 只算落在自己那 128 个专家上的约 3 个。
+**同样 FLOPs,但主线的切法让"每层的活跃专家数"翻倍、单专家 I 减半**,
+而我们的内核在 `I` 较小时每专家的并行度更低(分块 `inter/64` 从 32 降到 16)
+⇒ 小批量下固定开销占比上升 ⇒ 慢 2.6 倍。
+
+### (d) 结论(与用户第 210 轮的指示一致)
+> 用户:"实在不行的话,我们忽略那个 PR,参考 lvllm 的代码,只要跟现有的 upstream 代码不冲突,
+> 设计思路也不冲突,那么我们就可以基本复用 lvllm 的编排。"
+
+⇒ 主线窗口(monolithic CPU 后端 + 主线 TP 切法)**不是**能拿性能的那条路;
+它能跑、且路由干净,但慢 2.6 倍。**应当复用 lvllm 的编排**(它自己决定专家在 rank 间怎么分、
+自己调度 D2H/CPU/H2D),只要:
+1. 不改上游核心文件(我们用 OOT 覆盖 + shim,已经是这样);
+2. 设计思路不与上游冲突(我们仍然实现上游的 `FusedMoEExperts` 接口、用上游 router)。
+⇒ 即"**保留 OOT 编排(等价 lvllm),但把内核接口与路由对齐上游**"。当前 `hybrid_model.py` 已经是这个形态。
+
+## 269. 【用户第 210 轮指示】draft 层**永远在 GPU**;装不下就禁止 draft 并告警 —— 已实现
+
+用户原话:
+> "draft 层应该永远在 gpu,如果显存放不下,那就禁止 draft model,忽略这个参数,
+>  并给出警告提示信息。"
+> "实在不行的话,我们忽略那个 PR,参考 lvllm 的代码,只要跟现有的 upstream 代码不冲突,
+>  设计思路也不冲突,那么我们就可以基本复用 lvllm 的编排。"
+
+### (a) 改动(`hybrid_model.py`)
+1. **draft 常驻不再依赖 `XIAOTU_MOE_GPU_RESIDENT_LAYERS`**:凡是"同 prefix 第二次构造"
+   的层(即 draft/speculator 副本)默认就常驻,`XIAOTU_MOE_RESIDENT_DRAFT` 默认 `0 → 1`。
+   只有显式设 `=0` 才关,且关掉时打**告警**(说明"CPU draft 会让投机变负",
+   给出实测 7.11 vs 10.76 t/s 并建议去掉 `--speculative-config`)。
+2. **预算先扣 draft**:新增 `reserve_draft_bytes()`。构造顺序是"目标模型在前、draft 在后",
+   不预留的话 `XIAOTU_MOE_RESIDENT_BUDGET_GB` 会被 42 层目标层吃光,draft 只能落回 CPU。
+   现在第一个目标常驻层决预算之前,先按 `draft 层数(默认 3) × 每层字节` 预留出来。
+3. **draft 不受预算限制**(`resident_budget_ok(..., mandatory=True)`):预算只用来限制目标层。
+   draft 只有 3 层 ≈ 4.8 GiB/rank,是"必须项"而不是"可选项"。
+4. **装不下时的告警**:draft 若仍无法常驻,打印明确错误,指示用户
+   **去掉 `--speculative-config`** 或调整预算/常驻层数。
+5. **修掉一个会破坏该策略的 bug**:`resident_already_built()` 原来**只按 prefix 去重**,
+   而 draft 层的 prefix 与目标层完全相同(`model.layers.0` …)⇒ 目标层 0-2 常驻时,
+   draft 的 0-2 会被误判成"已建过"而跳过。改为按 **(prefix, 实例号)** 去重
+   (`_instance_index()`)。
+
+### (b) 关于"忽略那个 PR、复用 lvllm 编排"
+`§268` 已给证据:主线窗口路径(monolithic CPU 后端 + 主线 TP 切法)**跑得通但慢 2.6 倍**
+(C=1 4.26 vs 11.16 t/s,`I=1024` 且每 rank 256 专家)。
+⇒ 按用户这条指示:**保留我们的 OOT 编排(等价 lvllm 的"自己决定专家怎么分、自己调度
+D2H/CPU/H2D"),但同时满足两条约束**:
+1. 不改上游核心文件(我们全程用 OOT 覆盖 + `mainline_shims`,上游合并后 shim 自动失效);
+2. 设计思路不与上游冲突(内核仍实现上游 `FusedMoEExperts` 接口,路由仍用上游 `FusedTopKBiasRouter`)。
+⇒ 即"**lvllm 的编排 + 上游的接口与路由 + 我们自己的内核**"。
+
+### (c) 本轮的判定实验 `specdraft1`
+`OOT 路径 + cudagraph + dspark5 + draft 常驻GPU(新默认) + 目标层 0-6 常驻`
+比较基准:
+- OOT + 投机 + **CPU draft** + eager = **7.11 t/s**(旧)
+- OOT + 无投机 + 10 层常驻 + cudagraph = **12.97 t/s**
+判据:**投机能否首次转正**(>12.97)。
+
+## 270. `specdraft2`:draft 常驻 GPU 后投机**改善但仍为净负**(7.92 < 无投机 12.97)
+
+配置:`OOT 路径 + cudagraph + dspark5 + draft 常驻GPU(新默认,预留 4.78 GiB/rank) + 目标层 0-6 常驻`。
+| 配置 | C=1 单流 | 说明 |
+|---|---|---|
+| 无投机 + 10 层常驻 + cudagraph | **12.97** | §261 |
+| 投机 + **CPU** draft + eager(旧) | 7.11 | §245 |
+| 投机 + **GPU** draft + cudagraph(本次) | **7.92** | TPOT 119.63 ms |
+| C=2 聚合 | 13.04 | |
+⇒ draft 放到 GPU 只把 7.11 → 7.92(**+11%**),**远不足以转正**。
+⇒ **结论:投机亏本的主因不是"draft 在 CPU",而是"验证 6 个 token 时每层成本随 token 数增长"**
+(§246c 的假设成立;每层 compute ≈ 0.95 + 0.23×qlen)。要投机转正,必须先把**每层随 qlen 的
+增量**压下去 —— 这与"单流 12.97 → 30"是同一件事。
+(用户要求"draft 永远在 GPU"已实现并生效:`reserved 4.78 GiB for 3 GPU-resident draft layer(s)`。)

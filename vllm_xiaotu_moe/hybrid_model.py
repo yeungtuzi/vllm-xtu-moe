@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 
@@ -90,7 +91,15 @@ def _resident_state() -> dict:
     return st
 
 
-def resident_already_built(prefix: str) -> bool:
+def _instance_index(prefix: str) -> int:
+    """同一 prefix 的第几次构造(0 = 目标模型,>=1 = draft/speculator 副本)。"""
+    st = _resident_state()
+    n = st["seen"].get(prefix, 0)
+    st["seen"][prefix] = n + 1
+    return n
+
+
+def resident_already_built(prefix: str, instance: int = 0) -> bool:
     """这个 prefix 的常驻槽位是否已经建过(进程级)。
 
     插件模块被复制成两份时会各自调用一次 `finalize_mega_moe_weights`,同一个层就会
@@ -99,23 +108,76 @@ def resident_already_built(prefix: str) -> bool:
     """
     st = _resident_state()
     keys = st.setdefault("built", set())
-    if prefix in keys:
+    # 必须带实例号:目标层与 draft 层的 prefix 相同(都叫 model.layers.0…),
+    # 只按 prefix 去重会把 draft 的常驻槽位误判成"已建过"而跳过它。
+    key = f"{prefix}#{instance}"
+    if key in keys:
         return True
-    keys.add(prefix)
+    keys.add(key)
     return False
 
 
-def resident_budget_ok(nbytes: int) -> bool:
+def _spec_decode_requested() -> bool:
+    """是否请求了投机解码(仅用于"预留 draft 常驻额度"这一件事)。
+
+    在层构造期拿不到 `vllm_config`,而 `--speculative-config` 一定在 `sys.argv` 里,
+    所以直接看命令行;也允许用 `XIAOTU_SPEC_DECODE=0/1` 显式覆盖。
+    """
+    flag = os.environ.get("XIAOTU_SPEC_DECODE")
+    if flag == "1":
+        return True
+    if flag == "0":
+        return False
+    return any("speculative" in a for a in sys.argv)
+
+
+def _draft_layer_count() -> int:
+    """DSpark 起草块的层数(本 checkpoint 是 `mtp.0/1/2` ⇒ 3)。"""
+    try:
+        return max(1, int(os.environ.get("XIAOTU_DRAFT_LAYERS", "3")))
+    except ValueError:
+        return 3
+
+
+def reserve_draft_bytes(per_layer_bytes: int) -> None:
+    """把 draft 层要占的显存**先从预算里预留出来**(只做一次)。
+
+    构造顺序是"目标模型在前、draft 在后"(`LLMBaseProposer.load_model()`),若不预留,
+    `XIAOTU_MOE_RESIDENT_BUDGET_GB` 会被 42 层目标层吃光,draft 只能落回 CPU ——
+    而实测 draft 走 CPU 时投机是**净负**的(7.11 vs 不开投机 10.76 t/s,见 NOTES §245)。
+    因此按用户要求:**draft 永远在 GPU**,预算先扣掉它的份额。
+    """
+    st = _resident_state()
+    if st.get("draft_reserved"):
+        return
+    st["draft_reserved"] = True
+    if not _spec_decode_requested():
+        st["reserved_bytes"] = 0
+        return
+    st["reserved_bytes"] = per_layer_bytes * _draft_layer_count()
+    print(
+        f"[xiaotu] reserved {st['reserved_bytes'] / 2**30:.2f} GiB for "
+        f"{_draft_layer_count()} GPU-resident draft layer(s)",
+        flush=True,
+    )
+
+
+def resident_budget_ok(nbytes: int, mandatory: bool = False) -> bool:
     """本次常驻是否还在显存预算内(`XIAOTU_MOE_RESIDENT_BUDGET_GB`,0=不限)。
 
-    这是控制常驻层数的**硬旋钮**:比"判断哪一份是 draft"可靠得多,而且直接对应
-    目标(塞进 40 GiB)。构造顺序上目标模型在前 ⇒ 预算自然优先给目标模型。
+    `XIAOTU_MOE_RESIDENT_BUDGET_GB` 是控制**目标模型**常驻层数的硬旋钮(直接对应
+    "塞进 40 GiB")。`mandatory=True` 表示这是 **draft 层**:按用户要求 draft 永远在
+    GPU,所以不受预算限制(它很小:3 层 ≈ 4.8 GiB/rank),预算是留给目标层的。
     """
     gb = float(os.environ.get("XIAOTU_MOE_RESIDENT_BUDGET_GB", "0") or 0)
+    st = _resident_state()
+    if mandatory:
+        st["used_bytes"] += nbytes
+        return True
     if gb <= 0:
         return True
-    st = _resident_state()
-    if st["used_bytes"] + nbytes > int(gb * (1 << 30)):
+    reserved = int(st.get("reserved_bytes", 0))
+    if st["used_bytes"] + reserved + nbytes > int(gb * (1 << 30)):
         return False
     st["used_bytes"] += nbytes
     return True
@@ -210,6 +272,21 @@ _PREBUILD_STARTED = False
 _PROF_STATE: dict = {"prof": None, "calls": 0}
 
 
+def _capture_guard() -> bool:
+    """True while vLLM is capturing a CUDA graph.
+
+    Every debug/profiling helper must bail out here: anything that synchronizes
+    the stream (``torch.profiler.__enter__``, ``.item()``, ``.cpu()``) inside a
+    capture region raises ``cudaErrorStreamCaptureUnsupported`` and invalidates
+    the whole capture, which aborts engine startup. Costing a 13-minute reload to
+    learn that is not worth it (TRIED_AND_REVERTED R101).
+    """
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _maybe_profile() -> None:
     """Env-gated torch profiler around the first N GPU-prefill layers.
 
@@ -221,6 +298,8 @@ def _maybe_profile() -> None:
     """
     path = os.environ.get("XIAOTU_TORCH_PROFILE")
     if not path:
+        return
+    if _capture_guard():
         return
     st = _PROF_STATE
     if st["prof"] is None:
@@ -254,6 +333,8 @@ def _maybe_profile_decode() -> None:
     """
     path = os.environ.get("XIAOTU_TORCH_PROFILE_DECODE")
     if not path:
+        return
+    if _capture_guard():          # 捕获期启动 profiler 会作废捕获(见 R101)
         return
     st = _PROF_DEC
     if st["prof"] is None:
@@ -513,17 +594,32 @@ class CpuXiaotuMoE(nn.Module):
         self._slot = None
         self._slot_device = None
         # ---- GPU 常驻层(见 gpu_resident_layers()) ----
+        self._is_draft = False
         try:
-            self._gpu_resident = extract_layer_index(prefix) in gpu_resident_layers()
-            if self._gpu_resident and _is_duplicate_model_instance(prefix):
-                # 同一 prefix 第二次出现 = **draft/speculator 模型**(vLLM 先建目标模型,
-                # 再由 LLMBaseProposer.load_model() 建起草模型,两者层名相同)。
-                # draft 的专家权重**不需要**常驻:它只用于起草,常驻会把显存占用翻倍
-                # (实测 tp2resE:6 层每卡 3.2 GiB/层,其中一半是 draft 副本) ⇒ 常驻层数
-                # 上不去、预填充降不下来。用 XIAOTU_MOE_RESIDENT_DRAFT=1 恢复旧行为。
-                self._gpu_resident = os.environ.get("XIAOTU_MOE_RESIDENT_DRAFT", "0") == "1"
-                print(f"[xiaotu] resident skip (draft/speculator copy): {prefix} "
-                      f"-> gpu_resident={self._gpu_resident}", flush=True)
+            _li = extract_layer_index(prefix)
+            # 每个 prefix 恰好登记一次(目标模型先构造,draft 后构造)。
+            self._resident_instance = _instance_index(prefix)
+            _dup = self._resident_instance > 0
+            if _dup:
+                # 同一 prefix 第二次出现 = **draft/speculator 模型**。
+                # 【用户要求·第 210 轮】draft 层**永远在 GPU**:它只有几层,而且实测
+                # draft 走 CPU 时投机是净负的(7.11 vs 10.76 t/s)。因此它的常驻
+                # **不依赖** `XIAOTU_MOE_GPU_RESIDENT_LAYERS`,默认就开;只有显式
+                # `XIAOTU_MOE_RESIDENT_DRAFT=0` 才关(关掉时会告警,因为那会让投机变负)。
+                self._is_draft = True
+                self._gpu_resident = (
+                    os.environ.get("XIAOTU_MOE_RESIDENT_DRAFT", "1") != "0"
+                )
+                if not self._gpu_resident:
+                    print(
+                        f"[xiaotu] WARNING: draft layer {prefix} forced onto CPU by "
+                        f"XIAOTU_MOE_RESIDENT_DRAFT=0. Speculative decoding is "
+                        f"net-negative with a CPU draft (measured 7.11 vs 10.76 t/s); "
+                        f"drop --speculative-config or unset that variable.",
+                        flush=True,
+                    )
+            else:
+                self._gpu_resident = _li in gpu_resident_layers()
         except Exception:
             self._gpu_resident = False
         self._resident_slot = None
@@ -587,23 +683,43 @@ class CpuXiaotuMoE(nn.Module):
         if self._gpu_resident:
             # 【幂等 + 预算】常驻层不设 self.engine,这个钩子可能被调用两次(同一进程
             # 里插件模块被复制成两份时尤其明显)⇒ 必须自己防重复分配,否则显存翻倍。
-            if self._resident_slot is not None or resident_already_built(self.prefix):
+            if self._resident_slot is not None or resident_already_built(
+                self.prefix, getattr(self, "_resident_instance", 0)
+            ):
                 return
             _nb = self._resident_bytes()
             if _nb <= 0:   # 形状取不到时的兜底估计(打包 fp4 ≈ 12.6MB/专家 + 尺度)
                 _nb = int(13.5e6 * max(1, int(self._ep_local)))
+            if not self._is_draft:
+                # 目标层第一个决预算之前,先把 draft 的份额扣掉(用户要求:
+                # draft 永远在 GPU;预算只用来限制目标层)。
+                reserve_draft_bytes(_nb)
             _gb = float(os.environ.get("XIAOTU_MOE_RESIDENT_BUDGET_GB", "0") or 0)
             _st = _resident_state()
             print(f"[xiaotu] resident try {self.prefix}: {_nb/2**30:.2f} GiB, "
-                  f"used={_st['used_bytes']/2**30:.2f}, budget={_gb:.1f} GiB", flush=True)
-            if resident_budget_ok(_nb):
+                  f"used={_st['used_bytes']/2**30:.2f}, "
+                  f"reserved={_st.get('reserved_bytes', 0)/2**30:.2f}, "
+                  f"budget={_gb:.1f} GiB"
+                  f"{' [draft, mandatory]' if self._is_draft else ''}", flush=True)
+            if resident_budget_ok(_nb, mandatory=self._is_draft):
                 self._build_resident_slot()
                 return
+            if self._is_draft:
+                # draft 是 mandatory ⇒ 正常不会走到这里;真走到了说明显存彻底不够。
+                print(
+                    f"[xiaotu] ERROR: draft layer {self.prefix} could not be made "
+                    f"GPU-resident. Speculative decoding is net-negative with a CPU "
+                    f"draft (measured 7.11 vs 10.76 t/s). DISABLE it: drop "
+                    f"--speculative-config, or lower XIAOTU_MOE_GPU_RESIDENT_LAYERS / "
+                    f"raise XIAOTU_MOE_RESIDENT_BUDGET_GB.",
+                    flush=True,
+                )
+            else:
+                print(f"[xiaotu] resident budget exhausted -> {self.prefix} stays on CPU",
+                      flush=True)
             # 预算用尽 ⇒ 本层当普通 CPU 层:继续往下把 CPU 引擎建起来,否则前向会
             # 因为 engine=None 而静默返回输入(算错)。
             self._gpu_resident = False
-            print(f"[xiaotu] resident budget exhausted -> {self.prefix} stays on CPU",
-                  flush=True)
         # ---- 线程池自旋窗口(重要) -------------------------------------------
         # 引擎 worker 在两次调用之间自旋 spin_idle_us 等下一次任务,引擎默认 5 ms。
         # 但解码步里相邻两次调用只隔 ~2-4 ms ⇒ 192 个 worker 在整个解码期间几乎
@@ -937,7 +1053,7 @@ class CpuXiaotuMoE(nn.Module):
             _maybe_profile()
             if self.shared_experts is not None:
                 gpu_out = gpu_out + self.shared_experts(hidden_states)
-            if os.environ.get("XIAOTU_DEBUG_L1") == "1":
+            if os.environ.get("XIAOTU_DEBUG_L1") == "1" and not _capture_guard():
                 print(
                     f"[dbg] {self.prefix} GPU-prefill qlen={qlen} tp={tp} "
                     f"out_mean={gpu_out.abs().mean().item():.3e}",
@@ -1005,7 +1121,7 @@ class CpuXiaotuMoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states
             )
-        if os.environ.get("XIAOTU_DEBUG_L1") == "1":
+        if os.environ.get("XIAOTU_DEBUG_L1") == "1" and not _capture_guard():
             nz = (final_hidden_states != 0).sum().item()
             nn = final_hidden_states.numel()
             fn = (final_hidden_states != final_hidden_states).sum().item()  # NaN
@@ -1037,7 +1153,22 @@ class HybridDeepseekV4ForCausalLM(dv4_nvidia.DeepseekV4ForCausalLM):
 
 
 def register():
-    """vllm.general_plugins 入口:OOT 覆盖 DS-V4 arch(主线零改动)。"""
+    """vllm.general_plugins 入口:OOT 覆盖 DS-V4 arch(主线零改动)。
+
+    可用 `XIAOTU_OOT_OVERRIDE=0` 关掉本覆盖,改用 **lk/lvllm 同构**的路径:
+    主线的 `RoutedExperts` 保持不动,由 `mixed_experts.register_mixed_cpu_backend()`
+    把 `Mxfp4MoeBackend.CPU` 指向 `xiaotu_moe` 引擎(等价于上游 PR #56118 的
+    `VLLM_EXPERTS_LOAD_DEVICE=cpu` + CPU 后端)。两条路的数值应一致,但 lk 那条
+    能原生吃下主线的 cudagraph / prefix caching / chunked prefill / spec decode。
+    """
+    if os.environ.get("XIAOTU_OOT_OVERRIDE", "1") == "0":
+        print(
+            "[vllm-xtu-moe] OOT DS-V4 model override DISABLED "
+            "(XIAOTU_OOT_OVERRIDE=0) -> mainline RoutedExperts + xiaotu CPU backend",
+            flush=True,
+        )
+        return None
+
     if not getattr(dv4_nvidia, "_xiaotu_patched", False):
         dv4_nvidia.DeepseekV4MoE = CpuXiaotuMoE
         dv4_nvidia._xiaotu_patched = True  # 幂等

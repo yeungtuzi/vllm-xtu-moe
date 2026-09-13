@@ -428,11 +428,22 @@ C=64/out=256 时 TPOT 是 0.6~1.3 s/路 —— 人机交互上等于卡死。
 ### 16.2 DSpark 跑通(主线 `mtp` 方法不可用,`dspark` 可以)
 
 - `--speculative-config '{"method":"mtp",...}'` 会被主线接受,但**加载草稿权重时崩**
-  (`KeyError: model.layers.43.mtp_block.main_norm.weight` —— 主线把 `mtp.{i}.` 映射成
-  `model.layers.{43+i}.` 后又加了 `.mtp_block.`,而模型参数名里没有它);
+  (`KeyError: model.layers.43.mtp_block.main_norm.weight`,栈顶在主线**原生**实现
+  `vllm/models/deepseek_v4/nvidia/mtp.py:480`)。
+  **第 208 轮结案 —— 这不是引擎缺陷,而是这件 checkpoint 里根本没有 MTP 权重**:
+  `enorm/hnorm/e_proj/h_proj/shared_head/mtp_block` 在 index.json 的 72317 个 key 里
+  出现次数**全为 0**;`mtp.{0,1,2}.*` 是 **DSpark 草稿**(`main_proj/main_norm` +
+  3 个 decoder block + `mtp.2` 上的 `norm/hc_head_*/markov_head/confidence_head`)。
+  ⇒ **`method:"mtp"` 永久放弃**,不要再尝试改名映射或移植。详见
+  `report/tuning/NOTES.md` §255。
 - **`{"method":"dspark", ...}` 可用**:日志 `DSpark draft model loaded: 97 params`,
   与 lk-moe 生产同款(draft block=5,`num_speculative_tokens=4`);
+  **注意 lk 本机生产脚本 `process_data/scripts/dsv4.sh` 的 dspark 配置里没有 `model` 键** ——
+  主线据此自动指向目标 checkpoint 自身(`speculative.py:1129-1136`
+  "DSpark can ship the weights inside the target checkpoint"),草稿就是
+  `mtp.0/1/2` 三个 block,而不是整模型拷贝。
 - **CUDA graph 与 DSpark 不兼容**:捕获期草稿模型会 `aten::new_empty` 失败 ⇒ 用 `--enforce-eager`。
+  (这条是**带 `"model": CKPT` 的配置**下的结论;lk 生产的无-`model` 形态能否捕获,第 208 轮起重新验。)
 
 ### 16.3 实测:投机解码在两种并发下方向相反
 

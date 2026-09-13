@@ -169,6 +169,29 @@ class _XiaotuExpertsMixin:
         for name in _ROUTING_ATTRS:
             if hasattr(layer, name):
                 setattr(self, name, getattr(layer, name))
+        # DeepSeek-V4 routes with `sqrtsoftplus` + a per-expert correction bias;
+        # mainline expresses exactly that as `FusedTopKBiasRouter`
+        # (fused_topk_bias_router.py, which handles the bias, sqrtsoftplus, the
+        # hash table and the vision bias). `router_factory.create_fused_moe_router`
+        # only picks it when `e_score_correction_bias is not None`; otherwise it
+        # falls back to `FusedTopKRouter`, whose `fused_topk` has no sqrtsoftplus
+        # support and raises `ValueError: Unsupported scoring function`.
+        # `RoutedExperts` does not always expose the bias as a top-level attribute
+        # (DeepSeek-V4 keeps it on the gate), so resolve it from the usual owners.
+        if getattr(self, "e_score_correction_bias", None) is None:
+            gate = getattr(layer, "gate", None)
+            for owner, attr in (
+                (layer, "e_score_correction_bias"),
+                (gate, "e_score_correction_bias"),
+                (gate, "bias"),
+                (getattr(layer, "router", None), "e_score_correction_bias"),
+            ):
+                if owner is None:
+                    continue
+                bias = getattr(owner, attr, None)
+                if isinstance(bias, torch.Tensor):
+                    self.e_score_correction_bias = bias
+                    break
         for name in _SWIGLU_ATTRS:
             if hasattr(layer, name):
                 setattr(self, name, getattr(layer, name))
@@ -217,6 +240,16 @@ class _XiaotuExpertsMixin:
             kwargs.setdefault(name, value)
         try:
             self._router = create_fused_moe_router(**kwargs)
+            print(
+                f"[vllm-xtu-moe] router={type(self._router).__name__} "
+                f"scoring_func={self.scoring_func} "
+                f"top_k={self.moe_config.experts_per_token} "
+                f"bias={'yes' if self.e_score_correction_bias is not None else 'no'} "
+                f"hash={'yes' if self._router_extra.get('hash_indices_table') is not None else 'no'} "
+                f"vl={'yes' if self._router_extra.get('bias_vl') is not None else 'no'} "
+                f"grouped={self.use_grouped_topk}",
+                flush=True,
+            )
         except Exception as exc:  # noqa: BLE001
             print(
                 f"[vllm-xtu-moe] router factory failed ({exc}); falling back to "
@@ -226,13 +259,30 @@ class _XiaotuExpertsMixin:
             self._router = False  # sentinel: use the legacy fallback
         return self._router
 
-    def _select_topk(self, hidden_states, router_logits):
+    def _select_topk(self, hidden_states, router_logits, input_ids=None):
         router = self._get_router()
         if router:
             return router.select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 topk_indices_dtype=torch.int32,
+                # DeepSeek-V4's first `num_hash_layers` layers route by table
+                # lookup on the token ids (upstream `fused_topk_bias`); without
+                # this the hash router has nothing to look up. `input_ids` never
+                # reaches fused_experts through the monolithic chain, so shim 6
+                # (mainline_shims) parks it on the layer.
+                input_ids=input_ids,
+            )
+        # `select_experts` only implements softmax/sigmoid. Silently mapping any
+        # other scoring function onto softmax picks the WRONG experts (see
+        # docs/UPSTREAM.md §2.1), so refuse instead of degrading quietly.
+        if self.scoring_func not in ("softmax", "sigmoid"):
+            raise ValueError(
+                f"xiaotu CPU backend has no fallback routing for "
+                f"scoring_func={self.scoring_func!r}; the upstream "
+                f"FusedTopKBiasRouter (router_factory) should have been selected "
+                f"instead — check that e_score_correction_bias reached the router "
+                f"factory."
             )
         return select_experts(
             hidden_states=hidden_states,
@@ -243,10 +293,7 @@ class _XiaotuExpertsMixin:
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
-            scoring_func=(
-                self.scoring_func if self.scoring_func in ("softmax", "sigmoid")
-                else "softmax"
-            ),
+            scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.e_score_correction_bias,
         )
@@ -552,7 +599,9 @@ class _XiaotuExpertsMixin:
             )
         # monolithic apply() 拿不到 input_ids,若模型的路由需要它(hash routing),
         # router 会在这里报错——比静默选错专家好。
-        topk_weights, topk_ids = self._select_topk(hidden_states, router_logits)
+        # shim 6(mainline_shims)把 monolithic 链路丢掉的 input_ids 暂存在 layer 上。
+        _ids = getattr(self._layer_ref, "_xiaotu_input_ids", None)
+        topk_weights, topk_ids = self._select_topk(hidden_states, router_logits, _ids)
 
         # 专家并行(EP):路由给出的是全局 expert id,需要按 expert_map 映射到本
         # rank 的本地 id;映射为 -1 表示该专家不在本 rank,把权重置 0。

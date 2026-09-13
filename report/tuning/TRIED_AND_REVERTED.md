@@ -761,3 +761,33 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
   C=1 单流 6.30 → **7.11 t/s**,与 `EP_SHM=0` 上界(72.5%)一致。
 - **注**:投机仍未转正(7.11 < 不开投机 10.76),原因是**每层固定开销**导致
   "6 个 token 花 6 倍的钱" —— 见 §240(b),那是下一场仗。
+
+## R100. `--speculative-config '{"method":"mtp"}'` —— **不是"引擎不支持",是"checkpoint 里没有 MTP 权重"**(第 208 轮结案)
+- **试过**:`{"method":"mtp","num_speculative_tokens":5}`(带/不带 `model` 键都试),
+  三次启动全部失败,报 `KeyError: 'model.layers.43.mtp_block.main_norm.weight'`,
+  栈顶在 **`vllm/models/deepseek_v4/nvidia/mtp.py:480`**(即主线**原生**的
+  DeepSeek-V4 MTP 实现,**不是**通用 `deepseek_mtp.py`)。
+- **曾经的错判**:由此推断"主线缺 nvidia 专用实现,需要移植 `Lvllmds4-x` 的 1400 行",
+  并写成 §254 的"架构级根因"。**该结论作废**。
+- **真因(权重清单直接证伪)**:把 `model.safetensors.index.json` 的 72317 个 key 全量统计,
+  `enorm/hnorm/e_proj/h_proj/eh_proj/shared_head/mtp_block` 的出现次数**全是 0**;
+  `mtp.{0,1,2}.*` 的 4705 个张量是 **DSpark 草稿**(`main_proj/main_norm` + 3 个
+  decoder block + `mtp.2` 上的 `norm/hc_head_*/markov_head/confidence_head`),
+  与 `nvidia/dspark.py:_remap_dspark_name()` 的表逐条对上。
+  ⇒ **这件 checkpoint 是"带 DSpark 草稿"的版本,不含 MTP 权重。**
+- **处置**:**永久放弃 `method:"mtp"`**,不再尝试改名映射/移植(见 NOTES §255)。
+  原生命中路径 `DeepSeekV4MTP` 就在这里、是好的,只是没有权重喂它。
+- **教训(铁律 7)**:比对参考实现前,必须先确认"参考"是**哪一棵被 import 的树**、
+  跑的是**哪条权重布局**;否则会把"命名/布局不匹配"误判成"架构缺失"。
+
+## R101. `XIAOTU_TORCH_PROFILE_DECODE` + `cudagraph_mode=FULL_DECODE_ONLY`(捕获被作废)
+- **做法**:在一个已经成功的 cudagraph 配置(mir2)上只加
+  `XIAOTU_TORCH_PROFILE_DECODE=/tmp/decprof.json`,想拿 decode 的 kernel 分解。
+- **结果**:启动在 `compile_or_warm_up_model` 失败:
+  `CUDA error: operation failed due to a previous error during capture
+  (cudaErrorStreamCaptureInvalidated)`;日志紧邻 `SyncActivityProfilerHandler profiler_start/stop`。
+- **根因**:`_maybe_profile_decode()` 惰性 `torch.profiler.profile().__enter__()`,而"第一次
+  MoE forward"就发生在**捕获期** ⇒ profiler 启动的同步操作落在捕获区内。
+- **处置**:回退(不加 profiler)。**在 FULL_DECODE_ONLY 下分层诊断只用
+  `XIAOTU_CD_TIMING`(host 回调内,零同步、每次 replay 都跑)。**
+  同理 `XIAOTU_DEBUG_L1` 等含 `.item()`/`.cpu()` 的开关在捕获下都会破坏启动。
