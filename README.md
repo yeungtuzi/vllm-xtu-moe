@@ -6,6 +6,11 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
+> **📌 里程碑(2026-09-13)**:除了本插件路径,仓库里还有一条**把 lvllm 的编排链移植进 vLLM fork**
+> 的路线(同样是我们的 CPU 引擎,但由 lvllm 自己决定专家怎么分/怎么调度)。
+> 两条路线都已实测:**移植路线在两卡 A100-40GB 上跑到解码 C=1 20.29 t/s、预填充 1287 t/s、1M 上下文**。
+> 见 [`docs/MILESTONE_lk_port.md`](docs/MILESTONE_lk_port.md) 与 `report/tuning/NOTES.md` §290-§299。
+
 ---
 
 ## 它解决什么问题
