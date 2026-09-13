@@ -791,3 +791,22 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 - **处置**:回退(不加 profiler)。**在 FULL_DECODE_ONLY 下分层诊断只用
   `XIAOTU_CD_TIMING`(host 回调内,零同步、每次 replay 都跑)。**
   同理 `XIAOTU_DEBUG_L1` 等含 `.item()`/`.cpu()` 的开关在捕获下都会破坏启动。
+
+## R102. TP=1 + `GPU_UTIL=0.90` + 草稿常驻(10.12 GiB)= 预热期 CUDA OOM
+- **做法**:为了"草稿永远在 GPU",把草稿层 43-45 加进 `LVLLM_GPU_RESIDENT_MOE_LAYERS`
+  (TP=1 ⇒ 草稿 10.12 GiB/rank),`GPU_UTIL=0.90`、`MAXLEN=8192`、`EAGER=1`
+  (tag `lkport25spec`)。
+- **结果**:加载与 KV 划分都成功(`Model loading took **20.66 GiB**`= 目标 10.44 + 草稿 10.12,
+  证明草稿确实进了显存;`Available KV cache memory: 5.85 GiB / 15,941 tokens`),
+  随后**预热阶段 OOM**:
+  `torch.OutOfMemoryError: Tried to allocate 2.00 GiB. GPU 0 has 39.49 GiB total, 1.89 GiB free,
+   this process has 37.33 GiB in use` ⇒ `RuntimeError: Engine core initialization failed`.
+- **根因**:`GPU_UTIL` 只约束 **KV cache 划分那一刻**的账;之后 lk 引擎自己还要在 GPU 上分配
+  缓冲(`prepare_decode_buffers`/`_initialize_cuda_graph_buffers`/gpu_prefill staging,实测 ≈5-6 GiB)
+  以及稀疏 MLA 预热的临时显存(≈2-3 GiB)。TP=1 下 `0.90` 没有给这部分留余量。
+- **处置**:①**改为按 TP 估账**(脚本内 `MODEL_EST_GIB=auto` → TP=1:11 / TP=2:7,
+  另加 `LK_BUF_GIB=6`、`WARMUP_GIB=3`、`KV_MIN_GIB=6`),现在 TP=1+util0.90+草稿常驻会被
+  护栏**提前拦下并禁用草稿**(`need 36.12 > budget 35.50`),不再浪费一次 13 分钟加载;
+  ②**回到作者配方的 TP=2 / `GPU_UTIL=0.80`**(草稿只 5.34 GiB/rank),见 `lkport26spec`。
+- **教训**:显存护栏必须把"KV 划分之后才分配的第三方缓冲"算进去;只按
+  `util×显存 − 模型 − 草稿` 估账会低估 8-9 GiB。

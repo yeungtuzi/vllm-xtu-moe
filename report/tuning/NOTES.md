@@ -9706,3 +9706,23 @@ layer model.layers.45.ffn.experts [GPU]
 4. **draft 是否常驻**的取舍:常驻 = 满足硬约束、草稿全程 GPU,代价是 TP=1 约 **10.12 GiB/rank**、
    TP=2 约 **5.34 GiB/rank** 的 KV 预算(1M 上下文下这笔预算很关键);
    可用 `DRAFT_RESIDENT=0` 完全复刻作者配方做 A/B。
+
+### (e) 实测补充:草稿常驻确实进显存,但 TP=1+util0.90 会 OOM(→ R102)
+
+`lkport25spec`(TP=1 / `GPU_UTIL=0.90` / `MAXLEN=8192` / `EAGER=1` / `SPEC=1` / `PREFETCH=2`):
+
+* **层分类**(`routed_experts.process_weights_after_loading` 的日志):
+  ```
+  layer model.layers.43.ffn.experts [GPU]
+  layer model.layers.44.ffn.experts [GPU]
+  layer model.layers.45.ffn.experts [GPU]
+  ```
+  合计 **43×[CPU](目标) + 3×[GPU](草稿)**,正是硬约束要的状态(靠 lk 现成开关达成,未改一行 vLLM 代码)。
+* **显存证据**:`Model loading took **20.66 GiB**`(无草稿时 10.44 GiB)= 目标 10.44 + 草稿 10.12 ✅
+  且走的是 **V2 runner**(`v1/worker/gpu/model_runner.py:292`,dspark 强制 V2)。
+* **但** KV 划分后(`Available KV cache memory: 5.85 GiB`、15,941 tokens)预热阶段
+  **OOM**(要 2.00 GiB,只剩 1.89 GiB)⇒ 见 **R102**。
+* ⇒ 结论:**"草稿常驻"在 TP=1 上要配 `GPU_UTIL≤0.85` 或 `TP=2`**;
+  TP=2 时草稿只要 5.34 GiB/rank,作者配方的 `GPU_UTIL=0.80` 正好够。
+  护栏已按实测改成 TP 感知(`MODEL_EST=auto`→TP1:11/TP2:7,`LK_BUF=6`,`WARMUP=3`,`KV_MIN=6`),
+  现在这种配置会在**启动前**被拦下并给出警告,而不是白等 13 分钟。

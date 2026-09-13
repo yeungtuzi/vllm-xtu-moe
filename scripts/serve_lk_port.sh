@@ -41,8 +41,10 @@ EAGER="${EAGER:-0}"   # 1 = 加 --enforce-eager(避开 lk 的 _cpu_prefill 在�
 PREFETCH="${PREFETCH:-1}"        # GPU 预取窗口;**作者推荐值 1**(README:一般预取 1~2 层)
 RESIDENT="${RESIDENT:-}"         # 额外常驻 GPU 的 MoE 层,如 "0-9";这里只填开关,不改代码
 DRAFT_RESIDENT="${DRAFT_RESIDENT:-1}"  # 1=草稿层强制常驻 GPU(用户硬约束);0=完全复刻作者配方(不设常驻)
-MODEL_EST_GIB="${MODEL_EST_GIB:-12}"  # 目标模型 GPU 占用估值(实测 TP=1 为 10.44 GiB)
-KV_MIN_GIB="${KV_MIN_GIB:-8}"         # 必须留给 KV cache + 激活的最低显存
+MODEL_EST_GIB="${MODEL_EST_GIB:-auto}"  # 目标模型 GPU 占用估值(auto: 按实测 TP=1→11 / TP=2→7)
+LK_BUF_GIB="${LK_BUF_GIB:-6}"           # lk 引擎在 GPU 的缓冲 + decode/gpu_prefill 暂存(实测≈5.3)
+WARMUP_GIB="${WARMUP_GIB:-3}"           # 预热/首次分配的余量(实测 0.90 时因一笔 2 GiB 分配 OOM)
+KV_MIN_GIB="${KV_MIN_GIB:-6}"           # 必须留给 KV cache + 激活的最低显存
 
 OUTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/report/tuning/logs"
 mkdir -p "$OUTDIR"
@@ -143,7 +145,10 @@ if [ "$SPEC_ON" = "1" ]; then
         nvidia-smi --id="$_g" --query-gpu=memory.total --format=csv,noheader,nounits
       done | sort -n | head -1)
     BUDGET_GIB=$(python3 -c "print(f'{$TOTAL_MIB/1024*$GPU_UTIL:.2f}')")
-    NEED_GIB=$(python3 -c "print(f'{$MODEL_EST_GIB+$DRAFT_GIB+$KV_MIN_GIB:.2f}')")
+    M_EST="$MODEL_EST_GIB"
+    [ "$M_EST" = "auto" ] && M_EST=$( [ "$TP" -ge 2 ] && echo 7 || echo 11 )
+    NEED_GIB=$(python3 -c "print(f'{$M_EST+$DRAFT_GIB+$LK_BUF_GIB+$WARMUP_GIB+$KV_MIN_GIB:.2f}')")
+    echo "[lk_port] 估算: 模型 ${M_EST} + 草稿 ${DRAFT_GIB} + lk缓冲 ${LK_BUF_GIB} + 预热 ${WARMUP_GIB} + KV最低 ${KV_MIN_GIB} = ${NEED_GIB} GiB"
     echo "[lk_port] draft=$NMTP 层(层号 $DRAFT_IDS) 需常驻 GPU ≈${DRAFT_GIB} GiB/rank; 预算 ${BUDGET_GIB} GiB, 需要 ≥${NEED_GIB} GiB"
     if python3 -c "import sys; sys.exit(0 if $BUDGET_GIB >= $NEED_GIB else 1)"; then
       RESIDENT="${RESIDENT:+$RESIDENT,}$DRAFT_IDS"
