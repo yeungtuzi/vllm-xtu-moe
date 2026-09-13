@@ -41,6 +41,7 @@ EAGER="${EAGER:-0}"   # 1 = 加 --enforce-eager(避开 lk 的 _cpu_prefill 在�
 PREFETCH="${PREFETCH:-1}"        # GPU 预取窗口;**作者推荐值 1**(README:一般预取 1~2 层)
 RESIDENT="${RESIDENT:-}"         # 额外常驻 GPU 的 MoE 层,如 "0-9";这里只填开关,不改代码
 DRAFT_RESIDENT="${DRAFT_RESIDENT:-1}"  # 1=草稿层强制常驻 GPU(用户硬约束);0=完全复刻作者配方(不设常驻)
+FORCE_DRAFT="${FORCE_DRAFT:-0}"        # 1=跳过显存护栏(明知偏紧仍要开草稿),会打印警告
 MODEL_EST_GIB="${MODEL_EST_GIB:-auto}"  # 目标模型 GPU 占用估值(auto: 按实测 TP=1→11 / TP=2→7)
 LK_BUF_GIB="${LK_BUF_GIB:-6}"           # lk 引擎在 GPU 的缓冲 + decode/gpu_prefill 暂存(实测≈5.3)
 WARMUP_GIB="${WARMUP_GIB:-3}"           # 预热/首次分配的余量(实测 0.90 时因一笔 2 GiB 分配 OOM)
@@ -150,7 +151,11 @@ if [ "$SPEC_ON" = "1" ]; then
     NEED_GIB=$(python3 -c "print(f'{$M_EST+$DRAFT_GIB+$LK_BUF_GIB+$WARMUP_GIB+$KV_MIN_GIB:.2f}')")
     echo "[lk_port] 估算: 模型 ${M_EST} + 草稿 ${DRAFT_GIB} + lk缓冲 ${LK_BUF_GIB} + 预热 ${WARMUP_GIB} + KV最低 ${KV_MIN_GIB} = ${NEED_GIB} GiB"
     echo "[lk_port] draft=$NMTP 层(层号 $DRAFT_IDS) 需常驻 GPU ≈${DRAFT_GIB} GiB/rank; 预算 ${BUDGET_GIB} GiB, 需要 ≥${NEED_GIB} GiB"
-    if python3 -c "import sys; sys.exit(0 if $BUDGET_GIB >= $NEED_GIB else 1)"; then
+    if [ "$FORCE_DRAFT" = "1" ]; then
+      echo "[lk_port] WARNING: FORCE_DRAFT=1 ⇒ 跳过显存护栏(预算 ${BUDGET_GIB} < 估算 ${NEED_GIB});" \
+           "若预热 OOM 请回调 GPU_UTIL 或改 TP=2(实测 TP=1 草稿常驻至少要 util≈0.85 且 KV 会被压到 ~5 GiB)"
+    fi
+    if [ "$FORCE_DRAFT" = "1" ] || python3 -c "import sys; sys.exit(0 if $BUDGET_GIB >= $NEED_GIB else 1)"; then
       RESIDENT="${RESIDENT:+$RESIDENT,}$DRAFT_IDS"
       ARGS+=("${DRAFT_ARGS[@]}")
     else
