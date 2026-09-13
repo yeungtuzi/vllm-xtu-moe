@@ -10185,3 +10185,57 @@ vllm/v1/worker/gpu/spec_decode/speculator.py:83
 1. 参考引擎 + 同配置(**MBT=8192**)的投机 —— 正在跑(`lkref_spec2`):
    若**它也慢到 ~10 t/s**,说明这是 vLLM 侧 + MBT 配置的问题,**与我们的引擎无关**;
 2. 再把 **MBT 降到 256/512** 重测两边 —— 预期投机吞吐跳回 40-90 t/s(与用户记忆的 80-90 一致)。
+
+---
+
+## 302. 【第 213 轮·控制组实测】**投机崩塌不是我们引擎的锅:参考 lk_moe 在 MBT=8192 下更慢(5.18 t/s)**
+
+同机、同配置(TP=2 / util 0.80 / MAXLEN=1M / SEQS=4 / **MBT=8192** / 图 / 草稿常驻 GPU /
+`dspark 5/probabilistic`,即作者推荐命令里的那组参数)、**只换引擎**:
+
+| 配置 | **参考 lk_moe** | **ours** |
+|---|---|---|
+| 不投机 C=1 | 20.48 t/s(TPOT 25.36 ms) | 20.29 t/s(TPOT 37.33 ms) |
+| **投机 C=1** | **5.18 t/s**(TPOT 56.86 ms) | **9.68 t/s**(TPOT 91.94 ms) |
+| 投机 C=2 聚合 | 21.59 | 13.03 |
+| 投机 C=4 聚合 | 26.16 | 13.20 |
+| 投机 vs 自己的不投机 | **0.25×**(崩了 4 倍) | 0.48× |
+
+⇒ **两边的投机都崩**,而且参考引擎更崩 ⇒ **这不是 `xiaotu_moe` 的问题,是 vLLM 的 dspark 路径
+在本配置下被拖垮**。指向 `speculator.py:83`:`self.max_num_tokens = max_num_batched_tokens`
+—— 我们所有投机实测都用 **MBT=8192**,而作者推荐命令里 `--max-num-batched-tokens` 是 **8192**??
+不,作者的 config.yaml 是 **256**。⇒ **验证:MBT=256**(`lkport40spec_mbt256`,带 CD_TIMING)。
+
+## 303. **草稿模型是不是 100% 在 GPU 上算?—— 是**(代码级证据)
+
+DSpark 草稿 = `main_proj`/`main_norm` + **3 个 `DeepseekV4DecoderLayer`**(各有 attn 与
+`DeepseekV4MoE`:256 路由专家 + 共享专家)+ `hc_head_*`/`markov_head`/`confidence_head`。
+
+lk 只会把 **`RoutedExperts`(路由专家)** 这一类模块按"驻留/CPU"分流,其它部分(注意力、norm、
+共享专家、各种 head、embed)都是普通 vLLM 模块,**永远在 GPU**。而路由专家这一块:
+
+1. `envs.py:2272 is_lk_moe_gpu_resident_layer()` —— 我们把草稿层号 43-45 填进
+   `LVLLM_GPU_RESIDENT_MOE_LAYERS` ⇒ 返回 True;
+2. `quantization/mxfp4.py:548` —— `isinstance(layer,RoutedExperts) and not layer.is_gpu_resident_layer`
+   才把 device 设成 `"cpu"`;驻留 ⇒ **权重在 CUDA**;
+3. `RoutedExperts.process_weights_after_loading()`(**`routed_experts.py:1274`**):
+   ```
+   if self.is_gpu_resident_layer:
+       logger.info("... [GPU]"); return          # ← 提前返回
+   ...
+   self._do_process_weights_after_loading()      # ← 只有非驻留层才会走到
+       → _process_mxfp4() → 建 CPU 引擎 + `.cpu()` 拷贝权重
+   ```
+   ⇒ **驻留层既不建 CPU 引擎、也不留 CPU 权重副本**;
+4. 计算走 `forward_monolithic()`(`routed_experts.py:1159`)→ `quant_method.apply_monolithic()`
+   = **vLLM 原生 GPU MXFP4 MoE(MARLIN)**。
+
+日志证据(每次投机启动都有):
+```
+layer model.layers.43.ffn.experts [GPU]
+layer model.layers.44.ffn.experts [GPU]
+layer model.layers.45.ffn.experts [GPU]        (TP=2 时两个 rank 各 3 行)
+Model loading took 11.39 GiB /rank   = 目标 6.22 + 草稿 5.34   ← 草稿专家在显存里
+```
+⇒ **结论:草稿(含注意力、路由专家、共享专家)全部驻留 GPU、全部由 GPU 计算**,
+CPU 上只有目标模型的 43 层专家(那是 lk 的设计)。
