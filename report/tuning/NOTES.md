@@ -9131,3 +9131,60 @@ Initialized lk_moe with 256 experts for layer model.layers.0.ffn.experts [CPU]  
    约定之间的交互,属于"引擎接入"层,不是 vLLM 侧移植的问题;
 3. 在此之前,**性能对比仍应以我们主线 OOT 路径的实测为准**(预填充 5263 t/s @8192、
    C=1 12.97 t/s、C=8 聚合 60.80),因为那是唯一同时具备正确性与速度的配置。
+
+## 279. 🔴🔴 **TP=2 性能/正确性的根因:我们的引擎**没有实现** `lk_moe` 的"引擎内部跨 rank 归约"**
+
+### (a) lk 的契约(逐字来自移植进来的 lk 代码)
+```python
+# routed_experts.py:_process_mxfp4
+num_processes, process_id, gpu_id = self._get_processes_info()   # 非 EP 时 = (tp_size, tp_rank, dev)
+cfg.num_processes = num_processes        # = 2
+cfg.process_id    = process_id           # = rank
+cfg.expert_num    = self.local_num_experts               # = 256
+cfg.intermediate_size = self.intermediate_size_per_partition   # = 2048/2 = **1024**
+...
+self.lk_moe.cpu_prefill(qlen, top_k, ids_ptr, wts_ptr, x_ptr, out_ptr)   # 注意:签名里没有 num_processes
+```
+⇒ 每个 rank 只持有**每个专家的一半 intermediate**(row-parallel 的 w2),所以它算出的
+MoE 输出是**部分和**;**完整输出必须把两个 rank 的部分和相加**,而这件事 lk 交给
+**引擎自己做**(配置里的 `num_processes`/`process_id` 就是给它的)。
+
+### (b) 反编译证据(`lk_moe` 是专有二进制,但符号/字符串可读)
+```
+$ strings -n5 _lk_moe_C_avx512_base.so | grep -xE "cpu_decode|cpu_prefill|num_processes|process_id|expert_num|MOEConfigV2|MOE_MXFP4"
+cpu_decode / cpu_prefill / num_processes / process_id / expert_num / MOEConfigV2 / MOE_MXFP4   ← 全部命中
+$ strings -n6 … | grep -i "shm_open"
+shm_open                                   ← **lk_moe 自己开 POSIX 共享内存做跨进程合并**
+$ strings -n5 … | grep -E "^(LK|LVLLM)_[A-Z_]+$"
+LK_POWER_SAVING / LK_THREADS / LK_THREAD_BINDING
+(源码路径泄漏: csrc/cuda/moe_v2_gpu_memory.cu / moe_v2_gpu_metadata.cu / moe_v2_gpu_prefill.cu)
+```
+⇒ **`lk_moe` 从 `num_processes`/`process_id` 自行建立 `/dev/shm` 归约**,不依赖调用方。
+
+### (c) 我们的引擎**没有这条路**(源码实证)
+```
+$ grep -rn "num_processes|process_id" xiaotu_moe/csrc/
+moe_v2.hpp:47/48     int num_processes = 1; int process_id = 0;     ← 只是两个字段
+binding.cpp:579/580  .def_readwrite("num_processes"/"process_id")   ← 只暴露给 Python
+binding.cpp:121      // 注释:参考实现也是把 num_processes=ep_size 交给引擎内部合并
+```
+归约状态 `EpShmState` **只能**由显式的 **`configure_ep(rank, world, base, stride)`** 建立
+(`binding.cpp:241-268`),而 **lk 的编排链从不调用 `configure_ep`**(那是我们插件自己的 API)。
+⇒ 在 lk 链下,我们的引擎:**不做任何跨 rank 归约**,`num_processes`/`process_id` 被完全忽略。
+
+### (d) 后果(与实测症状对得上)
+1. **正确性**:TP=2 时每层输出只有一半贡献(缺另一 rank 的部分和)。这解释了为什么
+   TP=2 的数(0.08 t/s、请求失败)与 TP=1(1.62 t/s、输出语义正确)表现完全不同;
+2. **性能**:`shm_broadcast 60 秒无可用块` + TPOT 12.8 s 说明有 rank 卡住;在归约缺失的前提下
+   继续谈速度没有意义 —— **先把归约接上,再谈性能**。
+
+### (e) 修法(**复用 lk 的行为,不是自创**)
+让我们的引擎在 `MOEConfigV2.num_processes > 1` 时**自己**建立跨进程归约(对应 `lk_moe` 的
+`shm_open` 做法),而不是要求调用方先调 `configure_ep`:
+* 在 `binding.cpp` 里,构造 `MOE` 时若 `cfg.num_processes > 1`,按
+  `/dev/shm/…_{world}_{rank}` 之类的确定性命名自行 `shm_open` + 映射 + 初始化 header;
+* 归约逻辑**完全复用**现有 `EpShmState` 的那一段(两个自旋 barrier + 部分和相加),
+  它已经写好并被我们的插件在主线路径上验证过(接受率 26%→74.4%);
+* 保留 `configure_ep` 作为显式覆盖(主线插件仍用它,行为不变)。
+构建:`xiaotu-moe/scripts/build_variants.sh`(g++ 多 ISA 变体,分钟级);装进 `lkxtu` 后重测 TP=2。
+⇒ 这是**引擎接入层**的缺口(我们的组件),不是 vLLM 侧移植的问题;vLLM 侧的移植已确认与参考一致。
