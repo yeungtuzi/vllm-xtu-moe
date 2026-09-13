@@ -678,6 +678,17 @@ public:
             if (diag_active()) {
                 shard_cnt_.assign((size_t)nnodes * kShardDiagStride, 0u);
             }
+            // 【第 182 轮·消融 #2,env 控制,**绝不进交付配置**】
+            // 中性堆数组填零,规模与 shard_cnt_ 相同,位置也与它相同(发布窗口之前)。
+            // 目的:复现 POOL_TRACE 对"发布者节奏"的扰动,以判别停顿是否与发布节奏相关。
+            static std::vector<unsigned char> s_ablate_buf;
+            static const bool s_ablate2_on = [] {
+                const char* e = std::getenv("XIAOTU_MOE_ABLATE_HEAPFILL");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (s_ablate2_on) {
+                s_ablate_buf.assign((size_t)nnodes * (size_t)kShardDiagStride, 0u);
+            }
             // 【第 124 轮·真根因修复】下面这些字段原本写在**奇数 store 之前**,
             // 直接违反本文件 :455-471 自己写下的不变式:"先 store 奇数 → 写完全部字段
             // → 再 store 偶数,worker 只接受偶数"。后果:仍在上一代(偶代)的 worker 会在
