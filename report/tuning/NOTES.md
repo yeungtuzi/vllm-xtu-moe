@@ -7866,3 +7866,39 @@ RuntimeError: Engine core initialization failed
 上一轮 `ev2` 的失败是 **M9**(32.22 GiB 未释放就启动)—— 我跳过了 `kill_serve.sh` 的硬校验;
 这一轮加了校验就立刻暴露了**真正的** `mtp` 加载错误。
 ⇒ **"先排除环境噪声,再看真实报错"** —— 否则一个 M9 会把真正的 bug 藏整整一轮。
+
+## 249. **决定性发现**:checkpoint 的 MTP 权重是 `mtp.0.*`,而 vLLM 的 `mtp` 方法要 `model.layers.43.*`
+
+### (a) 免费检查的结果(权重索引)
+```
+总张量 72317 | 含 mtp 的键: **4705**
+   mtp.0.hc_attn_base / mtp.0.hc_ffn_base / mtp.0.attn.attn_sink / mtp.0.attn.wq_a.weight / ...
+model.layers.43.* 的键数: **0**
+```
+⇒ **checkpoint 里 MTP 权重命名是 `mtp.0.*`**(4705 个张量,是一个完整的 MTP 块),**没有** `model.layers.43.*`。
+而 vLLM 的 `method:"mtp"` 期望 `model.layers.43.mtp_block.*` ⇒ **命名不匹配 ⇒ 加载失败**(§248 的那条报错)。
+
+### (b) 但这正好对上插件自己的设计
+插件注释早就写了:"draft = `mtp.0.*`,**插件把 draft 的 3 个子模块映射到层号 43/44/45**"
+—— 这正是参考常驻列表 `43-45` 的含义。
+⇒ **插件是为 `mtp.0.*` 写的;而 vLLM 通用 `mtp` 方法要的是另一套命名** ⇒ 两者不匹配。
+
+### (c) 关键线索:方法可以**不传 draft model**
+`config/speculative.py:636`:
+```python
+if self.method == "mtp" and self.draft_model_config is not None:
+    ...
+```
+⇒ 这个条件本身暗示:**`method:"mtp"` 允许 `draft_model_config is None`** ——
+也就是**用目标模型自带的 MTP 头**(`num_nextn_predict_layers=1`)做起草,**不需要额外的 draft 模型**。
+**而我方 SPEC 一直传了 `model` 路径** ⇒ 才走了"另建一个 draft 模型"的路(并在 `dspark` 下变成整模型拷贝)。
+
+### (d) 下一轮(最便宜、最可能一次中的实验)
+```json
+{"method":"mtp","num_speculative_tokens":5}       ← **不传 model**
+```
+判据:
+1. **能起来**(不再报 `mtp_block` 缺失);
+2. MoE 引擎计数不再是 86/92,而是 **43 + 1**(目标 43 层 + MTP 那一层);
+3. 投机的接受率与单流 tok/s 一起改善(起草从"整模型"变"1 层")。
+若成功 ⇒ **"开投机 ≥100 t/s"与"单流 >30"两个目标同时有了正确的结构。**
