@@ -7731,3 +7731,44 @@ mtpspec_a2.log: 总 MoE 引擎数 = **86**  唯一层数 = 43  每层仍 "2 buil
 ### (c) 备注
 - 这一步**不改任何代码**(复用已有埋点),纯粹读执行计数 —— 正是 §243(d) 立下的规矩;
 - 读完后无论结论如何,都要**在同一条 NOTES 里写清"证实/撤回"**。
+
+## 245. `method:"mtp"` 的实际加载结构:**代码与日志仍有冲突,不宣布结论**
+
+### (a) 代码侧(明确)
+1. 存在**专用 MTP 模型类** `vllm/model_executor/models/deepseek_mtp.py`,
+   它按 `config.num_nextn_predict_layers` 建层:
+   ```python
+   self.num_mtp_layers = config.num_nextn_predict_layers     # :145
+   self.num_moe_layers = self.config.num_nextn_predict_layers # :245
+   ```
+2. `config/speculative.py` 的 `hf_config_override` 对**我们的模型类型确实生效**:
+   ```python
+   if hf_config.model_type == "deepseek_v4":          # ← 我们就是这个
+       hf_config.model_type = "deepseek_mtp"
+       hf_config.update({"n_predict": n_predict,
+                         "architectures": ["DeepSeekV4MTPModel"]})
+   ```
+⇒ 按代码,`method:"mtp"` 应该让 draft 只建 **1 层** MoE。
+
+### (b) 日志侧(mtpspec_a2.log)
+```
+架构/模型类出现次数: CpuXiaotuMoE 4 | DeepSeekV4MTPModel 1 | DeepseekV4ForCausalLM 6
+MoE 引擎 prefix 统计: 86 × "model.layers.N.ffn"   唯一层号 43,每层 "2 built"
+```
+- **`DeepSeekV4MTPModel` 确实被加载了**(说明 override 生效);
+- **但 86 个 MoE 引擎的 prefix 全是 `model.layers.N.ffn`,没有一条带 `mtp`**,
+  且唯一层号 43、每层两遍 ⇒ **看起来仍是"43 层 ×2"**。
+
+### (c) 我**不**宣布结论的理由
+两种解释都还没被排除:
+1. **`DeepSeekV4MTPModel` 自身的层命名就是 `model.layers.N.ffn`**,并且它**比 1 层大**
+   (即 `n_predict` 没被正确读取)⇒ §242 成立;
+2. 那 86 个里有一份是**别的东西**建的第二份完整模型(例如插件/加载器行为),而 MTP 模型
+   只贡献了其中 1 层 ⇒ §242 不成立。
+⇒ 单靠"prefix 计数"分不开这两者。**必须拿到"draft 模型自己声明的层数"**
+   (例如在构建时打印 `num_moe_layers`/`num_mtp_layers`,或列出 draft 实例的层名清单)。
+
+### (d) 下一步(最小、决定性)
+在插件记录 MoE 层构建时**同时打印该层的 prefix 与所属模型实例的层数声明**;
+或直接读 `DeepSeekV4MTPModel.__init__` 里 `num_moe_layers` 的取值(打印一行即可)。
+一行日志即可定案 —— 这也符合 §243(d) 的规矩:**不要再用间接计数去推断执行结构**。
