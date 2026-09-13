@@ -893,23 +893,29 @@ private:
         // NUMA 子集),引擎侧的分片数同步切成 1/world(见 moe_v2.hpp 的 nshard_)。
         // TP=1(world_<=1)时**完全不改变行为**。
         if (world_ > 1 && cores_.size() >= (size_t)world_ * 2) {
-            // 先算出"本 rank 的第一个 NUMA node"(真实 node id),后面要把
-            // worker_node_ / node_present_ 都变成**相对 shard 下标**(0..nshard_-1):
-            // worker 只在 `myn < sharded_call_` 时才去拉 shard 的活,若沿用真实
-            // node id(rank1 = 4..7)就会一个都不拉 ⇒ 分片路径死等(2026-09-13 实测
-            // watchdog:node0/1 pulled=72,node2/3 pulled=0 ⇒ worker 静默死亡)。
-            std::vector<int> nodes;
+            // 【第 212 轮·TP=2 解码】把核表按 rank 过滤成"本 rank 的 NUMA 子集"。
+            // 必须**过滤**而不是"排序后切一段":`cores_` 原本是 slot-major/ccd-minor
+            // (跨所有 CCD 轮流),这样 48 个线程才会铺满本 rank 的所有 node。
+            // 若排序后取连续一段,48 个线程会全压在**最前面 2 个 node** 上,
+            // 而分片调度要求每个 shard(node)都有 worker ⇒ node2/3 没人拉活 ⇒
+            // watchdog 报 `pulled=0` 并死等(2026-09-13 实测两次)。
+            std::vector<int> allnodes;
             for (int cpu : cores_) { auto it = topo_.cpu_node.find(cpu);
-                if (it != topo_.cpu_node.end()) nodes.push_back(it->second); }
-            std::sort(nodes.begin(), nodes.end());
-            nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
-            const size_t nper = nodes.empty() ? 0
-                              : std::max<size_t>(1, nodes.size() / (size_t)world_);
-            rank_node0_ = (int)((size_t)std::max(0, rank_) * nper);
-            std::sort(cores_.begin(), cores_.end());
-            const size_t per = cores_.size() / (size_t)world_;
-            const size_t b = (size_t)std::max(0, rank_) * per;
-            cores_ = std::vector<int>(cores_.begin() + b, cores_.begin() + b + per);
+                if (it != topo_.cpu_node.end()) allnodes.push_back(it->second); }
+            std::sort(allnodes.begin(), allnodes.end());
+            allnodes.erase(std::unique(allnodes.begin(), allnodes.end()), allnodes.end());
+            const int nper = allnodes.empty() ? 1
+                           : std::max(1, (int)allnodes.size() / world_);
+            rank_node0_ = std::max(0, rank_) * nper;
+            std::vector<int> mine;
+            mine.reserve(cores_.size() / (size_t)world_);
+            for (int cpu : cores_) {                       // 保持 slot-major 顺序
+                auto it = topo_.cpu_node.find(cpu);
+                if (it == topo_.cpu_node.end()) continue;
+                const int rel = it->second - rank_node0_;
+                if (rel >= 0 && rel < nper) mine.push_back(cpu);
+            }
+            if (!mine.empty()) cores_ = mine;
         }
         // Record which NUMA nodes at least one worker is pinned to (used to
         // validate node-scoped sharding: every sharded node must have a worker).

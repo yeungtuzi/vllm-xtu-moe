@@ -882,3 +882,18 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
   `world<=1` 时 `rank_node0_=0`,行为与以前逐位相同。第二版见 `lkport35tp2rank2`。
 - **教训**:分片调度里"node 身份"必须与"shard 标签"同口径 —— 一个是物理拓扑、
   一个是任务编号,混用就会静默死锁;引擎自带的 WATCHDOG 打印是这次能 5 分钟定位的关键。
+
+## R106. rank 切分第二版:排序后"切连续一段" ⇒ 线程全压在前 2 个 node,分片仍死等
+- **做法(第二版)**:在 (R105) 相对 node 下标的基础上,把核表 `std::sort` 后取
+  rank 的那一段(`cores_[b : b+per]`)。
+- **结果**:仍然死等,watchdog 一模一样(`node0/1 pulled=72, node2/3 pulled=0`,
+  `abandoned=48`)。
+- **根因**:`cores_` 原本是 **slot-major/ccd-minor**(跨所有 CCD 轮流),排序之后
+  `cores_[0..47]`(= 48 个线程按 `cores_[w % size]` 取)只覆盖**最前面 2 个 NUMA node**;
+  而分片调度要求**每个 shard(node)都有 worker**(`node_present_` 检查只验证"该 node
+  在核表里存在",不验证"真有线程 pin 在上面")⇒ node2/3 的活永远没人拉。
+- **处置(第三版)**:改成**过滤**而非切片 —— 遍历原始 slot-major `cores_`,只保留
+  属于本 rank node 子集的 CPU,保持交错顺序 ⇒ 48 线程铺满本 rank 的 4 个 node
+  (每 node 12 线程)。见 `lkport36tp2rank3`。
+- **教训**:"按 rank 切资源"在**已经做过拓扑交错排序**的核表上,正确操作是过滤,
+  不是排序后切片;否则会破坏交错性,把并行度压到少数 node 上。
