@@ -265,6 +265,25 @@ https://pypi.org/project/lk-moe/     License: Proprietary
 (历史教训见 `TRIED_AND_REVERTED.md` R100:`method:"mtp"` 那条线曾诱使人自己造 ——
 已废止,理由是该 checkpoint 根本没有 MTP 权重,而不是"要自研"。)
 
+### 8.3 【第 211 轮·移植路径(lk port)的合规审计】投机解码全序列的**实际来源**
+
+本轮真正跑起来的是 **lvllm 的编排链 + 我们的引擎**(env `lkxtu`),投机解码**全序列**逐环节
+都来自 vLLM 自己(下表均为**被 import 的那棵树** `lkxtu/lib/python3.12/site-packages/vllm` 中的文件):
+
+| 环节 | 上游文件:行 | 我们做了什么 |
+|---|---|---|
+| 打开投机解码 | `config/speculative.py`(`SpeculativeConfig`) | 只传官方的 `--speculative-config`(脚本里一行字符串) |
+| dspark 形态判定 + 草稿 config | `config/speculative.py:810-820` | 无(自动) |
+| 草稿模型类 | `models/deepseek_v4/nvidia/dspark.py:306` | 无(自动) |
+| 草稿加载/权重映射 | `v1/worker/gpu/spec_decode/dspark/utils.py:36`、`dspark.py:502` | 无(自动) |
+| 起草(proposer) | `v1/worker/gpu/spec_decode/dspark/speculator.py:43 DSparkSpeculator` | 无(自动) |
+| 验证/拒绝采样 | `v1/worker/gpu/spec_decode/rejection_sampler.py` | 无(自动) |
+| 接受率统计 | `v1/spec_decode/metrics.py:120` | 无(自动,直接读日志) |
+| 草稿层放 GPU | lvllm 的 `envs.py:2272` + `quantization/mxfp4.py:548` | **只填 lk 现成环境变量** `LVLLM_GPU_RESIDENT_MOE_LAYERS`(层号由 ckpt config 自动算出) |
+
+⇒ 移植路径下我们新增的代码**只有** `scripts/serve_lk_port.sh` 里的:①从 ckpt config 算草稿层号;
+②显存护栏(不够就禁用 draft + 警告)。二者都是**策略/参数**,不含任何起草、接受、拒绝、验证算法。
+
 ### 8.2 由此推出的一条设计约束(以后照此办理)
 > **凡是 vLLM 已有的"全序列"(投机解码/验证、prefix caching、chunked prefill、调度、
 > KV 管理、EP/DP、cudagraph),我们的插件只允许做两件事:
