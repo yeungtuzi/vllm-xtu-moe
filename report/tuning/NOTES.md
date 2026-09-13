@@ -7818,3 +7818,11 @@ class DeepSeekMultiTokenPredictor:
    若接近 1,则我的假设错。
 2. 那个"第二份完整实例"虽然是死重,但要**确认它不执行**(执行级证据),再决定是否
    从配置上避免它(例如让 draft 只加载 MTP 权重)。
+
+## 247. 第 202 轮:`ev2`(投机 + DEBUG_QLEN + CD_TIMING)启动失败,证据仍缺
+
+- 启动报 `Exception: WorkerProc initialization failed due to an exception`(原因待看具体行);
+- 很可能是**显存未释放**(M9:上一轮 kill 后立即启动)或 `mtp` spec 配置问题;
+- ⇒ **两项待测证据仍然没拿到**(①`[qlen]` 执行级 ②`qlen=1` vs `qlen=6` 的 compute 比);
+- **下一轮第一件事**:先 `scripts/kill_serve.sh`(它会硬校验显存归零),确认三卡 0 MiB 后再启动,
+  并**看清启动报错的原始行**(不要跳过)。
