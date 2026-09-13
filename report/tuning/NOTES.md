@@ -9726,3 +9726,34 @@ layer model.layers.45.ffn.experts [GPU]
   TP=2 时草稿只要 5.34 GiB/rank,作者配方的 `GPU_UTIL=0.80` 正好够。
   护栏已按实测改成 TP 感知(`MODEL_EST=auto`→TP1:11/TP2:7,`LK_BUF=6`,`WARMUP=3`,`KV_MIN=6`),
   现在这种配置会在**启动前**被拦下并给出警告,而不是白等 13 分钟。
+
+---
+
+## 292. 【第 212 轮·目标第 1-2 步】**版本检索与 rebase 审计结论:lk 编排链已经是最新,无需 rebase**
+
+### (a) 检索到的更新(2026-09-13)
+
+| 来源 | 版本/状态 | 与我们的关系 |
+|---|---|---|
+| `Lvllmds4-x`(SM80,我们移植的落点) | `origin/main = a9f97ec09`,本地 = 它 + 我们的移植 commit `faf95dd5b` | **无更新** |
+| `Lvllm`(上游 lk 集成) | `origin/main = ea439b178`(2026-09-10 新增 `RELEASE_NOTES.md` + **官方可移植补丁** `patches/01_lk_moe__3116c5d.patch`,并 rebase 到上游 **`3116c5d`**,含 UVA PLE-offload + Engram TP) | **有更新** ⇒ 必须 diff 后再决定 |
+| `vllm` 主线 | `origin/main = b7e0cdac5d`,我们 mainline fork 的 pin = `6c73b08dec`(2026-09-08) | 主线有前进,但与 lk 编排无关 |
+| `lk_moe`(PyPI,专有引擎) | **2.4.3**(2026-09-10);我们 `lvllmds4-x` env 里是 2.4.2 | 引擎已被我们自己的 `xiaotu_moe` 取代,版本只作行为对照 |
+
+### (b) **关键 diff 结果:三处 lk 集成点逐行相同**(归一化 `lk_moe`↔`xiaotu_moe` 改名后)
+
+方法:把 `Lvllm/main`(最新官方,base `3116c5d`)的三个文件与我们移植后的文件,**只比 lk 相关行**
+(`lk_moe|is_lk_moe|gpu_prefill|prefetch|is_gpu_resident|is_cpu_layer|_cpu_decode|_gpu_prefill|_cpu_prefill|forward_monolithic|forward_modular`),
+排序去重后 diff:
+
+```
+routed_experts.py : 仅 import 行的行尾空格不同,其余 100% 相同
+moe_runner.py     : 完全一致 ✅
+envs.py(lk 段)    : 完全一致 ✅   ← 含 is_lk_moe_mtp_layer / is_lk_moe_gpu_resident_layer 全体
+```
+
+⇒ **结论:lk 的编排链(含 gpu_prefill、prefetch window、常驻层判定、四路派发)我们移植的就是最新版
+(v0.29.0 等价),rebase 到 `3116c5d` 不会给编排链带来任何功能变化。** 新版差异只在:
+①上游 base 版本(与我们无关);②AutoAWQ 的 CPU 常驻支持;③文档/测试。
+⇒ 因此**不做无意义的基座 rebase**(那会把 DS-V4 模型支持从 SM89 fork 挪到主线,风险大收益零),
+只要在**行为上**与最新版对齐即可 —— 已用上面三处 diff 证明对齐。
