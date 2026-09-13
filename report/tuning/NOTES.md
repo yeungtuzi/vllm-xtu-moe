@@ -9870,3 +9870,31 @@ lk 链**从不调用** `prepare_decode_buffers`(它的 `_initialize_cuda_graph_b
 * 想要"投机 + 体面 KV"就上 **TP=2**(作者配方的真正理由):草稿被切成 5.34 GiB/rank,
   KV 13.14 GiB / 194 万 token。
 * 护栏已按此标定:TP=1+草稿会被**提前拦下**(`FORCE_DRAFT=1` 可强行试),不再白等加载。
+
+---
+
+## 295. 🎉🎉 **CUDA 图 = 解码 2.5× 提升:TP=1 从 7.89 → 19.42 t/s**(`lkport30tp1graph`)
+
+配置:`TP=1 / GPU_UTIL=0.87 / MAXLEN=8192 / SEQS=8 / MBT=8192 / MINBATCH=1024 /
+PREFETCH=1 / **EAGER=0(图)** / SPEC=0 / 草稿不常驻`(KV 27,403 tokens;捕获 4 张 decode 图)。
+
+| C | 单流 t/s | 聚合 t/s | TPOT | 对照:EAGER(`lkport22`) | 提升 |
+|---|---|---|---|---|---|
+| 1 | **19.42** | 19.42 | 44.62 ms | 7.89 | **2.46×** |
+| 2 | 15.35 | **30.69** | 55.57 ms | 13.91 | 2.21× |
+| 4 | 9.59 | **38.34** | 83.44 ms | 21.44 | 1.79× |
+| 8 | 5.68 | **45.46** | 140.89 ms | 28.81 | 1.58× |
+
+**换算**:C=1 = 44.62 ms/token ÷ 43 层 = **1.04 ms/层**(EAGER 时是 2.95 ms/层)。
+我们的引擎内核 ≈0.40-0.51 ms/层 ⇒ 内核之外的每层开销从 2.4 ms 压到 **≈0.55 ms**。
+
+**离 lk 还有多远**:lk 参考 C=1 30-35 t/s(=0.67-0.78 ms/层)、C=4 ≈70 t/s。
+⇒ 现在 C=1 差 **1.6-1.8×**,C=4 差 **1.8×**(此前差 4-15×)。
+⇒ 剩下的 0.55 ms/层就是下一段的靶子(D2H/H2D staging、pybind/dispatch、
+`output.to(bf16)`、`nan_to_num`、TP=2 时每层跨 socket barrier)。
+
+**这条结论的复用价值(重要)**:让"图"可用的**前提**是引擎侧那个捕获安全修复
+(`TRIED_AND_REVERTED` R103:引擎构造时预分配 pinned 解码缓冲,捕获期绝不再
+`cudaHostAlloc`)。也就是:**lk 的编排链 + 我们的引擎,终于能跑 vLLM 的
+`FULL_DECODE_ONLY` 图了**——这是移植路径上第一次把 lk 生产配方里的
+`compilation_config.cudagraph_mode: FULL_DECODE_ONLY` 真正用起来。
