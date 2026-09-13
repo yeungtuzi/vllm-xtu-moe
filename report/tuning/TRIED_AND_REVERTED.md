@@ -845,3 +845,15 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
   2. 同时核对 lk 的 `output_gpu`(`(max_num_seqs, hidden)`,**全层共享**)在投机解码下是否越界:
      若目标验证批 = `seqs×(spec+1)`,则它必须按 **token** 数开,而不是序列数;
   3. 改完用 `EAGER=0` 重测(图模式对解码吞吐通常是 1.3-2×,值得修)。
+
+## R104. 【流程教训】不要在模型加载期间跑重型引擎对拍 —— 会把 worker 挤成 OOM 被杀
+- **现象**:`lkport27spec`(TP=2/EAGER=1)已经 `Model loading took 11.39 GiB` 成功、进入预热后,
+  15:53:24 突然 `Worker proc VllmWorker-0 died unexpectedly, shutting down executor`
+  → `RuntimeError: cancelled`(`shm_broadcast.py:701 acquire_read`)→
+  `Engine core initialization failed`。**worker 日志里没有任何 Python 异常/CUDA 报错**(静默死亡)。
+- **根因**:同一时间我在另一个进程里跑 `scripts/test_block23_equiv.py`(真实 MXFP4 层、256 专家、
+  多组对拍 + torch 参考,单进程可吃几十 GB),而两个 rank 各自已把 ≈69 GiB 专家权重放在主机内存里。
+  `/proc/vmstat` 的 `oom_kill` 计数为 **24**(内核 OOM killer 出手过)⇒ worker 被 SIGKILL。
+- **处置/规矩(加到操作纪律)**:模型加载/预热期间**只做轻量工作**(读日志、写文档、git),
+  不要在同一个 box 上跑 `test_block23_equiv.py` / 多引擎对拍 / 大内存基准。
+  真要跑对拍,等 __serve 起来并测完__再跑,或者明确分时。
