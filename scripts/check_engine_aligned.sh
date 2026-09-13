@@ -21,7 +21,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PY:-/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python}"
 # 两项检查需要**不同的 fixture**:对拍要小 npz,bench 要真实模型目录。
 NPZ="${NPZ:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master}"
-NPZ_EQ="${NPZ_EQ:-/home/user/lvllm/xiaotu-moe/scripts/real_layer1_model.npz}"
+NPZ_EQ="${NPZ_EQ:-/home/user/lvllm/vllm-xiaotu-moe/fixtures/real_layer1_model.npz}"
 THRESH="${THRESH:-0.70}"
 REP="${REP:-60}"
 FAIL=0

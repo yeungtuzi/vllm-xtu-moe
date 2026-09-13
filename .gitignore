@@ -33,3 +33,7 @@ report/rd1
 # ---- 调参产物(report/tuning)--------------------------------------
 report/tuning/logs/
 report/tuning/nsys/
+
+# 重复/过时的源码副本与本地大 fixture(2026-09-13 按用户要求归档)
+backup/
+fixtures/*.npz
