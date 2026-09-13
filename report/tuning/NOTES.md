@@ -10364,3 +10364,45 @@ CPU 上只有目标模型的 43 层专家(那是 lk 的设计)。
 * **默认仍可 `SPEC=0`**(自由文本下更稳),但只要任务是**可预测/结构化**的
   (代码、表格、数字、模板化输出),就应该 `SPEC=auto` —— 实测 +22%~64%;
 * 真正的"无投机也要追"的差距在引擎 marshalling(§305(c)):TPOT 37.33 vs 参考 25.36 ms。
+
+---
+
+## 307. 【第 214 轮·性能优化开始】建立"分钟级"马达:三层诊断证据链
+
+### (a) 新工具:`scripts/bench_cd_plumbing.py`(不需要加载模型)
+
+用**真实一层权重**造 N 个引擎(默认 8,可 43),按服务里的方式**轮转**调用
+`cpu_decode`(GPU bf16 输入 → D2H → CPU MoE → H2D fp32 输出),给出 µs/layer 与
+`serial`/`pipe` 两种模式。`ENGINE_MODULE=lk_moe` 可在参考 env 里跑同一份基准。
+
+**实测(43 引擎,qlen=1,真实权重)**:
+
+| 引擎 | ms/pass(43 层) | µs/层 | 引擎自带 CD_TIMING |
+|---|---|---|---|
+| **ours(xiaotu_moe)** | **19.56** | **455** | `period=0.46ms compute=0.41ms(engine=0.41 ep=0.00) rest=0.05ms` |
+| lk_moe 2.4.2(同 harness) | 504 (8 层) | **63,000** | —(参考引擎没有我们的计时) |
+
+* **ours 与线上一致**:harness 0.41-0.46 ms/层 ≈ 服务里 `compute 0.37 + rest 0.05`
+  ⇒ 这个工具**可以代表我们的引擎**做分钟级 A/B ✅
+* **lk_moe 在 harness 里 63 ms/层 = 线上(0.59 ms/层)的 100 倍**,说明参考引擎需要
+  它自己的调用/初始化序列(它的构造会申请 GPU 显存,错误栈里是 `moe_v2_gpu_memory.cu`)
+  ⇒ **不要用这个 harness 给 lk_moe 下结论**;它只用于我们自己的迭代。
+
+### (b) 三层证据链(关键推理)
+
+1. **两个 env 的 vLLM 代码只差 1 个 hunk,而且是 import 行的空白**
+   (`diff -rq` 全树:唯一差异文件 = `routed_experts.py`,逐行 diff 只有 `import lk_moe` 的空格)
+   ⇒ 两次"只换引擎"对照里,**GPU 侧的模型代码完全同源**。
+2. **我们的 marshalling 只有 0.05 ms/层**(harness 实测,43 引擎轮转)
+   ⇒ 服务里 `rest=0.66` **不是拷贝/派发**,而是 **GPU 非 MoE 工作(注意力/dense/norm/路由)**
+   加上"CPU 计算期间 GPU 干等"的那段。
+3. 参考引擎的总成本 **0.59 ms/层**,比我们"引擎(0.37-0.41)+ 纯 marshalling(0.05)"之和还小
+   ⇒ 参考要么 GPU 侧更快,要么**把 CPU 计算与 GPU 工作重叠**了(它的 `moe_v2_gpu_memory.cu`
+   说明它内部有 GPU 显存管理/搬运,很可能做了 staging 与计算的重叠)。
+   **这就是下一步要打的靶子**(优化手段 1/3:第二流 + event / 常驻线程)。
+
+### (c) 本轮正在跑:常驻层分解(`lkport42resident10`)
+
+`SPEC=0 / MBT=256 / RESIDENT=0-9`(10 层常驻 GPU,TP=2 ⇒ 16 GiB/rank):
+用 TPOT 的斜率分离"一层 CPU 专家"与"一层 GPU 常驻"的真实成本差
+⇒ 直接量化"每加一层常驻能省多少 ms/token",同时给出"CPU 路径相对 GPU 路径的净开销"。
