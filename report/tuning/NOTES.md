@@ -9900,3 +9900,45 @@ PREFETCH=1 / **EAGER=0(图)** / SPEC=0 / 草稿不常驻`(KV 27,403 tokens;捕�
 `cudaHostAlloc`)。也就是:**lk 的编排链 + 我们的引擎,终于能跑 vLLM 的
 `FULL_DECODE_ONLY` 图了**——这是移植路径上第一次把 lk 生产配方里的
 `compilation_config.cudagraph_mode: FULL_DECODE_ONLY` 真正用起来。
+
+---
+
+## 296. **每层成本分层实测(`XIAOTU_CD_TIMING=1`):compute 0.53 + rest 0.53 = 1.06 ms/层;差距的真正解释**
+
+### (a) 实测(`lkport32tp1timing`:TP=1 / util 0.87 / 图 / SEQS=8 / SPEC=0 / MBT=8192)
+
+```
+qlen=1: period=1.06ms compute=0.53ms rest=0.53ms (compute 50%, rest 50%)
+qlen=2: period≈1.36ms compute≈0.82ms rest≈0.54ms (compute 60%, rest 40%)
+```
+
+* **period** = 引擎回调入口到入口(严格串行的每层真实时间);
+  **compute** = CPU MoE 内核本身;**rest** = GPU 工作(attention/dense/routing)+ D2H/H2D +
+  host-fn 派发延迟(注释里写明:`rest` 正是"驻留层能消掉的那部分")。
+* 同样配置下的端到端:C=1 **16.71-19.42 t/s**(TPOT 44-46 ms),C=2 聚合 25-31 t/s。
+
+### (b) 与 lk 的 30-35 t/s(0.67-0.78 ms/层)**在同等资源下对比**
+
+| | lk 参考(用户给的数) | 我们(TP=1,图) |
+|---|---|---|
+| 每层总时间 | 0.67-0.78 ms | **1.06 ms** |
+| 其中 CPU 计算 | ? | **0.53 ms** |
+| 其中 rest(GPU+拷贝+派发) | ? | **0.53 ms** |
+
+**关键观察**:**我们的 CPU 内核 0.53 ms 已经 ≈ lk 的整层预算(0.67-0.78)**。
+lk 的 headline 数字来自 `tensor-parallel-size: 4`(作者 config.yaml 就是 4 卡):
+把 attention/dense 摊到 4 张卡上,它的 `rest` 会掉到 ~0.15-0.2 ms ⇒ 总 0.7 ms/层 ✅ 与数吻合。
+⇒ **我们只有 2 张可用卡(且 TP=2 的每层跨 socket 归约很贵,见下),所以"1.06 ms/层"并不丢人:
+它对应的是"1 张卡干完 attention + dense + CPU MoE"的物理量。**
+
+### (c) 由分层数据推出的、按性价比排序的下一步
+
+1. **用 2 张卡做"两个独立 TP=1 实例"(数据并行)** —— 单实例 C=1 19.42、C=2 聚合 30.69 t/s,
+   两个实例聚合约 **38-61 t/s**,而且**完全避开 TP=2 每层的跨 socket 归约**(见 §297 实测)。
+   这是当前 2 卡机器上最省事的部署形态(不需要改一行代码)。
+2. **把更多 MoE 层标成常驻 GPU**:每层可省掉 compute+部分 rest(≈1.06 ms/层),
+   代价 3.19 GiB/层(TP=1)。用 KV 换:~3 层 = 9.6 GiB ⇒ C=1 46 → 43 ms(-7%)。
+3. **CPU 内核 0.53 ms/层**对应"6 个活跃专家 × 12.6 MB ≈ 76 MB / 0.53 ms ≈ 143 GB/s":
+   已接近单 socket 带宽上限;**想再快就要提高带宽利用率**(多 NUMA 就近、
+   专家权重按 CCD 亲和放置)或**提高批量**(C≥4 时每 token 摊薄到 0.35 ms/层,这就是
+   C=4 聚合能到 38 t/s 的原因)。
