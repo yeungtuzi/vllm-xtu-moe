@@ -43,6 +43,8 @@ RESIDENT="${RESIDENT:-}"         # 额外常驻 GPU 的 MoE 层,如 "0-9";这里
 DRAFT_RESIDENT="${DRAFT_RESIDENT:-1}"  # 1=草稿层强制常驻 GPU(用户硬约束);0=完全复刻作者配方(不设常驻)
 FORCE_DRAFT="${FORCE_DRAFT:-0}"        # 1=跳过显存护栏(明知偏紧仍要开草稿),会打印警告
 EXTRA_ENV="${EXTRA_ENV:-}"             # 额外环境变量透传给服务进程,如 EXTRA_ENV="XIAOTU_CD_TIMING=1"
+# 投机解码参数:**默认取作者 config.yaml 的值**(num 3 / greedy);可用 SPEC_JSON 覆盖
+SPEC_JSON="${SPEC_JSON:-{\"method\":\"dspark\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"greedy\"}}"
 MODEL_EST_GIB="${MODEL_EST_GIB:-auto}"  # 目标模型 GPU 占用估值(auto: 按实测 TP=1→11 / TP=2→7)
 LK_BUF_GIB="${LK_BUF_GIB:-6}"           # lk 引擎在 GPU 的缓冲 + decode/gpu_prefill 暂存(实测≈5.3)
 WARMUP_GIB="${WARMUP_GIB:-3}"           # 预热/首次分配的余量(实测 0.90 时因一笔 2 GiB 分配 OOM)
@@ -136,7 +138,7 @@ if [ "$SPEC" = "auto" ] || [ "$SPEC" = "AUTO" ]; then
 fi
 
 if [ "$SPEC_ON" = "1" ]; then
-  DRAFT_ARGS=(--speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}')
+  DRAFT_ARGS=(--speculative-config "$SPEC_JSON")
   if [ "$DRAFT_RESIDENT" = "0" ]; then
     # 完全复刻作者配方:不设常驻 ⇒ 草稿是"GPU 预填充层":预填充 _gpu_prefill(GPU),
     # 解码落 _cpu_prefill/_cpu_decode(CPU)。仅用于 A/B 对照(见 NOTES §291)。
@@ -173,7 +175,7 @@ RESIDENT="${RESIDENT# }"
 {
   echo "tag=$TAG port=$PORT tp=$TP gpus=$GPUS maxlen=$MAXLEN seqs=$SEQS mbt=$MBT"
   echo "gpu_util=$GPU_UTIL threads=$THREADS minbatch=$MINBATCH spec=$SPEC_ON eager=$EAGER"
-  echo "extra_env='$EXTRA_ENV'"
+  echo "extra_env='$EXTRA_ENV' spec_json=$SPEC_JSON"
   echo "spec_mode=$SPEC prefetch=$PREFETCH resident='$RESIDENT' draft_ids=$DRAFT_IDS draft_gib=$DRAFT_GIB nlayers=$NLAYERS nmtp=$NMTP is_dspark=$IS_DSPARK"
   echo "env=$ENV"
   date -Is
