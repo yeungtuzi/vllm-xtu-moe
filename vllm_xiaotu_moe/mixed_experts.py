@@ -603,45 +603,72 @@ class _XiaotuExpertsMixin:
                   f"diff={float(np.abs(d2 - ds_ck).max()):.3e}", flush=True)
 
     # ---- compute ------------------------------------------------------
+    # Two upstream call conventions must both work:
+    #   * monolithic (shim path): apply(hidden_states, w1, w2, router_logits, ...)
+    #     -> we compute routing here from router_logits.
+    #   * modular (upstream RoutedExperts + our CPU backend, mainline >= 0.29):
+    #     apply(output=..., hidden_states=..., w1=..., w2=..., topk_weights=...,
+    #     topk_ids=..., ..., workspace13=..., expert_tokens_meta=...)
+    #     -> the router already produced topk_weights/topk_ids AND already applied
+    #     expert_map (upstream's own CPUExperts*.apply does not remap either), so
+    #     we must NOT remap them again. The result is written into `output`.
+    # The first nine parameters keep the monolithic order so existing positional
+    # calls are unaffected; everything new is keyword-only.
     def apply(
         self,
         hidden_states: torch.Tensor,
         w1: torch.Tensor,
         w2: torch.Tensor,
-        router_logits: torch.Tensor,
-        activation: MoEActivation,
-        global_num_experts: int,
-        expert_map: torch.Tensor | None,
-        a1q_scale: torch.Tensor | None,
-        apply_router_weight_on_input: bool,
+        router_logits: torch.Tensor | None = None,
+        activation: MoEActivation | None = None,
+        global_num_experts: int = 0,
+        expert_map: torch.Tensor | None = None,
+        a1q_scale: torch.Tensor | None = None,
+        apply_router_weight_on_input: bool = False,
         num_expert_group: int | None = None,
         e_score_correction_bias: torch.Tensor | None = None,
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
+        *,
+        output: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        a2_scale: torch.Tensor | None = None,
+        workspace13: torch.Tensor | None = None,
+        workspace2: torch.Tensor | None = None,
+        expert_tokens_meta: object | None = None,
     ) -> torch.Tensor:
         if apply_router_weight_on_input:
             raise NotImplementedError(
                 "xiaotu CPU experts backend does not support "
                 "apply_router_weight_on_input"
             )
-        # monolithic apply() 拿不到 input_ids,若模型的路由需要它(hash routing),
-        # router 会在这里报错——比静默选错专家好。
-        # shim 6(mainline_shims)把 monolithic 链路丢掉的 input_ids 暂存在 layer 上。
-        _ids = getattr(self._layer_ref, "_xiaotu_input_ids", None)
-        topk_weights, topk_ids = self._select_topk(hidden_states, router_logits, _ids)
+        if topk_weights is not None and topk_ids is not None:
+            # Modular path: routing is done, expert ids are already local.
+            topk_weights = topk_weights.to(torch.float32)
+            topk_ids = topk_ids.to(torch.int32)
+        else:
+            # Monolithic path: compute routing ourselves.
+            # monolithic apply() 拿不到 input_ids,若模型的路由需要它(hash routing),
+            # router 会在这里报错——比静默选错专家好。
+            # shim 6(mainline_shims)把 monolithic 链路丢掉的 input_ids 暂存在 layer 上。
+            _ids = getattr(self._layer_ref, "_xiaotu_input_ids", None)
+            topk_weights, topk_ids = self._select_topk(
+                hidden_states, router_logits, _ids
+            )
 
-        # 专家并行(EP):路由给出的是全局 expert id,需要按 expert_map 映射到本
-        # rank 的本地 id;映射为 -1 表示该专家不在本 rank,把权重置 0。
-        if expert_map is not None:
-            em = self._local_expert_map(expert_map, topk_ids.device)
-            local = em[topk_ids.to(torch.long)]
-            miss = local < 0
-            if bool(miss.any()):
-                topk_weights = torch.where(
-                    miss, torch.zeros_like(topk_weights), topk_weights
-                )
-                local = torch.where(miss, torch.zeros_like(local), local)
-            topk_ids = local.to(torch.int32)
+            # 专家并行(EP):路由给出的是全局 expert id,需要按 expert_map 映射到本
+            # rank 的本地 id;映射为 -1 表示该专家不在本 rank,把权重置 0。
+            if expert_map is not None:
+                em = self._local_expert_map(expert_map, topk_ids.device)
+                local = em[topk_ids.to(torch.long)]
+                miss = local < 0
+                if bool(miss.any()):
+                    topk_weights = torch.where(
+                        miss, torch.zeros_like(topk_weights), topk_weights
+                    )
+                    local = torch.where(miss, torch.zeros_like(local), local)
+                topk_ids = local.to(torch.int32)
 
         layer = self._layer_ref
         if layer is None:
@@ -709,7 +736,13 @@ class _XiaotuExpertsMixin:
             if bool((ids_i32 >= 0).all()):
                 self._verified_n = getattr(self, "_verified_n", 0) + 1
                 self._verify_once(layer, h_bf16, ids_i32, wts_f32, out)
-        return out.to(hidden_states.dtype)
+        result = out.to(hidden_states.dtype)
+        if output is not None:
+            # Modular upstream API: the caller owns the output buffer and uses it
+            # directly, so the result must land in it (upstream ignores our return).
+            output.copy_(result)
+            return output
+        return result
 
 
 class XiaotuCPUExpertsBF16(_XiaotuExpertsMixin, CPUUnquantizedExperts):
