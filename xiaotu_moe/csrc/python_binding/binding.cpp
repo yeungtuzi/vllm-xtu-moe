@@ -105,6 +105,11 @@ struct CpuDecodeState {
     void (*w_fn)(void*, int, int, const uint16_t*, const uint32_t*, const float*, float*) = nullptr;
     void* out_ptr_seen = nullptr;   // out_gpu 指针缓存(避免每次调用做 Python shape 查询)
     size_t out_rows = 0;
+    // ---- 异步路径的 per-layer 计时(XIAOTU_CD_TIMING=1)-------------------
+    // period = 上一次"看到 din==1"到本次:即真实串行的每层时间(GPU+拷贝+握手)。
+    // compute = 本次 CPU MoE(+EP)本身。rest = period - compute。
+    std::chrono::steady_clock::time_point last_seen{};
+    bool seen_once = false;
     bool ensure_buffers(size_t nh, size_t ni, size_t nw, size_t no, bool retire = false) {
         bool realloc = false;
         auto grow = [&](void*& p, size_t& cap, size_t need) {
@@ -237,14 +242,57 @@ static std::vector<CpuDecodeState*> g_async_slots;
 static std::atomic<bool> g_async_stop{false};
 static std::thread g_async_thr;
 static std::atomic<bool> g_async_started{false};
+// worker 线程上最近一次 run_moe_and_ep 的 EP 耗时(仅诊断计时用)。
+static thread_local double g_async_ep_last = 0.0;
 
 static void async_loop() {
+    // per-layer 计时(与 host-func 路径同口径;XIAOTU_CD_TIMING=1 时打印)。
+    const bool timing = std::getenv("XIAOTU_CD_TIMING") != nullptr;
+    const int every = [] {
+        const char* e = std::getenv("XIAOTU_CD_TIMING_EVERY");
+        return e ? std::atoi(e) : 43;
+    }();
+    double sum_compute = 0, sum_period = 0, sum_ep = 0;
+    int n = 0;
     while (!g_async_stop.load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> lg(g_async_mtx);
         for (auto* st : g_async_slots) {
             if (st->hin && st->hin[0] == 1) {
+                auto t_cb = std::chrono::steady_clock::now();
+                double ep = 0.0;
                 if (st->w_fn) st->w_fn(st->w_engine, st->w_qlen, st->w_k,
                                        st->w_hid, st->w_ids, st->w_wts, st->w_out);
+                if (timing) {
+                    // EP 时间由 run_moe_and_ep 经 thread_local 传出(worker 是单线程)。
+                    ep = g_async_ep_last;
+                    auto t_end = std::chrono::steady_clock::now();
+                    const double compute_ms =
+                        std::chrono::duration<double, std::milli>(t_end - t_cb).count();
+                    if (st->seen_once) {
+                        const double period_ms = std::chrono::duration<double, std::milli>(
+                                                     t_cb - st->last_seen).count();
+                        sum_compute += compute_ms;
+                        sum_period += period_ms;
+                        sum_ep += ep;
+                        if (++n % every == 0) {
+                            fprintf(stderr,
+                                    "[cd-timing/async] layers=%d qlen=%d k=%d "
+                                    "period=%.2fms compute=%.2fms(engine=%.2f ep=%.2f) "
+                                    "rest=%.2fms (compute %.0f%%, rest %.0f%%)\n",
+                                    every, st->w_qlen, st->w_k,
+                                    sum_period / every, sum_compute / every,
+                                    (sum_compute - sum_ep) / every, sum_ep / every,
+                                    (sum_period - sum_compute) / every,
+                                    100.0 * sum_compute / std::max(1e-9, sum_period),
+                                    100.0 * (sum_period - sum_compute) /
+                                        std::max(1e-9, sum_period));
+                            fflush(stderr);
+                            sum_compute = sum_period = sum_ep = 0.0;
+                        }
+                    }
+                    st->seen_once = true;
+                    st->last_seen = t_cb;
+                }
                 st->hout[0] = 1;                       // 通知 GPU:结果已写好
                 while (st->hin[0] == 1 && !g_async_stop.load(std::memory_order_relaxed))
                     _mm_pause();                       // 等 GPU 归还槽位(hin=0)
@@ -673,6 +721,7 @@ static void bind_moe_class(py::module& m, const char* name) {
                                   const uint32_t* i, const float* w, float* o) {
                         double ep = 0.0;
                         run_moe_and_ep<MOE>((MOE*)e, q, k, h, i, w, o, &ep);
+                        g_async_ep_last = ep;
                     };
                 }
                 CUstream cs = (CUstream)s;

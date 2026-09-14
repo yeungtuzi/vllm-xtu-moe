@@ -10965,3 +10965,20 @@ PREFETCH=1 / EAGER=0 / THREADS=48 / SPEC=0 / `RESIDENT=0-11`):
   ⇒ **差距的本质仍是"CPU 引擎每层慢 ~2×"**,不是编排、不是拷发。
 * 参考同配置 KV = **0.5 GiB / 29,152 token**,我们 = 0.19 GiB / 10,847 token
   ⇒ 我们的引擎在 GPU 上多占 ~0.3 GiB(item 4 天花板的一个真实代价)。
+
+---
+
+## 325. 【第 218 轮·部署陷阱(必须永久记住)】**服务用的引擎 `.so` 在 conda env 的 site-packages 里,不是本仓库**
+
+* **真相**:
+  * **服务**(`serve_lk_port.sh` → `$ENV/bin/python -m vllm...`):import 的是
+    `$ENV/lib/python3.12/site-packages/xiaotu_moe/`(一份**拷贝**,含自己的 `build/*.so`);
+  * **harness**(`bench_cd_plumbing.py` / `bench_vs_lkmoe.py`):显式 `PYTHONPATH` 指向**本仓库**
+    ⇒ import 的是 `./xiaotu_moe/build/*.so`。
+* **后果(已踩)**:`build_engine_variants.sh` 只更新**仓库**的 `.so`;
+  服务里 `XIAOTU_MOE_ASYNC=1` **完全不生效**(实测:site-packages 的 `.so` 里
+  `strings | grep XIAOTU_MOE_ASYNC` = **0 次**,仓库的是 1 次)。
+  ⇒ 之前服务量到的 `C=1 28.76 ms` **还是旧的 host-func 路径**。
+* **修复**:新增 **`scripts/deploy_engine.sh`**(build + 复制 `build/*.so` 与源码到各 env)。
+  `python_binding` 构建需要 `PYBIND11_INC`,本机只有 torch 自带的:
+  `/home/user/anaconda3/lib/python3.10/site-packages/torch/include`(脚本已自动探测)。
