@@ -915,7 +915,11 @@ class CpuXiaotuMoE(nn.Module):
                 self.engine.prepare_decode_buffers(max(1, _pre), self.top_k)
             except Exception as _e:  # 老 .so 没有该方法时静默跳过
                 print(f"[xiaotu] prepare_decode_buffers skipped: {_e}", flush=True)
-        # 引擎持有这些参数的内存(达 data_ptr),必须防被替换/释放。
+        # 【第 16 轮更正】原注释说"引擎持有这些参数的内存(达 data_ptr),必须防被
+        # 替换/释放" —— 该前提已被 `scripts/test_engine_copies_weights.py` 证伪:
+        # 引擎构造时就 memcpy 进自己的 NUMA 分片内存,原地改写调用方缓冲后输出逐位不变。
+        # 这里保留强引用**另有原因**:`gpu_prefill._pin_key()` 会把源 storage 存进
+        # `_PIN_CACHE`(见 NOTES §346c),GPU 预填充/常驻层路径需要这些 host 张量存活。
         self._w13, self._w2 = w13, w2
         self._s13, self._s2 = s13, s2
         del w13, w2, s13, s2

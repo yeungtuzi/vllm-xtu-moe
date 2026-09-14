@@ -12340,3 +12340,63 @@ GPU KV cache size: 180,582 tokens, Maximum concurrency for 8,192 tokens per requ
    **这是下一轮应该修的**:加载期按 EP 切分 ⇒ 138 → 69 GB/worker,
    总占用从 ≈424 GB 降到 ≈286 GB,而且很可能**不再需要 interleave**。
 3. 在那之前,**`INTERLEAVE=1` 是必须的**(已设为默认),因为那 138 GB 是未绑定分配。
+
+### 346. 【v0.2·第 16 轮】"每 rank 装全量专家"的内存**没救回来** —— 但定位到了真正的持有者
+
+#### (a) ✅ 先确立前提(无模型加载微基准,已产出脚本)
+
+新增 `scripts/test_engine_copies_weights.py`:造一个小引擎(E=8/H=256/I=512),
+跑一次 `cpu_prefill`,然后**原地改写调用方的权重缓冲**(同地址、新字节:权重填 0、
+scale 字节填 255 ⇒ 若引擎是别名,输出必然爆成 inf),再跑一次:
+
+```
+out1[:4] = [-4.0236141e-11 -3.2660208e-11 -2.9788587e-12  2.1169956e-11]
+out2[:4] = [-4.0236141e-11 -3.2660208e-11 -2.9788587e-12  2.1169956e-11]
+internal w13 same after clobber : True
+max|out1-out2|                  = 0
+VERDICT: engine COPIES weights -> caller's buffers may be released.   (exit 0)
+```
+
+⇒ **引擎在构造时就 `memcpy` 进自己的 NUMA 分片内存**(`moe_v2.hpp` shard_fill_w13/w2
+→ `shard_region` 的 copier),不是别名。所以 `hybrid_model` 里那句
+"引擎持有这些参数的内存(达 data_ptr),必须防被替换/释放" **前提是错的**。
+
+#### (b) ❌ 但按这个前提去省内存**没有效果**(已回滚)
+
+改动:把 `w13[st:st+L].contiguous()`(no-op 视图)改成 `.clone()`(独立紧凑存储),
+再把 `ex.w13_weight` 等 Parameter 换成这个紧凑分片,让全量参数失去引用。
+
+结果(同配置 `MBT=1024/GP_MIN=1024/RESIDENT=`,86 层 = 每 rank 43 层):
+
+| | 每 worker anon |
+|---|---|
+| 裁剪前(ml_gp4) | 279.9 GB |
+| **裁剪后(ml_trim)** | **276.3 GB** |
+
+**几乎没变**,而 276.3 ≈ `138(非专家) + 43 × 3.2(整层全量)` —— 说明那份全量**根本没被释放**。
+⇒ 已 `git checkout` **回滚**(不留未验证的改动),并保留脚本作为前提证据。
+
+#### (c) 🎯 真正的持有者(读代码就能定位,下一轮修这里)
+
+`self._w13 = w13` **不是**主因。真正的持有者是 **pinned K-major 缓存的键**:
+
+```python
+def _pin_key(t, tag):
+    stor = t.untyped_storage()          # ← 关键
+    return (stor.data_ptr(), t.storage_offset(), tuple(t.shape), ...), stor
+def _pinned_kmajor(t):
+    key, ent = _kmajor_cached(t)
+    return _ensure_pinned(key, ent)     # _PIN_CACHE[key] = (stor, transposed_copy)
+```
+
+缓存项里**存了 `stor`(源 storage 的强引用)**。`_pinned_kmajor(w13)` 传进来的 `w13`
+是**全量张量的切片视图**,`untyped_storage()` 就是**整份 3.2 GB** ⇒ 一旦
+`_start_pinned_prebuild()` 跑过(它在**第一次 GPU 预填充**时触发,而 vLLM 的
+profiling/warmup 前向用的是 `MBT` 个 token ⇒ 必然触发),**每一层的全量权重都被
+pin 缓存强引用住**,与 Parameter 是否被替换无关 —— 这正好解释了 (b) 的"换了 Parameter 也不掉内存"。
+
+**⇒ 下一轮的修法(二选一,都要先于 pin 发生)**:
+1. **先缩容再 pin**:在 `_start_pinned_prebuild()` 之前就把 `ex.w13_weight` 换成紧凑分片
+   (即 (b) 的改动**提前**到 profiling 之前),这样切片视图的 storage 本身就是 1.6 GB;
+2. **让 pin 缓存不持有源 storage**:`_pin_key` 只保留 `data_ptr` 用于失效判断,
+   值里只放转置副本,靠"源参数在模型生命周期内不会被释放"这一事实(需配合弱引用/显式失效)。
