@@ -12523,3 +12523,35 @@ final_hidden_states = out.to(hidden_states.dtype)   # 又一次新地址
    的"无限重做预填充")—— 这是 160 s/it 与 21.6 s(128×169 ms)之间 7× 差距的关键;
 4. 用**同样的 `MBT=256`** 在参考 fork 上跑同一协议,确认 26 ms 是否真的可达
    (0.1.0 的数字来自 fork,主线模式 A 的解码此前**从未**被测过)。
+
+### 349. 🎯【v0.2·第 18 轮】qlen 谱给出真相:**没有"无限重做预填充"**;真问题是**解码 169 ms/token(6.5×)**
+
+512-token 输入 / 6-token 输出的完整计时(`XIAOTU_TIMING=1`,**总墙钟只有 6.41 s**):
+
+| qlen | step_wall | 每 token | 判读 |
+|---|---|---|---|
+| **256** | **43.442 s** | 170 ms | 第一个预填充块 —— **含 Triton JIT 编译** |
+| **179** | **1.957 s** | **10.9 ms** | 第二个预填充块 = **真实预填充速率(92 t/s)** |
+| 1 | 0.169 s | **169 ms** | **稳态解码** |
+
+**⇒ 三条结论:**
+
+1. **`qlen` 永远是 256→179→1…… 没有 257 的"无限重做"**。所以 §347 里我把它归因给
+   §334u 的图契约症状**是错的** —— 那个 1136.8 ms/token 是**另一个配置**下的另一回事。
+   (这条要更正:160 s/it 与 "无限重做" 无关。)
+2. **第一块 43.4 s 是 Triton JIT**,不是模型慢 —— 日志里 `jit_monitor` 明确报了
+   `ComputePrefillMetadataKernel` / `BuildPrefillChunkMetadataKernel` /
+   `_dequantize_and_gather_k_kernel` 在**推理期**被编译。这解释了 bench_lat 的
+   "每个请求都 160 s"里的一大块(以及为什么第 1 个请求特别贵)。
+   ⇒ **warmup 覆盖不到这些形状**(我们 `KERNEL_WARMUP=0` 关掉了 JIT warmup)。
+3. 🎯 **真正要修的是稳态解码:169 ms/token vs 0.1.0 的 26 ms(6.5×)。**
+   而 `engine_frac=0.01` ⇒ enqueue 只占 1%;`attn_43layers=0.052s` +
+   `layer_43x=0.089s` ⇒ **每 token 约 89 ms 花在"43 个 MoE 层"里,而引擎 enqueue 只有 2 ms**。
+   89 ms / 43 层 = **2.07 ms/层**,而**同机微基准(`bench_cd_plumbing.py`)只有 0.32 ms/层**
+   ⇒ **服务里每层比隔离测慢 6.5×,差值只能来自"与 vLLM 自身线程抢核"**
+   (正是 NOTES §334p 记录的双峰现象:MIN 0.41 ms vs 典型 9.5 ms)。
+
+**⇒ 下一轮第一件事**:验证第 15 轮 `cfg.num_processes=2`(每 rank 12 CCD)是否**真的**
+把两个引擎的线程池分开了 —— 从微基准看 `CFG_WORLD=2` 是 371 µs/layer(比 world=1 的 315 慢 19%),
+但**服务里差 6.5×**,说明池的实际核表/亲和性没有按 rank 切开,或者被 vLLM 的线程压住。
+量法:`XIAOTU_MOE_PROFILE=1`(引擎自带 `[MOE-PROF]`)+ 检查每 rank 实际用到的 CPU 集合。
