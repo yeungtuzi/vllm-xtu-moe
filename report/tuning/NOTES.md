@@ -13405,3 +13405,68 @@ torch.zeros(num_experts, 2*I, H//2)                            # ⇒ 每 rank 13
    (gfx942 会写错格式)。这是**我们补丁自带的**、非本次引入;本机是 NVIDIA,**不影响 A100**,但应在 ROCm 上补门闸。
 6. 🟡 **遗留 3**:C=1 TTFT 变差 13% 需重复测量确认;`upstream main HEAD` 又往前走了 3 个 commit
    (**无轮子**),下次跟进目标已变成 `d392ac836`。
+
+### 369. 【v0.4·第 1 轮】目标切换:让 **DeepSeek-V4.1-Flash** 在 3×A100-40GB 上跑起来 —— 侦察结论
+
+用户 2026-09-14 指令:「让 ds-v4.1-flash 跑起来」。
+
+#### (a) 硬件可行性:内存这一关**已经过了**
+
+V4.1 需要 475 GiB 权重,本机 3×A100-40GB = 120 GB 显存。**但它天然适合本项目**:
+
+| 组件 | 大小 | vLLM 的处理 | 实测结果 |
+|---|---|---|---|
+| 路由专家(384×40,fp4) | 269 GiB | `Mxfp4MoeBackend.CPU` | ✅ **自动选中 CPU 后端,而且用的是我们的 `XiaotuCPUExpertsMxfp4`**(插件 26 条 shim 生效) |
+| Engram(2 表) | 188.8 GiB | `EngramConfig.cpu_offload=True`(**默认开**) | ✅ `offloaded to pinned host memory: 94.42 GiB per rank` × 2 |
+| 其余(dense/attn/embed/vision/DSpark) | ~23 GiB | GPU | ✅ `Model loading took 11.31 GiB` |
+
+**实测(dummy 权重,单卡,`VLLM_EXPERTS_LOAD_DEVICE=cpu`)**:
+`Model loading took 11.31 GiB memory and 1395.7 s`(23 min),EngineCore RSS **763 GB**
+(专家 269 GiB + 引擎分片副本 + Engram 189 GiB),`/dev/shm` 干净,无 OOM。
+
+⇒ **"装得下 + 专家/Engram 能卸载"这两件事不需要我们做任何事,主线已经支持,而且专家那一半已经在用我们的引擎。**
+
+#### (b) 唯一的硬阻塞:**注意力在 SM80 上没有实现**
+
+V4.1 只有两条注意力实现,**都不支持 SM80**:
+
+| 实现 | 位置 | 能力要求 | 结论 |
+|---|---|---|---|
+| `DeepseekV4FlashMLAAttention` | `deepseek_v41/nvidia/flashmla.py` | FlashMLA 库,`is_device_capability_family(90)` | ❌ A100 上 `flash_mla_sparse_fwd`/`flash_mla_with_kvcache` 被绑成 **`_raise_flashmla_unavailable` 抛错桩** |
+| `DeepseekV4FlashInferMLAAttention` / `SM120` | `deepseek_v41/nvidia/flashinfer_sparse.py` | `supports_compute_capability → major in [10, 12]` | ❌ SM100/SM120 only |
+
+实测选中的后端就是 `FLASHMLA_SPARSE_DSV41`(`Setting kv cache block size to 128 for
+FLASHMLA_SPARSE_DSV41 backend`)。探针被 25 min 超时在 **forward 之前**掐掉,
+所以"抛错"是**静态结论**(桩函数无歧义),不是实测到的栈。
+
+#### (c) 但阻塞面很窄:**只有 2 个调用点**
+
+`deepseek_v41/nvidia/flashmla.py` 只有 **387 行**,FlashMLA 只出现在两处:
+
+| 路径 | 行 | 调用 | 周边机械 |
+|---|---|---|---|
+| decode | 243 | `flash_mla_with_kvcache(q, k_cache=swa_cache, indices=swa_indices, topk_length=swa_lens, attn_sink, extra_k_cache, extra_indices_in_kvcache, extra_topk_length, out=…)` | 已实现 |
+| prefill | 379 | `flash_mla_sparse_fwd(q, kv, indices, sm_scale, attn_sink, topk_length, out)` | **已实现**(`dequantize_and_gather_k_cache` 把 KV 聚到连续缓冲 + `combine_topk_swa_indices` 造索引) |
+
+⇒ 真正要写的只有**两个 kernel 的等价物**,而且:
+
+* **KV 格式是 `fp8_ds_mla`**(实测日志 `Using DeepSeek's fp8_ds_mla KV cache format`)、
+  `supported_kv_cache_dtypes = ["auto","fp8_ds_mla","fp8"]`
+  —— **和 V4 完全一样**,不是论文里的 FP4 KV;
+* 我们在 V4 上**已经**写了同构的 SM80 Triton 稀疏 MLA:
+  `deepseek_v4/nvidia/flashmla.py::_forward_sparse_mla_prefill_triton` +
+  `_forward_sparse_mla_{swa_decode,compressed_decode}_triton`,内核在
+  `v1/attention/backends/mla/sparse_mla_kernels.py`(3517 行,已有
+  `accumulate_indexed/gathered/fp8ds_global_slots_sparse_mla_attention_chunk`、
+  `merge_*_with_sink`、`finish_materialized_sparse_mla_scores_with_sink`);
+* 官方参考实现 `inference/kernel.py` 是 **TileLang** 且显式
+  `TL_DISABLE_WARP_SPECIALIZED=True` + `TL_DISABLE_TMA_LOWER=True`
+  —— 说明官方参考内核本来就避开了 SM90 专属特性,可作算法对照。
+  ⚠️ 但参考实现走 `convert.py` 产出的 MP 分片格式、且需要**整模型进显存**
+  (默认 MP=8 ⇒ 640 GB),**在我们 120 GB 显存上跑不了**,不能当作捷径。
+
+#### (d) 本轮结论
+
+**V4.1 在本机"跑起来"= 只需要补 SM80 的稀疏 MLA 注意力**,其余(专家/Engram/KV/元数据/
+索引器)主线已具备且已验证可用。已开工:先做 **prefill** 的
+`flash_mla_sparse_fwd` 等价物(SM90 路径保持逐字节不变,仅 Ampere/Ada 走新路径)。
