@@ -59,15 +59,17 @@ CUDAGRAPH_SIZES="${CUDAGRAPH_SIZES:-}"
 # 引擎自身的权重分片已由 mbind 正确铺开(见 moe_v2.hpp shard_region),但管不到
 # vLLM 那 138 GB,所以必须在进程级交错。INTERLEAVE=0 仅在你自己已绑核/绑节点时用。
 INTERLEAVE="${INTERLEAVE:-1}"
-# 线程池自旋窗口 —— **解码性能的第一旋钮,不要留默认**。
-# 引擎 worker 默认 5 ms 没活就 park;而"层间隔"一旦变长(解码慢)就 park 更深、
-# wake 更慢 ⇒ **正反馈**(NOTES 的 N4:park/wake 成本与层间隔耦合)。
-# 实测主线模式 A(TP=2/MBT=256/RESIDENT=0-11,512-token prompt,ignore_eos):
-#     默认(5 ms)        : 1225.0 ms/token   ← 完全不可用
-#     SPIN_IDLE_US=600000: **43.5 ms/token** ← 28×,已接近 0.1.0 的 26 ms
-# 代价是空转吃 CPU(60 线程 × 2 rank 常驻自旋),本机 192 核可接受。
-# 想让出 CPU 可调小;但**不要不设**。
-SPIN_IDLE_US="${SPIN_IDLE_US:-600000}"
+# ⚠️ 线程池自旋窗口(**默认不设 = 用引擎自己的 5 ms**;这是诊断旋钮,不是调优旋钮)
+# 引擎 worker 默认 5 ms 没活就 park。实测主线模式 A(TP=2/MBT=256/RESIDENT=0-11,
+# 512-token prompt,ignore_eos):
+#     默认(5 ms)          : 1225 ms/token
+#     SPIN_IDLE_US=600000 : 43.5 ms/token  ← 但**只是暂时**的
+# 旋到 600000 后两个 worker 各烧 **3242% CPU(≈32 核)**、117 线程常驻自旋,
+# `load average` 在几分钟内从 41 爬到 **119**(192 核机),随后同一个服务又退化回
+# **1313 ms/token**。⇒ **空转只是把症状掩盖一会儿,同时把整机拖垮**,
+# 所以**不设为默认**。真正的修法见 NOTES §353(针对 park/wake 本身,
+# 以及解码只需 top_k 个线程却起 60 个线程的池同步开销)。
+SPIN_IDLE_US="${SPIN_IDLE_US:-}"
 if [ "$GP_MIN" -gt 0 ] && [ "$GP_MIN" -gt "$MBT" ]; then
   echo "[mainline] GP_MIN=$GP_MIN > MBT=$MBT ⇒ 夹到 MBT(否则预填充永远够不到阈值;NOTES §319c)"
   GP_MIN="$MBT"
@@ -158,8 +160,8 @@ nohup env \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
   XIAOTU_OOT_OVERRIDE="$OOT" \
   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$GP_MIN" \
-  XIAOTU_MOE_SPIN_IDLE_US="$SPIN_IDLE_US" \
   XIAOTU_MOE_THREADS="$THREADS" \
+  ${SPIN_IDLE_US:+XIAOTU_MOE_SPIN_IDLE_US="$SPIN_IDLE_US"} \
   XIAOTU_MOE_GPU_RESIDENT_LAYERS="$RESIDENT" \
   OMP_NUM_THREADS=1 \
   $EXTRA_ENV \
