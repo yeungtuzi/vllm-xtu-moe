@@ -13342,7 +13342,7 @@ torch.zeros(num_experts, 2*I, H//2)                            # ⇒ 每 rank 13
 | 3 | **逻辑重构**(最险) | 上游把 Triton kernel 重构成 `@kernel_launcher` 类(`LaunchParameters`/`LaunchSpec`)、`fp8_buf`→`out_buf`、新增 `quantize` 标志 | 按上游新结构逐文件重放我们的 SM80 intent(子代理并行做,见 (d)) |
 | 4 | **上游自己实现了同一功能** | `Qwen4ExpPLEFp8EmbeddingMethod` 从 `ple_layer.py` **移到** `ngram_embedding.py`,并新增 **`Qwen4ExpPLEPinnedHostEmbedding`**(pinned host + UVA + prefetch stream,由 `engram_config.cpu_offload` 选择) | 插件补 importlib 双路径查找;**并且发现 `XIAOTU_PLE_CPU=1` 会静默失效** ⇒ 改成**大声警告**(否则单卡会在 create_weights 时 OOM 48 GiB,离真因很远) |
 
-#### (d) SM80 移植被**大幅简化**:7001 行 → 净增 ~20 行
+#### (d) SM80 移植:补丁整体仍需 ~7.5k 行,但**冲突解决被大幅简化**(43 行 → ~20 行)
 
 - **mHC(第 1 个真拦路虎)**:上游 `_hc_prenorm_gemm_outputs` **本来就有** fallback
   (`use_deep_gemm = is_deep_gemm_supported() or not use_tilelang_fallback`),
@@ -13352,7 +13352,10 @@ torch.zeros(num_experts, 2*I, H//2)                            # ⇒ 每 rank 13
   而 broadcast 变体传的是 `x = residual (T, H)`。
   ⇒ 正解:按 `is_deep_gemm_supported()` 分支,非 DeepGEMM 走**同文件的 torch 参考**
   `_torch_hc_prenorm_gemm`(它本来就是为 n_splits=1 写的,输出 `(1,T,hc_mult3)/(1,T)` 与融合 kernel 匹配)。
-  最终 **净增 ~20 行**,替代了原来 7001 行的 pr3 主体。
+  最终这处**只净增 ~20 行**。
+  ⚠️ 注意口径:`pr3` **补丁文件整体仍然 ~7512 行** —— 因为它还要带**真正新增的 SM80 内核文件**
+  (`sparse_mla_kernels.py` 3517 行、`sm12x_mqa.py` 756、`sm12x_deep_gemm_fallbacks.py` 711、
+  `flashmla.py` +932、`fp8_einsum.py` 320)。**简化的是冲突面,不是补丁体积。**
 - 其余 3 个文件(`o_proj` / `fused_indexer_q` / `fused_inv_rope_fp8_quant` / `cache_utils`)
   的核心 intent 都是"**Ampere 没有 Triton `fp8e4nv`,改用 `_f32_to_e4m3_uint8` 直接编 e4m3 字节 + uint8 视图**"
   + `has_cutedsl() and not is_ampere_or_ada()` 门闸 + 4 个 fork 移植函数。
@@ -13392,8 +13395,10 @@ torch.zeros(num_experts, 2*I, H//2)                            # ⇒ 每 rank 13
 2. **上游正在把我们的"护城河"做进去**:PLE 表 pinned-host offload(`Qwen4ExpPLEPinnedHostEmbedding`)、
    Engram 主机内存 + RDMA 预取(`deepseek_v41/nvidia/engram.py`)、native `Mxfp4MoeBackend.CPU`。
    ⇒ 我们剩下的差异化越来越集中在 **"CPU 路由专家引擎"本身**(和它的 NUMA/线程几何)。
-3. 🔴 **`pr2`/`pr3` 每升一次都要重问**:本轮 pr3 的 7001 行里**绝大部分已不需要**(上游自己重构+适配了),
-   真正必需的只有 ~20 行。**不要再默认"补丁越多越安全"。**
+3. 🔴 **`pr2`/`pr3` 每升一次都要重问**:本轮 **pr1 少了一个 hunk**(mxfp4 被上游吸收)、
+   **mHC 那处从 43 行冲突缩到 ~20 行门闸**;但 pr3 仍然 ~7512 行(含新内核文件),
+   `pr2`/`pr3` 是否还需要**完全取决于主线对 A100 的支持现状**,每次升级都要重问。
+   **不要再默认"补丁越多越安全"。**
 4. 🟡 **遗留 1**:`XIAOTU_PLE_CPU=1` 已被上游 `engram_config.cpu_offload` 取代 ——
    应实测上游原生路径能否单卡跑 Qwen3.8-Flash-Next,能则**删掉我们的 `ple_offload.py`**。
 5. 🟡 **遗留 2**:`fused_indexer_q`/`fused_inv_rope` 用 `_f32_to_e4m3_uint8` 时**无 FNUZ 分支**
