@@ -11883,3 +11883,49 @@ def triton_kernel_moe_forward(
      与本引擎的 `cpu_prefill` 对拍(**复用 §335f 的门禁脚本,只换 GPU 侧入口**);
   2. 确认 DS-V4 路由语义一致(或改用显式 topk 的 modular 路径);
   3. 再接进插件的 `apply()` + 阈值 `T` + 显存预算。
+
+### 336. 【v0.2·第 12 轮】P2 的入口再筛:**Triton MXFP4 只支持 SWIGLUOAI**;正确路线是 **MARLIN**
+
+本轮把"用哪个上游 GPU 内核做预填充"这件事彻底筛清了。
+
+#### (a) ❌ `triton_kernel_moe_forward` / `triton_kernel_fused_experts`(OAI Triton MXFP4)
+
+实测(把打包权重 + e8m0 scales 送上 GPU,用 precomputed routing 调 modular 入口):
+
+```
+AssertionError: Only SWIGLUOAI activation is supported
+```
+（`experts/gpt_oss_triton_kernels_moe.py:663`）
+
+* 它是 **GPT-OSS 专用**(SWIGLUOAI = 交错 gate/up 的夹取激活),**不支持** DS-V4 的
+  "packed gate/up + 夹取 SwiGLU" ⇒ **这条门对我们是关的**;
+* 顺带确认了路由不是问题:modular 入口吃 `make_routing_data(topk_ids, topk_weights, E)`,
+  **DS-V4 自己的路由可以照用**(monolithic 入口才是内部 softmax/topk)。
+
+#### (b) ✅ 正确路线:**`MarlinExperts`** —— 它的 `apply()` **吃显式 `w1`/`w2`**
+
+```python
+# vllm/.../fused_moe/experts/marlin_moe.py:737
+def apply(self, output, hidden_states, w1, w2, topk_weights, topk_ids,
+          activation, global_num_experts, expert_map,
+          a1q_scale, a2_scale, workspace13, workspace2,
+          expert_tokens_meta, apply_router_weight_on_input) -> None
+```
+
+* **显式 w1/w2** ⇒ 与"一层 staging"的设计**完全吻合**(不需要把权重常驻 GPU);
+* 这也解释了为什么 **lk fork 在 A100 上用的就是 MARLIN MXFP4**;
+* 构造只需 `FusedMoEConfig` + `FusedMoEQuantConfig`:
+  * `FusedMoEQuantConfig` 已经有现成助手 `mxfp4_w4a16_moe_quant_config(w1_scale, w2_scale, gemm1_clamp_limit=…)`
+    —— **`gemm1_clamp_limit` 正好能表达 DS-V4 的夹取**;
+  * `FusedMoEConfig` 是个普通 dataclass,它的 `moe_parallel_config: FusedMoEParallelConfig`
+    也只是 **12 个字段的普通 dataclass**(tp/pcp/dp/ep size+rank、sp_size、use_ep、all2all_backend、enable_eplb)
+    ⇒ **不需要任何重型 vLLM 配置管线**,可以裸构造。
+
+#### (c) ⚠️ P2 剩下的唯一未知:**MARLIN 是否需要"重排后"的权重布局**
+
+MARLIN 通常要求自己的 repack 布局(主线在 `process_weights_after_loading` 里做)。
+若需要,方案是**加载期在主机侧预重排一次**(1.5 TB 内存放得下),之后每次预填充的 H2D
+搬的就是重排后的 1.61 GiB/rank —— DMA 预算不变(§2.2)。
+
+**下一轮**:用裸构造的 `MarlinExperts` + staging 跑通单层,接进 §335f 的门禁脚本;
+若 repack 是必须的,就加一个"加载期预重排 + 缓存"的步骤。

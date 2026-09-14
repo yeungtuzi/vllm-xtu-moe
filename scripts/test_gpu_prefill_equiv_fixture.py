@@ -96,6 +96,14 @@ def main() -> int:
             act = (g / (1.0 + np.exp(-g))) * u
             gold_bf16[t] += w * (g2b[e] @ bf16_bits_to_f32(f32_to_bf16_bits(act)))
 
+    # ---- GPU 路径可切换 ----
+    #  GPUMODE=bf16 (默认)  : 未量化 fused_experts(吃反量化的 bf16 权重),只验证语义
+    #  GPUMODE=mxfp4         : **上游真正的 MXFP4 GPU 内核**(吃打包权重 + e8m0 scales),
+    #                          走 modular 入口 triton_kernel_fused_experts(precomputed routing),
+    #                          这样 DS-V4 自己的 sqrtsoftplus/group-topk 路由可以照用。
+    GPUMODE = os.environ.get("GPUMODE", "bf16")
+    if GPUMODE == "mxfp4":
+        return _gpu_mxfp4(d, ids, wts, xf, M, K, E, I, H, golden)
     # ---- GPU:上游 fused_experts(未量化,吃 gol13/gol2 的 bf16)----
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
@@ -141,6 +149,51 @@ def main() -> int:
     print(f"[fx] 判定: cpu(max={cmax:.2e} <1e-4? {ok_cpu})  "
           f"gpu(p50={g50:.2e} <eps? {g50 < EPS_BF16}; p99={g99:.2e} <10eps? {g99 < 10*EPS_BF16})  "
           f"=> {'OK(P1 通过)' if ok else 'MISMATCH'}")
+    return 0 if ok else 1
+
+
+
+def _gpu_mxfp4(d, ids, wts, x_bf16, M, K, E, I, H, golden):
+    """上游真正的 MXFP4 GPU 内核 + **precomputed routing**(DS-V4 路由由我们给)。"""
+    import torch
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        mxfp4_w4a16_moe_quant_config,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (
+        make_routing_data,
+        triton_kernel_fused_experts,
+    )
+
+    dev = torch.device("cuda:0")
+    w13, w2 = d["w13"], d["w2"]
+    s13, s2 = d["g13"], d["g2"]          # fixture 的 fp32 尺度 ⇒ 转 e8m0 字节
+    def f32_to_e8m0(ss):
+        lg = np.round(np.log2(np.maximum(ss, 1e-30))).astype(np.int32) + 127
+        return np.clip(lg, 0, 255).astype(np.uint8)
+    t_w1 = torch.from_numpy(w13).to(dev)                    # uint8 packed
+    t_w2 = torch.from_numpy(w2).to(dev)
+    t_s1 = torch.from_numpy(f32_to_e8m0(s13)).to(dev)
+    t_s2 = torch.from_numpy(f32_to_e8m0(s2)).to(dev)
+    hs = torch.from_numpy(x_bf16.reshape(M, H)).to(dev).to(torch.bfloat16)
+    t_ids = torch.from_numpy(ids.astype(np.int64)).to(dev)
+    t_wts = torch.from_numpy(wts).to(dev)
+    qc = mxfp4_w4a16_moe_quant_config(t_s1, t_s2)
+    routing_data, gather_idx, scatter_idx = make_routing_data(t_ids, t_wts, E)
+    out = torch.empty_like(hs, dtype=torch.float32)
+    triton_kernel_fused_experts(
+        out, hs, t_w1, t_w2, routing_data, gather_idx, scatter_idx,
+        topk=K, activation=MoEActivation.SILU, quant_config=qc,
+        global_num_experts=E,
+    )
+    y = out.float().cpu().numpy()
+    ad = np.abs(y - golden)
+    scale = float(np.abs(golden).mean()) or 1.0
+    print(f"[fx] gpu(mxfp4) vs golden: abs p50={np.percentile(ad,50):.2e} "
+          f"p99={np.percentile(ad,99):.2e} max={ad.max():.2e}  "
+          f"归一化 p50={np.percentile(ad,50)/scale:.2e} max={ad.max()/scale:.2e}")
+    ok = np.percentile(ad, 50) / scale < 3.9e-3
+    print("[fx] 判定(mxfp4):", "OK" if ok else "MISMATCH")
     return 0 if ok else 1
 
 
