@@ -10537,3 +10537,29 @@ harness 实测(真实一层权重,qlen=1,**每层读 76 MB**;`XIAOTU_MOE_NSHARD`
 * 已加开关 `XIAOTU_MOE_RANK_SPLIT=0`(关掉 rank 切核,`nshard_` 恢复 8),
   正在跑 `lkport49nosplit96`(TP=2 / THREADS=96 / RANK_SPLIT=0 / CD_TIMING)验证。
   预期:compute 0.41 → ~0.20 ms/层 ⇒ CPU 段 17.55 → ~9 ms/token,C=1 TPOT 37.33 → ~29 ms。
+
+---
+
+## 313. 【第 214 轮】不切核表 = 灾难(compute 9.8ms/层);正解是 **CCD 交错切分**
+
+`lkport49nosplit96`(TP=2 / `THREADS=96` / `XIAOTU_MOE_RANK_SPLIT=0`,即两个 rank 共用核表):
+
+| | compute/层 | engine | ep | C=1 TPOT |
+|---|---|---|---|---|
+| 不切核表(rank split=0) | **9.80 ms** | 7.55-7.93 | 1.6-2.3 | **244.56 ms**(3.96 t/s) |
+
+⇒ 与切分前的 7.41 ms 病态**完全一样**:两个进程都把 worker pin 在 `cores_[0..95]`(同一批核)
+⇒ 2× 超订 + 抢同一批 node。**rank 切分必须保留**。
+
+但前面 harness 证明:**按 node 子集切**会把 `nshard` 从 8 压到 4 ⇒ 白吃 1.4×。
+⇒ 正解 = **按 CCD 交错切**:
+```
+rank r 只保留 {cpu | 其 L3(CCD) 序号 % world == r}
+```
+* 核**互不重叠**(解决超订);
+* 但每个 rank 仍**覆盖全部 8 个 NUMA node**(本机 node = 3 个 CCD,两个 rank 在每 node 都有 CCD)
+  ⇒ `node_present_` 全 8 ⇒ **可以继续用 nshard=8**(最快布局);
+* 实现:`XIAOTU_MOE_RANK_SPLIT=2`(默认仍 1 = node 子集,便于对照),`rank_node0_=0`、
+  worker node 用**绝对**号、`nshard_` 不切。
+正在跑:`lkport50interleave`(TP=2 / THREADS=48 / RANK_SPLIT=2 / CD_TIMING)。
+预期 compute 0.41 → ~0.20 ms/层 ⇒ CPU 段 17.55 → ~9 ms ⇒ C=1 TPOT 37.33 → ~29 ms(达标 ≤30)。

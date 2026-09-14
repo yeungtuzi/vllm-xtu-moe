@@ -80,8 +80,8 @@ def main() -> int:
     w13, w2, s13, s2 = load_layer(ckpt, layer)
 
     cfg = xiaotu_moe.MOEConfigV2()
-    cfg.num_processes = 1
-    cfg.process_id = 0
+    cfg.num_processes = int(os.environ.get("CFG_WORLD", "1"))
+    cfg.process_id = int(os.environ.get("CFG_RANK", "0"))
     cfg.gpu_id = 0
     cfg.has_gate_proj = True
     cfg.expert_num = E

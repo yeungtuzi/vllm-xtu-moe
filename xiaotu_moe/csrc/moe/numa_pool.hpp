@@ -892,34 +892,52 @@ private:
         // 切分后 rank r 只用第 r 份核(按 cpu 编号=node 编号排序 ⇒ 天然是自己的
         // NUMA 子集),引擎侧的分片数同步切成 1/world(见 moe_v2.hpp 的 nshard_)。
         // TP=1(world_<=1)时**完全不改变行为**。
-        // XIAOTU_MOE_RANK_SPLIT=0 可**关掉**按 rank 切核表(用于对照:两个 rank 共用全部核,
-        // 靠调度器分配;配合每 rank 96 线程 = 192 线程铺满 192 核,避免超订)。
-        static const bool rank_split = [] {
+        // 多 rank 同机的核表切分(2026-09-13/14 三次迭代的结论):
+        //   XIAOTU_MOE_RANK_SPLIT=0 → 不切(两 rank 共用核表;实测会 2× 超订 ⇒ compute 9.8ms/层 ✗)
+        //   XIAOTU_MOE_RANK_SPLIT=1(默认)→ 按 **NUMA node 子集**切(核互不重叠,但每 rank 只覆盖
+        //        一半 node ⇒ 引擎只能 nshard=4,harness 证明比 nshard=8 慢 1.4×)
+        //   XIAOTU_MOE_RANK_SPLIT=2(interleave,推荐)→ 按 **CCD 交错**切:rank r 拿
+        //        {ccd | ccd_slot % world == r},核互不重叠 **且每个 rank 覆盖全部 8 个 node**
+        //        ⇒ 可以继续用 nshard=8(最快),两个 rank 也不抢核。
+        static const int rank_split_mode = [] {
             const char* e = std::getenv("XIAOTU_MOE_RANK_SPLIT");
-            return !(e && std::atoi(e) == 0);
+            return e ? std::atoi(e) : 1;
         }();
-        if (rank_split && world_ > 1 && cores_.size() >= (size_t)world_ * 2) {
-            // 【第 212 轮·TP=2 解码】把核表按 rank 过滤成"本 rank 的 NUMA 子集"。
-            // 必须**过滤**而不是"排序后切一段":`cores_` 原本是 slot-major/ccd-minor
-            // (跨所有 CCD 轮流),这样 48 个线程才会铺满本 rank 的所有 node。
-            // 若排序后取连续一段,48 个线程会全压在**最前面 2 个 node** 上,
-            // 而分片调度要求每个 shard(node)都有 worker ⇒ node2/3 没人拉活 ⇒
-            // watchdog 报 `pulled=0` 并死等(2026-09-13 实测两次)。
-            std::vector<int> allnodes;
-            for (int cpu : cores_) { auto it = topo_.cpu_node.find(cpu);
-                if (it != topo_.cpu_node.end()) allnodes.push_back(it->second); }
-            std::sort(allnodes.begin(), allnodes.end());
-            allnodes.erase(std::unique(allnodes.begin(), allnodes.end()), allnodes.end());
-            const int nper = allnodes.empty() ? 1
-                           : std::max(1, (int)allnodes.size() / world_);
-            rank_node0_ = std::max(0, rank_) * nper;
+        if (rank_split_mode != 0 && world_ > 1 && cores_.size() >= (size_t)world_ * 2) {
             std::vector<int> mine;
             mine.reserve(cores_.size() / (size_t)world_);
-            for (int cpu : cores_) {                       // 保持 slot-major 顺序
-                auto it = topo_.cpu_node.find(cpu);
-                if (it == topo_.cpu_node.end()) continue;
-                const int rel = it->second - rank_node0_;
-                if (rel >= 0 && rel < nper) mine.push_back(cpu);
+            if (rank_split_mode >= 2) {
+                // CCD 交错:rank_node0_ 保持 0、worker_node_ 用**绝对** node 号
+                rank_node0_ = 0;
+                for (int cpu : cores_) {                   // 保持 slot-major 顺序
+                    const auto ct = topo_.cpu_node.find(cpu);   // 只为跳过未知 cpu
+                    if (ct == topo_.cpu_node.end()) continue;
+                    // CCD 序号 = 该 cpu 在 slot-major 核表里的 "ccd slot":
+                    // 用 L3 cache id 稳定标识 CCD
+                    char l3p[256];
+                    snprintf(l3p, sizeof(l3p),
+                             "/sys/devices/system/cpu/cpu%d/cache/index3/id", cpu);
+                    std::ifstream fl3(l3p); int ccd = -1;
+                    if (fl3.good()) fl3 >> ccd;
+                    if (ccd < 0) ccd = ct->second;         // 没有 L3 信息就退化到 node
+                    if ((ccd % world_) == std::max(0, rank_)) mine.push_back(cpu);
+                }
+            } else {
+                // 旧的 node 子集切法(保留以便对照)
+                std::vector<int> allnodes;
+                for (int cpu : cores_) { auto it = topo_.cpu_node.find(cpu);
+                    if (it != topo_.cpu_node.end()) allnodes.push_back(it->second); }
+                std::sort(allnodes.begin(), allnodes.end());
+                allnodes.erase(std::unique(allnodes.begin(), allnodes.end()), allnodes.end());
+                const int nper = allnodes.empty() ? 1
+                               : std::max(1, (int)allnodes.size() / world_);
+                rank_node0_ = std::max(0, rank_) * nper;
+                for (int cpu : cores_) {                   // 保持 slot-major 顺序
+                    auto it = topo_.cpu_node.find(cpu);
+                    if (it == topo_.cpu_node.end()) continue;
+                    const int rel = it->second - rank_node0_;
+                    if (rel >= 0 && rel < nper) mine.push_back(cpu);
+                }
             }
             if (!mine.empty()) cores_ = mine;
         }
