@@ -10837,3 +10837,31 @@ PREFETCH=1 / EAGER=0(图) / THREADS=48 / SPEC=0 / RESIDENT=0-10(11 层常驻)
 * **剩下的唯一未落地手段**:marshalling(item 1/3,上限 ~2.4 ms/token)—— 需要"常驻工作线程 +
   设备可见 flag(流内存操作)+ 自旋内核"替换 `cudaLaunchHostFunc`(图模式下必须用 flag 握手,
   不能用 event 同步,否则捕获期非法)。
+
+---
+
+## 322. 【第 217 轮·item 1/3 实施设计】**用"设备可见 flag + 流内存操作"取代 `cudaLaunchHostFunc`**(图安全)
+
+### 为什么不能用 event/线程同步
+
+* `cpu_decode` 在**捕获期只被调用一次**,replay 时**没有 host 代码运行** ⇒
+  "工作线程 + `cudaStreamWaitEvent`" 在图模式下无法每步重新触发;
+* 而 `cudaLaunchHostFunc` 会**阻塞整条流**并引入驱动回调派发延迟(每层一次)。
+
+### 采用方案:**每层一对 mapped flag + 流内存操作**(全部可捕获,无内核、无 host-func)
+
+```
+捕获期记录(每层独立的一对 flag,避免复用竞态):
+  D2H(hidden/ids/wts → pinned)
+  cuStreamWriteValue32(stream, dev_hin, 1)          # 输入就绪(GPU→host 可见)
+  cuStreamWaitValue32 (stream, dev_hout, 1, EQ)     # 等 CPU 结果
+  H2D(pin_out → out_dev)
+  cuStreamWriteValue32(stream, dev_hin, 0)          # 归还槽位
+工作线程(每进程一个,轮询所有层的 hin):
+  hin==1 → 取该层参数 → forward_many(+EP) → 写 pin_out → hout=1
+         → 等 hin==0 → hout=0(为下一次 replay 复位)
+```
+* 每层**独立 flag** ⇒ 层间/步间无竞态;`hin=0` 由**图层内**在 H2D 之后写,工作线程据此复位 `hout`。
+* 期望收益:去掉每层 host-func 派发(~10-20 µs/层 ⇒ **0.4-0.9 ms/token**),
+  而**拷贝本身(~30 µs/层)留在原地** ⇒ 这就是本条手段的天花板。
+* 用 `XIAOTU_MOE_ASYNC=1` 启用,host-func 路径保留为回退。
