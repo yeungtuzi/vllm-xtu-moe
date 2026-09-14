@@ -628,6 +628,7 @@ class CpuXiaotuMoE(nn.Module):
         self._ep_start = 0
         # 图安全的输出缓冲(见 _graph_out_buffers);cap 在 finalize 里定
         self._out_buf = None
+        self._io_buf = None
         self._out_cap = 8
         self._ep_local = int(self.n_routed_experts)
         try:
@@ -663,7 +664,20 @@ class CpuXiaotuMoE(nn.Module):
             bf16 = torch.empty(cap, self.hidden_size, dtype=torch.bfloat16, device=device)
             buf = (f32, bf16)
             self._out_buf = buf
-        return buf[0][:qlen], buf[1][:qlen]
+        # 【第 26 轮】ids/weights 也必须用持久缓冲。
+        # fork 的 `_cpu_decode` 是**直接透传** `topk_ids.data_ptr()/topk_weights.data_ptr()`;
+        # 我们这边为了做 EP 重映射,每层新建 4 个张量(减/夹/转 int32/where/转 f32)。
+        # 在图重放下,图里记录的 D2H 源地址是**捕获期**的地址,而 Python 侧每层给的是新地址
+        # ⇒ 引擎读到陈旧/未就绪数据,而且这种"读到的不是刚写的那份"会让异步握手的
+        # 完成判定出问题,表现为**周期性等待**(实测主线 28 ms/层 vs fork 0.9 ms/层)。
+        rb = self._io_buf
+        if rb is None or rb[0].device != device:
+            ids = torch.empty(cap, self.top_k, dtype=torch.int32, device=device)
+            wts = torch.empty(cap, self.top_k, dtype=torch.float32, device=device)
+            mask = torch.empty(cap, self.top_k, dtype=torch.bool, device=device)
+            rb = (ids, wts, mask)
+            self._io_buf = rb
+        return buf[0][:qlen], buf[1][:qlen], rb[0][:qlen], rb[1][:qlen], rb[2][:qlen]
 
     def _gpu_shard(self):
         """(w13, s13, w2, s2, start, local_E, tp) CPU views for the GPU path."""
@@ -1138,13 +1152,14 @@ class CpuXiaotuMoE(nn.Module):
         # 的形状(超长预填充)才临时分配。
         _gb = self._graph_out_buffers(qlen, hidden_states.device)
         if _gb is not None:
-            out, _out_bf16 = _gb
+            out, _out_bf16, _ids_b, _wts_b, _mask_b = _gb
         else:
             out = torch.empty(
                 qlen, self.hidden_size, dtype=torch.float32,
                 device=hidden_states.device
             )
             _out_bf16 = None
+            _ids_b = _wts_b = _mask_b = None
         stream = torch.cuda.current_stream()
         # 引擎 binding 的指针提取只认 numpy 数组或整数 data_ptr()(对 torch 张量返回
         # nullptr → cudaMemcpyAsync(nullptr) → invalid argument),故传 data_ptr()。
@@ -1155,16 +1170,32 @@ class CpuXiaotuMoE(nn.Module):
             # (`weights[ai] != 0.f`) drops them, so they cost nothing — and their
             # id is remapped into the local range so it can never index OOB.
             _st, _L = self._ep_start, self._ep_local
-            ids_i32 = (topk_ids - _st).clamp_(0, _L - 1).to(torch.int32)
-            _in = (topk_ids >= _st) & (topk_ids < _st + _L)
-            wts_f32 = torch.where(
-                _in,
-                topk_weights,
-                torch.zeros((), dtype=topk_weights.dtype, device=topk_weights.device),
-            ).to(torch.float32)
+            if _ids_b is not None:
+                # 就地写(地址稳定,图重放安全);见 _graph_out_buffers 的说明。
+                _ids_b.copy_(topk_ids)          # int64 -> int32,copy_ 自带转换
+                _ids_b.sub_(_st).clamp_(0, _L - 1)
+                ids_i32 = _ids_b
+                _wts_b.copy_(topk_weights)      # -> float32
+                torch.logical_and(topk_ids >= _st, topk_ids < _st + _L, out=_mask_b)
+                _wts_b.masked_fill_(~_mask_b, 0.0)
+                wts_f32 = _wts_b
+            else:
+                ids_i32 = (topk_ids - _st).clamp_(0, _L - 1).to(torch.int32)
+                _in = (topk_ids >= _st) & (topk_ids < _st + _L)
+                wts_f32 = torch.where(
+                    _in,
+                    topk_weights,
+                    torch.zeros((), dtype=topk_weights.dtype,
+                                device=topk_weights.device),
+                ).to(torch.float32)
         else:
-            ids_i32 = topk_ids.to(torch.int32)
-            wts_f32 = topk_weights.to(torch.float32)
+            if _ids_b is not None:
+                _ids_b.copy_(topk_ids)
+                _wts_b.copy_(topk_weights)
+                ids_i32, wts_f32 = _ids_b, _wts_b
+            else:
+                ids_i32 = topk_ids.to(torch.int32)
+                wts_f32 = topk_weights.to(torch.float32)
         _t0 = time.perf_counter() if self._timing else 0.0
         self.engine.cpu_decode(
             stream.cuda_stream, qlen, self.top_k,
