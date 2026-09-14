@@ -12555,3 +12555,61 @@ final_hidden_states = out.to(hidden_states.dtype)   # 又一次新地址
 把两个引擎的线程池分开了 —— 从微基准看 `CFG_WORLD=2` 是 371 µs/layer(比 world=1 的 315 慢 19%),
 但**服务里差 6.5×**,说明池的实际核表/亲和性没有按 rank 切开,或者被 vLLM 的线程压住。
 量法:`XIAOTU_MOE_PROFILE=1`(引擎自带 `[MOE-PROF]`)+ 检查每 rank 实际用到的 CPU 集合。
+
+### 350. 🎯🎯【v0.2·第 19 轮】定案:**解码慢不是我们的插件** —— MoE 只占 1225 ms/token 的 3.4%
+
+#### (a) `[cd-timing]` 把每层拆成 period / compute(engine+ep) / rest
+
+服务里 `XIAOTU_CD_TIMING=1`,稳态解码 qlen=1:
+
+```
+[cd-timing/async] calls=43 qlen=1 k=6 period=0.981ms compute=0.315ms(engine=0.246 ep=0.068) rest=0.666ms
+                  MIN period=0.589ms compute=0.255ms rest=0.183ms
+```
+
+| 项 | 每层 | 每 token(×43) | 占比 |
+|---|---|---|---|
+| **engine(纯 CPU MoE)** | **0.246 ms** | 10.6 ms | 25% of period |
+| ep(跨 rank 归约) | 0.068 ms | 2.9 ms | 7% |
+| **rest**(GPU 工作+拷贝+host-fn 派发) | **0.666 ms** | 28.6 ms | **68% of period** |
+| period(层到层的真实串行时间) | 0.981 ms | **42.2 ms** | — |
+
+**⇒ `engine = 0.246 ms/层`,与无模型加载的隔离微基准(`bench_cd_plumbing.py`,0.32 ms/层)一致。**
+
+⚠️ **这推翻了我上一轮(§349)的"服务里每层慢 6.5× = 与 vLLM 抢核"结论。**
+服务里 CPU MoE 本身**根本没有变慢** —— 上一轮我把 `layer_43x=89 ms` 当成了 CPU MoE 时间,
+其实那 89 ms 里绝大部分是 **`rest`(GPU 侧)**,引擎只占 10.6 ms/43 层。
+**教训:分层计时必须用引擎自报的 `period/compute/ep/rest`,不要用外层的层循环墙钟去反推引擎。**
+
+#### (b) 触发条件排查:与 prompt / 采样**无关**,是稳态解码本身
+
+同一台服务,`ignore_eos=true`、固定 16 个输出 token:
+
+| 用例 | wall | per-token |
+|---|---|---|
+| 自然文本 32tok,greedy | 19.58 s | 1223.8 ms |
+| 自然文本 32tok,temp=1.0 | 19.54 s | 1221.3 ms |
+| 随机 token id 512,greedy | 21.48 s | 1342.8 ms |
+| 随机 token id 512,temp=1.0 | 20.03 s | 1251.9 ms |
+
+⇒ **四种组合都是 ~1.22–1.34 s/token**,与 prompt 内容、采样方式都无关。
+与 `bench_lat.sh` 的 `mean_tpot=1225.04 ms` 完全吻合(C=1、OUT=16 实测
+`mean_ttft=3428.7 ms`、`mean_e2el=21804.3 ms`,且 160 s/请求就是 128 × 1.225 s)。
+
+⚠️ **方法学教训**:我前几轮用 `max_tokens=90`(没设 `ignore_eos`)测出过 "36 ms/token",
+那是**提前 EOS + 前缀缓存命中**的假象。**测每 token 时间必须 `ignore_eos=true` 并读
+`usage.completion_tokens` 来算**,否则数字毫无意义。
+
+#### (c) 结论:瓶颈在**主线自身的 GPU 栈**,不在插件
+
+`cd-timing` 说我们的 MoE 回调链是 `0.981 ms/层 × 43 = 42 ms/token`;
+而端到端实测 **1225 ms/token** ⇒ **剩下 ~1183 ms/token(96%)完全在我们的模块之外**。
+
+⇒ **主线模式 A 的解码慢是主线 vLLM 在 SM80 上的注意力/dense/FP8 路径的问题**,
+这与 v0.2 的"最小补丁集"(尤其 pr2/pr3 的 SM80 移植)直接相关 —— 也已确认
+**当前 env 里 pr0/pr1/pr2/pr3 都已打上**(`process_fp8_weight_block_strategy` 标志存在,
+tree B 在 `6c73b08dec` 上有 32 个改动文件),所以**不是"补丁没打"这么简单**。
+
+⇒ **下一步**:用 `XIAOTU_MOE_FAKE_ALL=1`(纯 GPU 地板,文档里 fork 的 C=1 地板是 **16.80 ms**)
+把"主线 GPU 栈"单独量出来,与 16.80 ms 对照 —— 若主线地板也是 ~1.2 s,就是主线 SM80 路径
+需要继续移植;/若地板正常,则问题在 MoE 回调与 GPU 的交错上。
