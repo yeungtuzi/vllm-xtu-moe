@@ -1,0 +1,32 @@
+# vllm-xtu-moe: make the EngineCore<->front-end handshake timeout configurable.
+#
+# Why: the budget is a hard-coded 5 minutes.  In a CPU/GPU hybrid MoE deployment
+# (routed-expert weights in host memory, VLLM_EXPERTS_LOAD_DEVICE=cpu) the worker
+# builds one CPU MoE engine per layer while loading the checkpoint; for a 43-layer
+# model on a 2x EPYC host that takes ~6 minutes, so the 5-minute budget expires
+# during a *healthy* load and the engine core is torn down with
+#   "Did not receive response from front-end process within 5 minutes".
+#
+# Measured on the same machine (NOTES 334): worker init -> teardown at 313 s, twice,
+# while workers were still progressing (31/46 layers) and host RAM was fine
+# (11 GB used of 1.5 TB).  Nothing is wrong with the model or the plugin.
+#
+# No behaviour change by default (still 5 minutes); it only becomes overridable,
+# exactly like the sibling VLLM_ENGINE_READY_TIMEOUT_S knob.
+#
+# Apply with: git apply -p1   (or: patch -p1)   from the vllm repo root
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -97,7 +97,11 @@
+ logger = init_logger(__name__)
+ 
+ 
+-HANDSHAKE_TIMEOUT_MINS = 5
++# EngineCore <-> front-end handshake budget.  A CPU/GPU hybrid MoE deployment
++# (routed-expert weights in host memory) builds one CPU MoE engine per layer
++# during weight loading, which can exceed 5 minutes for a 40+ layer model; the
++# timeout is therefore overridable.  Defaults to the upstream 5 minutes.
++HANDSHAKE_TIMEOUT_MINS = int(os.environ.get("VLLM_HANDSHAKE_TIMEOUT_MINS", "5"))
+ 
+ _R = TypeVar("_R")  # Return type for collective_rpc
+ 

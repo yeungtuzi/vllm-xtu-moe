@@ -11459,3 +11459,40 @@ NUMA 辅助(引擎自带 per-shard mbind)。
 新增 **`docs/INSTALL_MAINLINE.md`** —— 八节:前置条件 / 建环境 / 装 vLLM(方式 A 官方 wheel、
 方式 B 源码)/ **打补丁** / 装插件 / 自检 / 起服务 / 验证 / **失败回退表**。
 配套新增 **`scripts/apply_xtu_patches.sh`**(一键打补丁,支持 `LEVEL=1/2/3` 与 `DRY=1` 干跑)。
+
+### (e) 🔴 mainline 侧的真正阻塞:**加载期被"约 5–6 分钟"的看门狗掐掉**(5 次复现)
+
+| 尝试 | 常驻层 | 引擎建到 | worker 初始化 → 被掐 | 间隔 |
+|---|---|---|---|---|
+| ml02 | 12 | 50 | 05:43:43 → 05:48:56 | 313 s |
+| ml03 | 12 | 37 | 05:50:20 → 05:56:27 | 367 s |
+| ml04 | 12 | 36 | — | ~300 s |
+| ml05 | 12 | **62** | 06:07:19 → 06:12:32 | **313 s** |
+| ml06(已打 pr0) | 12 | 35 | 06:18:58 → 06:25:18 | 380 s |
+
+* **每次都停在"引擎建到一半"**(31/46 层左右),两个 rank 的进度不同(29 vs 33)⇒ **不是某一层的 bug**。
+* **主机内存充足**(实测 `free -g`:used 11 GB / 1501 GB)⇒ 不是 OOM。
+* worker 最后一行永远是 `[xiaotu] EP model.layers.N.ffn: rank r/2 owns experts …`,
+  然后 `[shutdown] Executor: waiting for worker exit` → **`all workers exited gracefully`**
+  ⇒ worker 是被**礼貌地要求退出**的,不是崩溃(日志里 0 条 Traceback/segfault)。
+* **已经排除/已调大的超时**:`VLLM_ENGINE_READY_TIMEOUT_S`(600→3600)、
+  `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`(300→3600)、
+  **`HANDSHAKE_TIMEOUT_MINS`(主线硬编码 5 分钟 → 新增 `pr0` 补丁可配,实测调到 60 分钟仍失败)**。
+* ⇒ **触发者仍未定位**;已排除"握手超时"。下一步:开 `PYTHONFAULTHANDLER=1`、
+  抓 EngineCore/worker 的**退出码**,并在 `wait_for_engine_startup` 的进程事件分支上打点。
+* 📌 **同时暴露一个真问题**:同样 43 层引擎,**lk 路径整机启动只用 2.4 分钟**
+  (`lkport57best12`:02:34:18 → 02:36:40),而 **mainline+插件路径 6 分钟还没建完** ⇒
+  **插件路径的引擎构造比 fork 路径慢 2.5×**(engine 构造里有 **1.6 GiB/层/rank 的 NUMA shard 拷贝**,
+  43 层 ≈ 69 GiB 主机内存搬运)。**把加载时间压到 5 分钟以内**本身就是一条可行的解法。
+
+### (f) 新增补丁 `pr0-handshake-timeout.patch`(1 文件 / +7 −1)
+
+把主线 `vllm/v1/engine/core.py` 里**硬编码**的 `HANDSHAKE_TIMEOUT_MINS = 5` 改成
+`int(os.environ.get("VLLM_HANDSHAKE_TIMEOUT_MINS", "5"))` —— **默认行为不变**,
+只是让"CPU 引擎逐层构造 > 5 分钟"的部署可以调大。已用 `patch --dry-run` 验证干净可用,
+并已应用到本机 mainline 工作树。`scripts/apply_xtu_patches.sh` 现在按 `pr0 → pr1 [→pr2 →pr3]` 顺序打。
+
+### (g) 安装说明成稿(见 `docs/INSTALL_MAINLINE.md`)
+
+八节 + 失败回退表,已把本轮踩到的**三个坑**写进去:两个启动看门狗、
+`pkill -f` 自杀(第 4 次复发)、常驻层与 KV 的显存取舍。

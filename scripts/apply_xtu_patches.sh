@@ -27,7 +27,10 @@ if [ -z "$TREE" ] || [ ! -d "$TREE/vllm" ]; then
   exit 2
 fi
 
-PATCHES=("$ROOT/patches/upstream/pr1-experts-load-device.patch")
+# pr0 必须最先打:它把"引擎握手超时"变成可配置的,否则 CPU 引擎逐层构造
+# (>5 min)会在健康加载过程中被主线硬编码的 5 分钟握手超时掐掉。
+PATCHES=("$ROOT/patches/upstream/pr0-handshake-timeout.patch"
+         "$ROOT/patches/upstream/pr1-experts-load-device.patch")
 [ "$LEVEL" -ge 2 ] && PATCHES+=("$ROOT/patches/upstream/pr2-fp8-sm80-o-proj.patch")
 [ "$LEVEL" -ge 3 ] && PATCHES+=("$ROOT/patches/upstream/pr3-sm80-port.patch")
 
