@@ -115,8 +115,16 @@ def main() -> int:
     rng = np.random.default_rng(7)
     x = torch.frombuffer(bytearray(rng.integers(0, 256, size=qlen * H * 2, dtype=np.uint8).tobytes()),
                          dtype=torch.uint8).view(torch.bfloat16).reshape(qlen, H).to(dev)
-    ids = torch.frombuffer(bytearray(rng.integers(0, E, size=qlen * K, dtype=np.int32).tobytes()),
-                           dtype=torch.int32).reshape(qlen, K).to(dev)
+    # DEDUP=N:所有 token 只用固定的 N 个专家(模拟"同一段文本连续 token 命中同一批专家",
+    # 用来量 L3(768 MB)复用能不能突破 DRAM 墙)。
+    dedup = int(os.environ.get("DEDUP", "0"))
+    if dedup > 0:
+        picks = rng.integers(0, E, size=(dedup,)).astype(np.int32)
+        flat = np.tile(picks, (qlen * K) // dedup + 1)[: qlen * K].astype(np.int32)
+        ids = torch.frombuffer(bytearray(flat.tobytes()), dtype=torch.int32).reshape(qlen, K).to(dev)
+    else:
+        ids = torch.frombuffer(bytearray(rng.integers(0, E, size=qlen * K, dtype=np.int32).tobytes()),
+                               dtype=torch.int32).reshape(qlen, K).to(dev)
     wts = torch.rand(qlen, K, dtype=torch.float32, device=dev)
     out = torch.zeros(max(qlen, 64), H, dtype=torch.float32, device=dev)   # 行数要 >= qlen
 

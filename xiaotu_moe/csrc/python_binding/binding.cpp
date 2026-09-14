@@ -88,6 +88,8 @@ struct CpuDecodeState {
     // 返回 true 表示发生了重新分配(旧 pinned 指针失效)。
     // retire=true(CUDA graph capture 期间)时只解除引用、不 cudaFreeHost ——
     // 捕获中既不允许 cudaStreamSynchronize,也不允许释放被 graph 节点引用的内存。
+    void* out_ptr_seen = nullptr;   // out_gpu 指针缓存(避免每次调用做 Python shape 查询)
+    size_t out_rows = 0;
     bool ensure_buffers(size_t nh, size_t ni, size_t nw, size_t no, bool retire = false) {
         bool realloc = false;
         auto grow = [&](void*& p, size_t& cap, size_t need) {
@@ -419,9 +421,24 @@ static void bind_moe_class(py::module& m, const char* name) {
             // 缓冲(`routed_experts.py:1700`);投机解码时一步要验证的 token 数可达
             // `num_seqs × (1 + num_spec_tokens)` > `max_num_seqs` ⇒ 直接写会**越界写显存**。
             // 这里显式检查:宁可少算这层并大声报错,也不要静默写坏设备内存。
+            // 每次调用都做 Python 属性查找太贵(每 token 43 次)⇒ 只在 out 指针
+            // 变化时才查一次形状,结果缓存在 state 里。
             try {
-                py::tuple shp = out_gpu.attr("shape");
-                const size_t rows = shp.size() > 0 ? py::cast<size_t>(shp[0]) : 0;
+                void* op = (void*)outg_dev;
+                size_t rows = 0;
+                {
+                    std::lock_guard<std::mutex> lg(g_cd_mtx);
+                    auto& stx = g_cd_state[&self];
+                    if (!stx) stx = std::make_unique<CpuDecodeState>();
+                    if (stx->out_ptr_seen == op) {
+                        rows = stx->out_rows;
+                    } else {
+                        py::tuple shp = out_gpu.attr("shape");
+                        rows = shp.size() > 0 ? py::cast<size_t>(shp[0]) : 0;
+                        stx->out_ptr_seen = op;
+                        stx->out_rows = rows;
+                    }
+                }
                 if (rows < (size_t)qlen) {
                     fprintf(stderr,
                             "[cd] ERROR: out_gpu rows=%zu < qlen=%d (lk 的 output_gpu 按 "
