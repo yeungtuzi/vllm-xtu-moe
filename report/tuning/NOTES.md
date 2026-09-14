@@ -10770,3 +10770,32 @@ max|ref| = 2.0   max_rel = 5.227e-3   → 门限 2e-3 ⇒ FAIL
 `MBT=256` + `MINBATCH=1024` 会让 lk 在初始化时报
 `gpu_prefill_min_batch_size (1024) must be less than or equal to max_num_batched_tokens (256)`
 (作者 config.yaml 也是这个组合)。⇒ 启动器里把 `MINBATCH` 夹到 `MBT` 以内。
+
+---
+
+## 320. 【第 216 轮】常驻层上限实测 **11 层**(12/13 层都失败);并锁定 CPU 段的真正瓶颈:**每个 rank 只有 48 线程**
+
+### (a) 常驻层上限(TP=2 / MBT=256 / util 0.90)
+
+| 常驻层数 | 结果 |
+|---|---|
+| 13(`RESIDENT=0-12`) | ❌ `No available memory for the cache blocks` |
+| 12(`RESIDENT=0-11`) | KV 只剩 **0.78 GiB**,预热期一笔 +2 GiB 分配 ⇒ ❌ worker 死 |
+| **11(`RESIDENT=0-10`,util 0.80)** | ✅ KV 2.19 GiB,**C=1 TPOT 31.78**(当前最优) |
+
+⇒ **11 层是这台 2×40GB 的上限**(util 0.90 也救不了:预热还要 ~2 GiB)。
+item 4 的量化到此完成:**每层 −0.70 ms/token(C=1)/−1.70(C=4),最多 11 层**。
+
+### (b) 🔑 CPU 段的真正瓶颈:**线程数,而不是内核**
+
+* harness(world=1,**96 线程**=4 核/CCD × 24 CCD)读 **76 MB** → **0.35-0.38 ms**;
+  而服务里 **每 rank 只有 48 线程**(rank 切分后只拥有 12 CCD × 4 核)读 **38 MB** → **0.41 ms**。
+* 折算成"每字节":harness 217 GB/s vs 服务 93 GB/s/rank(**2.3× 差**)——
+  **不是内核效率差,是每个 rank 只拿到了一半 CCD、一半线程**。
+* 这同时解释了参考的"每层 ~0.19 ms":它**很可能没有做核切分**,两个 rank 的 96 个线程
+  被 OS 铺在 192 核上(2×48=96 线程,无超订)⇒ 每个 rank 都能用到**全部 24 CCD 的带宽**。
+  我们之前测 `RANK_SPLIT=0` 得到 9.8 ms/层,是因为当时**两个 rank 各 96 线程 pin 在同一批 96 核**
+  (2× 超订),不是"不切分"本身的错。
+* **下一步实验(便宜、可能一次到位)**:`RANK_SPLIT=1` + **`THREADS=96`**
+  ⇒ 每个 rank 在自己那 12 个 CCD 上用 **8 核/CCD**;若 compute 从 0.41 掉到 ~0.25-0.30
+  ⇒ 11 层常驻下 C=1 TPOT 有望 **31.78 → ~27-28 ms(达标 ≤30)**。
