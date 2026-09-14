@@ -191,3 +191,23 @@ ls /tmp/ml_clean/vllm/models/deepseek_v4/
 | 模式 A 的能力缺口 | OOT 覆盖的是模型类,**cudagraph / prefix caching / chunked prefill / spec decode 是否全部可用未验证** | 本轮之后逐项实测;模式 B 原生吃主线机制,可能是更优形态 |
 | 结论只对当前主线 HEAD 成立 | 审计针对 `6c73b08dec` | 每次升主线重跑第五节命令即可 |
 | 参考对照会丢 | 一旦不再用 fork,`lk_moe` 同机对照仍需 `lvllmds4-x` env | 保留该 env 不动(0.1.0 已如此) |
+
+---
+
+## 七、补丁对主线 HEAD 的可用性(实测 `patch --dry-run`)
+
+在**干净主线 A**(`6c73b08dec` 的 `git archive` 导出)上逐个试打:
+
+| 补丁 | 检查文件数 | 失败 hunk | 结论 |
+|---|---|---|---|
+| `pr1-experts-load-device.patch` | 3 | **0** | ✅ 干净可用 |
+| `pr2-fp8-sm80-o-proj.patch` | 4 | **0** | ✅ 干净可用 |
+| `pr3-sm80-port.patch` | 21 | **0** | ✅ 干净可用 |
+
+```bash
+cd /tmp/ml_clean            # 干净主线工作树(无 .git 也可,用 patch(1))
+patch -p1 --dry-run < patches/upstream/pr1-experts-load-device.patch
+```
+
+⇒ **补丁集对当前主线 HEAD 是 rebase-clean 的**,不需要人工改行。
+这直接支撑 v0.2 的第 4 条目标(一条命令安装):`git clone mainline → patch -p1 → pip install wheel`。

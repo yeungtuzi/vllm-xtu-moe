@@ -11403,3 +11403,15 @@ NUMA/系统 ~+80,**非代码(README/CI/CLI/config)约 490 行**。
 NUMA 辅助(引擎自带 per-shard mbind)。
 
 审计全文见 **`docs/UPSTREAM_DRIFT.md`**。下一步:在主线最新版上实测形态 0 与形态 1 的端到端。
+
+### (e) ✅ 补丁对主线 HEAD 是 rebase-clean 的(实测)
+
+在干净主线(`6c73b08dec` 的 `git archive` 导出)上 `patch -p1 --dry-run`:
+
+| 补丁 | 检查文件 | 失败 hunk |
+|---|---|---|
+| `pr1-experts-load-device.patch` | 3 | **0** |
+| `pr2-fp8-sm80-o-proj.patch` | 4 | **0** |
+| `pr3-sm80-port.patch` | 21 | **0** |
+
+⇒ 三个补丁**全部干净可用**,无需人工改行。v0.2 的"一条命令安装"路径成立。
