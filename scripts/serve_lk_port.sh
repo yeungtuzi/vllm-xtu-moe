@@ -35,7 +35,13 @@ MAXLEN="${MAXLEN:-262144}"
 SEQS="${SEQS:-8}"
 MBT="${MBT:-8192}"
 GPU_UTIL="${GPU_UTIL:-0.90}"
-THREADS="${THREADS:-48}"          # lk 生产是每卡 48(LK_THREADS)
+THREADS="${THREADS:-60}"          # 每 rank 5 核/CCD(RANK_SPLIT=1 ⇒ 每 rank 12 CCD)
+                                 # 【第 220 轮实测】去掉并行区自旋(PUBLISH_SETTLE 2000→200)之后,
+                                 # 线程最优点从 4 核/CCD(48)移到 5 核/CCD(60):
+                                 # 服务端 C=1 26.48→26.17 ms、C=4 聚合 104.98→107.34 t/s;
+                                 # KV 不变(0.6 GiB / 34,858 token),0 错误。
+                                 # 铁律 R1 的"每 CCD 4–5 核"由此得到端到端确认。
+                                 # 回退:THREADS=48
 MINBATCH="${MINBATCH:-1024}"      # lk 生产同值:开 GPU prefill
 SPEC="${SPEC:-0}"      # **默认 0 = 不投机**(实测最快:TP=2 图 C=1 20.06 vs 投机 11.60 t/s,见 NOTES §298)
                        # auto = 从 ckpt config/张量自动识别 dspark 并把草稿钉在 GPU;1 = 强制开
