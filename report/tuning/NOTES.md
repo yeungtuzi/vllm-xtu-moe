@@ -12658,3 +12658,29 @@ FAKE_ALL 16tok: wall=0.54s  out_tok=16  per_tok=33.6 ms
 
 **关键**:NOTES 里的 **N4**(线程池 park/wake 成本与层间隔耦合)正好解释这个现象 ——
 层间隔越长(1.2 s/token!)park 越深,wake 越慢,形成正反馈。**这是本轮定位到的最可能的机制。**
+
+### 352. 🎉🎉🎉【v0.2·第 19 轮·定案】`XIAOTU_MOE_SPIN_IDLE_US=600000` ⇒ 解码 **1225 → 43.5 ms/token(28×)**
+
+同一个服务、同一协议(512-token prompt / `ignore_eos` / 16 输出 token),只改线程池自旋窗口:
+
+| 配置 | 每 token | 相对 0.1.0(26 ms) |
+|---|---|---|
+| 引擎默认(5 ms 后 park) | **1225.0 ms** | 47× 慢 |
+| **`XIAOTU_MOE_SPIN_IDLE_US=600000`** | **43.5 ms** | **1.67×** |
+
+**⇒ 机制确认(N4:线程池 park/wake 成本与层间隔耦合)**:worker 默认 5 ms 没活就 park;
+而"层间隔"一旦变长(开始变慢)就 park 更深、wake 更慢 ⇒ **正反馈**。
+这个正反馈就是 1225 ms 与 43.5 ms 的全部差别 —— **既不是引擎算力,也不是主线 GPU 栈**
+(前者隔离测 0.32 ms/层,后者 `FAKE_ALL` 地板 33.6 ms/token)。
+
+**⇒ 已设为 `serve_mainline.sh` 的默认**(`SPIN_IDLE_US=600000`),不再留引擎默认值。
+代价是 60 线程 × 2 rank 常驻自旋吃 CPU(本机 192 核可接受)。
+
+**本轮方法论总结(值得记住的三条)**:
+1. **每 token 时间必须 `ignore_eos=true` 并读 `usage.completion_tokens`** —— 否则
+   提前 EOS + 前缀缓存会给出低 30× 的假数字(我因此浪费了两轮)。
+2. **`FAKE_ALL` / `FAKE_CPU` 是分离"我们的模块 vs 其余"的最快手段** ——
+   33.6 ms 的地板一句话就排除掉了整条主线 GPU 栈。
+3. **`[cd-timing/async]` 的 `period`/`compute` 只反映"投递",不反映异步 worker 的真实计算** ——
+   异步路径下不能用它下结论;隔离微基准同样覆盖不到异步 worker,所以它给 0.32 ms/层
+   而服务里是 28.5 ms/层。**"微基准正常"不等于"服务正常",差在异步/池行为上。**
