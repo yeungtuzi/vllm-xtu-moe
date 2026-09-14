@@ -26,10 +26,13 @@ GPU_UTIL="${GPU_UTIL:-0.80}"
 MAXLEN="${MAXLEN:-8192}"
 SEQS="${SEQS:-8}"
 MBT="${MBT:-}"                       # 空 = 用主线默认
+# 加载策略:实测插件路径读分片 2.5-4.8 s/片(fork 路径 0.6 s/片);
+# 主线日志明确建议 EXT4 上用 prefetch 强制预取。
+LOAD_STRATEGY="${LOAD_STRATEGY:-prefetch}"
 # 引擎线程:插件侧旋钮(每 rank 12 CCD ⇒ 5 核/CCD = 60)
 THREADS="${THREADS:-60}"
 # 额外常驻 GPU 的 MoE 层(与 lk 的 LVLLM_GPU_RESIDENT_MOE_LAYERS 同义)
-RESIDENT="${RESIDENT:-0-11}"
+RESIDENT="${RESIDENT-0-11}"
 # 1 = OOT 模型覆盖(默认,零补丁);0 = 主线 RoutedExperts + 我们的 CPU 后端
 OOT="${XIAOTU_OOT_OVERRIDE:-1}"
 EXTRA_ENV="${EXTRA_ENV:-}"
@@ -49,10 +52,11 @@ ARGS=(
   --served-model-name DeepSeek-V4-Flash-xiaotu
 )
 if [ -n "$MBT" ]; then ARGS+=(--max-num-batched-tokens "$MBT"); fi
+if [ -n "$LOAD_STRATEGY" ]; then ARGS+=(--safetensors-load-strategy "$LOAD_STRATEGY"); fi
 
 {
   echo "tag=$TAG port=$PORT tp=$TP gpus=$GPUS maxlen=$MAXLEN seqs=$SEQS gpu_util=$GPU_UTIL"
-  echo "mbt='$MBT' threads=$THREADS resident='$RESIDENT' oot=$OOT extra_env='$EXTRA_ENV'"
+  echo "mbt='$MBT' threads=$THREADS resident='$RESIDENT' oot=$OOT load_strategy='$LOAD_STRATEGY' extra_env='$EXTRA_ENV'"
   echo "env=$ENV"; echo "ckpt=$CKPT"; date -Is
 } > "$OUTDIR/$TAG.env"
 

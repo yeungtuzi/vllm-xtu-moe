@@ -11496,3 +11496,35 @@ NUMA 辅助(引擎自带 per-shard mbind)。
 
 八节 + 失败回退表,已把本轮踩到的**三个坑**写进去:两个启动看门狗、
 `pkill -f` 自杀(第 4 次复发)、常驻层与 KV 的显存取舍。
+
+### (h) ✅ 找到加载慢的真因:`--safetensors-load-strategy=prefetch`(加载 330 s → **133 s**)
+
+用日志时间戳做了相位分析(ml06hs):
+
+| 阶段 | T+ | 证据 |
+|---|---|---|
+| worker 初始化 | 16 s | `gpu_worker.py:438 Using V2 Model Runner` |
+| **开始读 checkpoint** | 66 s | `Checkpoint size: 155.43 GiB`,48 个分片 |
+| **被掐** | **397 s** | `[shutdown] Executor` |
+
+* **checkpoint 分片读取速率是主因**:插件路径 **2.5–4.8 s/片**,而 **lk fork 路径只要 0.6 s/片(1.5–3 片/s)**
+  —— **慢 7×**。主线日志里自己给了提示:
+  `Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS.
+   If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.`
+* **加 `--safetensors-load-strategy=prefetch` 后(实测 ml07pf)**:
+  **48 个分片 100% 完成只用了 ~133 s**(此前 ~330 s),**加载时间直接砍掉 60%**。
+* 启动器已把 `LOAD_STRATEGY=prefetch` 设为默认(可用 `LOAD_STRATEGY=` 关闭)。
+
+⚠️ 但**仍未通过**:ml07pf 在 T+276 s 仍被掐(35 层引擎已建,加载已完成)。
+⇒ 掐的时间点 **276/313/367/380/397 s 各不相同**,**不是固定超时**;
+   更像"某个与进度相关/事件驱动的条件"触发的。下一步要用**退出码 + faulthandler**取实证。
+
+### (i) 加载耗时的账(供安装说明参考)
+
+```
+155.43 GiB checkpoint × 2 rank
+  默认策略:2.5–4.8 s/片 × 48 ≈ 330 s
+  prefetch:≈ 133 s              ← 默认已开
++ 逐层 CPU 引擎构造(含 1.6 GiB/层/rank 的 NUMA shard 拷贝)≈ 140 s(35 层)
+⇒ 总计 ~4.6 分钟,仍贴着看门狗的边界
+```
