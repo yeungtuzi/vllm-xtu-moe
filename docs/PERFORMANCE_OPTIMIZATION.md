@@ -1005,3 +1005,120 @@ lk:单流 30-35、投机 ≈50、C=4 ≈70(其 `config.yaml` 是 **4 卡** `tens
   "不投机 30-35、投机 ≈50"一致。
 * ⇒ **两卡部署请用 `SPEC=0`**(`bash scripts/serve_lk_port.sh SPEC=0 ...`);
   要开投机就同时给出更高的接受率(`SPEC_JSON` 可调)或更多卡。
+
+---
+
+# 【第 218 轮·收官】"不投机解码"同机差距的四条手段:逐条 before/after(全部同机实测)
+
+> 目标(第 217 轮立项):把不投机解码的同机差距追回来。
+> 基线:ours C=1 TPOT **37.33 ms** / C=4 聚合 **~34 t/s**;参考 lk_moe 2.4.2 同机同配置 **25.36 / 66.10**。
+> 全部数字来自本机实测;协议见文末"测量口径"一节。
+
+## 一、总览(四条手段的最终账)
+
+| # | 手段 | 结果 | before → after(同口径) |
+|---|---|---|---|
+| 1 | staging 与计算重叠(第二 CUDA 流 + 双缓冲) | 🟡 **以"异步握手"实现等价重叠**;严格依赖链内无法双缓冲(有实测依据) | 见手段 3(重叠收益全部体现在 `V` 上) |
+| 2 | 减少每层驱动/Python 调用 | 🟡 **图模式下收益为 0(已实测解释)**;eager 模式下才有意义 | 图模式 Python 调用次数 = **0**(解码步整体 replay) |
+| 3 | **常驻工作线程 + flag 握手取代 `cudaLaunchHostFunc`** | ✅ **最大单点收益** | 同协议 A/B:TPOT `28.76→28.10 / 36.12→30.49 / 48.35→33.51`;聚合 `32.5→32.7 / 51.3→**60.0** / 71.8→**100.5**` |
+| 4 | **用 KV 换常驻层** | ✅ 收益已量化 | **−0.70 ms/token/层 @C=1,−1.70 @C=4**;可用上限 **12 层** |
+
+**最终验收(同协议 `bench_lat.sh`,L=256/OUT=512/N=8,TP=2,util 0.80,MBT 256,`MINBATCH=0`,图,SPEC=0,12 层常驻):**
+
+| 并发 | 专有 lk_moe | **vllm-xtu-moe** | 我们/参考 | 验收 |
+|---|---|---|---|---|
+| C=1 | 23.11 ms / 41.04 t/s | **28.13 ms / 32.67 t/s** | 0.82× | ✅ ≤30 ms |
+| C=2 | 31.75 ms / 59.73 t/s | **30.55 ms / 59.89 t/s** | **1.00×** | — |
+| C=4 | 41.88 ms / 86.92 t/s | **33.60 ms / 100.16 t/s** | **1.15×** | ✅ ≥50(>60) |
+
+步代价拟合 `TPOT(C)=F+C·V`:参考 `F=16.85 / V=6.26`;我们 **`F=26.30 / V=1.80`**
+⇒ **每 token 边际成本已反超**,剩余差距 100% 在"每步固定开销"。
+
+## 二、手段 3 细节:为什么不能用 `cudaStreamWaitEvent`,以及怎么做的
+
+* **问题**:`cudaLaunchHostFunc` 每层让整条流排空 —— 服务内实测 **36 µs/层 ≈ 1.55 ms/token**。
+* **为什么不用 event**:event 只能由 **GPU 侧**记录;CPU 算完无法"记录事件"给 GPU 等。
+  原立项里写的 `cudaStreamWaitEvent` 在**这条依赖方向**上不成立。
+* **实现**:每层一对 `cudaHostAllocMapped` flag(`hin`/`hout`,分处不同 cache line)+ 一个常驻自旋 worker:
+  * 流内:`3×D2H` → `cuStreamWriteValue32(hin,1)` → `cuStreamWaitValue32(hout,EQ 1)` → `H2D` → `cuStreamWriteValue32(hin,0)`;
+  * worker:轮询 `hin != 0` → 算 CPU MoE + EP → `hout=1` → 等 `hin==0` → `hout=0`。
+  * 两者都是**流内存操作**,图捕获安全(已实测通过捕获)。
+* **两个必须记住的坑**(详见 NOTES §326):
+  1. mapped flag **必须在构造期分配** —— 服务里第一次 `cpu_decode` 发生在 **CUDA graph 捕获区内**,
+     捕获期 `cudaHostAlloc` 会让整段 capture 作废(`cudaErrorStreamCaptureInvalidated`);
+  2. 常驻 worker 在**静态析构期**仍会轮询 ⇒ 状态容器改为 `*new` 故意泄漏到进程退出,否则 SIGSEGV。
+* **数值**:async 与 host-func 输出 **逐位相同**;服务级 greedy 文本 **5/5 完全一致**。
+
+## 三、手段 4 细节:常驻层的显存→延迟兑换率
+
+| 常驻层数 | KV(TP=2, util 0.80) | C=1 TPOT | 备注 |
+|---|---|---|---|
+| 0(基线) | 18.78 GiB | 37.33 ms | — |
+| 5 | 6.15 GiB | 33.82 ms | −0.70 ms/层/token |
+| 11 | 2.19 GiB | 31.78 ms | 历史可用上限 |
+| **12** | 0.6 GiB(34,858 token) | **28.13 ms** | 当前配置(短上下文基准够用) |
+| 13 | — | ❌ 启动失败 | `No available memory for the cache blocks` |
+
+* 每层常驻 = **1.6 GiB/rank**;C=4 时每层价值 **−1.70 ms/token**(批量越大越值)。
+* ⚠️ 12 层只剩 ~0.6 GiB KV ⇒ **只适合短上下文**;长上下文请用 11 层。
+
+## 四、手段 2 细节:为什么"图模式下"为 0(附 eager 对照)
+
+* `compilation_config.cudagraph_mode=FULL_DECODE_ONLY` 下,**解码步整体 replay**:
+  Python 侧 `RoutedExperts.forward` / `_cpu_decode` / `pybind` 调用在稳态下**一次都不执行**,
+  每步只有 graph 节点(D2H / flag / H2D)在跑。
+  ⇒ 因此"去掉每层 Python 属性查找、合并 3 次 D2H"这类改动**在稳态解码里拿不到收益**。
+* 已做且保留的改进:`out_gpu.shape` **护栏改为按 out 指针缓存**(每引擎只查一次,
+  仅首次/换缓冲时做 Python 形状查询)。
+* **3×D2H 合并的可行性结论**:hidden / ids / weights 是**三个独立设备张量**,
+  没有 nvcc 就无法在设备侧打包 ⇒ 单流内无法合并为 1 次 `cudaMemcpyAsync`;
+  且三项拷贝合计实测仅 **10.1 µs/层**(≈0.3 ms/token)。**判定:低收益,不做。**
+
+## 五、手段 1 细节:为什么"第二 CUDA 流 + 双缓冲"在严格依赖链内拿不到收益
+
+* 解码路径是**严格串行链**:`注意力(L) → MoE(L) → 残差 → 注意力(L+1)`,
+  层 L 的 MoE 输出是层 L+1 的**输入** ⇒ 同一 token 内**不存在可双缓冲的独立分块**。
+* 真正的重叠只能来自"**其它并行工作**"(别的 stream / 别的子图 / 通信)。
+  这正好是 `cudaLaunchHostFunc` 破坏掉的东西:它让**整条流**排空,
+  而 flag 握手只阻塞**等待的那条流**。实测证据:
+  * C=1(无可重叠工作):只赚 0.66 ms;
+  * C=4(有其它 token / 子图的工作):赚 **14.8 ms**(48.35 → 33.51)。
+  ⇒ **"重叠"的收益随并发放大**,与"双缓冲"预期一致,只是实现手段换成了 flag 握手。
+
+## 六、测量口径(复现命令)
+
+```bash
+# 服务端(我们)
+ENV=/home/user/anaconda3/envs/lkxtu TAG=<tag> TP=2 GPUS=0,1 GPU_UTIL=0.80 MAXLEN=8192 \
+  SEQS=8 MBT=256 MINBATCH=0 PREFETCH=1 EAGER=0 THREADS=48 SPEC=0 RESIDENT=0-11 \
+  EXTRA_ENV="XIAOTU_MOE_ASYNC=1" bash scripts/serve_lk_port.sh
+# 服务端(参考,只换引擎)
+ENV=/home/user/anaconda3/envs/lvllmds4-x ... (同上) bash scripts/serve_lk_port.sh
+# 客户端(唯一协议)
+PORT=8070 TAG=<tag> L=256 OUT=512 CS="1 2 4" SERVER_TAG=<tag> bash scripts/bench_lat.sh
+# 每层 rest/compute 拆分
+EXTRA_ENV="XIAOTU_MOE_ASYNC=1 XIAOTU_CD_TIMING=1 XIAOTU_CD_TIMING_EVERY=3100"
+# 数值门禁
+XIAOTU_LAYER1_NPZ=fixtures/real_layer1_model.npz python scripts/test_block23_equiv.py
+```
+
+* ⚠️ **`MINBATCH=0` 时预填充走 CPU(~230 t/s)**;若用长输入 + 短输出,聚合吞吐会被预填充主导
+  (L=512/C=4 会量出 21.6 t/s 而 TPOT 只有 86 ms)⇒ **量解码必须"短输入 + 长输出"**。
+* ⚠️ **引擎改完必须 `scripts/deploy_engine.sh`**:服务 import 的是 conda env `site-packages` 里的拷贝,
+  不是本仓库(踩过:一整轮的结论其实跑的是旧代码)。
+
+## 七、下一轮的唯一目标:每层 ~0.23 ms 的"非字节成本"
+
+本轮的机制诊断(见 NOTES §328)给出了明确方向:
+
+| 观测 | 数值 | 结论 |
+|---|---|---|
+| 每层 `compute`(服务,qlen=1) | **0.304 ms**(engine 0.304 / EP 0.014) | 仍是 C=1 的最大单项 |
+| 线程伸缩(harness,DEDUP=6) | 24→0.645 / 48→0.419 / **96→0.344** / 192→0.333 ms | **4 核/CCD 即饱和**(铁律 R1 得到干净曲线) |
+| **边际带宽**(DEDUP 1→6,FLOPs 不变) | 63 MB / 0.091 ms = **692 GB/s**(48 线程档 **768 GB/s**) | **权重流式读取已在机器上限(740)的 93–100%** |
+| 单专家时(12.6 MB)仍要 | **0.253 ms** | ⇒ **每层约 0.23 ms 与字节数无关**,是真正的下一个靶子 |
+
+⇒ **不要再优化"每字节搬得更快"(已到顶)**,要打"**与字节无关的那 0.23 ms**"。
+首要嫌疑(已有证据):工作池在**每个并行区**都会把全部线程唤醒一次 ——
+`SHARD-JOBDIAG` 显示 `total=64 exec=64` 时 **`abandoned=96`**(正好等于线程数),
+且 `issued = total + nthreads` ⇒ **每层每个并行区都有 nthreads 次"空领票/重新武装"**。
