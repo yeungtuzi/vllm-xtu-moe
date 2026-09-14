@@ -409,8 +409,17 @@ class CpuMegaExpertsParams(nn.Module):
     关键:分配在 CPU => 模型构造不再在 GPU 上 materialize 138GB => 解决构造期 OOM。
     """
 
-    def __init__(self, num_experts, hidden_size, intermediate_size, device="cpu"):
+    def __init__(self, num_experts, hidden_size, intermediate_size, device="cpu",
+                 ep_start=0, ep_local=None, ep_global=None):
         super().__init__()
+        # 【NOTES §365】EP:只分配**本 rank 的专家分片**。
+        # 主线原先按 config.n_routed_experts(=256) 全量分配 ⇒ 每 rank 138 GB,
+        # 而 fork 用 `moe_config.num_local_experts`(=256/TP) ⇒ 只要一半。
+        # 同机实测:fork+我们的引擎 105 GB/worker vs 主线+我们的插件 260 GB/worker。
+        self.ep_start = int(ep_start)
+        self.ep_local = int(ep_local if ep_local is not None else num_experts)
+        self.ep_global = int(ep_global if ep_global is not None else num_experts)
+        num_experts = self.ep_local          # 下面的 zeros 全部按本地数分配
         self.num_experts = num_experts
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -449,7 +458,16 @@ class CpuMegaExpertsParams(nn.Module):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
-        local_ids = _map_global_expert_id(expert_id)
+        # global -> local(§365):不属于本 rank 的专家直接跳过(不写、不占内存)。
+        try:
+            _eid = int(expert_id)
+        except Exception:  # noqa: BLE001 - 0-dim tensor / numpy 标量
+            _eid = expert_id
+        if isinstance(_eid, int):
+            _lid = _eid - self.ep_start
+            local_ids = [_lid] if 0 <= _lid < self.ep_local else []
+        else:
+            local_ids = _map_global_expert_id(expert_id)
         loaded_any = False
         for local_expert_id in local_ids:
             expert_data = param.data[local_expert_id]
@@ -517,13 +535,33 @@ class CpuXiaotuMoE(nn.Module):
         self.renormalize = config.norm_topk_prob
         self.scoring_func = getattr(config, "scoring_func", "sqrtsoftplus")
         self.n_shared_experts = config.n_shared_experts or 0
-        self.n_local_experts = config.n_routed_experts
+        # ---- EP 存储分片(§365)----------------------------------------------
+        # 默认跟 fork 一样:每个 rank **只分配/加载** n_routed_experts/TP 个专家。
+        # XIAOTU_MOE_EP_SHARD_STORAGE=0 可回到旧的"每 rank 持全部"行为(排障用)。
+        self._shard_storage = os.environ.get(
+            "XIAOTU_MOE_EP_SHARD_STORAGE", "1") != "0"
+        _tp, _rk = 1, 0
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            _tp = int(get_tensor_model_parallel_world_size())
+            _rk = int(get_tensor_model_parallel_rank())
+        except Exception:  # noqa: BLE001
+            _tp, _rk = 1, 0
+        if not self._shard_storage:
+            _tp, _rk = 1, 0
+        self._ep_tp, self._ep_rank = max(1, _tp), max(0, _rk)
+        self._stor_local = config.n_routed_experts // self._ep_tp
+        self._stor_start = self._ep_rank * self._stor_local
+        self.n_local_experts = self._stor_local
         self.n_logical_experts = config.n_routed_experts
         self.n_physical_experts = config.n_routed_experts  # 无 redundant
-        self.n_local_physical_experts = config.n_routed_experts  # 单 rank 持全部
+        self.n_local_physical_experts = self._stor_local
         self.n_redundant_experts = 0
-        self.experts_start_idx = 0
-        self.experts_end_idx = config.n_routed_experts
+        self.experts_start_idx = self._stor_start
+        self.experts_end_idx = self._stor_start + self._stor_local
         self.hash_indices_dtype = torch.int64  # mega 语义
         self.image_sentinel_lo = (
             IMAGE_SENTINEL_BASE_ID
@@ -588,6 +626,9 @@ class CpuXiaotuMoE(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             device="cpu",
+            ep_start=self._stor_start,
+            ep_local=self._stor_local,
+            ep_global=config.n_routed_experts,
         )
         self.engine = None
         self._timing = os.environ.get("XIAOTU_TIMING") == "1"
@@ -689,6 +730,13 @@ class CpuXiaotuMoE(nn.Module):
 
         tp = get_tensor_model_parallel_world_size()
         if tp > 1:
+            if getattr(self, "_shard_storage", False):
+                # 【§365】参数已经是本 rank 分片,整份返回,不要再切。
+                return (
+                    ex.w13_weight.data, ex.w13_weight_scale.data,
+                    ex.w2_weight.data, ex.w2_weight_scale.data,
+                    self._stor_start, self._stor_local, tp,
+                )
             # Expert-parallel: each rank streams only its 1/TP expert shard.
             rank = get_tensor_model_parallel_rank()
             L = self.n_routed_experts // tp
@@ -824,13 +872,19 @@ class CpuXiaotuMoE(nn.Module):
             tp = int(get_tensor_model_parallel_world_size())
             if tp > 1:
                 rank = int(get_tensor_model_parallel_rank())
-                E = int(w13.shape[0])
-                L = E // tp
-                st = rank * L
-                w13 = w13[st:st + L].contiguous()
-                w2 = w2[st:st + L].contiguous()
-                s13 = s13[st:st + L].contiguous()
-                s2 = s2[st:st + L].contiguous()
+                if getattr(self, "_shard_storage", False):
+                    # 【§365】参数**已经只含本 rank 分片**(分配期就切了)⇒ 绝不能再切一次,
+                    # 否则切出空张量。直接沿用分配时记下的 start/local。
+                    E = self.n_logical_experts
+                    st, L = self._stor_start, self._stor_local
+                else:
+                    E = int(w13.shape[0])
+                    L = E // tp
+                    st = rank * L
+                    w13 = w13[st:st + L].contiguous()
+                    w2 = w2[st:st + L].contiguous()
+                    s13 = s13[st:st + L].contiguous()
+                    s2 = s2[st:st + L].contiguous()
                 self._ep = True
                 self._ep_start = st
                 self._ep_local = L

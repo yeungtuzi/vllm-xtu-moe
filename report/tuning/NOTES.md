@@ -13240,3 +13240,45 @@ torch.zeros(num_experts, 2*I, H//2)                            # ⇒ 每 rank 13
 ⇒ **不是 async、也不是 NSLICE**;是主线栈上更深的一层(候选:
 (b) 那个"每 rank 持全量专家 + 恒等 expert_map"导致的**路由/规约结构与 fork 不同**)。
 **先做 (b) 再复测确定性** —— 两者很可能是同一个根因。
+
+### 366. ✅【v0.2·第 29 轮】C3 修复落地:**每 worker 260 → 190 GB(−70 GB/worker,−140 GB 总)**
+
+#### (a) 改了什么(`XIAOTU_MOE_EP_SHARD_STORAGE`,默认 1)
+
+学 fork 的做法 —— **按本地专家数分配**,而不是全量:
+
+| | 改前 | 改后 |
+|---|---|---|
+| `CpuXiaotuMoE.n_local_experts` | `config.n_routed_experts`(256) | `n_routed_experts // tp`(128) |
+| `experts_start_idx / end_idx` | `0 / 256` | `rank*L / rank*L+L` |
+| `CpuMegaExpertsParams` 分配 | `torch.zeros(256, …)` = **138 GB/rank** | `torch.zeros(128, …)` = **69 GB/rank** |
+| `weight_loader` 映射 | 恒等(`_map_global_expert_id`) | **global→local**,不属于本 rank 的直接跳过 |
+| `finalize` / `_gpu_shard` 的切片 | `w13[st:st+L]` | **已分片 ⇒ 不再切**(否则切出空张量) |
+
+`XIAOTU_MOE_EP_SHARD_STORAGE=0` 可回到旧行为(排障用)。
+
+#### (b) 实测
+
+| | 改前 | **改后** | fork(参照) |
+|---|---|---|---|
+| 每 worker `RssAnon` | 260.0 GB | **190.0 / 189.9 GB** | 105 GB |
+| 加载 | OK | OK | OK |
+| EP 报告 | `rank 0/2 owns [0,128)` | 同(正确) | — |
+| 墙钟(同一请求) | 1.42 s | **1.47 s** | 1.18 s |
+
+**−70 GB/worker** = `138 → 69 GB`(专家权重正好减半)⇒ 与预期**逐位吻合**。
+剩余 190 − 105 = 85 GB 的差在别处(引擎自身 ~74 GB + pinned 缓存),是**第二段差距**,
+不是这一次的目标。
+
+#### (c) 正确性:语义等价(不是逐位等价)
+
+| 对比 | 逐字符一致 |
+|---|---|
+| 分片后 连续两次 | 3/5 |
+| 分片后 vs 改前 | 2/5 |
+
+**但差异全部落在"思考"开头一句的措辞上,最终答案一致**(cap_fr 都答 Paris;zh 都给出
+同一段 MoE 定义;code 都是同一道题)。**⇒ 语义等价 ⇒ 分片没有破坏模型**
+(若 expert 映射错位,会立刻表现为乱码/复读)。
+同时印证 §365(c):**TP=2 这个栈本身不是逐位确定的**,分歧来自近似并列候选的 FP 次序,
+与本次改动无关(改前也是 2-3/5)。
