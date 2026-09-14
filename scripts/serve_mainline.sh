@@ -69,7 +69,14 @@ INTERLEAVE="${INTERLEAVE:-1}"
 # **1313 ms/token**。⇒ **空转只是把症状掩盖一会儿,同时把整机拖垮**,
 # 所以**不设为默认**。真正的修法见 NOTES §353(针对 park/wake 本身,
 # 以及解码只需 top_k 个线程却起 60 个线程的池同步开销)。
-SPIN_IDLE_US="${SPIN_IDLE_US:-}"
+# 🎯 **必须设 0**。引擎默认 5000 µs:每次调用后**所有** worker 都要自旋 5 ms
+# (wlimit=0 时门闸不生效)。43 层 × ~3 相 × 5 ms ⇒ 池几乎永不停转:
+#   实测 worker 1433–1552% CPU(≈15 核/worker,两个 rank ≈30 核)常驻自旋,
+#   load average 冲到 40+,而**自己制造的那 30 核争抢又反过来拖慢调用线程** ——
+#   形成正反馈:同一服务会从 37 ms/token 一路漂到 1420 ms/token(NOTES §355)。
+# 设 0 ⇒ 完全不自旋,worker 直接 futex 睡;CPU 145%、load 11、**37.7 ms/token 稳定**。
+# 注意这与"旋到 600000"是两个方向:600000 是让所有人**永远**自旋(更糟)。
+SPIN_IDLE_US="${SPIN_IDLE_US:-0}"
 # 🎯 解码性能的**真正开关**(NOTES §354):关掉"小 batch N-slice"路径。
 # 原因:`MOE_V2::small_batch_workers()` 按 `single_us = NASS*3*I*H/(8*3e3)` 估线程数,
 # 假设 fp8 8 MAC/cycle;DS-V4 维度下 qlen=1/top_k=6 算出 **6292 µs**(实际单线程 ~百 µs 级)
@@ -174,7 +181,7 @@ nohup env \
   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$GP_MIN" \
   XIAOTU_MOE_THREADS="$THREADS" \
   XIAOTU_MOE_NSLICE_SMALL="$NSLICE_SMALL" \
-  ${SPIN_IDLE_US:+XIAOTU_MOE_SPIN_IDLE_US="$SPIN_IDLE_US"} \
+  XIAOTU_MOE_SPIN_IDLE_US="$SPIN_IDLE_US" \
   XIAOTU_MOE_GPU_RESIDENT_LAYERS="$RESIDENT" \
   OMP_NUM_THREADS=1 \
   $EXTRA_ENV \

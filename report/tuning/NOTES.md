@@ -12775,3 +12775,55 @@ if (wl > 0 && wl < nt_) { size_t stride = nt_/wl;   // 60/59 = 1
 差距的合理归因:legacy 路径对 qlen=1 没用上 N-slice 的并行;
 正解是**把 `small_batch_workers()` 的 `single_us` 估准**(用实测单线程时间而不是标称 MAC 率),
 让 `wlimit` 落在"真的该用的线程数"(个位数),而不是 59。**这是下一轮的引擎侧改动。**
+
+### 355. 【v0.2·第 20 轮·收尾】两个旋钮都必要,但**还剩最后一层**:`wlimit=0` 让 60 个 worker 全部参与每一相
+
+#### (a) 更正 §354 过早下的结论
+
+§354 我写"28–33×"是基于两次幸运读数(43.7 / 36.4 ms)。继续测就露出**漂移**:
+同一台 `NSLICE_SMALL=0` 的服务,同一请求,时间序列是
+`36 → 330 → 1160 → 1420 ms/token`(每个窗口内稳定,跨窗口漂移)。
+⇒ **`NSLICE_SMALL=0` 单独一个旋钮不够。**
+
+#### (b) 两个旋钮都必要,合起来才稳
+
+| 配置 | 每 token | worker CPU | load |
+|---|---|---|---|
+| 默认 | 1225 ms(漂到 1420) | 3242% ×2 | 119 |
+| 仅 `NSLICE_SMALL=0` | 36 → **1420 ms**(漂移) | 1433–1552% ×2 | 40 |
+| `SPIN_IDLE_US=600000` | 43.5 → 1313 ms | 3242% ×2 | 119 |
+| **`NSLICE_SMALL=0` + `SPIN_IDLE_US=0`** | **rep1..5 = 37.9/37.8/37.6/37.6/37.4(median 37.7)** | **145%/137%** | **11** |
+
+⇒ 两个旋钮的**方向相反、都必要**:
+* `NSLICE_SMALL=0` 绕开 `wlimit=59` 的 limited 路径;
+* `SPIN_IDLE_US=0` 关掉"每次调用后所有 worker 自旋 5 ms"。
+**已同时设为 `serve_mainline.sh` 默认**(`NSLICE_SMALL=0` / `SPIN_IDLE_US=0`)。
+干净测量下 **37.7 ms/token 稳定**,对 0.1.0 的 26 ms 是 **1.45×**。
+
+#### (c) ⚠️ 仍未解决:`bench_lat.sh` 的工作负载下依旧退化
+
+在同一个(已设两个旋钮的)服务上:
+* 我的直连探测(natural prompt / 16 tok / ignore_eos):**37.7 ms/token,稳定**;
+* `bench_lat.sh`(random 512-token / 128 out / C=1):**158.8 s/请求 ≈ 1.24 s/token**。
+
+诊断:此时 worker CPU 仍是 **1112% / 1211%**(≈11 核/worker)。而 `SPIN_IDLE_US=0`
+已经让 worker 不再自旋 ⇒ **这 11 核是"真的在算"**:`wlimit=0`(unlimited)时
+`parallel_for` 会把**全部 60 个 worker 唤醒**参与每一相,每个只分到极小一片,
+唤醒/派发开销远大于算术本身。
+
+#### (d) 🎯 下一轮的引擎侧正解(已定位到具体函数)
+
+`moe_v2.hpp::small_batch_workers()` 的 `single_us` 估算取自**标称** MAC 率:
+
+```cpp
+const double single_us = macs / (8.0 * 3.0e3);   // macs = 6*3*2048*4096 = 1.51e8
+                                                 // ⇒ 6292 µs
+double t = std::sqrt(single_us / 1.8);           // ⇒ 59
+```
+
+**真实单线程解码耗时是百 µs 量级,估算高估了约 50×** ⇒ `wlimit = 59/nt=60`
+⇒ `stride = 60/59 = 1` ⇒ 门闸完全失效(**没有任何 worker 去 park**)。
+修法:把 `single_us` 换成**实测单线程时间**(或用 `NASS` 直接推:
+解码 `NASS=6` 时合理的并行度就是个位数),使 `wlimit` 落在 **4–8**;
+这样 `stride = 60/6 = 10`,只有 6 个 worker 自旋/参与,其余 park。
+**这正是代码注释里描述的设计意图**(line 1007-1012),只是估算公式没标定对。
