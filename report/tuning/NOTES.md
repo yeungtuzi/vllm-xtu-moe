@@ -12157,3 +12157,64 @@ Out of memory: Killed process ... (VLLM::Worker_TP) total-vm:678339392kB anon-rs
 
 ⇒ **下一步**:先用 `MBT=1024 = GP_MIN` 验证三个开关确实打通(GPU 路径被选中、结果正确),
 再把 `group_max_len` 与 `MBT` 解耦,最后才能对齐参考的大 `MBT` 拿到 4× 以上的预填充收益。
+
+### 342. 🎯【v0.2·第 14 轮】OOM 真因 = **NUMA 单节点耗尽**(不是总量不足);**`numactl --interleave=all` 一行修复**
+
+§341 我猜是 `group_max_len` 随 `MBT` 涨 —— **错了**。`MBT=1024` 同样 OOM(死在 layer 34/35,而 MBT=8192 死在 28/33),
+说明不是 `MBT` 的函数。真正的线索在 `oom-kill` 那一行的**约束字段**:
+
+```
+oom-kill:constraint=CONSTRAINT_MEMORY_POLICY,nodemask=0,cpuset=user.slice,
+         mems_allowed=0-7,global_oom,task_memcg=/user.slice/.../session-2224.scope
+```
+
+而 `memory.max = max`(cgroup **没有**限制)、`free` 显示还有 1.2 TB 可用 —— **总量根本没满**。
+本机 NPS=4 ⇒ **8 个 NUMA 节点,每个只有 193 GB**;而**单个 worker 的 anon-rss 就达 219–242 GB**,
+**超过一个节点的容量**。分配是 first-touch(node-local),于是一个节点先被填满 ⇒ 在 `nodemask=0` 上 OOM,
+即使别的节点还空着。
+
+**修复**:启动时加 `numactl --interleave=all`(mempolicy 被 fork 出的 worker 继承)⇒ 立刻启动成功:
+
+```
+Available KV cache memory: 18.32 GiB
+GPU KV cache size: 180,582 tokens, Maximum concurrency for 8,192 tokens per request: 22.04x
+Breakable CUDA graph enabled ... Graph capturing finished in 3 secs, took 2.14 GiB
+Application startup complete.
+```
+
+⇒ **这是一条通用经验:本机任何"单进程 >190 GB"的负载都必须 interleave 或显式绑节点,
+否则会在"明明还有 1.2 TB 空闲"的情况下被 OOM kill。** 已写进 `serve_mainline.sh` 的建议用法。
+
+#### (b) 那 219–242 GB/worker 到底是什么?——**实测逐层斜率**
+
+用 `/proc/<pid>/status` 的 `RssAnon` 逐步采样(ml_gp4 那次):
+
+| 阶段 | 每 worker anon | 增量 |
+|---|---|---|
+| 进程刚起 | 26.6 GB | — |
+| 加载 checkpoint(尚未建层) | **132.4 → 138.2 GB** | **vLLM 自己装了整个模型进"每个 rank"** |
+| 建层 18→86 层(即每 worker 9→43 层) | 168 → **279.9 GB** | **≈3.3 GB/层/worker** |
+
+**3.3 GB/层 正好是每层 256 个专家的全量 mxfp4 权重**(`(2·2048·4096 + 4096·2048)·0.5 B = 3.22 GB`)。
+⇒ **我们存了 4 份权重**:vLLM 的整模型 ×2 rank(276 GB)+ 我们引擎的各一份全量 ×2 rank(276 GB)
+= **552 GB**,而理论下限是 **160 GB 一份**。
+⇒ 用户指出得对:"切片的话也不会多占内存" —— 这里的问题**不是切片,而是"根本没有切片 + 又复制了一份"**。
+**这是下一轮最值得做的内存优化**:让引擎直接引用(而不是复制)checkpoint 张量,并让 vLLM 的
+expert 权重按 TP/EP 真正分片 ⇒ 552 GB → 160 GB,顺带把 interleave 的需求也消掉。
+
+#### (c) GPU prefill 在主线上**确实生效了**(TTFT 实测,`report/tuning/ttft_mainline_gp.jsonl`)
+
+主线 `PREFILL=1`(`MBT=1024 / GP_MIN=1024 / CUDAGRAPH_SIZES="1 2 4 8"` / `RESIDENT=` 空即 0 常驻),
+用 `scripts/probe_ttft.py` 测真实 TTFT(并经 `/tokenize` 标定真实 token 数):
+
+| 真实 tokens | TTFT | 有效 t/s | 该 prompt 的 chunk 情况 |
+|---|---|---|---|
+| 218 | 3.257 s | 67 | 1 chunk < 1024 ⇒ **CPU** |
+| 874 | **7.843 s** | 111 | 1 chunk < 1024 ⇒ **CPU** |
+| **1750** | **3.544 s** | **494** | 首 chunk = 1024 ⇒ **GPU 命中** |
+| ~3500 | 10.718 s | 326 | 多 chunk,每 chunk 各付一次 DMA |
+
+**🔑 决定性证据:token 数更多的 1750 反而比 874 快一倍以上(3.544 s vs 7.843 s)**
+—— 因为 874 全程 `<GP_MIN` 走 CPU,而 1750 的首个 chunk 达到 1024 触发了 GPU 路径。
+这正是阈值语义应有的行为,也证明三个开关在主线上真的打通了。
+(3500 变慢符合预期:每个 chunk 都要把 43 层权重重 DMA 一遍 ⇒ **`MBT` 必须 ≥ prompt 长度**才能拿到最好的收益。)
