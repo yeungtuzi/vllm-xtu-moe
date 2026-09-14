@@ -10982,3 +10982,44 @@ PREFETCH=1 / EAGER=0 / THREADS=48 / SPEC=0 / `RESIDENT=0-11`):
 * **修复**:新增 **`scripts/deploy_engine.sh`**(build + 复制 `build/*.so` 与源码到各 env)。
   `python_binding` 构建需要 `PYBIND11_INC`,本机只有 torch 自带的:
   `/home/user/anaconda3/lib/python3.10/site-packages/torch/include`(脚本已自动探测)。
+
+---
+
+## 326. 🎯🎯【第 218 轮·item 1/3 端到端落地】异步握手(常驻 worker + mapped flag)让 **C=4 聚合 71.8 → 100.5 t/s**,反超参考(86.9)
+
+### (a) 踩坑:捕获期 `cudaHostAlloc` 让整段 graph 作废
+
+* 第一版把 `cudaHostAlloc(mapped)` 放在 `async_init()` 里**惰性分配** ⇒ 服务启动时
+  `cudaErrorStreamCaptureInvalidated`(worker 报 `Profiling CUDA graph memory: FULL=4` 时炸)。
+  原因:**服务里第一次 `cpu_decode` 就发生在 CUDA graph 捕获区内**(`gpu_model_runner.py:6481`);
+  捕获期分配 pinned 内存 = 非法(与旧代码 `kDecodeTokenFloor` 预分配是同一个坑)。
+* 修复:把 mapped flag 的分配搬进 **`CpuDecodeState` 构造函数**(与 decode 缓冲同处),
+  `async_init()` 只做"注册 slot + 起 worker"。
+* 另修:harness 退出时 SIGSEGV —— 常驻 worker 在**静态析构期**仍轮询 `g_cd_state`,
+  而此时 map 已析构。改为 `*new` 故意泄漏(进程退出时由 OS 回收)。
+* 另修:`build_engine_variants.sh` 缺 `-l:libcuda.so.1` ⇒ `undefined symbol: cuStreamWriteValue32_v2`。
+* 另修:`scripts/deploy_engine.sh`(见 §325)—— **之前服务根本没跑 async**。
+
+### (b) 数值正确性:两条路径**逐位相同**
+
+* harness:async vs host-func 输出 dump 全等(u32 全等比例 **1.0000**)。
+* 服务:`scripts/probe_greedy.py`(temperature=0,5 个 prompt)greedy 文本逐字对比
+  —— 待本节 (d) 补记。
+
+### (c) 🎯 端到端结果(同协议 `bench_lat.sh` L=256 / OUT=512 / N=8 / 12 层常驻 / TP=2)
+
+| 并发 | **host-func TPOT / 聚合** | **async TPOT / 聚合** | 提升 |
+|---|---|---|---|
+| C=1 | 28.76 ms / 32.46 | **28.10 ms / 32.71** | 聚合 +0.8% |
+| C=2 | 36.12 ms / 51.29 | **30.49 ms / 59.98** | 聚合 **+17%** |
+| C=4 | 48.35 ms / 71.78 | **33.51 ms / 100.47** | 聚合 **+40%** ⚡ |
+
+* 与参考 `lk_moe` 同协议同配置(23.11 / 59.73 / 86.92)对比:
+  **C=1 0.82×(28.10 vs 23.11)、C=2 1.004×(打平)、C=4 1.16×(反超)**。
+* 步代价拟合 `TPOT(C)=F+C·V`:host-func `F=22.2, V=6.53` → async **`F=26.3, V=1.80`**。
+  ⇒ **async 几乎消掉了"每 token 边际成本"**:之前"多一个 token 就多 6.5 ms"是
+  **host-func 每层把整条流排空**造成的;换成 flag 握手后,同一层的
+  CPU 计算/拷贝能与**其它并行子图/别的 stream** 重叠 ⇒ 批量越大越赚。
+  (C=1 只有 1 个 token,GPU 没有可重叠的活 ⇒ 只赚 0.66 ms。)
+* ⚠️ 仍未达标项:C=1 28.10 ms > 参考 23.11;固定开销 F 反而从 22.2 涨到 26.3
+  —— 需要下一轮定位(F 里最大项仍是"31 层 CPU MoE 在 qlen=1 时的串行关键路径")。

@@ -80,6 +80,21 @@ else
   exit 2
 fi
 
+# CUDA **驱动** API:item 1/3 的 `cuStreamWriteValue32`/`cuStreamWaitValue32` 在 libcuda。
+# 不链接会在 `import` 时报 `undefined symbol: cuStreamWriteValue32_v2`(已踩)。
+DRV_LIBDIR=""; DRV_SONAME=""
+for d in /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib /usr/local/cuda/lib64/stubs; do
+  if [[ -e "$d/libcuda.so.1" ]]; then DRV_LIBDIR="$d"; DRV_SONAME="libcuda.so.1"; break; fi
+  if [[ -e "$d/libcuda.so" ]];   then DRV_LIBDIR="$d"; DRV_SONAME="libcuda.so";   break; fi
+done
+if [[ -n "$DRV_SONAME" ]]; then
+  CUDA_FLAGS+=(-L"$DRV_LIBDIR" -Wl,--no-as-needed -l:"$DRV_SONAME" -Wl,--as-needed)
+  echo ">> CUDA driver: $DRV_LIBDIR ($DRV_SONAME)"
+else
+  echo "!! CUDA driver lib not found (libcuda.so.1 is required for cuStreamWriteValue32)" >&2
+  exit 2
+fi
+
 COMMON="-std=c++17 -shared -fPIC -O3 -ffast-math -fno-finite-math-only"
 
 VARIANTS=(

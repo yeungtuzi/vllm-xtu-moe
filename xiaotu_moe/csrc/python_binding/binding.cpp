@@ -105,11 +105,27 @@ struct CpuDecodeState {
     void (*w_fn)(void*, int, int, const uint16_t*, const uint32_t*, const float*, float*) = nullptr;
     void* out_ptr_seen = nullptr;   // out_gpu 指针缓存(避免每次调用做 Python shape 查询)
     size_t out_rows = 0;
-    // ---- 异步路径的 per-layer 计时(XIAOTU_CD_TIMING=1)-------------------
-    // period = 上一次"看到 din==1"到本次:即真实串行的每层时间(GPU+拷贝+握手)。
-    // compute = 本次 CPU MoE(+EP)本身。rest = period - compute。
-    std::chrono::steady_clock::time_point last_seen{};
-    bool seen_once = false;
+
+    // 【必须】mapped flag 的**分配**放在构造期,不能在 cpu_decode 里惰性分配:
+    // 服务里第一次 cpu_decode 很可能发生在 **CUDA graph 捕获区**内
+    // (`gpu_model_runner.py:6481 Profiling CUDA graph memory`),
+    // 而捕获期 `cudaHostAlloc` 会让整段 capture 作废
+    // (实测:`cudaErrorStreamCaptureInvalidated`)。
+    CpuDecodeState() {
+        if (!std::getenv("XIAOTU_MOE_ASYNC")) return;
+        void* p = nullptr;
+        if (cudaHostAlloc(&p, 256, cudaHostAllocMapped) != cudaSuccess) return;
+        std::memset(p, 0, 256);
+        pin_flags = p;
+        hin = (volatile uint32_t*)p;
+        hout = hin + 32;                    // 不同 cache line,避免伪共享
+        void* dp = nullptr;
+        if (cudaHostGetDevicePointer(&dp, (void*)hin, 0) == cudaSuccess)
+            din = (CUdeviceptr)dp;
+        if (cudaHostGetDevicePointer(&dp, (void*)hout, 0) == cudaSuccess)
+            dout = (CUdeviceptr)dp;
+    }
+
     bool ensure_buffers(size_t nh, size_t ni, size_t nw, size_t no, bool retire = false) {
         bool realloc = false;
         auto grow = [&](void*& p, size_t& cap, size_t need) {
@@ -135,6 +151,7 @@ struct CpuDecodeState {
         if (pin_ids) cudaFreeHost(pin_ids);
         if (pin_weights) cudaFreeHost(pin_weights);
         if (pin_out) cudaFreeHost(pin_out);
+        if (pin_flags) cudaFreeHost(pin_flags);
         for (void* p : retired) cudaFreeHost(p);
     }
 };
@@ -231,14 +248,18 @@ bool auto_ep_setup(const void* key, const MOEConfigV2& cfg) {
 // MOE* identity; every MOE instance across every type has a unique address, so
 // sharing one map across all template instantiations is safe.
 std::mutex g_cd_mtx;
-std::unordered_map<const void*, std::unique_ptr<CpuDecodeState>> g_cd_state;
+// 故意"泄漏"到进程退出(`*new`):常驻 async worker 线程在**静态析构期**仍可能轮询
+// 这些 state,若此时 vector/map 已析构就会 SIGSEGV(实测,harness 退出时必崩)。
+// 泄漏的只是几十个 pinned 缓冲,进程退出后由 OS 回收。
+std::unordered_map<const void*, std::unique_ptr<CpuDecodeState>>& g_cd_state =
+    *new std::unordered_map<const void*, std::unique_ptr<CpuDecodeState>>();
 
 // ---- 异步枢纽(item 1/3)-----------------------------------------------
 // 每层一对 mapped flag:GPU 在 D2H 之后 cuStreamWriteValue32(hin,1),
 // 然后 cuStreamWaitValue32(hout,1) 等 CPU 结果,最后 H2D 并写回 hin=0。
 // 一个常驻 worker 轮询所有层的 hin;它**只自旋**(单线程,占 ~0.5% CPU)以保证低延迟。
-static std::mutex g_async_mtx;
-static std::vector<CpuDecodeState*> g_async_slots;
+static std::mutex& g_async_mtx = *new std::mutex();
+static std::vector<CpuDecodeState*>& g_async_slots = *new std::vector<CpuDecodeState*>();
 static std::atomic<bool> g_async_stop{false};
 static std::thread g_async_thr;
 static std::atomic<bool> g_async_started{false};
@@ -254,6 +275,13 @@ static void async_loop() {
     }();
     double sum_compute = 0, sum_period = 0, sum_ep = 0;
     int n = 0;
+    double min_period = 1e18, min_compute = 1e18;
+    // period = **相邻两次 cpu_decode 调用**的间隔(任意层),即每次调用实际覆盖的
+    // "GPU/常驻层 + 拷贝 + 握手"时间;compute = 本次调用的 CPU MoE(+EP)。
+    // ⚠️ 均值会被"请求之间的预填充空档"污染 ⇒ 同时给出 **min**(稳态下界,无空档)。
+    // ⚠️ 有常驻层时 1 次调用平均跨 `总层数/CPU层数` 个模型层,换算"每模型层"要再除这个比。
+    auto last_cb = std::chrono::steady_clock::now();
+    bool seen = false;
     while (!g_async_stop.load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> lg(g_async_mtx);
         for (auto* st : g_async_slots) {
@@ -268,30 +296,32 @@ static void async_loop() {
                     auto t_end = std::chrono::steady_clock::now();
                     const double compute_ms =
                         std::chrono::duration<double, std::milli>(t_end - t_cb).count();
-                    if (st->seen_once) {
+                    if (seen) {
                         const double period_ms = std::chrono::duration<double, std::milli>(
-                                                     t_cb - st->last_seen).count();
+                                                     t_cb - last_cb).count();
                         sum_compute += compute_ms;
                         sum_period += period_ms;
                         sum_ep += ep;
+                        if (period_ms < min_period) min_period = period_ms;
+                        if (compute_ms < min_compute) min_compute = compute_ms;
                         if (++n % every == 0) {
                             fprintf(stderr,
-                                    "[cd-timing/async] layers=%d qlen=%d k=%d "
-                                    "period=%.2fms compute=%.2fms(engine=%.2f ep=%.2f) "
-                                    "rest=%.2fms (compute %.0f%%, rest %.0f%%)\n",
+                                    "[cd-timing/async] calls=%d qlen=%d k=%d "
+                                    "period=%.3fms compute=%.3fms(engine=%.3f ep=%.3f) "
+                                    "rest=%.3fms | MIN period=%.3fms compute=%.3fms "
+                                    "rest=%.3fms\n",
                                     every, st->w_qlen, st->w_k,
                                     sum_period / every, sum_compute / every,
                                     (sum_compute - sum_ep) / every, sum_ep / every,
                                     (sum_period - sum_compute) / every,
-                                    100.0 * sum_compute / std::max(1e-9, sum_period),
-                                    100.0 * (sum_period - sum_compute) /
-                                        std::max(1e-9, sum_period));
+                                    min_period, min_compute, min_period - min_compute);
                             fflush(stderr);
                             sum_compute = sum_period = sum_ep = 0.0;
+                            min_period = min_compute = 1e18;
                         }
                     }
-                    st->seen_once = true;
-                    st->last_seen = t_cb;
+                    seen = true;
+                    last_cb = t_cb;
                 }
                 st->hout[0] = 1;                       // 通知 GPU:结果已写好
                 while (st->hin[0] == 1 && !g_async_stop.load(std::memory_order_relaxed))
@@ -310,17 +340,8 @@ static bool async_enabled() {
 static bool async_init(CpuDecodeState* st) {
     if (st->async_ready) return true;
     if (!async_enabled()) return false;
-    void* p = nullptr;
-    if (cudaHostAlloc(&p, 256, cudaHostAllocMapped) != cudaSuccess) return false;
-    std::memset(p, 0, 256);
-    st->pin_flags = p;
-    st->hin = (volatile uint32_t*)p;
-    st->hout = st->hin + 32;                    // 不同 cache line,避免伪共享
-    void* dp = nullptr;
-    if (cudaHostGetDevicePointer(&dp, (void*)st->hin, 0) != cudaSuccess) return false;
-    st->din = (CUdeviceptr)dp;
-    if (cudaHostGetDevicePointer(&dp, (void*)st->hout, 0) != cudaSuccess) return false;
-    st->dout = (CUdeviceptr)dp;
+    // flag 已在构造期分配(捕获期不能 cudaHostAlloc,见 CpuDecodeState 构造函数)。
+    if (!st->pin_flags || !st->din || !st->dout) return false;
     {
         std::lock_guard<std::mutex> lg(g_async_mtx);
         g_async_slots.push_back(st);
