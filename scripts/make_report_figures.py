@@ -25,21 +25,26 @@ os.makedirs(OUT, exist_ok=True)
 
 # ---- 中文字体 ---------------------------------------------------------------
 # 字体不入库(8 MB);缺失时自动下载一次,失败则退化为英文标签。
-FONT = os.path.join(OUT, "fonts", "NotoSansSC-Regular.otf")
-FONT_URL = ("https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/"
-            "Sans/SubsetOTF/SC/NotoSansSC-Regular.otf")
-if not os.path.exists(FONT):
-    os.makedirs(os.path.dirname(FONT), exist_ok=True)
-    try:
-        import urllib.request
-        with urllib.request.urlopen(FONT_URL, timeout=90) as r, open(FONT, "wb") as f:
-            f.write(r.read())
-        print("downloaded CJK font ->", FONT)
-    except Exception as e:  # noqa: BLE001
-        print("CJK font unavailable (%s); falling back to English labels" % e, file=sys.stderr)
+_FONT_URL = ("https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/"
+             "Sans/SubsetOTF/SC/NotoSansSC-%s.otf")
+FONT_DIR = os.path.join(OUT, "fonts")
+for _w in ("Regular", "Bold"):
+    _f = os.path.join(FONT_DIR, "NotoSansSC-%s.otf" % _w)
+    if not os.path.exists(_f):
+        os.makedirs(FONT_DIR, exist_ok=True)
+        try:
+            import urllib.request
+            with urllib.request.urlopen(_FONT_URL % _w, timeout=90) as r, open(_f, "wb") as fh:
+                fh.write(r.read())
+            print("downloaded CJK font ->", _f)
+        except Exception as e:  # noqa: BLE001
+            print("CJK %s font unavailable (%s)" % (_w, e), file=sys.stderr)
 CJK = False
-if os.path.exists(FONT):
-    font_manager.fontManager.addfont(FONT)
+if os.path.exists(os.path.join(FONT_DIR, "NotoSansSC-Regular.otf")):
+    for _w in ("Regular", "Bold"):
+        _f = os.path.join(FONT_DIR, "NotoSansSC-%s.otf" % _w)
+        if os.path.exists(_f):
+            font_manager.fontManager.addfont(_f)
     plt.rcParams["font.family"] = ["Noto Sans SC"]
     CJK = True
 plt.rcParams["axes.unicode_minus"] = False
@@ -335,7 +340,246 @@ def fig_rest_compute():
     save(fig, "fig07_rest_compute.png")
 
 
+# =============================================================================
+# 图 0:项目定位二维图(替代 ASCII 图,避免 Markdown 渲染错位)
+# =============================================================================
+def fig_positioning():
+    from matplotlib.patches import FancyBboxPatch
+
+    fig, ax = plt.subplots(figsize=(10.6, 5.6))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 6.4)
+    ax.axis("off")
+    ax.grid(False)
+
+    # 象限底色
+    ax.add_patch(plt.Rectangle((0.6, 0.6), 4.35, 2.6, fc="#F5F7FA", ec="#D5DBE3"))
+    ax.add_patch(plt.Rectangle((5.05, 0.6), 4.35, 2.6, fc="#F5F7FA", ec="#D5DBE3"))
+    ax.add_patch(plt.Rectangle((0.6, 3.3), 4.35, 2.6, fc="#EFF5FF", ec="#D5DBE3"))
+    ax.add_patch(plt.Rectangle((5.05, 3.3), 4.35, 2.6, fc="#E7F0FF", ec=C_OURS, lw=2.2))
+
+    def box(x, y, w, h, title, lines, fc, ec, tc="#12233B"):
+        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.06,rounding_size=0.10",
+                                    fc=fc, ec=ec, lw=1.4))
+        ax.text(x + w / 2, y + h - 0.22, title, ha="center", va="top",
+                fontsize=11.5, fontweight="bold", color=tc)
+        ax.text(x + w / 2, y + h - 0.62, "\n".join(lines), ha="center", va="top",
+                fontsize=9.2, color="#33465F", linespacing=1.5)
+
+    box(0.85, 3.55, 3.85, 2.1,
+        T("vLLM 主线", "vLLM mainline"),
+        [T("CPU = “虚拟显存”(官方原话)", "CPU = \"virtual GPU memory\""),
+         T("CPU MoE kernel 仅在纯 CPU 后端", "CPU MoE kernel only on CPU backend"),
+         T("MoE 卸载 RFC #38256 仍 open", "MoE-offload RFC #38256 still open"),
+         T("须 --enforce-eager、同步 H2D、单卡", "needs --enforce-eager, sync H2D, 1 GPU")],
+        "#FFFFFF", "#C7D0DC")
+
+    box(5.3, 3.55, 3.85, 2.1,
+        T("ktransformers(+SGLang)", "ktransformers (+SGLang)"),
+        [T("CPU-GPU 异构,CPU 真的算", "real CPU-GPU heterogeneous compute"),
+         T("重心转向微调 / 消费级卡 / Windows", "focus shifted to SFT/consumer/Windows"),
+         T("原始一体化框架已 archive", "original framework archived"),
+         T("依赖 Intel AMX(本机 EPYC 无)", "requires Intel AMX (EPYC has none)")],
+        "#FFFFFF", "#8FB4E8")
+
+    box(5.3, 0.85, 3.85, 2.1,
+        T("lk_moe / Lvllmds4-x", "lk_moe / Lvllmds4-x"),
+        [T("性能标杆(本机唯一比我们快)", "performance leader (this machine)"),
+         T("LICENSE = PROPRIETARY", "LICENSE = PROPRIETARY"),
+         T("明文禁止逆向 / 衍生 / 再分发", "reverse-engineering forbidden"),
+         T("fork-of-a-fork,无法合入主线", "fork-of-a-fork, cannot upstream")],
+        "#FBF3F3", "#E0B4B4", "#7A2E2E")
+
+    box(0.85, 0.85, 3.85, 2.1,
+        T("(空白象限)", "(empty quadrant)"),
+        [T("闭源 + CPU 不参与计算", "closed + CPU does not compute"),
+         T("没有长期维护的项目:", "no maintained project:"),
+         T("闭源引擎必须有性能卖点,", "a closed engine needs a perf story,"),
+         T("而卖点恰恰来自 CPU 参与计算", "which comes from CPU compute")],
+        "#F7F7F7", "#DDDDDD", "#8A8A8A")
+
+    # 四角标签
+    ax.text(5.0, 6.24, T("开源 / 可改造", "Open / modifiable"), ha="center", fontsize=13,
+            fontweight="bold", color="#12233B")
+    ax.text(5.0, 0.28, T("闭源 / 不可改", "Closed / not modifiable"), ha="center", fontsize=13,
+            fontweight="bold", color="#12233B")
+    ax.text(0.28, 3.25, T("CPU 不参与计算", "CPU does not compute"), ha="center", va="center",
+            rotation=90, fontsize=13, fontweight="bold", color="#12233B")
+    ax.text(9.76, 3.25, T("CPU 参与计算", "CPU computes"), ha="center", va="center",
+            rotation=270, fontsize=13, fontweight="bold", color="#12233B")
+
+    # 我们的定位星标
+    ax.text(7.2, 3.44, T("★ vllm-xtu-moe(本项目)", "★ vllm-xtu-moe (this project)"),
+            ha="center", va="bottom", fontsize=12, fontweight="bold", color=C_OURS)
+
+    ax.set_title(T("项目定位:开源可改 × CPU 参与计算 —— 与 ktransformers 同象限,但面向不同的机器与目标",
+                   "Positioning: open-source x CPU-compute — same quadrant as KT, different target hardware"),
+                 fontsize=11.8, fontweight="bold", pad=14)
+    save(fig, "fig00_positioning.png")
+
+
+# =============================================================================
+# 图 8:系统架构图(替代 ASCII 图)
+# =============================================================================
+def fig_architecture():
+    from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+
+    fig, ax = plt.subplots(figsize=(11.2, 7.0))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 8.6)
+    ax.axis("off")
+    ax.grid(False)
+
+    def panel(y, h, title, fc, ec, tc="#12233B"):
+        ax.add_patch(FancyBboxPatch((0.35, y), 9.3, h, boxstyle="round,pad=0.08,rounding_size=0.12",
+                                    fc=fc, ec=ec, lw=1.8))
+        ax.text(0.62, y + h - 0.26, title, ha="left", va="top", fontsize=11.5,
+                fontweight="bold", color=tc)
+
+    # --- vLLM 编排层 ---
+    panel(6.05, 2.35, T("vLLM fork —— 编排链(与参考实现逐字节同源,只差 1 个空白 hunk)",
+                        "vLLM fork — orchestration (byte-identical to the reference)"),
+          "#F2F7FF", "#9DBEF5")
+    ax.text(0.65, 7.62, T("Scheduler · PagedAttention · CUDA Graph(FULL_DECODE_ONLY)· DSpark 投机 · Prefix Cache",
+                          "Scheduler · PagedAttention · CUDA Graph · DSpark speculative · Prefix cache"),
+            fontsize=9.3, color="#33465F")
+    ax.text(0.65, 6.92, T("RoutedExperts.forward() —— 按层分派", "RoutedExperts.forward() — per-layer dispatch"),
+            fontsize=10.2, fontweight="bold", color="#12233B")
+
+    rows = [
+        (6.52, "常驻层(0–11)", "resident layers", "vLLM 原生 GPU MoE · MARLIN MXFP4", "#DFF3E3", "#8CC79A"),
+        (6.16, "GPU 预填充层", "gpu-prefill layer", "_gpu_prefill(GPU)", "#E8F0FE", "#A9C3E8"),
+        (5.80, "预填充", "prefill", "_cpu_prefill(CPU 引擎)", "#FFF6E5", "#E8C078"),
+    ]
+    for y, zh, en, val, fc, ec in rows:
+        ax.add_patch(FancyBboxPatch((0.62, y - 0.24), 3.05, 0.30,
+                                    boxstyle="round,pad=0.02,rounding_size=0.06", fc=fc, ec=ec, lw=1.1))
+        ax.text(2.14, y - 0.09, T(zh, en), ha="center", va="center", fontsize=9.2, color="#12233B")
+        ax.add_patch(FancyArrowPatch((3.72, y - 0.09), (4.30, y - 0.09),
+                                     arrowstyle="-|>", mutation_scale=11, color="#7A8798", lw=1.2))
+        ax.text(4.40, y - 0.09, val, ha="left", va="center", fontsize=9.2, color="#33465F")
+
+    # 解码行(高亮)
+    ax.add_patch(FancyBboxPatch((0.62, 5.20), 3.05, 0.30,
+                                boxstyle="round,pad=0.02,rounding_size=0.06", fc="#DCE9FF", ec=C_OURS, lw=1.4))
+    ax.text(2.14, 5.35, T("解码(主战场)", "decode (main path)"), ha="center", va="center",
+            fontsize=9.4, fontweight="bold", color="#12233B")
+    ax.add_patch(FancyArrowPatch((3.72, 5.35), (4.30, 5.35), arrowstyle="-|>",
+                                 mutation_scale=11, color=C_OURS, lw=1.6))
+    ax.text(4.40, 5.35, "_cpu_decode(CPU 引擎)", ha="left", va="center", fontsize=9.4,
+            fontweight="bold", color=C_OURS)
+
+    # --- 引擎层 ---
+    ax.add_patch(FancyArrowPatch((7.6, 5.15), (7.6, 4.62), arrowstyle="-|>",
+                                 mutation_scale=14, color=C_OURS, lw=2.0))
+    ax.text(7.72, 4.88, T("7 个指针 + stream", "7 pointers + stream"), ha="left", va="center",
+            fontsize=9.2, color=C_OURS)
+
+    panel(0.55, 3.95, T("xiaotu_moe —— 自研 CPU 引擎(C++ / AVX-512,无 nvcc 依赖)",
+                        "xiaotu_moe — in-house CPU engine (C++/AVX-512, no nvcc)"),
+          "#EFF5FF", C_OURS)
+    items = [
+        T("MXFP4 权重常驻主机内存;按 NUMA 节点 mbind 切片(实测 128/128 rc=0)",
+          "MXFP4 weights resident in host DRAM; per-NUMA-node mbind sharding (128/128 rc=0)"),
+        T("进程内共享工作线程池,每 CCD 4 核(实测 4→8 核/CCD 无增益)",
+          "process-wide shared worker pool, 4 cores/CCD (4→8 cores/CCD: no gain)"),
+        T("跨 rank EP 归约走 /dev/shm(不走 NCCL:每层 4~6.5 ms → ~14 µs)",
+          "cross-rank EP reduction over /dev/shm (not NCCL: 4-6.5 ms → ~14 us per layer)"),
+        T("异步握手:常驻 worker + mapped flag + 流内存操作,取代 cudaLaunchHostFunc",
+          "async handshake: resident worker + mapped flags, replacing cudaLaunchHostFunc"),
+        T("FP4 解码:fp32 LUT + vpermps(每 32 权重 19 → 10 条指令)",
+          "FP4 decode: fp32 LUT + vpermps (19 → 10 instructions per 32 weights)"),
+    ]
+    for i, it in enumerate(items):
+        y = 3.85 - i * 0.62
+        ax.text(0.78, y, "•", ha="left", va="center", fontsize=12, color=C_OURS)
+        ax.text(1.02, y, it, ha="left", va="center", fontsize=9.4, color="#22374F")
+
+    # 侧栏:两个 rank
+    ax.add_patch(FancyBboxPatch((7.35, 0.72), 2.05, 3.60,
+                                boxstyle="round,pad=0.06,rounding_size=0.10", fc="#FFFFFF", ec="#C7D0DC", lw=1.2))
+    ax.text(8.37, 4.14, T("TP=2 两 rank", "TP=2, two ranks"), ha="center", va="top",
+            fontsize=10, fontweight="bold", color="#12233B")
+    for i, (t, sub) in enumerate([
+        (T("rank 0", "rank 0"), T("socket 0 · 12 CCD · 48 线程", "socket 0 · 12 CCD · 48 threads")),
+        (T("rank 1", "rank 1"), T("socket 1 · 12 CCD · 48 线程", "socket 1 · 12 CCD · 48 threads")),
+    ]):
+        y = 3.55 - i * 1.05
+        ax.add_patch(FancyBboxPatch((7.55, y - 0.62), 1.65, 0.80,
+                                    boxstyle="round,pad=0.04,rounding_size=0.08", fc="#EFF5FF", ec="#9DBEF5", lw=1.1))
+        ax.text(8.37, y - 0.12, t, ha="center", va="center", fontsize=9.8, fontweight="bold", color=C_OURS)
+        ax.text(8.37, y - 0.42, sub, ha="center", va="center", fontsize=8.2, color="#33465F")
+    ax.text(8.37, 1.18, T("只读本地内存\n跨 socket 仅做归约", "local reads only\ncross-socket: reduction only"),
+            ha="center", va="center", fontsize=8.4, color="#33465F")
+
+    ax.set_title(T("系统架构:把 MoE 层劈开 —— 注意力/KV 留 GPU,专家计算放 CPU",
+                   "Architecture: split the MoE layer — attention/KV on GPU, experts on CPU"),
+                 fontsize=12.5, fontweight="bold", pad=10)
+    save(fig, "fig08_architecture.png")
+
+
+# =============================================================================
+# 图 9:AI 的局部搜索 vs 人类换搜索空间
+# =============================================================================
+def fig_search_space():
+    from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+
+    fig, ax = plt.subplots(figsize=(10.8, 5.2))
+    ax.set_xlim(0, 10); ax.set_ylim(0, 5.6); ax.axis("off"); ax.grid(False)
+
+    def blob(cx, cy, w, h, title, sub, fc, ec, tc):
+        ax.add_patch(FancyBboxPatch((cx - w / 2, cy - h / 2), w, h,
+                                    boxstyle="round,pad=0.08,rounding_size=0.14",
+                                    fc=fc, ec=ec, lw=1.8, linestyle="--"))
+        ax.text(cx, cy + h / 2 - 0.28, title, ha="center", va="top", fontsize=11,
+                fontweight="bold", color=tc)
+        ax.text(cx, cy + h / 2 - 0.62, sub, ha="center", va="top", fontsize=8.8,
+                color="#33465F", linespacing=1.5)
+
+    # 左:AI 的搜索空间(小,密)
+    blob(2.6, 2.5, 4.2, 3.2, T("AI 能测、能改的邻域", "what AI can measure and change"),
+         "", "#F4F6F9", "#B9C2CE", "#12233B")
+    import numpy as np
+    rng = np.random.default_rng(3)
+    for i in range(34):
+        ax.plot(2.6 + rng.normal(0, 0.72), 2.5 + rng.normal(0, 0.62), "o",
+                ms=5.0, color="#A9B4C2", alpha=0.85)
+    ax.text(2.6, 1.02, T("约 30 轮内核微优化\n(seqlock / padding / K-major / 列分块 / 线程数 …)",
+                         "~30 rounds of kernel micro-tuning"),
+            ha="center", va="center", fontsize=9.2, color="#7A2E2E", linespacing=1.5)
+    ax.text(2.6, 4.42, T("局部都“正确”,但整个搜索空间是错的", "every step locally right, the space is wrong"),
+            ha="center", va="center", fontsize=9.6, color="#7A2E2E", style="italic")
+
+    # 右:人类换掉整个空间
+    blob(7.7, 2.5, 4.2, 3.2, T("人类一句话换掉的搜索空间", "the space a human replaces in one sentence"),
+         "", "#EFF5FF", C_OURS, C_OURS)
+    cases = [
+        T("① 划界:“第一条视为已完成”", "1. draw the boundary"),
+        T("② 预期形状:“C=2 怎么不涨?”", "2. expected shape"),
+        T("③ 参考数字:生产接受率 40–50%", "3. reference numbers"),
+        T("④ 架构放置:“投机模型跑在 GPU 上吧”", "4. architectural placement"),
+    ]
+    for i, c in enumerate(cases):
+        ax.text(7.7, 3.86 - i * 0.50, c, ha="center", va="center", fontsize=9.4, color="#12233B")
+
+    # 箭头:人的一句话把 AI 从局部里"拎"出来
+    ax.add_patch(FancyArrowPatch((5.05, 2.5), (5.9, 2.5), arrowstyle="-|>",
+                                 mutation_scale=26, color=C_ACC, lw=3.2))
+    ax.text(5.48, 2.86, T("一句话", "one sentence"), ha="center", va="bottom",
+            fontsize=10.5, fontweight="bold", color=C_ACC)
+    ax.text(5.48, 2.08, T("收益\n数轮~数十轮", "payoff\ndozens of rounds"), ha="center", va="top",
+            fontsize=9, color=C_ACC, linespacing=1.4)
+
+    ax.set_title(T("人类工程师的关键作用:AI 在邻域内穷举,人换掉整个搜索空间",
+                   "Why the human matters: AI exhausts a neighbourhood, the human replaces the space"),
+                 fontsize=12.5, fontweight="bold", pad=12)
+    save(fig, "fig09_search_space.png")
+
+
 def main():
+    fig_positioning()
+    fig_architecture()
+    fig_search_space()
     fig_main_result()
     fig_async_ab()
     fig_history()
