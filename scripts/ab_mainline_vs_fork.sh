@@ -46,17 +46,22 @@ launch_and_wait() {
   rm -f "$log"
   setsid "$@" > "$log" 2>&1 < /dev/null &
   disown 2>/dev/null || true
+  # 【坑】"Application startup complete" 是 vLLM 写进**服务自己的日志**
+  # (report/tuning/logs/$tag.log)的;我们捕获的 stdout 里只有 serve 脚本打印的
+  # "[mainline] READY tag=..." / "[lk_port] READY tag=..."。两个文件都要看。
+  local slog="$ROOT/report/tuning/logs/$tag.log"
   local waited=0
   while [ "$waited" -lt "$READY_TIMEOUT_S" ]; do
-    if grep -qa "Application startup complete" "$log" 2>/dev/null; then
+    if grep -qa "READY tag=" "$log" 2>/dev/null \
+       || grep -qa "Application startup complete" "$slog" 2>/dev/null; then
       note "$tag READY(${waited}s) on :$port"; return 0
     fi
     if [ "$waited" -ge 60 ] && ! pgrep -f "VLLM::Worke[r]" >/dev/null 2>&1; then
-      warn "$tag 进程退出;日志尾部:"; tail -8 "$log"; return 1
+      warn "$tag 进程退出;日志尾部:"; tail -8 "$slog" 2>/dev/null || tail -8 "$log"; return 1
     fi
     sleep 15; waited=$((waited+15))
   done
-  warn "$tag 等待超时(${READY_TIMEOUT_S}s)"; tail -8 "$log"; return 1
+  warn "$tag 等待超时(${READY_TIMEOUT_S}s)"; tail -8 "$slog" 2>/dev/null || tail -8 "$log"; return 1
 }
 
 stop_tag() {
