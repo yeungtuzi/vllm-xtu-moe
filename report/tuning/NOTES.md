@@ -11788,3 +11788,50 @@ A(gate/up)=7.2 ms、B(down)=4.5 ms —— 而 fork 路径是 **0.135 / 0.105 ms*
 
 **落地四步**:P0 修图契约(预分配输出缓冲)→ P1 单层接 `fused_experts` + **数值对拍**(硬门禁)
 → P2 全层 + 阈值标定 + 显存预算 → P3 与解码共存 + 端到端验收。
+
+---
+
+## 335. 【v0.2·第 10 轮】GPU prefill P1:三方数值对拍打通(CPU ≡ golden 1.2e-4;GPU 均值一致、max 3.7%)
+
+### (a) 新增两个对拍脚本(都不加载模型,分钟级)
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/test_gpu_prefill_equiv.py` | **真实层**(E=256,H=4096,I=2048)+ 自建反量化 golden,可调 `M/K/NE/CLAMP` |
+| `scripts/test_gpu_prefill_equiv_fixture.py` | **复用已验证 fixture**(E=16,自带权威反量化权重 `gol13/gol2`)做**三方对拍** |
+
+### (b) ✅ 先验证了自己的 MXFP4 反量化**逐位正确**
+
+把 nibble + e8m0 反量化的结果与 fixture 里权威的 `gol13/gol2` 比:
+```
+w13: max_abs=0.0000e+00   w2: max_abs=0.0000e+00     (nibble 顺序也确认:反序会差 2.2e-01)
+```
+⇒ 后面所有"谁对谁错"的判断都有了这个地基。
+
+### (c) 🎯 三方对拍结果(REP=3 ⇒ M=8,K=6,E=16,I=2048,H=4096)
+
+| | vs numpy golden(block23 同语义,含激活 bf16 取整) |
+|---|---|
+| **CPU(xiaotu 引擎)** | **max_abs = 1.22e-04** ✅ |
+| **GPU(上游 `fused_experts`,bf16 权重)** | mean 与 golden 一致到 **1e-4 相对**;`max_abs = 2.22`(均值 60.7 的 **3.7%**) |
+| GPU vs **bf16 一致的 golden**(权重也取整到 bf16) | 仍是 2.22 ⇒ **不是权重精度,是内核累加/实现的差异**,待查 |
+
+**结论**:上游 GPU MoE 与我们的 CPU 引擎在**均值层面完全一致**;**最大值处有 3.7% 偏差**,
+需要下一步用"fp32 权重 + 更小的 K"定位(P1 的硬门禁要求 max 也 < 1e-2)。
+
+### (d) ⚠️ 关键工程发现:MXFP4 的 GPU 入口不是 `fused_experts`
+
+| 尝试 | 结果 |
+|---|---|
+| `fused_experts(..., quant_config=mxfp4_w4a16_moe_quant_config(...))` | ❌ `NotImplementedError: Using ocp_mx_scheme=w_mxfp4 in functional fused_experts call is deprecated. Please use OCP_MXQuantizationEmulationTritonExperts.` |
+| `OCP_MXQuantizationEmulationTritonExperts` | ❌ 它的 `is_supported_config` 要求 **AMD Quark**(`has_quark()`) |
+| 正确入口(A100/SM80) | `Mxfp4MoeBackend.TRITON → OAITritonMxfp4ExpertsMonolithic` / `Mxfp4MoeBackend.MARLIN → MarlinExperts`(`oracle/mxfp4.py:196/225`) |
+| 本轮的替代做法 | 把 MXFP4 **主机侧反量化成 bf16**,走**未量化** `fused_experts` —— 先验证"路由+激活+夹取+累加"的语义 |
+
+⇒ P2 接入插件时要走**experts 类**(而不是 functional 入口),并且要用 `gemm1_clamp_limit`
+表达 DS-V4 的 SWIGLU 夹取(未量化入口没有这个参数)。
+
+### (e) 顺带发现(非生产路径):同一行里出现**重复专家**时,引擎与"逐 assignment 累加"的
+golden 不一致(实测 max_abs ~8e-2,与 NE/me/NSHARD 无关;K=1 时完全一致 9.8e-4)。
+真实路由的 top-k **互不相同**,所以不影响生产;但说明引擎在"同一 (token,专家) 多 assignment"
+时走了**去重路径**而权重语义与逐条累加不同。已记录,暂不处理(改它风险高于收益)。
