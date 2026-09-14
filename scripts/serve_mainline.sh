@@ -89,6 +89,15 @@ SPIN_IDLE_US="${SPIN_IDLE_US:-0}"
 # 即 **28–33× 且 CPU 降到 1/22**。(对比:`SPIN_IDLE_US=600000` 只是把 park 换成
 # 整机自旋,几分钟后反而退化 —— 那是掩盖,这才是修。)
 NSLICE_SMALL="${NSLICE_SMALL:-0}"
+# 🎯🎯 **主线解码性能的头号杀手**(NOTES §364):必须关掉引擎的**异步握手**路径。
+# 引擎默认 `XIAOTU_MOE_ASYNC=1`:host 回调把活儿丢给 worker 线程就返回,GPU 靠
+# mapped flag + 流内存操作等它。这条路在 fork 编排下正常(1.18 s/请求),
+# **在主线下每层要多等 ~28 ms**(43 层 × 10 pass ≈ 11 s):
+#     主线 async=1(默认) : 11.96 s/请求   ← 慢 8.4×
+#     主线 async=0       : **1.42 s/请求**  ← 与 fork 的 1.18 s 同级
+# 关掉后 host 回调**同步**做 CPU MoE,没有任何等待/握手。
+# 代价:失去"投递与计算重叠",但在主线上重叠本来就是负的。
+ASYNC="${ASYNC:-0}"
 if [ "$GP_MIN" -gt 0 ] && [ "$GP_MIN" -gt "$MBT" ]; then
   echo "[mainline] GP_MIN=$GP_MIN > MBT=$MBT ⇒ 夹到 MBT(否则预填充永远够不到阈值;NOTES §319c)"
   GP_MIN="$MBT"
@@ -163,7 +172,7 @@ fi
 {
   echo "tag=$TAG port=$PORT tp=$TP gpus=$GPUS maxlen=$MAXLEN seqs=$SEQS gpu_util=$GPU_UTIL"
   echo "mbt='$MBT' chunked='$CHUNKED_PREFILL' threads=$THREADS resident='$RESIDENT' oot=$OOT load_strategy='$LOAD_STRATEGY' extra_env='$EXTRA_ENV'"
-echo "gp_min=$GP_MIN cudagraph_sizes='$CUDAGRAPH_SIZES' prefill_preset='${PREFILL:-0}' interleave='$INTERLEAVE' spin_idle_us='$SPIN_IDLE_US' nslice_small='$NSLICE_SMALL'"
+echo "gp_min=$GP_MIN cudagraph_sizes='$CUDAGRAPH_SIZES' prefill_preset='${PREFILL:-0}' interleave='$INTERLEAVE' spin_idle_us='$SPIN_IDLE_US' nslice_small='$NSLICE_SMALL' async='$ASYNC'"
   echo "env=$ENV"; echo "ckpt=$CKPT"; date -Is
 } > "$OUTDIR/$TAG.env"
 
@@ -196,6 +205,7 @@ nohup env \
   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$GP_MIN" \
   XIAOTU_MOE_THREADS="$THREADS" \
   XIAOTU_MOE_NSLICE_SMALL="$NSLICE_SMALL" \
+  XIAOTU_MOE_ASYNC="$ASYNC" \
   XIAOTU_MOE_SPIN_IDLE_US="$SPIN_IDLE_US" \
   XIAOTU_MOE_GPU_RESIDENT_LAYERS="$RESIDENT" \
   OMP_NUM_THREADS=1 \

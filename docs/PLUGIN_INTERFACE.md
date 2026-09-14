@@ -20,6 +20,7 @@
 | # | 旋钮 | 引擎默认 | **主线下的必需值** | 缺失/设错的后果 | 证据 |
 |---|---|---|---|---|---|
 | C1 | `XIAOTU_MOE_SPIN_IDLE_US` | `5000` µs | **`0`** | 每次调用后**所有** worker 自旋 5 ms;43 层×~3 相 ⇒ 池几乎不停转:worker **3242% CPU**(≈32 核/worker)、load **119**;自造的争抢又反过来拖慢调用线程 —— **正反馈**,解码从 37 ms 漂到 **1225 ms** | §352 / §355 |
+| **C0** | **`XIAOTU_MOE_ASYNC`** | **`1`(异步)** | **`0`(同步)** | 异步握手在主线下**每层多等 ~28 ms**(43 层×10 pass ≈ 11 s):端到端 **11.96 s → 1.42 s(8.4×)**。同一条异步路径在 fork 编排下正常(1.18 s)⇒ **执行模型开关必须在真实服务负载下 A/B**,分层计时与隔离微基准都覆盖不到 | §364 |
 | C2 | `XIAOTU_MOE_NSLICE_SMALL` | 开 | **`0`** | `small_batch_workers()` 用标称 8 MAC/cycle 估算,DS-V4 解码维度算出 `single_us=6292 µs`(真实百 µs 级,**高估约 50×**)⇒ `wlimit=59/nt=60` ⇒ `stride=1` ⇒ `worker_limit_` 门闸**完全失效**(没有 worker 去 park),且走 `parallel_for_limited` —— **那条路会挂死** | §354 / §356 |
 | C3 | `XIAOTU_MOE_THREADS` | `min(hw,120)` | **`60`** | 退到 120 就超出本机甜蜜点(每 CCD 4–5 核 = 96–120 才能跑满 DDR5 通道,再加核只增竞争) | R1 / §44 |
 | C4 | `XIAOTU_MOE_RANK_SPLIT` | `1` | **`1`(不要动)** | 设 `2`(强制 fork 式全 node 布局)实测**请求全部挂死** | §361 |
@@ -84,12 +85,18 @@ TAG=ml_gp1 bash scripts/check_mainline_env.sh   # 检查某个已启动实例的
 
 ---
 
-## 5. 还没解决的(诚实记录)
+## 5. 曾经的"未解决项"已破案(§364)
 
-C1+C2 让**干净测量窗口**回到 37.7 ms/token,但**在 `bench_lat` 的 random-512/128-out 负载下
-主线仍会退化到 ~1.24 s/token**,而 fork 在同一负载下是 26.81 ms。
-已排除:引擎算力、调用次数、qlen 谱(只有 `{1,2,4,8,16}`,无 257)、拷贝/派发(`FAKE_CPU` 0.91 s)、
-`RANK_SPLIT=2`(挂死)。
+`bench_lat` 负载下主线曾退化到 ~1.24 s/token(fork 26.81 ms)。**根因是 C0**:
+引擎的**异步握手**路径在主线下每层多等 ~28 ms。设 `XIAOTU_MOE_ASYNC=0` 后:
 
-**下一轮的入口**:在同负载下抓"异步 `投递→算完` 延迟"的直方图(引擎侧记 `enqueue_ts → worker_done_ts`),
-以及 `/proc/<worker>/task/*/stat` 的**每线程 CPU 时间** —— 判断是"一直慢"还是"被 vLLM 线程周期性抢核"。
+| | C=1 TPOT | C=1 agg |
+|---|---|---|
+| fork + 我们的引擎 | 26.81 ms | 22.42 t/s |
+| 主线 + 我们的插件(`ASYNC=0`) | **35.97 ms** | 16.95 t/s |
+| 修复前 | ~1225 ms | 0.73 t/s |
+
+⇒ **47× ⇒ 1.34×**,剩余部分是"主线编排 vs fork 编排"的可量化移植税。
+
+**已穷举否定**(勿重走):`numactl --interleave=all`(fork 加上反而更快)、`SPIN_IDLE_US`、
+`THREADS`、`RANK_SPLIT=2`(挂死)、每层新建 ids/weights 张量(仅 7%)。

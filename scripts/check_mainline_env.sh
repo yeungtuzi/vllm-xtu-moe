@@ -31,6 +31,7 @@ if [ -n "${TAG:-}" ]; then
     INTERLEAVE="$(sed -n "s/.*interleave='\([^']*\)'.*/\1/p" "$ENVF" | head -1)"
     SPIN_IDLE_US="$(sed -n "s/.*spin_idle_us='\([^']*\)'.*/\1/p" "$ENVF" | head -1)"
     NSLICE_SMALL="$(sed -n "s/.*nslice_small='\([^']*\)'.*/\1/p" "$ENVF" | head -1)"
+    ASYNC="$(sed -n "s/.*async='\([^']*\)'.*/\1/p" "$ENVF" | head -1)"
     RESIDENT="$(sed -n "s/.*resident='\([^']*\)'.*/\1/p" "$ENVF" | head -1)"
     THREADS="$(sed -n "s/.*threads=\([0-9]*\).*/\1/p" "$ENVF" | head -1)"
     OOT="$(sed -n "s/.*oot=\([0-9]*\).*/\1/p" "$ENVF" | head -1)"
@@ -70,6 +71,15 @@ if [ "${NSLICE_SMALL}" = "0" ]; then
   ok "XIAOTU_MOE_NSLICE_SMALL=0" "绕开 wlimit=59 的 limited 路径"
 else
   bad "XIAOTU_MOE_NSLICE_SMALL=0" "当前='${NSLICE_SMALL:-<未设=默认开>}' ⇒ 60 个 worker 全部参与每一相"
+fi
+
+# --- 2b) 异步握手:必须关掉 ---------------------------------------------------
+# 引擎默认 ASYNC=1:回调投递完就返回,GPU 靠 mapped flag 等 worker。这条路在 fork
+# 编排下正常,在**主线下每层多等 ~28 ms** ⇒ 端到端 11.96 s vs 1.42 s(8.4×)。
+if [ "${ASYNC:-0}" = "0" ]; then
+  ok "XIAOTU_MOE_ASYNC=0" "同步 host-func(主线实测 1.42 s vs 异步 11.96 s)"
+else
+  bad "XIAOTU_MOE_ASYNC=0" "当前='${ASYNC:-<未设=引擎默认 1 异步>}' ⇒ 主线解码慢 8.4×"
 fi
 
 # --- 3) 线程数必须显式给 -----------------------------------------------------
