@@ -39,6 +39,8 @@ LOAD_STRATEGY="${LOAD_STRATEGY:-prefetch}"
 # A100(SM80)没有 fp8e4nv:Triton 的 PackSeq 等内核在 JIT warmup 时会报
 # "type fp8e4nv not supported in this architecture" ⇒ 直接关掉预热(实测 ml08modeB)
 KERNEL_WARMUP="${KERNEL_WARMUP:-0}"
+# EAGER=1 ⇒ --enforce-eager(关 CUDA 图)。诊断用:区分"图捕获契约"与"调度"问题。
+EAGER="${EAGER:-0}"
 # 引擎线程:插件侧旋钮(每 rank 12 CCD ⇒ 5 核/CCD = 60)
 THREADS="${THREADS:-60}"
 # 额外常驻 GPU 的 MoE 层(与 lk 的 LVLLM_GPU_RESIDENT_MOE_LAYERS 同义)
@@ -64,6 +66,7 @@ ARGS=(
 if [ -n "$MBT" ]; then ARGS+=(--max-num-batched-tokens "$MBT"); fi
 if [ "$CHUNKED_PREFILL" = "0" ]; then ARGS+=(--no-enable-chunked-prefill); fi
 if [ "$CHUNKED_PREFILL" = "1" ]; then ARGS+=(--enable-chunked-prefill); fi
+if [ "$EAGER" = "1" ]; then ARGS+=(--enforce-eager); fi
 if [ -n "$LOAD_STRATEGY" ]; then ARGS+=(--safetensors-load-strategy "$LOAD_STRATEGY"); fi
 if [ "$KERNEL_WARMUP" = "0" ]; then
   ARGS+=(--kernel-config '{"enable_jit_warmup": false}')

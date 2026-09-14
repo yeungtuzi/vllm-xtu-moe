@@ -11751,3 +11751,40 @@ A(gate/up)=7.2 ms、B(down)=4.5 ms —— 而 fork 路径是 **0.135 / 0.105 ms*
 
 **当前可用结论(写进 v0.2)**:**形态 B 在"短 prompt / 纯解码"下与 fork 打平(31.5 vs 26.1 ms,
 且我们这次是 0 层常驻、fork 是 12 层常驻 ⇒ 折算后我们其实更好)**;长 prompt 的预填充路径有 bug。
+
+### (u) 🎯🎯 决定性实验:**关掉 CUDA 图,长 prompt 的"无限重做预填充"消失**
+
+同一台服务器、同一份权重、同一个 257-token prompt,只把 `EAGER` 从 0 改成 1:
+
+| 配置 | 实测 | `qlen` 分布 |
+|---|---|---|
+| 图(`EAGER=0`)| 1136.8 ms/token | **qlen=257 × 200/200**(每步重做整段预填充)❌ |
+| **`--enforce-eager`** | 124.1 ms/token | **qlen=1 × 100/100**(预填充正常完成)✅ |
+
+⇒ **那个 bug 在 CUDA 图路径里**,不在调度、不在引擎。与 §334t 的假设一致:
+形态 B 的 `apply()` **每次 `torch.empty` 新输出缓冲** + 每次 `tensor.to(dtype)` 新张量,
+**地址每步都变**,破坏了主线 piecewise 图的捕获/重放契约(chunked prefill 的图)。
+
+**两条修法(下一轮)**:
+1. **契约对齐**:每个 expert 层持有一个预分配的 `[max_num_batched_tokens, H]` 输出缓冲,
+   写进去、返回视图(与 fork 的 `RoutedExperts.output_gpu` 完全同构)⇒ 图可稳定引用;
+2. 或在 prefill 尺寸上直接 `--enforce-eager` 回退(主线对不支持的形状本来就该回退 eager,
+   现在是静默进了图 ⇒ 也可以给主线报一个"该形状不要进图"的开关)。
+
+### (v) 转向 GPU prefill(用户指示):设计已成型,见 `docs/GPU_PREFILL_MAINLINE.md`
+
+**核心洞察**:预填充是**层间串行**的,所以 GPU 侧**只需要一层大小的 staging**
+(TP=2 每 rank **1.61 GiB**),不需要 137 GiB 全量 —— 每层"权重 H2D → 上游 GPU MoE 内核 → 下一层"。
+
+**DMA 预算(实测参数)**:`1.61 GiB × 43 = 69 GiB`,`H2D 实测 20.1–21.4 GB/s`
+⇒ 一次完整预填充的 DMA 下限 **≈ 3.4 s** ⇒
+**吞吐与 batch 基本无关**:batch 8192 ⇒ **≈2400 t/s**、1024 ⇒ 300 t/s、256 ⇒ 75 t/s(**比 CPU 的 230 还差**)
+⇒ **必须设阈值 T ≈ 256–1024**(与 fork 的 `gpu_prefill_min_batch_size` 同义)。
+
+**复用上游(零补丁)**:主线自带 **`fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, …)`**
+(`vllm/model_executor/layers/fused_moe/fused_moe.py:1593`)—— **吃显式 w1/w2 的 GPU MoE**,
+插件直接调即可,**不用写任何 GPU kernel、不用改主线**。对照 fork:它调的是
+`lk_moe.gpu_prefill`(**专有二进制**),我们换成上游实现后**更干净、可读、可随主线升级**。
+
+**落地四步**:P0 修图契约(预分配输出缓冲)→ P1 单层接 `fused_experts` + **数值对拍**(硬门禁)
+→ P2 全层 + 阈值标定 + 显存预算 → P3 与解码共存 + 端到端验收。
