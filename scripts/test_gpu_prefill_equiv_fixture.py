@@ -219,6 +219,23 @@ def _gpu_marlin(d, ids, wts, xf, M, K, E, I, H, golden):
     t_w2 = torch.from_numpy(w2).to(dev)
     t_s1 = torch.from_numpy(f32_to_e8m0(d["g13"])).to(dev)
     t_s2 = torch.from_numpy(f32_to_e8m0(d["g2"])).to(dev)
+    # ★ MARLIN 需要它自己的打包布局:调用主线**同一个纯函数**做重排
+    #   (`prepare_moe_mxfp4_layer_for_marlin`,只用到 layer.params_dtype ⇒ 用 stub 即可)。
+    #   生产里这一步在**加载期做一次并缓存**,不在热路径。
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+        prepare_moe_mxfp4_layer_for_marlin,
+    )
+
+    class _Stub:
+        params_dtype = torch.bfloat16
+
+    import time as _t
+    _t0 = _t.time()
+    t_w1, t_w2, t_s1, t_s2, _b1, _b2 = prepare_moe_mxfp4_layer_for_marlin(
+        _Stub(), t_w1, t_w2, t_s1, t_s2, None, None
+    )
+    print(f"[fx] marlin repack: {_t.time()-_t0:.2f}s  w1={tuple(t_w1.shape)} {t_w1.dtype} "
+          f"s1={tuple(t_s1.shape)} {t_s1.dtype}")
     hs = torch.from_numpy(xf.reshape(M, H)).to(dev).to(torch.bfloat16)
     t_ids = torch.from_numpy(ids.astype(np.int32)).to(dev)
     t_wts = torch.from_numpy(wts).to(dev)

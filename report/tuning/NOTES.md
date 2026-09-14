@@ -11984,3 +11984,56 @@ vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py:311
 
 **下一轮**:在 fixture 上跑通 `_repack_marlin_experts` + `fused_marlin_moe` 的单层对拍,
 接进 §335f 的门禁(判定口径同:归一化中位数 < bf16 eps)。
+
+### 338. 🎉🎉【v0.2·第 14 轮】P2 打通:**真实 MXFP4 走上游 MARLIN GPU 内核,与我们的 CPU 引擎在 bf16 精度内一致**
+
+#### (a) 把三块拼起来就通了(全程**零主线补丁**)
+
+```python
+# 1) 加载期(一次):主线自己的纯函数做 MARLIN 重排
+from vllm...utils.marlin_utils_fp4 import prepare_moe_mxfp4_layer_for_marlin
+w13r, w2r, s13r, s2r, _, _ = prepare_moe_mxfp4_layer_for_marlin(
+    stub_layer,          # 只用它的 params_dtype ⇒ 一个 4 行的 stub 就够
+    w13_gpu, w2_gpu, s13_gpu, s2_gpu, None, None)
+# 2) 每次预填充:显式权重 + 我们自己的 topk 直接调上游内核
+fused_marlin_moe(hs, w13r, w2r, None, None, s13r, s2r, topk_weights, topk_ids,
+                 scalar_types.float4_e2m1f.id, activation=MoEActivation.SILU, ...)
+```
+
+实测输出:
+```
+[fx] marlin repack: 0.04s  w1=(16, 256, 8192) torch.int32  s1=(16, 128, 4096) torch.float8_e8m0fnu
+[fx] gpu(marlin) vs golden: abs p50=2.22e-01 p99=1.29e+00 max=3.09e+00
+                            归一化 p50=3.66e-03  max=5.10e-02
+[fx] 判定(marlin): OK
+```
+
+| | 归一化中位数 | 判定 |
+|---|---|---|
+| CPU(引擎) | 1.3e-07 | ✅ fp32 参考 |
+| GPU MARLIN(**真实 MXFP4**) | **3.66e-03** | ✅ **= bf16 eps(3.9e-03)**,`OK` |
+
+⇒ **归一化中位数正好等于 bf16 机器精度** ⇒ 两边**在 bf16 精度内等价**,
+而且这次走的是**真实打包权重 + e8m0 scales 的完整链路**(不是反量化的 bf16 近似)
+⇒ **P2 的核心风险(量化布局)彻底退役**。
+
+#### (b) 三块拼图(全部复用上游,无自研 kernel)
+
+| 环节 | 上游件 | 备注 |
+|---|---|---|
+| 后端选型 | 主线 `oracle/mxfp4.py` 优先级 | A100 → **MARLIN**(SM100 才用 TRTLLM、SM90 才用 DeepGEMM) |
+| 权重重排 | **`prepare_moe_mxfp4_layer_for_marlin`** | 纯函数、不改 layer;但**必须打在主函数之前** |
+| 计算 | **`fused_marlin_moe`** | 吃显式 w1/w2 + **precomputed topk**(DS-V4 路由照用) |
+
+#### (c) 踩到的顺序坑(值得记)
+
+`prepare_moe_mxfp4_layer_for_marlin` 的 `permute_scales` 里有
+`scales = scales.view(torch.float8_e8m0fnu)` ⇒ **必须先把输入转成 GPU 上的 e8m0**;
+而 `_repack_marlin_experts` 期望的是**没重排过**的原始 nibble 打包 ⇒ 两者顺序不能颠倒。
+
+#### (d) 下一步(P3)
+
+1. **性能证明**:在**真实层**(E=256,H=4096,I=2048)上量 `fused_marlin_moe` 在
+   M=256/1024/8192 的耗时 + H2D 时间,验证 §2.2 的 DMA 预算(~3.4 s/次 ⇒ 8192 token ≈ 2400 t/s);
+2. 接进插件 `apply()` + 阈值 `T` + staging 显存预算;
+3. 修 §334u 的图契约 bug(预分配输出缓冲)。

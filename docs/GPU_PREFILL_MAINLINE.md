@@ -111,7 +111,7 @@ else:
 |---|---|---|---|
 | **P0** | 修**图契约**(预分配输出缓冲,或大 batch 回退 eager) | 257-token prompt 在**图模式**下也得到 `qlen=1` 的纯解码 | 0.5 天 |
 | **P1** | ✅ **已完成**:`scripts/test_gpu_prefill_equiv_fixture.py` 三方对拍 | **CPU:归一化 max = 2.1e-06**;GPU:归一化中位数 **3.07e-03 = bf16 的 eps**,p99 = 2.1e-02 ⇒ **在 bf16 精度内等价,无实现差异** | 已完成 |
-| **P2** | 全层接入 + 阈值 `T` 标定 + 显存预算。**入口已找到**:`triton_kernel_moe_forward(hidden,w1,w2,gating_output,topk,renormalize,activation,quant_config)`(`experts/gpt_oss_triton_kernels_moe.py:541`)—— 吃显式权重、**不需要构造 FusedMoEConfig**;⚠️ 它内部自己路由,须确认与 DS-V4 的 sqrtsoftplus+夹取+group-topk 一致 | `bench_lat.sh` L=512/2048/8192 的 **TTFT** 与 fork 对照 | 1 天 |
+| **P2** | ✅ **数值已打通**(2026-09-14):真实 MXFP4 + 上游 MARLIN 与 CPU 引擎**归一化中位数 3.66e-03 = bf16 eps** ⇒ OK;三块拼图 = 主线优先级选 MARLIN + `prepare_moe_mxfp4_layer_for_marlin`(重排,纯函数) + `fused_marlin_moe`(吃显式权重与 precomputed topk)。**剩余**:全层接入 + 阈值 `T` 标定 + 显存预算。**入口已找到**:`triton_kernel_moe_forward(hidden,w1,w2,gating_output,topk,renormalize,activation,quant_config)`(`experts/gpt_oss_triton_kernels_moe.py:541`)—— 吃显式权重、**不需要构造 FusedMoEConfig**;⚠️ 它内部自己路由,须确认与 DS-V4 的 sqrtsoftplus+夹取+group-topk 一致 | `bench_lat.sh` L=512/2048/8192 的 **TTFT** 与 fork 对照 | 1 天 |
 | **P3** | 与解码路径共存(阈值切换)、KV/显存再平衡 | C=1/2/4 端到端 + 数值门禁 `OK=7 BAD=1` | 1 天 |
 
 **P1 的数值对拍是硬门禁**:GPU MoE 与 CPU 引擎的 MXFP4 结果必须一致(参考已有的
