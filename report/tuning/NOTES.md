@@ -10878,3 +10878,51 @@ PREFETCH=1 / EAGER=0(图) / THREADS=48 / SPEC=0 / RESIDENT=0-10(11 层常驻)
 * ⇒ **解码优先的配置应该显式 `MINBATCH=0`(关闭 gpu_prefill)**,而不是靠报错路径;
   这样既省显存(可能多放常驻层),也避免"靠 bug 运行"。
 * (prefill 变慢是代价;本目标是解码,先这么配,prefill 用另一套配置跑。)
+
+---
+
+## 324. 【第 218 轮·item 1/3 落地 + 12 层常驻】异步握手**逐位等价**已证;`C=1 TPOT 28.76 ms` **首次达标 ≤30**
+
+### (a) 异步握手(常驻 worker + `cuStreamWriteValue32/WaitValue32`)正确性 ✅
+
+* `XIAOTU_MOE_ASYNC=1` 与 host-func 路径的输出 dump(`/tmp/out_async.npy` vs `/tmp/out_hostfunc.npy`,
+  形状 `(64,4096)`)**逐位相同**:`u32` 全等比例 **1.0000**,bf16 高 16 位全等比例 **1.0000**。
+  ⇒ 数值无差异(之前打印 `checksum nan` 只是因为 harness 的输入是随机 bf16/uint8 字节,本来就会出 NaN)。
+* harness 每层 µs:`host-func 403.2` → **async 387.1**(−16.1 µs/层)⇒ **≈0.69 ms/token**。
+* 机制:每层一对 mapped flag(`cudaHostAllocMapped` + `cudaHostGetDevicePointer`)。
+  流序:`3×D2H` → `WriteValue32(din,1)` → `WaitValue32(dout,EQ 1)` → `H2D` → `WriteValue32(din,0)`;
+  worker 自旋轮询 `din`,算完写 `hout=1`,等 `din==0` 后复位 `hout=0`。
+  `WriteValue32/WaitValue32` 是**流内存操作**,图捕获安全(不能用 event/线程同步)。
+
+### (b) `MINBATCH=0`(显式关 gpu_prefill)+ **12 层常驻** 能起来,但 KV 只剩 0.19 GiB
+
+`lkport57best12`(TP=2 / util 0.80 / MAXLEN 8192 / SEQS 8 / MBT 256 / MINBATCH=0 /
+PREFETCH=1 / EAGER=0 / THREADS=48 / SPEC=0 / `RESIDENT=0-11`):
+
+* ✅ 启动成功:`Available KV cache memory: 0.19 GiB` ⇒ `GPU KV cache size: 10,847 tokens`
+  ⇒ **12 层是"能启动"的上限,但只剩 ~10.8k token 的 KV**,只够短上下文基准;
+  11 层(2.19 GiB)才是可用配置。**item 4 的天花板结论不变:11 层可用 / 12 层仅能启动。**
+
+### (c) 🎯 `C=1 TPOT` **首次低于 30 ms**
+
+| 客户端协议 | C=1 TPOT | C=1 单流 | 说明 |
+|---|---|---|---|
+| `bench_lat.sh` **L=256 / OUT=128 / N=8** | **28.76 ms** | **26.94 t/s** | ✅ 达标(≤30 ms) |
+| `bench_lat.sh` **L=512 / OUT=128 / N=8** | **29.51 ms** | 20.73 t/s | ✅ 达标(输入更长,聚合被 CPU 预填充拖低) |
+
+* 与上一轮最优(11 层常驻)31.78 ms 相比:**−3.0 ms**,来源 = 多 1 层常驻(−0.70)+ 协议/噪声。
+* **归因(与 §310/§320b 一致)**:参考 lk_moe 的 25.36 ms = 纯 GPU 17.3 + **CPU ~8.2 ms**
+  (43 层 × ~0.19 ms/层);我们是 17.3 + 17.6(43 × 0.41)⇒ 差距**就是 CPU 引擎每层慢 2×**,
+  不是编排、不是重叠(依赖链严格串行,数学上无法重叠同一 token 的 MoE 与后续层)。
+  ⇒ **常驻层是唯一能"删掉 CPU 层"的手段**,11 层 × 0.41 ≈ **4.5 ms/token** 已拿到。
+
+### (d) ⚠️ 基准协议坑(必须记住)
+
+* `scripts/bench_nat.sh`(`--dataset-name custom`)**现在已经跑不了**:mainline 的
+  `datasets.py:2610` 会调 `tokenizer.apply_chat_template`,而 DS-V4-Flash 快照的
+  `tokenizer_config.json` **没有 chat_template** ⇒ `ValueError: Cannot use chat template functions...`。
+* ⇒ 新增 **`scripts/bench_lat.sh`**(`--dataset-name random`,token 级、不依赖 chat 模板),
+  协议固定并可复现:`L / OUT / N / CS="1 2 4"`;`TAG=<base>` 自动生成 `<base>_c<C>`。
+* ⚠️ **聚合吞吐口径对输入长度极其敏感**:`MINBATCH=0` 下预填充走 CPU 引擎(~230 t/s),
+  L=512/C=4 时 TTFT 达 11 s,**聚合吞吐被预填充主导**(C=4 只有 21.6 t/s,而 TPOT 是 86 ms)。
+  量聚合吞吐必须用**短输入 + 长输出**(OUT≥512 摊薄预填充),否则量的是 CPU 预填充,不是解码。

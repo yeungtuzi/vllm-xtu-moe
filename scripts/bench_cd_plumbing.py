@@ -155,6 +155,12 @@ def main() -> int:
     # warmup
     for _ in range(3):
         one_pass(False)
+    # DUMP=<path>:把最后一个引擎的输出写盘,用于 host-func / async 两条路径的逐位对拍
+    _dump = os.environ.get("DUMP")
+    if _dump:
+        torch.cuda.synchronize()
+        import numpy as _np
+        _np.save(_dump, out.cpu().numpy())
     print(f"{'mode':>7} {'ms/pass':>9} {'us/layer':>9} {'t/s(N=layers)':>14}", flush=True)
     # GPU_GRAPH=1:把整串调用**捕获进一张 CUDA 图**再 replay —— 直接检验
     # "host-func 节点在图里会排空流水线(43 次/步)"这个假设(服务里就是图模式)。

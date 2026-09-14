@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include <cuda_runtime.h>
+#include <cuda.h>   // 驱动 API:cuStreamWriteValue32 / cuStreamWaitValue32(item 1/3)
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #endif
@@ -88,6 +89,20 @@ struct CpuDecodeState {
     // 返回 true 表示发生了重新分配(旧 pinned 指针失效)。
     // retire=true(CUDA graph capture 期间)时只解除引用、不 cudaFreeHost ——
     // 捕获中既不允许 cudaStreamSynchronize,也不允许释放被 graph 节点引用的内存。
+    // ---- 异步握手(item 1/3,XIAOTU_MOE_ASYNC=1):用"mapped flag + 流内存操作"
+    // 取代 cudaLaunchHostFunc —— host-func 会阻塞整条流并由驱动派发回调,实测每层 36 µs。
+    void* pin_flags = nullptr;
+    volatile uint32_t* hin = nullptr;    // GPU 写 1(输入就绪)/ 0(槽位归还);CPU 轮询
+    volatile uint32_t* hout = nullptr;   // CPU 写 1(结果就绪)/ 0(复位);GPU 等
+    CUdeviceptr din = 0, dout = 0;
+    bool async_ready = false;
+    int w_qlen = 0, w_k = 0;
+    const uint16_t* w_hid = nullptr;
+    const uint32_t* w_ids = nullptr;
+    const float* w_wts = nullptr;
+    float* w_out = nullptr;
+    void* w_engine = nullptr;
+    void (*w_fn)(void*, int, int, const uint16_t*, const uint32_t*, const float*, float*) = nullptr;
     void* out_ptr_seen = nullptr;   // out_gpu 指针缓存(避免每次调用做 Python shape 查询)
     size_t out_rows = 0;
     bool ensure_buffers(size_t nh, size_t ni, size_t nw, size_t no, bool retire = false) {
@@ -212,6 +227,66 @@ bool auto_ep_setup(const void* key, const MOEConfigV2& cfg) {
 // sharing one map across all template instantiations is safe.
 std::mutex g_cd_mtx;
 std::unordered_map<const void*, std::unique_ptr<CpuDecodeState>> g_cd_state;
+
+// ---- 异步枢纽(item 1/3)-----------------------------------------------
+// 每层一对 mapped flag:GPU 在 D2H 之后 cuStreamWriteValue32(hin,1),
+// 然后 cuStreamWaitValue32(hout,1) 等 CPU 结果,最后 H2D 并写回 hin=0。
+// 一个常驻 worker 轮询所有层的 hin;它**只自旋**(单线程,占 ~0.5% CPU)以保证低延迟。
+static std::mutex g_async_mtx;
+static std::vector<CpuDecodeState*> g_async_slots;
+static std::atomic<bool> g_async_stop{false};
+static std::thread g_async_thr;
+static std::atomic<bool> g_async_started{false};
+
+static void async_loop() {
+    while (!g_async_stop.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lg(g_async_mtx);
+        for (auto* st : g_async_slots) {
+            if (st->hin && st->hin[0] == 1) {
+                if (st->w_fn) st->w_fn(st->w_engine, st->w_qlen, st->w_k,
+                                       st->w_hid, st->w_ids, st->w_wts, st->w_out);
+                st->hout[0] = 1;                       // 通知 GPU:结果已写好
+                while (st->hin[0] == 1 && !g_async_stop.load(std::memory_order_relaxed))
+                    _mm_pause();                       // 等 GPU 归还槽位(hin=0)
+                st->hout[0] = 0;                       // 复位,供下一轮 replay
+            }
+        }
+    }
+}
+
+static bool async_enabled() {
+    static const bool e = std::getenv("XIAOTU_MOE_ASYNC") != nullptr;
+    return e;
+}
+
+static bool async_init(CpuDecodeState* st) {
+    if (st->async_ready) return true;
+    if (!async_enabled()) return false;
+    void* p = nullptr;
+    if (cudaHostAlloc(&p, 256, cudaHostAllocMapped) != cudaSuccess) return false;
+    std::memset(p, 0, 256);
+    st->pin_flags = p;
+    st->hin = (volatile uint32_t*)p;
+    st->hout = st->hin + 32;                    // 不同 cache line,避免伪共享
+    void* dp = nullptr;
+    if (cudaHostGetDevicePointer(&dp, (void*)st->hin, 0) != cudaSuccess) return false;
+    st->din = (CUdeviceptr)dp;
+    if (cudaHostGetDevicePointer(&dp, (void*)st->hout, 0) != cudaSuccess) return false;
+    st->dout = (CUdeviceptr)dp;
+    {
+        std::lock_guard<std::mutex> lg(g_async_mtx);
+        g_async_slots.push_back(st);
+    }
+    bool expected = false;
+    if (g_async_started.compare_exchange_strong(expected, true)) {
+        g_async_thr = std::thread(async_loop);
+        g_async_thr.detach();   // 常驻 worker:进程退出时由 g_async_stop 结束;
+                                // 不 detach 会在退出时 terminate(joinable 析构)。
+    }
+    st->async_ready = true;
+    return true;
+}
+
 
 // 【第 217 轮】"CPU MoE + EP 归约"抽成独立函数:host-func 路径与异步握手
 // 路径(worker 线程)共用同一份实现,避免两份代码漂移。
@@ -583,6 +658,36 @@ static void bind_moe_class(py::module& m, const char* name) {
                 float* out;
                 bool graph_owned;   // true: 由 graph 节点持有,回调不得释放
             };
+
+            // ---- 异步握手路径(item 1/3)---------------------------------
+            // 参数(指针)在捕获期就固定下来;replay 时只有 pinned 内容与 flag 变化。
+            if (async_init(st.get())) {
+                st->w_qlen = qlen; st->w_k = top_k;
+                st->w_hid = (const uint16_t*)st->pin_hidden;
+                st->w_ids = (const uint32_t*)st->pin_ids;
+                st->w_wts = (const float*)st->pin_weights;
+                st->w_out = (float*)st->pin_out;
+                st->w_engine = (void*)&self;
+                if (!st->w_fn) {
+                    st->w_fn = [](void* e, int q, int k, const uint16_t* h,
+                                  const uint32_t* i, const float* w, float* o) {
+                        double ep = 0.0;
+                        run_moe_and_ep<MOE>((MOE*)e, q, k, h, i, w, o, &ep);
+                    };
+                }
+                CUstream cs = (CUstream)s;
+                st->outg = outg_dev; st->out_bytes = no;
+                st->out = (float*)st->pin_out;
+                // D2H 拷贝(与旧路径一致)
+                cudaMemcpyAsync(st->pin_hidden, hid_dev, nh, cudaMemcpyDeviceToHost, s);
+                cudaMemcpyAsync(st->pin_ids, ids_dev, ni, cudaMemcpyDeviceToHost, s);
+                cudaMemcpyAsync(st->pin_weights, wts_dev, nw, cudaMemcpyDeviceToHost, s);
+                cuStreamWriteValue32(cs, st->din, 1, 0);
+                cuStreamWaitValue32(cs, st->dout, 1, CU_STREAM_WAIT_VALUE_EQ);
+                cudaMemcpyAsync(st->outg, st->out, no, cudaMemcpyHostToDevice, s);
+                cuStreamWriteValue32(cs, st->din, 0, 0);
+                return;
+            }
 
             // 1) Async D2H copies on the caller stream (graph-capturable).
             cudaMemcpyAsync(st->pin_hidden, hid_dev, nh,
