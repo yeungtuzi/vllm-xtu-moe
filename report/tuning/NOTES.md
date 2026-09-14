@@ -10733,3 +10733,40 @@ max|ref| = 2.0   max_rel = 5.227e-3   → 门限 2e-3 ⇒ FAIL
   当前是**每层关键路径的延迟/MLP**受限(76 MB / 0.36 ms ≈ **211 GB/s**,而本机现实上限 600-800 GB/s)。
 * **下一步(R8 的方向)**:提高每线程 MLP(一次处理 2-4 个输出行 ⇒ 多组独立在途 load)、
   以及批处理(C≥2 时同样字节数只多 2.6× 时间 ⇒ 利用率更高)。
+
+---
+
+## 319. 【优化落地 1 的端到端结果 + 现场 NUMA 核查】
+
+### (a) PERMV 端到端:**中性**(harness +10%,服务在噪声内)
+
+| 配置(TP=2 / MBT=256 / 11 层常驻) | C=1 TPOT | C=2 聚合 | C=4 聚合 |
+|---|---|---|---|
+| 改前(bf16 LUT 解码) | 31.87 | 44.43 | 60.38 |
+| **改后(PERMV 解码)** | **31.78** | 44.41 | 60.17 |
+
+⇒ 与 §318 的归因一致:**服务路径不是指令受限**(harness 里 10% 的 compute 收益,在
+"GPU 0.44 + 拷贝 0.057 + CPU 0.41 串行"的账里被摊掉/被内存延迟吃掉)。
+**保留该改动**(数值完全等价、harness 更快),但**不能指望它解决端到端**。
+
+### (b) 现场 NUMA 核查(`/proc/<worker>/numa_maps`,TP=2 / 11 层常驻)
+
+| NUMA 策略 | anon 内存 | 节点分布 | 判定 |
+|---|---|---|---|
+| `bind:0 / bind:1 / bind:2 / bind:3` | **12 GiB** | 各 3 GiB,严格本地 | ✅ 引擎的 per-shard `mbind` **生效** |
+| `interleave:0-7` | **15 GiB** | 8 节点各 1.9 GiB | ⚠️ **lk 的 `LVLLM_ENABLE_NUMA_INTERLEAVE=1` 全节点交织** |
+
+* worker **VmRSS = 114 GB/rank**,而按 TP=2(128 专家/rank)的 MXFP4 期望值 ≈ **1.61 GB/层**
+  ⇒ 32 层 ≈ 52 GiB;**实际 114 GB ≈ 2.2×** ⇒ 存在**重复的权重副本**(原始 vLLM CPU 张量
+  与引擎分片副本可能同时存在,或 interleave 区里就是它们)。
+* **待办(下一轮)**:
+  1. `XIAOTU_MOE_SHARD_DIAG=1` 数 mbind 成功/失败(是否有 shard 因 mbind 失败而落到 interleave);
+  2. 试 **关掉 `LVLLM_ENABLE_NUMA_INTERLEAVE`**(它会把非 shard 的分配全交织到 8 节点,
+     与 R7"按 socket 切片"冲突),看 RSS 与带宽变化;
+  3. 查清 114 GB 里那 ~60 GB 的重复副本(谁没释放),省下来的内存可以换更多常驻层。
+
+### (c) 发现的配置 bug(必须修)
+
+`MBT=256` + `MINBATCH=1024` 会让 lk 在初始化时报
+`gpu_prefill_min_batch_size (1024) must be less than or equal to max_num_batched_tokens (256)`
+(作者 config.yaml 也是这个组合)。⇒ 启动器里把 `MINBATCH` 夹到 `MBT` 以内。

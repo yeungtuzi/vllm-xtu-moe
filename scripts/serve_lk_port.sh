@@ -53,6 +53,13 @@ LK_BUF_GIB="${LK_BUF_GIB:-6}"           # lk 引擎在 GPU 的缓冲 + decode/gp
 WARMUP_GIB="${WARMUP_GIB:-3}"           # 预热/首次分配的余量(实测 0.90 时因一笔 2 GiB 分配 OOM)
 KV_MIN_GIB="${KV_MIN_GIB:-6}"           # 必须留给 KV cache + 激活的最低显存
 
+# MBT 是 lk/speculator 的缓冲上界;MINBATCH 必须 <= MBT,否则 lk 会报
+# "gpu_prefill_min_batch_size must be <= max_num_batched_tokens"(实测)
+if [ "$MINBATCH" -gt "$MBT" ]; then
+  echo "[lk_port] MINBATCH=$MINBATCH > MBT=$MBT ⇒ 夹到 MBT(否则 lk 报错,见 NOTES §319c)"
+  MINBATCH="$MBT"
+fi
+
 OUTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/report/tuning/logs"
 mkdir -p "$OUTDIR"
 LOG="$OUTDIR/$TAG.log"
