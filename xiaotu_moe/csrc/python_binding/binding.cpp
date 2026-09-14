@@ -210,6 +210,15 @@ std::atomic<int> g_auto_ep_seq{0};
 
 bool auto_ep_setup(const void* key, const MOEConfigV2& cfg) {
     if (cfg.num_processes <= 1) return false;
+    // 【v0.2】有些调用方(主线的 mixed-mode 插件)只用 num_processes/process_id 表达
+    // "本进程该占哪一半 CCD / NUMA node",而**归约由框架自己做**(专家按 I 切分 +
+    // expert_map,引擎不该再叠加一层 shm 归约)。此时必须能显式关掉自建归约,
+    // 否则会多算一次、结果错误。
+    static const bool no_auto_ep = [] {
+        const char* v = std::getenv("XIAOTU_MOE_NO_AUTO_EP");
+        return v && std::atoi(v) != 0;
+    }();
+    if (no_auto_ep) return false;
     const int world = cfg.num_processes;
     const int rank = cfg.process_id;
     if (rank < 0 || rank >= world) return false;

@@ -378,8 +378,24 @@ class _XiaotuExpertsMixin:
             )
 
         cfg = xiaotu_moe.MOEConfigV2()
-        cfg.num_processes = 1
-        cfg.process_id = 0
+        # 【v0.2】把 TP rank 告诉引擎,**只用于 NUMA/核放置**(每个 rank 只占自己那半
+        # 12 个 CCD + 4 个 NUMA node),归约由主线自己做(专家按 I 切分 + expert_map)
+        # ⇒ 必须同时关掉引擎的自建 EP 归约,否则会重复归约。
+        # 实测动机:num_processes=1 时池横跨全部 24 CCD,与 vLLM 自己的线程抢核,
+        # 每层 compute 呈双峰(MIN 0.41 ms vs 典型 9.5 ms,见 NOTES §334p)。
+        os.environ.setdefault("XIAOTU_MOE_NO_AUTO_EP", "1")
+        _tp, _rank = 1, 0
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            _tp = int(get_tensor_model_parallel_world_size())
+            _rank = int(get_tensor_model_parallel_rank())
+        except Exception:  # noqa: BLE001
+            _tp, _rank = 1, 0
+        cfg.num_processes = max(1, _tp)
+        cfg.process_id = max(0, _rank)
         cfg.gpu_id = torch.cuda.current_device()
         cfg.has_gate_proj = True
         cfg.expert_num = num_local_experts

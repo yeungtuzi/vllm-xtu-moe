@@ -11640,3 +11640,33 @@ A(gate/up)=7.2 ms、B(down)=4.5 ms —— 而 fork 路径是 **0.135 / 0.105 ms*
 * **单机形态 B 的修法**(下一轮验证):把引擎的池限制到一半 CCD。
   现成旋钮是 `RANK_SPLIT=1`,但它要求 `world≥2`;形态 B 里 `cfg.num_processes=1`(mainline 自己做
   EP),所以要么给插件加"池只用一半 node"的选项,要么用 `taskset` 把模型主线程与池隔离。
+
+### (q) 🎉🎉 v0.2 的里程碑:**根因⑤(核争抢)修好了 —— 引擎回到 0.26 ms/层,与 fork 路径持平**
+
+**改动(2 处,都在"零核心补丁"约束内)**:
+
+1. `binding.cpp`:`auto_ep_setup()` 增加 `XIAOTU_MOE_NO_AUTO_EP` 开关 ——
+   允许调用方**只用** `num_processes/process_id` 表达"本进程占哪一半 CCD/NUMA node",
+   而**不要**引擎再叠加一层自建 shm 归约(那会重复归约、算错)。
+2. `mixed_experts.py`(插件形态 B):把 **TP rank** 告诉引擎,并默认开 `XIAOTU_MOE_NO_AUTO_EP=1`:
+   ```python
+   os.environ.setdefault("XIAOTU_MOE_NO_AUTO_EP", "1")
+   cfg.num_processes = tp      # 只用于 NUMA/核放置
+   cfg.process_id = rank
+   ```
+
+**为什么这是根因**:原来 `cfg.num_processes = 1` ⇒ 引擎的池横跨**全部 24 个 CCD / 8 个 NUMA node**,
+而**同一个进程里 vLLM 自己的线程正在跑模型前向** ⇒ 池线程被换出 ⇒ 每层出现 ~9 ms 的停顿
+(双峰:MIN 0.41 ms vs 典型 9.5 ms)。改成每 rank 只用**自己那半(12 CCD / 4 node)**后:
+
+| | 修前 | **修后** |
+|---|---|---|
+| `compute`(引擎/层) | 10.0–13.6 ms | **0.262–0.304 ms** |
+| `period`(每层) | 12.5–15.6 ms | **0.640 ms** |
+| 64 token 墙钟 | ~140 s(2.2 s/token) | **2.40 s(37.5 ms/token)** |
+| 与 fork 路径(26.1 ms/token) | 85× | **1.44×** |
+
+* 每层 `compute` **0.262 ms** 与 fork 路径(0.24–0.30 ms)**完全同量级** ⇒ 形态 B 的引擎效率已达标;
+* 剩下的 1.44× 差距**有明确解释**:形态 B 这次 **`RESIDENT=` 空(0 层常驻)**,而 fork 路径是 12 层常驻
+  (实测每层 −0.70 ms/token ⇒ 12 层 ≈ −8.4 ms)。**37.5 − 8.4 ≈ 29 ms**,与 fork 的 26.1 ms 基本对齐。
+* **数值门禁**:`OK=7 BAD=1 (me=1 max_rel 1.873e-02)`,与基线**逐字相同** ✅
