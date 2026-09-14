@@ -1,0 +1,52 @@
+{
+ "cap_fr": {
+  "text": "1. The user is asking for the capital of France.\n2. The answer",
+  "finish_reason": "length",
+  "usage": {
+   "prompt_tokens": 16,
+   "total_tokens": 32,
+   "completion_tokens": 16,
+   "prompt_tokens_details": null
+  }
+ },
+ "math": {
+  "text": "We need to compute 17*23 + 19. First, 17*23 = 391. Then add",
+  "finish_reason": "length",
+  "usage": {
+   "prompt_tokens": 18,
+   "total_tokens": 42,
+   "completion_tokens": 24,
+   "prompt_tokens_details": null
+  }
+ },
+ "code": {
+  "text": "We need to write a Python one-liner that returns the sum of squares of numbers from 1 to 10 inclusive. The user likely expects a single line of Python code that computes 1^2 + 2^2 + ...",
+  "finish_reason": "length",
+  "usage": {
+   "prompt_tokens": 22,
+   "total_tokens": 70,
+   "completion_tokens": 48,
+   "prompt_tokens_details": null
+  }
+ },
+ "zh": {
+  "text": "1.  **分析请求：**\n    *   主题：Mixture of Experts (MoE) 混合专家模型。\n    *   目标：用一句话解释。\n    *   限制：必须是一句话。\n\n2.  **",
+  "finish_reason": "length",
+  "usage": {
+   "prompt_tokens": 15,
+   "total_tokens": 63,
+   "completion_tokens": 48,
+   "prompt_tokens_details": null
+  }
+ },
+ "list": {
+  "text": "We need to list the first 8 prime numbers. Prime numbers are numbers greater than 1 that have no divisors other than 1 and themselves. The first",
+  "finish_reason": "length",
+  "usage": {
+   "prompt_tokens": 15,
+   "total_tokens": 47,
+   "completion_tokens": 32,
+   "prompt_tokens_details": null
+  }
+ }
+}

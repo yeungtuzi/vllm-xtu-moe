@@ -13168,3 +13168,75 @@ mapped flag + 流内存操作等它(`binding.cpp:68` "异步握手默认开启",
 必须在**真实服务负载**下 A/B,微基准与分层计时都覆盖不到。
 
 **已把 `XIAOTU_MOE_ASYNC=0` 设为 `serve_mainline.sh` 默认,并加入启动自检断言。**
+
+### 365. 【v0.2·第 29 轮】三件事:NUMA OOM 的真正机制 / **C3 确认存在且找到 fork 的做法** / B1 非确定性是真回归
+
+#### (a) 为什么 NPS=4(8 node)会 OOM,而"总量不变"不矛盾 —— 是**粒度 × 未绑定分配**
+
+用户提出:按 TP 式切法,node 越多每 node 的权重越小,总量不变,为什么会 OOM?
+**推理对的是权重那一半,而且权重确实切得很好**(`SHARD_DIAG` 实测):
+每层 `w13 sharding OK NS=8 total=1.0GiB`,8 个 node 各碰 1/8,`mbind` 全部成功
+⇒ 引擎分片每 rank ≈74 GB 摊到 8 node,**每 node 仅 ~18.5 GB**。**权重根本不是原因。**
+
+**OOM 来自一份"完全没有切分"的内存**:vLLM 加载 checkpoint 时
+**每个 worker 装全部 256 个专家 ≈138 GB**,而且是 **first-touch、未绑定** 的分配
+—— 落在**加载线程所在的 node** 上。2 个 rank = 276 GB 未绑定。
+
+| | 每 node 容量 | 同样 276 GB 堆到少数 node |
+|---|---|---|
+| **NPS=4(8 node)** | 189 GB | 堆到 185 GB **就撞顶** |
+| **NPS=1(2 node)** | 756 GB | **4× 余量**,撞不到 |
+
+**总量一样,但对失衡的脆弱度差 4 倍。** 实测:OOM 那一刻**总空闲还有 863 GB**,
+而 node 0/2 已 185/189 GB。
+
+⇒ 用户的两条路都对,但**关键区别**:
+* **NPS=1(BIOS)**:把所有分配的粒度都变粗(**包括 vLLM 那 138 GB**)⇒ **能真正解决 OOM**;
+* **`XIAOTU_MOE_NSHARD=2`**(引擎已有此旋钮,注释明确写着是 NPS=1 的等价物):
+  只影响**引擎自己的分片**,让局部性对上真正的边界(ACPI:同 socket 10–12、跨 socket 32);
+  **管不到 vLLM 的 138 GB**,所以还不能撤掉 `numactl --interleave=all`。
+  **值得一试**:`NSHARD=2` 可能同时改善局部性(实测延迟),而且它是"按 socket 切两片"的现成实现。
+
+#### (b) 🎯 **C3 确认存在**,并且找到了 fork 的做法 —— 每 worker **105 GB vs 主线 260 GB**
+
+同机实测(都是 fork 树/主线树 + **我们的引擎**,TP=2/RESIDENT=0-11/MBT=256):
+
+| 服务 | 每 worker `RssAnon` |
+|---|---|
+| **fork + 我们的引擎(`lkxtu`)** | **105.0 GB** |
+| **主线 + 我们的插件** | **259.7 GB** |
+
+差 **2.47×(≈155 GB/worker)**。机制(`routed_experts.py` vs `hybrid_model.py`):
+
+```python
+# fork:按"本地专家数"分配,并用 ExpertMapManager 做 global→local
+self.local_num_experts = moe_config.num_local_experts          # 128
+self.local_num_experts = self.expert_map_manager.local_num_experts
+"num_experts": moe_config.num_local_experts                    # 传给引擎的是本地数
+```
+```python
+# 主线:硬编码全量(注释还写着"单 rank 持全部")
+self.n_local_experts = config.n_routed_experts                 # 256
+torch.zeros(num_experts, 2*I, H//2)                            # ⇒ 每 rank 138 GB
+```
+
+**⇒ 修法(下一轮第一件事)**:让主线也按 `n_routed_experts // tp` 分配,
+并把 `_map_global_expert_id()` 从"恒等"改成"global→local"映射
+(该函数**已经存在**并被 `weight_loader` 调用,只需改映射本身),
+同时设 `experts_start_idx/end_idx` 与 TP 对齐。
+**收益**:−155 GB/worker ⇒ 很可能**不再需要 `interleave`**,并腾出空间给大 `MBT`(C1)。
+这也解释了为什么 C2(pin-cache 持有全量)那条"缩容"没效果 —— 因为**根本没缩,分配就是全量**。
+
+#### (c) B1 非确定性:**是主线回归,fork 是确定的**
+
+| 配置 | 同配置连续两次 greedy 逐字符一致 |
+|---|---|
+| **引擎单 rank(无模型加载,`test_engine_determinism.py`)** | **11/11 完全一致** ⇒ 引擎本身确定 |
+| **fork(0.1.0 栈)** | **5/5 一致** ⇒ 0.1.0 是确定的 |
+| 主线 ASYNC=1 | 2/5 |
+| 主线 ASYNC=0 + NSLICE=0 | 2/5 |
+| 主线 ASYNC=0 + NSLICE=1 | 3/5(且速度 1.48 s,与 NSLICE=0 的 1.42 s 同级) |
+
+⇒ **不是 async、也不是 NSLICE**;是主线栈上更深的一层(候选:
+(b) 那个"每 rank 持全量专家 + 恒等 expert_map"导致的**路由/规约结构与 fork 不同**)。
+**先做 (b) 再复测确定性** —— 两者很可能是同一个根因。
