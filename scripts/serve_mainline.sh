@@ -29,6 +29,9 @@ MBT="${MBT:-}"                       # 空 = 用主线默认
 # 加载策略:实测插件路径读分片 2.5-4.8 s/片(fork 路径 0.6 s/片);
 # 主线日志明确建议 EXT4 上用 prefetch 强制预取。
 LOAD_STRATEGY="${LOAD_STRATEGY:-prefetch}"
+# A100(SM80)没有 fp8e4nv:Triton 的 PackSeq 等内核在 JIT warmup 时会报
+# "type fp8e4nv not supported in this architecture" ⇒ 直接关掉预热(实测 ml08modeB)
+KERNEL_WARMUP="${KERNEL_WARMUP:-0}"
 # 引擎线程:插件侧旋钮(每 rank 12 CCD ⇒ 5 核/CCD = 60)
 THREADS="${THREADS:-60}"
 # 额外常驻 GPU 的 MoE 层(与 lk 的 LVLLM_GPU_RESIDENT_MOE_LAYERS 同义)
@@ -53,6 +56,9 @@ ARGS=(
 )
 if [ -n "$MBT" ]; then ARGS+=(--max-num-batched-tokens "$MBT"); fi
 if [ -n "$LOAD_STRATEGY" ]; then ARGS+=(--safetensors-load-strategy "$LOAD_STRATEGY"); fi
+if [ "$KERNEL_WARMUP" = "0" ]; then
+  ARGS+=(--kernel-config '{"enable_jit_warmup": false}')
+fi
 
 {
   echo "tag=$TAG port=$PORT tp=$TP gpus=$GPUS maxlen=$MAXLEN seqs=$SEQS gpu_util=$GPU_UTIL"
@@ -76,6 +82,8 @@ nohup env \
   HF_HUB_OFFLINE=1 \
   VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}" \
   VLLM_HANDSHAKE_TIMEOUT_MINS="${VLLM_HANDSHAKE_TIMEOUT_MINS:-60}" \
+  VLLM_USE_FLASHINFER_SAMPLER=0 \
+  FLASHINFER_DISABLE_VERSION_CHECK=1 \
   VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-3600}" \
   VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS="${VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS:-30}" \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \

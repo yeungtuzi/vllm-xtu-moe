@@ -11528,3 +11528,50 @@ NUMA 辅助(引擎自带 per-shard mbind)。
 + 逐层 CPU 引擎构造(含 1.6 GiB/层/rank 的 NUMA shard 拷贝)≈ 140 s(35 层)
 ⇒ 总计 ~4.6 分钟,仍贴着看门狗的边界
 ```
+
+### (j) 🎉 里程碑:mainline + 插件**功能跑通**(零核心补丁)
+
+`XIAOTU_OOT_OVERRIDE=0`(形态 B:主线 `RoutedExperts` 原样 + 我们的 CPU 后端),
+在 **mainline vLLM(未改任何源码,只调 env)** 上启动成功:
+
+```
+Worker_TP0 INFO [gpu_worker.py:637] Available KV cache memory: 22.04 GiB
+EngineCore INFO [kv_cache_utils.py:2312] GPU KV cache size: 112,304 tokens,
+                                          Maximum concurrency for 8,192 tokens per request: 13.71x
+APIServer  INFO: Application startup complete.
+Worker_TP0 [vllm-xtu-moe] xiaotu MOE_MXFP4 engine: E=256 H=4096 I=1024 topk=6
+                          group=1x32 scales=yes routing=sqrtsoftplus swiglu=clamp@10.0
+```
+
+* **输出正确**(实测):`prompt="The capital of France is"` → `" Paris. The capital of Spain is Madrid"`
+* **我们的引擎确实被调用**(mode B 的日志串是 `xiaotu MOE_MXFP4 engine:`,不是 mode A 的 `engine built`)
+* 对比 0.1.0 fork 路径:KV 从 0.6 GiB → **22.04 GiB(112,304 token)**,因为形态 B **不需要 12 层常驻**。
+
+### (k) 🔴 但性能差 85×:温请求 **2.2 s/token**(16 token 用 35.6 s,两次复现 35.64/35.55)
+
+| 观察 | 数值 | 说明 |
+|---|---|---|
+| 每层耗时 | **51 ms** | 应为 0.24 ms(引擎实测)⇒ 差 ~200× |
+| worker 线程数 | **115–117** | 线程池**已启动** |
+| worker CPU | **1867%**(≈19 核) | 确实在算,不是卡住 |
+| RSS | 227.7 GB/rank | 权重 + 分片,正常 |
+| JIT 警告 | `_deepseek_v4_sm12x_fp8_einsum_kernel`、`hc_prenorm_gemm_tilelang` … | **注意力/算子走的是 SM12x 回退路径** |
+
+**首要假设(证据支持)**:慢的是**注意力/算子**,不是 MoE —— 这棵树只有 **SM12x/SM80 的本地补丁(B)**,
+**没有打 `pr2/pr3`(A100/SM80 的正式移植)**;日志里出现 SM12x 的 Triton 回退。
+⇒ 下一步:在形态 B 上补打 **`pr2`(实测对 B 干净可用:3 文件 0 失败)** 与 `pr3` 的缺失 hunk,再复测。
+
+### (l) 形态 B 的架构红利(值得写进 release notes)
+
+* **KV 22 GiB / 112,304 token**(形态 A 的 12 层常驻只剩 0.6 GiB)⇒ 长上下文友好;
+* 主线原生 **cudagraph / prefix caching / chunked prefill** 全部保留(实测日志有 `Capturing CUDA graphs (FULL): 2/2`、
+  `Prefix cache hit rate` 指标);
+* **不需要改任何主线源码**(26 处猴补丁 + oracle 后端替换)。
+
+### (m) 本轮新增的三个"环境级"修复(全部已进启动器与安装说明)
+
+| 症状 | 根因 | 修复 | 实测 |
+|---|---|---|---|
+| 启动被掐(313–397 s) | 读 checkpoint 分片 2.5–4.8 s/片 | `--safetensors-load-strategy=prefetch` | 加载 **330 s → 133 s** |
+| `ValueError: type fp8e4nv not supported in this architecture` | A100 无 fp8e4nv,Triton JIT warmup 编译 `PackSeqTritonKernel` | `--kernel-config '{"enable_jit_warmup": false}'` | warmup 不再崩 |
+| `nvcc fatal: Unknown option '--compress-mode=size'` | FlashInfer 0.6.18 需 CUDA ≥12.8,本机 12.1 | `VLLM_USE_FLASHINFER_SAMPLER=0` | worker 不再猝死,服务启动成功 |
