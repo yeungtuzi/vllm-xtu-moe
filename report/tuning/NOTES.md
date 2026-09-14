@@ -12827,3 +12827,47 @@ double t = std::sqrt(single_us / 1.8);           // ⇒ 59
 解码 `NASS=6` 时合理的并行度就是个位数),使 `wlimit` 落在 **4–8**;
 这样 `stride = 60/6 = 10`,只有 6 个 worker 自旋/参与,其余 park。
 **这正是代码注释里描述的设计意图**(line 1007-1012),只是估算公式没标定对。
+
+### 356. ⚠️【v0.2·第 21 轮】想用 `wlimit` 限制 worker **会挂死** —— 那条路(代码自己警告过)确实坏的
+
+#### (a) 先给引擎加了标定旋钮(已提交,env-gated、默认行为不变)
+
+`XIAOTU_MOE_WLIMIT=N`(N>0 强制 worker 子集上限;未设=用原公式),接在
+`MOE_V2::wlimit_override()` 上,两个分支(`kNParallel` / `kNSliceSmallM`)都尊重它。
+重新构建 + 部署到 `lkxtu`(主线 env 走 editable install 从仓库读 `xiaotu_moe`,自动生效),
+**WLIMIT=0 时与改动前逐位同一量级:372.4/378.2 µs vs 改动前 371.6/384.2 µs(无回归)**。
+
+#### (b) 扫描直接挂死 —— 与 `moe_v2.hpp:509` 的警告完全一致
+
+```
+WLIMIT=0   serial 2.98ms  372.4us  pipe 3.03ms  378.2us      ← 正常
+WLIMIT=4   (无输出,挂死;600s 超时被杀)
+```
+
+而 `moe_v2.hpp:509` 早就写着:
+
+> 「注意:这里**不要**传 wlimit。实测 `parallel_for_limited(limit == nt_)` 会在
+>  warmup 阶段让 worker 卡死(shm_broadcast 超时)…真正要限制 worker 子集需要
+>  **先把 numa_pool 的 limited 路径修好**(见 report/tuning/NOTES.md §33)。」
+
+⇒ **`parallel_for_limited` 这条路径是坏的**,不是"没标定好"。所以
+"把 `wlimit` 调小"这条路**走不通**,除非先修 `numa_pool` 的 limited 同步。
+
+#### (c) ⇒ 剩下两条可行路(下一轮二选一)
+
+| 路 | 做法 | 代价/风险 |
+|---|---|---|
+| **(A) 修 `numa_pool` 的 limited 路径** | 按 §33 把边界竞态修掉,让 `wlimit` 真能用 | 引擎同步代码,风险中;但能精确控制参与度 |
+| **(B) 直接调小 `THREADS`** | `THREADS=60 → 12/16`。解码 `NASS=6` 本来就用不上 60 个线程;`nt` 小了 ⇒ "全员参与"也变得便宜,且**不进 limited 路径** | 一行 env,零风险;但要确认预填充没被拖慢 |
+
+**我倾向先试 (B)**:它绕开了已知坏掉的路径,而且直接命中"唤醒 60 个 worker 参与一相"
+这个根因。预填充阶段的并行度损失可以用 `NSLICE`/`NASS` 相关的既有逻辑覆盖,
+实测确认即可。
+
+#### (d) 当前已验证的净成果(第 20 轮)
+
+`NSLICE_SMALL=0` + `SPIN_IDLE_US=0`(均已设为 `serve_mainline.sh` 默认)在**干净测量**下:
+**median 37.7 ms/token(5 次重复 37.4–37.9),worker CPU 145%,load 11**
+—— 对比默认的 1225 ms/token、CPU 3242%、load 119。**这是 32× 且稳定。**
+仍未解决的是 `bench_lat.sh` 的 random-512/128-out 工作负载下退化(1.24 s/token),
+其直接原因是 `wlimit=0 ⇒ 60 个 worker 全部参与每一相`,而修它要先解决本节 (c) 的选择。

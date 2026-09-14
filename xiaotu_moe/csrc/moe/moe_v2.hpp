@@ -511,7 +511,8 @@ public:
             // 而 `small_batch_workers()` 在 DS-V4 维度上恒等于 nt_ ⇒ 传了也等于没限制,
             // 只会踩到 limited 等待路径的边界竞态。真正要限制 worker 子集需要
             // 先把 numa_pool 的 limited 路径修好(见 report/tuning/NOTES.md §33)。
-            forward_many_nsliced(M, k, expert_ids, weights, input, output);
+            forward_many_nsliced(M, k, expert_ids, weights, input, output, 0,
+                                 wlimit_override());
             return;
         }
         // Small-batch N-slicing (decode): with few assignments the grouped and
@@ -527,8 +528,9 @@ public:
                 return !(e && std::atoi(e) == 0);   // =0 forces the legacy path
             }();
             if (nslice_small && NASS <= 4 * (size_t)pool_.nthreads()) {
-                forward_many_nsliced(M, k, expert_ids, weights, input, output, -1,
-                                     small_batch_workers(NASS, inter, hidden));
+                size_t _wl = wlimit_override();
+                if (_wl == 0) _wl = small_batch_workers(NASS, inter, hidden);
+                forward_many_nsliced(M, k, expert_ids, weights, input, output, -1, _wl);
                 return;
             }
         }
@@ -706,6 +708,25 @@ public:
     // Worker count for a small batch: single-thread work is ~NASS*3*I*H MACs at
     // ~8 MAC/cycle (fp8 decode arithmetic), and a pool call costs ~40us +
     // ~1.8us/participating worker, so minimise W/T + overhead(T).
+    // 【第 21 轮】worker 子集上限的诊断/标定覆盖。
+    // `small_batch_workers()` 的 `single_us` 取自**标称** MAC 率(8 MAC/cycle @3GHz),
+    // 在 DS-V4 解码维度(NASS=1*6, I=2048, H=4096)上算得 **6292 µs**,而真实单线程
+    // 是百 µs 级 ⇒ 高估约 50× ⇒ `lim` 恒 ≥ nt ⇒ `worker_limit_` 的门闸
+    // (`if (w % stride != 0) goto park`) 因为 `stride = nt/lim = 1` **完全失效**
+    // ⇒ 60 个 worker 全部参与每一相、并与 vLLM 自己的线程抢核。
+    // `XIAOTU_MOE_WLIMIT=N`(N>0)强制该上限;未设/<=0 用公式。见 NOTES §355/§356。
+    size_t wlimit_override() const {
+        static const long v = [] {
+            const char* e = std::getenv("XIAOTU_MOE_WLIMIT");
+            return e ? std::atol(e) : 0L;
+        }();
+        if (v <= 0) return 0;
+        const size_t nt = pool_.nthreads();
+        size_t lim = (size_t)v;
+        if (lim > nt) lim = nt;
+        return lim;
+    }
+
     size_t small_batch_workers(size_t NASS, int inter, int hidden) const {
         const size_t nt = pool_.nthreads();
         const double macs = (double)NASS * 3.0 * (double)inter * (double)hidden;
