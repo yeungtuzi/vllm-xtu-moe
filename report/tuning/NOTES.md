@@ -11575,3 +11575,26 @@ Worker_TP0 [vllm-xtu-moe] xiaotu MOE_MXFP4 engine: E=256 H=4096 I=1024 topk=6
 | 启动被掐(313–397 s) | 读 checkpoint 分片 2.5–4.8 s/片 | `--safetensors-load-strategy=prefetch` | 加载 **330 s → 133 s** |
 | `ValueError: type fp8e4nv not supported in this architecture` | A100 无 fp8e4nv,Triton JIT warmup 编译 `PackSeqTritonKernel` | `--kernel-config '{"enable_jit_warmup": false}'` | warmup 不再崩 |
 | `nvcc fatal: Unknown option '--compress-mode=size'` | FlashInfer 0.6.18 需 CUDA ≥12.8,本机 12.1 | `VLLM_USE_FLASHINFER_SAMPLER=0` | worker 不再猝死,服务启动成功 |
+
+### (n) 🔴 定位到 mainline 慢的**真正位置**:**引擎本身在形态 B 下慢 42×**(不是注意力)
+
+给 mainline 形态 B 打开引擎自带的 `XIAOTU_CD_TIMING`(它测的是异步 worker 里的同一段代码),
+发一个 6-token 请求,得到(43 次调用的窗口):
+
+```
+[cd-timing/async] calls=43 qlen=1 k=6 period=12.5ms compute=10.0ms(engine=10.031 ep=0.000) rest=2.5ms
+[cd-timing/async] calls=43 qlen=1 k=6 period=12.4ms compute=10.5ms(engine=10.526 ep=0.000) rest=1.9ms
+```
+
+| 项 | 形态 B(mainline) | fork 路径 | 比值 |
+|---|---|---|---|
+| `compute`(引擎) | **10.0–11.6 ms/层** | 0.24 ms/层 | **~42×** |
+| `rest` | 1.9–3.3 ms | 0.33 ms | ~7× |
+| `ep` | **0.000**(形态 B 按 `I` 切分,没有 EP 归约) | 0.014 | — |
+
+⇒ **我上一轮的"注意力慢"假设被推翻**:慢的是**引擎调用本身**。
+10 ms 读 37.8 MB ⇒ **3.8 GB/s**,恰好是**单线程**流式的量级 ⇒
+**强假设:形态 B 里线程池实际只有 1 个核在干活**(或 worker 大面积休眠后唤醒代价极高)。
+
+**下一步(下一轮第一件事)**:用 `XIAOTU_MOE_POOL_DEBUG=1` 打印池的实际线程数/绑核,
+并试 `XIAOTU_MOE_SPIN_IDLE_US=200000`(不让 worker 休眠)。这是**成本极低、可能一次到位**的实验。
