@@ -12124,3 +12124,36 @@ GPU 走"权重 H2D + 上游 MARLIN",H2D 与 GPU 分别计时):
 
 ⇒ **结论**:v0.2 要让主线拿到参考的预填充性能,不需要新写内核,只需要把上面三个开关在
 `serve_mainline.sh` 里补齐并验证。**这是本轮的实施清单。**
+
+### 341. ⚠️【v0.2·第 14 轮】GPU prefill 上主线的**真实卡点不是开关,是宿主内存**:`group_max_len = max(4096, MBT)+128`
+
+按 §340(c) 把三个开关都打开后(`PREFILL=1` ⇒ `MBT=8192 / GP_MIN=1024 / CUDAGRAPH_SIZES="1 2 4 8"`),
+启动**直接 OOM**。`/var/log/kern.log`:
+
+```
+Out of memory: Killed process ... (VLLM::Worker_TP) total-vm:608535004kB
+  anon-rss:218866316kB ...            # 每个 worker ≈ 219 GB,两个 ≈ 437 GB
+Out of memory: Killed process ... (VLLM::Worker_TP) total-vm:678339392kB anon-rss:235200028kB
+```
+
+进程是**静默死亡**(没有 Traceback、没有 assert),所以引擎日志里只看到加载到
+`model.layers.28/33` 就没了 —— 这类"只说一半就没了"的日志,**先去 `/var/log/kern.log` 找 OOM**。
+
+**根因**:`hybrid_model.py:832` 把 `cfg.group_max_len` 设成 `max(4096, max_num_batched_tokens) + 128`。
+`MBT=256`(已知可启动的配置)⇒ `4224`;`MBT=8192` ⇒ **`8320`**,而 CPU 引擎的每专家 scratch
+是随 `group_max_len` 增长的 ⇒ 每层多占 ~5 GB × 44 层 × 2 rank ⇒ 爆。
+(注释里说"V2 引擎按调用动态分配,group_max_len 只是信息性的" —— **实测不成立**,
+至少 MXFP4 (V2) 路径仍然吃这个尺寸。这条注释需要按实测修正。)
+
+**⇒ 两个结论**:
+
+1. **`MBT` 不能盲目对齐参考的 8192**。本机(TP=2)安全上界在 **1024–2048** 之间,
+   要往上走必须先解决 `group_max_len` 的分配(或把它与 `MBT` 解耦)。
+2. **这对 GPU 预填充是硬约束**,因为:**GPU 预填充的收益来自"整段 prompt 一次过"**
+   —— 每过一个 chunk 就要把 43 层权重重 DMA 一遍。`MBT=1024` ⇒ 8192 token 的 prompt
+   要 8 个 chunk ⇒ **8 × DMA ≈ 45 s**,反而比 CPU(~180 s)只快 4× 而不是 16×。
+   `report/curve_thr.jsonl` 之所以有 2048→366 t/s、8192→956 t/s,正是因为它跑的是
+   **`mnbt=16384`(整段一批)**。
+
+⇒ **下一步**:先用 `MBT=1024 = GP_MIN` 验证三个开关确实打通(GPU 路径被选中、结果正确),
+再把 `group_max_len` 与 `MBT` 解耦,最后才能对齐参考的大 `MBT` 拿到 4× 以上的预填充收益。
