@@ -11598,3 +11598,25 @@ Worker_TP0 [vllm-xtu-moe] xiaotu MOE_MXFP4 engine: E=256 H=4096 I=1024 topk=6
 
 **下一步(下一轮第一件事)**:用 `XIAOTU_MOE_POOL_DEBUG=1` 打印池的实际线程数/绑核,
 并试 `XIAOTU_MOE_SPIN_IDLE_US=200000`(不让 worker 休眠)。这是**成本极低、可能一次到位**的实验。
+
+### (o) ✅ 验证成功:`SPIN_IDLE_US=600000`(不让 worker 停泊)让 mainline 形态 B **快 6×**
+
+| | 默认 5000 µs | **600000 µs** |
+|---|---|---|
+| 单请求 16 token 墙钟 | 35.6 s(2.2 s/token) | **5.97 s(0.37 s/token)** |
+| `compute`(引擎/层) | 10.0–11.6 ms | **3.3–5.0 ms** |
+
+机制(`numa_pool.hpp` worker 循环):自旋 `spin_idle_us_` 后 **park(等 `cv_`)**,发布者每次
+`publish + cv_.notify_all()`;代码注释里实测"空 body 的 `pfor` 也要 ~113 µs/区"(全局 `work_mtx_` 竞争)。
+mainline 形态 B 的层间隔 **12.5 ms ≫ 5000 µs** ⇒ **每个并行区都要唤醒 60 个线程** ⇒ 每层多花 ~6 ms。
+fork 路径层间隔只有 0.9 ms < 5000 µs ⇒ 永不 park ⇒ 没有这笔开销。
+
+**引擎自带的相位 profiler 同时给出了铁证**(decode 桶):
+```
+[NS-PROF] bucket=M<=2  calls=21 na=6.0 | per-call(us): A=7215 B=4475 C=11 TOTAL=11767
+```
+A(gate/up)=7.2 ms、B(down)=4.5 ms —— 而 fork 路径是 **0.135 / 0.105 ms**。
+
+⚠️ 仍未回到 0.24 ms ⇒ 还有**第二个原因**待查(下一轮:`XIAOTU_MOE_POOL_DEBUG=1` 看池的
+线程数与绑核;`M>8` 桶的 `setup=35 ms` 也异常,那是预填充路径)。
+⇒ 这条与集群设计**直接相关**,已作为 **N4 约束**写进 `docs/CLUSTER_SCALE_DESIGN.md §2.1`。
