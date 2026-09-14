@@ -12871,3 +12871,33 @@ WLIMIT=4   (无输出,挂死;600s 超时被杀)
 —— 对比默认的 1225 ms/token、CPU 3242%、load 119。**这是 32× 且稳定。**
 仍未解决的是 `bench_lat.sh` 的 random-512/128-out 工作负载下退化(1.24 s/token),
 其直接原因是 `wlimit=0 ⇒ 60 个 worker 全部参与每一相`,而修它要先解决本节 (c) 的选择。
+
+### 357. 【v0.2·第 21 轮】`THREADS` 扫描:**60 比 12 快**(37.7 vs 50.3)——(B) 方案否决,现有默认已是最优
+
+| `THREADS` | ms/token | worker CPU | worker 线程数 | load |
+|---|---|---|---|---|
+| **60**(当前默认) | **37.7**(5 次 37.4–37.9) | 145% | 117 | 11 |
+| 12 | 50.3(5 次 50.0–50.3) | 117% | 69 | 2.5 |
+
+⇒ 减线程确实把 CPU/负载压下去(load 11 → 2.5),但**延迟反而差 33%**
+(37.7 → 50.3)。所以 **(B) 方案否决**:`THREADS=60` + `NSLICE_SMALL=0` + `SPIN_IDLE_US=0`
+就是目前实测最好的组合,**保持不动**。
+
+⚠️ 注意 worker 线程数 117 远大于 `THREADS=60`:池的线程数不是简单等于该 env
+(还有 2 个 rank 的池按 NUMA 分片、加上 vLLM/torch 自己的线程),这一点下一轮若要
+继续调线程需要先看清 `NumaWorkPool` 的 `nt_` 到底怎么来。
+
+#### 仍未解决(下一轮的入口,已缩小到很具体)
+
+**同一个已调好的服务**(`THREADS=60` + 两旋钮):
+* 直连探测(natural / 16 tok / `ignore_eos`):**37.7 ms/token,稳定**;
+* `bench_lat.sh`(random 512-token / 128 out / C=1):**158.8 s/请求 ≈ 1.24 s/token**,
+  且此时 worker CPU 回到 1112%/1211%。
+
+⇒ 两者用的是**同一个服务、同一份引擎**,差别只在请求形态 ⇒ 下一轮该做的**不是再调旋钮**,
+而是**在 bench_lat 负载下直接抓证据**:
+1. 服务端挂 `XIAOTU_DEBUG_QLEN=1` + `XIAOTU_CD_TIMING=1`,看 qlen 谱与 `period/compute/ep/rest` 是否变样;
+2. 用 `XIAOTU_MOE_FAKE_ALL=1` 在同一负载下量地板 —— 若地板也从 33.6 ms 涨到 1.2 s,
+   说明是**vLLM 调度侧**(chunked prefill / 采样)而不是我们的 MoE;
+3. 特别注意 bench_lat **不设 temperature**(用 generation_config 的 1.0)且**不设 ignore_eos**
+   —— 随机采样会让每步路由完全不同,可能与"60 个 worker 参与"耦合出病态。
