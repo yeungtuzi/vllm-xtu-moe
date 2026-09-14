@@ -405,7 +405,11 @@ public:
                 // 【第 212 轮】多 rank 同机:分片数与 node 基址都按 rank 切开,
                 // 让 rank r 的 1/world 权重落在它自己那 1/world 个 NUMA node 上
                 // (与 numa_pool 的核表切分一致)。world<=1 时行为与以前完全一致。
-                const int _world = std::max(1, cfg_.num_processes);
+                static const bool _rank_split = [] {
+                    const char* e = std::getenv("XIAOTU_MOE_RANK_SPLIT");
+                    return !(e && std::atoi(e) == 0);
+                }();
+                const int _world = _rank_split ? std::max(1, cfg_.num_processes) : 1;
                 rank_node_base_ = std::max(0, cfg_.process_id) * (numa_node_count() / _world);
                 nshard_ = std::max(1, numa_node_count() / _world);
                 // XIAOTU_MOE_NSHARD=N 覆盖分片数。本机 NPS=4 ⇒ numa_node_count()=8,

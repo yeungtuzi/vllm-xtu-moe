@@ -892,7 +892,13 @@ private:
         // 切分后 rank r 只用第 r 份核(按 cpu 编号=node 编号排序 ⇒ 天然是自己的
         // NUMA 子集),引擎侧的分片数同步切成 1/world(见 moe_v2.hpp 的 nshard_)。
         // TP=1(world_<=1)时**完全不改变行为**。
-        if (world_ > 1 && cores_.size() >= (size_t)world_ * 2) {
+        // XIAOTU_MOE_RANK_SPLIT=0 可**关掉**按 rank 切核表(用于对照:两个 rank 共用全部核,
+        // 靠调度器分配;配合每 rank 96 线程 = 192 线程铺满 192 核,避免超订)。
+        static const bool rank_split = [] {
+            const char* e = std::getenv("XIAOTU_MOE_RANK_SPLIT");
+            return !(e && std::atoi(e) == 0);
+        }();
+        if (rank_split && world_ > 1 && cores_.size() >= (size_t)world_ * 2) {
             // 【第 212 轮·TP=2 解码】把核表按 rank 过滤成"本 rank 的 NUMA 子集"。
             // 必须**过滤**而不是"排序后切一段":`cores_` 原本是 slot-major/ccd-minor
             // (跨所有 CCD 轮流),这样 48 个线程才会铺满本 rank 的所有 node。
