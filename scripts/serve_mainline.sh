@@ -25,13 +25,41 @@ TP="${TP:-2}"
 GPU_UTIL="${GPU_UTIL:-0.80}"
 MAXLEN="${MAXLEN:-8192}"
 SEQS="${SEQS:-8}"
+# ---- GPU 预填充三开关(见 NOTES §340;缺一个就失效) ----
+# 便捷预设(必须放在 MBT 解析之前):PREFILL=1 ⇒ 对齐参考 fork 的生产预填充协议
+#   (serve_lk_port.sh: MBT=8192 / MINBATCH=1024 / 只捕获解码尺寸)。
+#   实测端到端:2048 token TTFT 5.71 s / 366 t/s(CPU 侧要 92.6 s ⇒ 16.2×);
+#   TP=2 16000 token ⇒ 1149 t/s(report/curve_thr.jsonl, report/curve_tp2.jsonl)。
+if [ "${PREFILL:-0}" = "1" ]; then
+  MBT="${MBT:-8192}"
+  GP_MIN="${GP_MIN:-1024}"
+  CUDAGRAPH_SIZES="${CUDAGRAPH_SIZES:-1,2,4,8}"
+fi
 MBT="${MBT:-256}"                    # 与 fork 协议对齐(实测:不设时主线默认很大)
+# GPU 预填充阈值(fork 里叫 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE,生产值 1024)。
+#   0 = 关(默认,保持解码基准协议不变);N>0 时 qlen>=N 的 MoE 层走 GPU
+#   (hybrid_model.py:982 的 _gp_min 分支)。**必须同时满足 MBT >= N**,
+#   否则 batch 永远到不了阈值 —— 与 fork 把 MINBATCH 夹到 MBT 的语义一致。
+GP_MIN="${GP_MIN:-0}"
+# 只给这些 batch size 捕获 CUDA 图(逗号分隔)。**这是让 GPU 预填充生效的关键**:
+#   预填充形状若不在捕获集里就不走图、直接 eager ⇒ hybrid_model 的 GPU 分支才会被选中;
+#   同时解码(size<=SEQS)仍然享有 CUDA 图。留空 = 用主线默认(PIECEWISE 会把预填充
+#   形状也捕获掉,重放永远走捕获时的 CPU 分支 ⇒ GPU 预填充形同虚设)。见 NOTES §340(c)。
+CUDAGRAPH_SIZES="${CUDAGRAPH_SIZES:-}"
+if [ "$GP_MIN" -gt 0 ] && [ "$GP_MIN" -gt "$MBT" ]; then
+  echo "[mainline] GP_MIN=$GP_MIN > MBT=$MBT ⇒ 夹到 MBT(否则预填充永远够不到阈值;NOTES §319c)"
+  GP_MIN="$MBT"
+fi
 # chunked prefill:**建议保持主线默认(开)**。
 #   * 关掉它时,主线要求 MBT >= max_model_len(否则直接报错),而且预填充会整段进
 #     我们的 CPU 引擎(qlen=MBT)⇒ 一次 256 token 的预填充就要 26 ms/层 × 43 ≈ 1.1 s;
 #   * 开着时,解码步里可能混进预填充块(qlen=257)⇒ 解码也会付这份钱。
 # ⇒ 两种都不理想,根因是**形态 B 没有"预填充专用路径"**(fork 里有 `_cpu_prefill` /
 #   `_gpu_prefill` 的分流)。见 NOTES §334s。默认先取主线默认(开)。
+# **补充(2026-09-14,NOTES §340)**:形态 A(OOT=1,本脚本默认)的 `hybrid_model.py`
+#   里 **GPU 预填充路径早就写好了**(gpu_prefill.py:KV-Major 锁页缓存 + PrefetchSlot
+#   重叠 + Triton MXFP4 分组 GEMM),只是本脚本一直**没导出阈值 + MBT=256 够不到 +
+#   预填充形状被 CUDA 图捕获**,三个开关全缺 ⇒ 形同虚设。用 `PREFILL=1` 一次打开。
 CHUNKED_PREFILL="${CHUNKED_PREFILL:-1}"
 # 加载策略:实测插件路径读分片 2.5-4.8 s/片(fork 路径 0.6 s/片);
 # 主线日志明确建议 EXT4 上用 prefetch 强制预取。
@@ -67,6 +95,7 @@ if [ -n "$MBT" ]; then ARGS+=(--max-num-batched-tokens "$MBT"); fi
 if [ "$CHUNKED_PREFILL" = "0" ]; then ARGS+=(--no-enable-chunked-prefill); fi
 if [ "$CHUNKED_PREFILL" = "1" ]; then ARGS+=(--enable-chunked-prefill); fi
 if [ "$EAGER" = "1" ]; then ARGS+=(--enforce-eager); fi
+if [ -n "$CUDAGRAPH_SIZES" ]; then ARGS+=(--cudagraph-capture-sizes "$CUDAGRAPH_SIZES"); fi
 if [ -n "$LOAD_STRATEGY" ]; then ARGS+=(--safetensors-load-strategy "$LOAD_STRATEGY"); fi
 if [ "$KERNEL_WARMUP" = "0" ]; then
   ARGS+=(--kernel-config '{"enable_jit_warmup": false}')
@@ -75,6 +104,7 @@ fi
 {
   echo "tag=$TAG port=$PORT tp=$TP gpus=$GPUS maxlen=$MAXLEN seqs=$SEQS gpu_util=$GPU_UTIL"
   echo "mbt='$MBT' chunked='$CHUNKED_PREFILL' threads=$THREADS resident='$RESIDENT' oot=$OOT load_strategy='$LOAD_STRATEGY' extra_env='$EXTRA_ENV'"
+echo "gp_min=$GP_MIN cudagraph_sizes='$CUDAGRAPH_SIZES' prefill_preset='${PREFILL:-0}'"
   echo "env=$ENV"; echo "ckpt=$CKPT"; date -Is
 } > "$OUTDIR/$TAG.env"
 
@@ -100,6 +130,7 @@ nohup env \
   VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS="${VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS:-30}" \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
   XIAOTU_OOT_OVERRIDE="$OOT" \
+  VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$GP_MIN" \
   XIAOTU_MOE_THREADS="$THREADS" \
   XIAOTU_MOE_GPU_RESIDENT_LAYERS="$RESIDENT" \
   OMP_NUM_THREADS=1 \
