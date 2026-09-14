@@ -65,6 +65,18 @@ using namespace xiaotu_moe;
 //
 // Requires only host-side CUDA runtime API (no device kernels), so the whole
 // module still builds with a plain host compiler once -lcudart is linked.
+// 【第 221 轮】异步握手**默认开启**(可用 `XIAOTU_MOE_ASYNC=0` 关闭)。
+// 理由:它是本项目最大的单点收益(V 6.53→1.80 ms/token,C=4 聚合 71.8→107.3 t/s),
+// 且已验证「与 host-func 逐位相同」+「服务级 greedy 文本 5/5 相同」+ 长跑无 hang。
+// 关闭后自动回落到 `cudaLaunchHostFunc` 路径(功能等价、更慢)。
+static bool xiaotu_async_enabled() {
+    static const bool e = [] {
+        const char* v = std::getenv("XIAOTU_MOE_ASYNC");
+        return !(v && std::atoi(v) == 0);
+    }();
+    return e;
+}
+
 struct CpuDecodeState {
     void* pin_hidden = nullptr;
     void* pin_ids = nullptr;
@@ -112,7 +124,7 @@ struct CpuDecodeState {
     // 而捕获期 `cudaHostAlloc` 会让整段 capture 作废
     // (实测:`cudaErrorStreamCaptureInvalidated`)。
     CpuDecodeState() {
-        if (!std::getenv("XIAOTU_MOE_ASYNC")) return;
+        if (!xiaotu_async_enabled()) return;
         void* p = nullptr;
         if (cudaHostAlloc(&p, 256, cudaHostAllocMapped) != cudaSuccess) return;
         std::memset(p, 0, 256);
@@ -275,7 +287,7 @@ static void async_loop() {
     }();
     double sum_compute = 0, sum_period = 0, sum_ep = 0;
     int n = 0;
-    double min_period = 1e18, min_compute = 1e18;
+    double min_period = 1e18, min_compute = 1e18, min_rest = 1e18;
     // period = **相邻两次 cpu_decode 调用**的间隔(任意层),即每次调用实际覆盖的
     // "GPU/常驻层 + 拷贝 + 握手"时间;compute = 本次调用的 CPU MoE(+EP)。
     // ⚠️ 均值会被"请求之间的预填充空档"污染 ⇒ 同时给出 **min**(稳态下界,无空档)。
@@ -304,6 +316,9 @@ static void async_loop() {
                         sum_ep += ep;
                         if (period_ms < min_period) min_period = period_ms;
                         if (compute_ms < min_compute) min_compute = compute_ms;
+                        // 【第 221 轮】rest 必须按**同一次采样**算,不能用
+                        // min(period) − min(compute)(两者来自不同样本,会高估 rest)。
+                        if (period_ms - compute_ms < min_rest) min_rest = period_ms - compute_ms;
                         if (++n % every == 0) {
                             fprintf(stderr,
                                     "[cd-timing/async] calls=%d qlen=%d k=%d "
@@ -314,10 +329,10 @@ static void async_loop() {
                                     sum_period / every, sum_compute / every,
                                     (sum_compute - sum_ep) / every, sum_ep / every,
                                     (sum_period - sum_compute) / every,
-                                    min_period, min_compute, min_period - min_compute);
+                                    min_period, min_compute, min_rest);
                             fflush(stderr);
                             sum_compute = sum_period = sum_ep = 0.0;
-                            min_period = min_compute = 1e18;
+                            min_period = min_compute = min_rest = 1e18;
                         }
                     }
                     seen = true;
@@ -332,10 +347,7 @@ static void async_loop() {
     }
 }
 
-static bool async_enabled() {
-    static const bool e = std::getenv("XIAOTU_MOE_ASYNC") != nullptr;
-    return e;
-}
+static bool async_enabled() { return xiaotu_async_enabled(); }
 
 static bool async_init(CpuDecodeState* st) {
     if (st->async_ready) return true;
