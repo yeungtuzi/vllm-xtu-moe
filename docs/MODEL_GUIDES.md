@@ -1,11 +1,10 @@
 # 模型使用指南与初步性能
 
-本文给出两个**已在 A100(SM 8.0,无 AMX)上跑通**的模型的完整使用步骤与**初步**性能数据:
+本文给出**已在 A100(SM 8.0,无 AMX)上跑通**的模型的完整使用步骤与**初步**性能数据:
 
 | 模型 | 专家格式 | 硬件 | 一句话结论 |
 |---|---|---|---|
 | **DeepSeek-V4-Flash**(0731) | MXFP4(4-bit + e8m0 块缩放) | 1 × A100-40GB(可 TP=2) | 单卡可跑;长 prefill 走 GPU 流式,16K ≈ 880 tok/s;批量 decode 74–80 tok/s |
-| **Qwen3.8-Flash-Next-FP8** | FP8 e4m3 block-128 | 2 × A100-40GB(必须 TP=2 + 部分 offload) | 能跑通且答案正确;decode 受 `--cpu-offload-gb` 搬运带宽限制,不在 MoE 引擎 |
 
 > **"初步"的含义**:全部为**单机、单/双卡、离线少量请求**的实测,用于判断"能不能跑、量级多少"。
 > 共享机器上有其他负载(每张表都给出数据来源与复现命令),**不是调优后的上限**。
@@ -43,7 +42,7 @@ VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py
 |---|---|
 | CPU 内存 | 专家权重全量 + 引擎快照一份(单份模式)⇒ 约 **2 × 专家权重**;另加 pinned 预取缓存(见 `GPU_PREFILL.md`) |
 | 显存 | 非专家权重 + KV cache;`--gpu-memory-utilization` 与 `--cpu-offload-gb` 用来在两者之间挪 |
-| KV | DeepSeek-V4-Flash ≈ **400 KiB/token**;Qwen3.8-Flash-Next 每 rank 实测 **20.27 GiB**(maxlen 4096) |
+| KV | DeepSeek-V4-Flash ≈ **400 KiB/token** |
 
 ### 0.3 下载(国内镜像)
 
@@ -185,91 +184,9 @@ CUDA_VISIBLE_DEVICES=0 TEST_MODEL=<DIR> CONCURRENCY=1 OUT_TOKENS=16 SKIP_TOK=0 \
 
 ---
 
-## 2. Qwen3.8-Flash-Next-FP8
+## 2. 目标 FP8 模型(暂不声明支持)
 
-### 2.1 模型与资源需求(为什么必须 TP=2 + offload)
-
-| 项 | 值 |
-|---|---|
-| 架构 | `Qwen4ExpForConditionalGeneration`,**48 层**,512 experts / **top-10**,H=2560,I=640,fp8 e4m3 block-128 |
-| 权重构成 | 专家 ≈120 GB(fp8)+ 非专家 ≈65 GB,其中 **PLE n-gram 嵌入表 ≈51 GB** |
-| 权重体积 | 约 **173 GiB**(本机下载实测;模型卡标注 185 GB) |
-| 显存 | 单卡 40 GB 放不下非专家权重 → 报 `No available memory for the cache blocks`;必须 **TP=2 + `--cpu-offload-gb`**;实测每 rank 非专家 6.25 GiB + KV 20.27 GiB |
-| CPU 内存 | 每 rank 约 60 GB 专家权重 + 引擎快照 ⇒ 合计约 240 GB |
-
-### 2.2 启动
-
-```bash
-export CUDA_VISIBLE_DEVICES=0,1
-export VLLM_ENGINE_READY_TIMEOUT_S=7200      # 加载实测 1500–1600 s
-
-vllm serve Qwen/Qwen3.8-Flash-Next-FP8 \
-  --tensor-parallel-size 2 \
-  --enable-expert-parallel \
-  --cpu-offload-gb 12 \
-  --max-model-len 4096 --max-num-seqs 2 \
-  --gpu-memory-utilization 0.85 --enforce-eager \
-  --kernel-config.enable_jit_warmup=false
-```
-
-离线冒烟脚本(自带计时与连贯性检查,推荐先用它验收):
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 VLLM_EXPERTS_LOAD_DEVICE=cpu \
-  VLLM_ENGINE_READY_TIMEOUT_S=7200 TP=2 EP=1 CPU_OFFLOAD_GB=12 \
-  SMOKE_MODEL=Qwen/Qwen3.8-Flash-Next-FP8 SMOKE_LONG_TOKENS=512 \
-  python scripts/fp8_moe_smoke.py
-```
-
-> 若多模态处理器报错,加 `--limit-mm-per-prompt '{"image":0,"video":0}'` 只跑文本。
-
-### 2.3 自检与验收
-
-启动日志中确认三件事:
-
-```
-Using CPU Fp8 MoE backend ...                                   # 后端被选中
-[vllm-xtu-moe] expert parallelism: local=256 global=512         # EP 生效
-[vllm-xtu-moe] xiaotu MOE_FP8 engine: E=256 H=2560 I=640 topk=10 group=128x128
-```
-
-冒烟脚本应输出 4 个正确回答(北京 / 2 / MoE 解释 / 长文补全),并打印 TTFT 与 decode。
-逐层数值可用 `XIAOTU_VERIFY_LAYER=1 XIAOTU_VERIFY_MAX=48` 打开:该自校验在最接近本模型的
-fp8 权重上已跑过(48 层 × 2304 次调用,rel_rms **1.9e-7 … 3.9e-4**,差异来自 GPU 侧动态量化
-激活 vs CPU 侧 bf16 激活,见 `docs/KNOWN_LIMITATIONS.md` §3);本模型本身只做了答案级验收。
-
-### 2.4 初步性能(2 × A100-40GB,TP=2 + EP + offload 12 GB)
-
-| 项 | 首次 | 复测(FP8 解码优化后) |
-|---|---|---|
-| 权重加载 | 1 583.8 s | **1 513.6 s** |
-| 3 个短问答 | 38.6 s | **24.2 s** |
-| 531-token prefill | 12.21 s(44 tok/s) | **8.66 s(61 tok/s)** |
-| decode(500 token 级长上下文) | ≈1.3 tok/s | ≈**0.7 tok/s** |
-| 答案正确性 | 北京 / 2 / MoE 解释 / 长文补全 | 同左 |
-
-复现即 §2.2 的 `scripts/fp8_moe_smoke.py`(脚本自己打印 `LOAD_OK` / `TTFT` / `decode`),
-汇总见 [`BENCHMARKS.md`](BENCHMARKS.md) §4.1。
-
-**为什么 decode 没随内核提速**——这是本模型最需要知道的一点:
-
-| 环节 | 实测 |
-|---|---|
-| 引擎在该形状(`E=256(local)/H=2560/I=640/top-10`)的耗时 | B=1 **0.826 ms/层**(B=4/16/64/256 → 2.4/12.6/23.2/42.6 ms) |
-| 端到端 decode | ≈28 ms/层 |
-| 结论 | **引擎只占 ≈3%**;其余是 `--cpu-offload-gb 12` 每步把 offload 权重搬回 GPU(≈12 GB/步,PCIe 无 NVLink)+ 逐层 dense/超连接算子 |
-
-⇒ 对"权重放不下、必须 offload"的模型,**继续优化 MoE 内核几乎没有收益**;
-要提速应减少 offload 量(加显存 / 加卡)或换更大的显存。
-
-### 2.5 已知限制
-
-| 项 | 说明 |
-|---|---|
-| 单卡不可用 | 非专家权重 + KV 超出 40 GB;这是**显存**限制,与本插件无关 |
-| offload 成本 | `--cpu-offload-gb` 越大越省显存、decode 越慢,建议在"能起 KV"的前提下取最小值 |
-| decode 慢 | 见 §2.4,瓶颈在 offload 带宽 |
-| 加载近半小时 | 2 个 rank 各自读全部 shard + 建 48 个引擎;分片布局已是 1 份内存 |
+> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `docs/HANDOFF_v0.2.md` §5.1。
 
 ---
 
@@ -283,7 +200,6 @@ fp8 权重上已跑过(48 层 × 2304 次调用,rel_rms **1.9e-7 … 3.9e-4**,�
 | DS-V4 批量 decode | `scripts/bench_llm.py`(`CONCURRENCY=1/32/64/128/256`,`OUT_TOKENS=32`) |
 | DS-V4 服务端并发 | `report/server_conc.jsonl`;`scripts/server_concurrency_test.py` |
 | 引擎 MXFP4 / FP8 吞吐 | `scripts/bench_cpu_engine.py`、`scripts/bench_fp8_engine.py` |
-| Qwen3.8-Flash-Next 端到端 | `scripts/fp8_moe_smoke.py`(见 §2.2);汇总见 `BENCHMARKS.md` §4.1 |
 
 图表由 `python report/make_figs.py` 从 `report/*.json` 重新生成,输出在 `report/fig/`。
 

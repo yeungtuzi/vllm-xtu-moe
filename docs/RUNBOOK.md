@@ -125,8 +125,8 @@ xiaotu_moe variant = _avx512_bf16
 
 ---
 
-> **两个已验证模型的逐步指南 + 初步性能数据**见 [`MODEL_GUIDES.md`](MODEL_GUIDES.md)
-> (DeepSeek-V4-Flash 与 Qwen3.8-Flash-Next-FP8);本节只给最简参考命令。
+> **DeepSeek-V4-Flash 的逐步指南 + 初步性能数据**见 [`MODEL_GUIDES.md`](MODEL_GUIDES.md);
+> 本节只给最简参考命令。
 
 ## 4. 参考启动命令
 
@@ -171,43 +171,9 @@ print(llm.generate(["1+1 = ?"], SamplingParams(max_tokens=16, temperature=0))[0]
 export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384     # 0 = 全部 CPU
 ```
 
-### 4.2 Qwen3.8-Flash-Next-FP8(专家权重 185 GB,混合模式的典型用例)
+### 4.2 目标 FP8 模型(暂不声明支持)
 
-该模型的权重构成:**专家 ~120 GB(fp8)** + **非专家 ~65 GB**,其中非专家里有一张
-约 **51 GB 的 PLE n-gram 嵌入表**——因此 2×A100-40GB 上**必须**用 TP=2 专家并行,
-并把一部分非专家权重 offload 到 CPU(`--cpu-offload-gb`),否则显存放不下 KV cache。
-
-```bash
-export CUDA_VISIBLE_DEVICES=0,1
-export VLLM_EXPERTS_LOAD_DEVICE=cpu
-export VLLM_ENGINE_READY_TIMEOUT_S=7200
-export VLLM_USE_FLASHINFER_SAMPLER=0
-
-vllm serve Qwen/Qwen3.8-Flash-Next-FP8 \
-  --tensor-parallel-size 2 \
-  --enable-expert-parallel \
-  --cpu-offload-gb 12 \
-  --max-model-len 4096 \
-  --max-num-seqs 2 \
-  --gpu-memory-utilization 0.85 \
-  --enforce-eager \
-  --kernel-config.enable_jit_warmup=false
-```
-
-> 单卡(40 GB)放不下非专家权重,会报 `No available memory for the cache blocks`;
-> 此时增大 `--gpu-memory-utilization` 或加大 `--cpu-offload-gb`。
-> CPU 侧内存需求:每 rank 约 60 GB 专家权重 + 引擎快照一份(共约 240 GB)。
-
-离线冒烟脚本(自带计时与连贯性检查):
-
-```bash
-CUDA_VISIBLE_DEVICES=0 VLLM_EXPERTS_LOAD_DEVICE=cpu \
-  SMOKE_MODEL=Qwen/Qwen3.8-Flash-Next-FP8 python scripts/fp8_moe_smoke.py
-```
-
-> 该架构为 `Qwen4ExpForConditionalGeneration`(48 层 / 512 专家 / top-10 /
-> hidden 2560 / moe_inter 640 / fp8 e4m3 block-128),主线已支持。
-> 若多模态处理器报错,可加 `--limit-mm-per-prompt '{"image":0,"video":0}'` 只跑文本。
+> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `docs/HANDOFF_v0.2.md` §5.1。
 
 ### 4.3 其它 MoE 模型
 

@@ -346,7 +346,7 @@ https://pypi.org/project/lk-moe/     License: Proprietary
 
 由此得到对本仓库的两条硬结论:
 1. `is_lk_moe_mtp_layer()` 的 `mtp.` 前缀规则**对 DS-V4 草稿永不命中**(上游 DS-V4 的 mtp/dspark 都把层建在 `model.layers.43+`),
-   它实际服务于"目标模型内嵌 `mtp.` 模块"的架构(qwen3_5 / mimo_v2 / minimax_m3 等);
+   它实际服务于"目标模型内嵌 `mtp.` 模块"的架构(mimo_v2 / minimax_m3 等);
 2. 想让草稿常驻 GPU,**唯一符合"复用优先"的做法**就是设置 lk 现成开关
    `LVLLM_GPU_RESIDENT_MOE_LAYERS`(常驻层由 `quantization/mxfp4.py:548` 决定拿 CUDA 权重),
    不新增任何 vLLM 代码 —— 已实现在 `scripts/serve_lk_port.sh`。

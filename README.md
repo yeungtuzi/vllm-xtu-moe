@@ -15,8 +15,8 @@
 
 ## 它解决什么问题
 
-现代 MoE 模型的**专家权重**动辄几十到几百 GB(DeepSeek-V4 ≈ 137 GiB、
-Qwen3.8-Flash-Next 185 GB),远超单卡显存;而注意力、KV cache、路由、共享专家
+现代 MoE 模型的**专家权重**动辄几十到几百 GB(DeepSeek-V4 ≈ 137 GiB),
+远超单卡显存;而注意力、KV cache、路由、共享专家
 这些"每 token 都要算"的部分留在 GPU 最划算。把两者拆开是唯一现实的部署方式。
 
 vLLM 主线已经支持"专家放 CPU"的**接口**(`FusedMoEFactory` + 量化后端槽位),
@@ -29,21 +29,21 @@ CPU 后端槽位,于是:
 - 任意使用 `FusedMoEFactory` 的 MoE 模型,只要量化格式在支持列表里,
   就能在 GPU 上跑注意力、在 CPU 上算专家;
 - 不需要 fork vLLM,也不需要改模型代码;
-- 支持 GLM / DeepSeek / Qwen / Mixtral 等不同**路由方式**的模型。
+- 支持 GLM / DeepSeek / Mixtral 等不同**路由方式**的模型。
 
 ## 支持矩阵
 
 | 权重格式 | 引擎内核 | 状态 |
 |---|---|---|
 | **BF16 / FP16**(无量化) | `MOE_BF16` / `MOE_FP16` | ✅ |
-| **FP8 e4m3 + block 128×128**(vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | ✅ 层内数值已验证(48 层自校验 ≤1.4e-4)+ 真实模型端到端:`Qwen3-30B-A3B-FP8` 单卡、`Qwen3.8-Flash-Next-FP8` 2×A100 TP=2+EP <br>⚠️ **这些实测早于 v0.2.0 的改动**(执行模型 / 小 batch 路径 / **EP 存储分片**)**未复验** —— 见下方"验证时点" |
+| **FP8 e4m3 + block 128×128**(vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | ✅ 层内数值已验证(48 层自校验 ≤1.4e-4) |
 | **MXFP4**(e2m1 + e8m0 block 32) | `MOE_MXFP4` | ✅ |
 | **NVFP4** | `MOE_NVFP4` | ✅ 引擎侧 |
-| **INT4 / WNA16**(GPTQ / compressed-tensors 组量化) | `MOE_WNA16` | ✅ 对称量化(zero point 8)已通:检查点布局在引擎构造时一次性重排,真实 `Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4` 端到端答案正确;非对称零点与 AWQ 的 N-packed 布局会**显式报错**,详见 `docs/KNOWN_LIMITATIONS.md` |
+| **INT4 / WNA16**(GPTQ / compressed-tensors 组量化) | `MOE_WNA16` | ✅ 对称量化(zero point 8)已通:检查点布局在引擎构造时一次性重排;非对称零点与 AWQ 的 N-packed 布局会**显式报错**,详见 `docs/KNOWN_LIMITATIONS.md` |
 | INT8 W8A8 | — | ❌ 引擎尚未实现 |
 
 **路由**:直接复用主线 router(softmax、sigmoid + `noaux_tc`、
-`sqrtsoftplus`、grouped-topk、自定义路由函数),因此 GLM、DeepSeek、Qwen 等
+`sqrtsoftplus`、grouped-topk、自定义路由函数),因此 GLM、DeepSeek 等
 不同路由风格都能正确选专家。
 
 **激活**:支持 packed 布局的 gated 激活(SILU、`SWIGLUOAI_UNINTERLEAVE`)
@@ -83,13 +83,13 @@ VLLM_EXPERTS_LOAD_DEVICE=cpu python -m vllm_xiaotu_moe.mainline_shims
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py   # 后端选择探测,秒级
 ```
 
-**Qwen3.8-Flash-Next 可在单张 40 GB 卡上运行**(⚠️ 实测时点为 v0.2.0 **之前**,未在 v0.2 代码上复验):`XIAOTU_PLE_CPU=1` 把 51 GB 的 PLE
-n-gram 查找表放进主机内存(锁页 + UVA 访问,显存不占),显存只剩 ~14.7 GiB 权重 + KV,
-262K 上下文仍有 2.78× 并发。两个已验证模型的**推荐参数与实测数据**见
+> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `docs/HANDOFF_v0.2.md` §5.1。
+
+DeepSeek-V4-Flash 的**推荐参数与实测数据**见
 **[`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md)**。
 
 完整安装、环境变量见 **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)**;
-**DeepSeek-V4-Flash 与 Qwen3.8-Flash-Next-FP8 的逐步使用指南 + 初步性能实测**见
+**DeepSeek-V4-Flash 的逐步使用指南 + 初步性能实测**见
 **[`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md)**。
 
 > ### ⚠️ 验证时点(重要)
@@ -99,8 +99,6 @@ n-gram 查找表放进主机内存(锁页 + UVA 访问,显存不占),显存只�
 > | 结论 | 验证于 | 在 v0.2.0 代码上复验? |
 > |---|---|---|
 > | **DeepSeek-V4-Flash 主线端到端**(服务、`bench_lat` C=1/2/4、数值门禁 `OK=7 BAD=1`、启动自检) | **v0.2.0**(2026-09-14) | ✅ **是** |
-> | Qwen3.8-Flash-Next-FP8(单卡 PLE offload) | v0.2.0 **之前**(mainline + 插件) | ❌ **否** |
-> | Qwen3-30B-A3B-FP8 / Qwen1.5-MoE-GPTQ-Int4 / 其它引擎内数值 | v0.2.0 **之前** | ❌ **否** |
 >
 > 原因:v0.2 改动了**所有模型都会走的路径**(执行模型 `XIAOTU_MOE_ASYNC=0`、
 > 小 batch 路径 `NSLICE_SMALL=0`、**EP 存储分片**)。**除 DeepSeek-V4-Flash 外均需复验**,
@@ -133,8 +131,8 @@ CPU:  routed experts 的权重与计算(xiaotu 引擎,AVX-512)
 | 文档 | 内容 |
 |---|---|
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | 安装、环境变量/参数、各模型运行命令、排错 |
-| [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) | **DeepSeek-V4-Flash / Qwen3.8-Flash-Next-FP8 使用指南与初步性能** |
-| [`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md) | **调参报告:两个模型的推荐运行参数 + 全部实测** |
+| [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) | **DeepSeek-V4-Flash 使用指南与初步性能** |
+| [`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md) | **调参报告:DeepSeek-V4-Flash 的推荐运行参数 + 全部实测** |
 | [`docs/PERFORMANCE_OPTIMIZATION.md`](docs/PERFORMANCE_OPTIMIZATION.md) | **性能优化手册:每层归因、NUMA 权重布局(单卡 +38%)、CPU-TP 设计、硬件评估与实验矩阵** |
 | [`docs/V41_FLASH_ANALYSIS.md`](docs/V41_FLASH_ANALYSIS.md) | DeepSeek-V4.1-Flash 资源账与可行性分析 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 混合模式与主线集成设计 |

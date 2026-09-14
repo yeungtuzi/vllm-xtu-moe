@@ -34,7 +34,7 @@ sparse 关闭(--hf-overrides '{"index_topk": null}'):
 
 | 限制 | 说明 |
 |---|---|
-| **专家并行(expert_map / EP)** | ✅ 已支持并在真实模型上验证(TP=2 + EP:Qwen3-30B-A3B-FP8 与 Qwen3.8-Flash-Next-FP8 均正常) |
+| **专家并行(expert_map / EP)** | ✅ 已支持(TP=2 + EP);EP 存储分片改动了专家分配/加载/映射,当前代码上的模型复验状态见 `docs/HANDOFF_v0.2.md` §5.1 |
 | **不支持 `apply_router_weight_on_input`** | 少数模型使用该选项 |
 | **不支持交错 gate/up 布局** | `SWIGLUOAI`(gpt-oss 系)把 gate/up 交错存在 `w13` 中;引擎按 packed 布局取数,因此该情形由 `_supports_activation` 拒绝 |
 | **INT4/WNA16 只支持对称量化** | GPTQ / compressed-tensors 的 `w13 [E, K/8, 2I] int32` + 组缩放会在引擎构造时重排为引擎布局(`[E, 2I, K/2]` u8 + `[E, N, K/group]` 缩放),**zero point 必须为 8**(对称)—— GPTQ 存 `zp-1`,即检查点的 `qzeros` 全为 7。出现非 8 的零点(非对称 AWQ/GPTQ)或 AWQ 的 N-packed 布局时插件**显式报错**,不会静默算错 |
@@ -47,11 +47,9 @@ sparse 关闭(--hf-overrides '{"index_topk": null}'):
 |---|---|
 | 引擎 vs torch 参考(BF16 路径) | ✅ 相对误差 ~1e-7 |
 | 引擎 vs numpy 参考(FP8 block-128,真实 GLM-5.3 专家权重) | ✅ RMS 相对误差 9.3e-5 |
-| 引擎 vs torch 参考(FP8,真实 Qwen3-30B 全部 48 层) | ✅ 相对误差 ~1e-7(`XIAOTU_VERIFY_LAYER=1`) |
 | 引擎 vs torch 参考(MXFP4,真实 DeepSeek-V4 层权重) | ✅ RMS 相对误差 5.6e-3 |
 | CPU 专家 vs GPU 专家端到端(bf16 微型模型) | ✅ greedy token 完全一致 |
 | **CPU 专家 vs GPU 专家端到端(真实 fp8 模型)** | ✅ 同一 prompt 下 **top-1 预测 20/20 一致**,实际 token 的 logprob 平均偏差 0.065(最大 0.24)——差异来自 GPU 侧对激活做动态 fp8 量化、CPU 侧用 bf16 |
-| **目标模型端到端**(Qwen3.8-Flash-Next-FP8,185 GB) | ✅ 2×A100 + TP=2 + EP + `--cpu-offload-gb 12`:三个问答答案正确,长 prompt 摘要正确 |
 
 ## 3.1 跨请求一致性(已从根因修复)
 

@@ -1,4 +1,4 @@
-# 调参计划:DeepSeek-V4-Flash-0731 与 Qwen3.8-Flash-Next 的最优运行参数
+# 调参计划:DeepSeek-V4-Flash-0731 的最优运行参数
 
 > 状态:**执行中**。原始数据落在 `report/tuning/`,最终结论写进
 > [`TUNING_REPORT.md`](TUNING_REPORT.md)。
@@ -8,12 +8,12 @@
 
 | 项 | 要求 |
 |---|---|
-| 上下文 | **≥ 262 144 token**(DS-V4-Flash 模型上限 1 048 576;Qwen3.8-Flash-Next 上限正好 262 144) |
+| 上下文 | **≥ 262 144 token**(DS-V4-Flash 模型上限 1 048 576) |
 | 单次输出 | 支持 **最多 131 072 token**(实际压测只生成 4–8K,避免测试时间失控) |
 | 数据集 | **ShareGPT**(`ShareGPT_V3_unfiltered_cleaned_split.json`,94 145 段对话),自然长度提示词 |
 | 指标 | 输出吞吐(tok/s)为主,同时记 TTFT / TPOT / 端到端时延 / 失败率 / 加载时间 |
 | 参考基线 | 生产环境 `lk-moe/deepseek-v4-flash-0731` ShareGPT 最大吞吐 **≈100 tok/s** |
-| 交付物 | 两个模型各一份**可直接用于实际工作**的推荐参数 + 数据 + 复现命令 |
+| 交付物 | DeepSeek-V4-Flash 一份**可直接用于实际工作**的推荐参数 + 数据 + 复现命令 |
 
 **"可用于实际工作"的定义**:服务能起来、长上下文不 OOM、输出正确、吞吐在候选参数里最优,
 并且参数之间不冲突(例如 `--max-num-seqs × --max-model-len` 不能超过 KV 容量)。
@@ -89,7 +89,6 @@ DS-V4 另跑 `"The capital of France is"` 固定提示比对首 token。
 |---|---|
 | DS-V4:TP=1 + `--kv-cache-dtype fp8` + util 0.90 | KV 减半;单卡 decode 更快 |
 | DS-V4:TP=2 + EP + `--kv-cache-dtype fp8` + util 0.90 | 双卡 KV 翻倍;prefill 更快 |
-| Qwen:TP=2 + EP + `--cpu-offload-gb {12, 24}` | 权重必须 offload;KV 需 ≥ 256K |
 
 判定:服务能起 + `Maximum concurrency for 262144 tokens per request ≥ 1.0×` + 128K 长提示冒烟通过。
 若 256K 放不下 ⇒ 回落 128K,并明确记录"可行的最大上下文"与瓶颈(KV 容量/权重)。
@@ -112,7 +111,7 @@ DS-V4 另跑 `"The capital of France is"` 固定提示比对首 token。
 | 10 | 输出长度 | 4096 / 8192 | 否 |
 
 优先做**不需要重启**的维度(1、2、10),再按预期收益排(3、4、5、6、7、8、9)。
-DS-V4 单次启动 5–16 分钟 ⇒ 整个 P2 控制在 **≤ 12 次启动**;Qwen 启动约 25 分钟 ⇒ **≤ 6 次**。
+DS-V4 单次启动 5–16 分钟 ⇒ 整个 P2 控制在 **≤ 12 次启动**。
 
 ### P3 — 长上下文验收(每个模型 1–2 次启动)
 
@@ -122,7 +121,7 @@ DS-V4 单次启动 5–16 分钟 ⇒ 整个 P2 控制在 **≤ 12 次启动**;Qw
 
 ### P4 — 报告与固化
 
-1. `docs/TUNING_REPORT.md`:两个模型的**推荐参数表**(可直接复制粘贴的命令)、
+1. `docs/TUNING_REPORT.md`:DeepSeek-V4-Flash 的**推荐参数表**(可直接复制粘贴的命令)、
    "为什么是这些值"的证据链、与生产参考(≈100 tok/s)的对比、剩余优化空间;
 2. `report/tuning/` 原始数据 + `scripts/tune_*.sh` 复现入口;
 3. 更新 `docs/RUNBOOK.md` 的参考命令(指向报告)、`ROADMAP.md`/`BACKLOG.md` 的待办与修订记录。

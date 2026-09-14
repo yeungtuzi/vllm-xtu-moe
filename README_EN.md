@@ -12,7 +12,7 @@
 ## The problem it solves
 
 Modern MoE models carry tens to hundreds of GB of **expert weights**
-(DeepSeek-V4 ≈ 137 GiB, Qwen3.8-Flash-Next 185 GB), far beyond a single GPU's
+(DeepSeek-V4 ≈ 137 GiB), far beyond a single GPU's
 VRAM. Meanwhile attention, KV cache, the router and shared experts are touched
 by *every* token and belong on the GPU. Splitting the two is the only practical
 deployment path.
@@ -28,22 +28,22 @@ into those slots, so:
 - any MoE model built on `FusedMoEFactory` runs attention on the GPU and experts
   on the CPU, as long as its weight format is supported;
 - no vLLM fork and no model-code changes are required;
-- different routing styles (GLM / DeepSeek / Qwen / Mixtral) are all supported.
+- different routing styles (GLM / DeepSeek / Mixtral) are all supported.
 
 ## Support matrix
 
 | Weight format | Engine kernel | Status |
 |---|---|---|
 | **BF16 / FP16** (unquantized) | `MOE_BF16` / `MOE_FP16` | ✅ |
-| **FP8 e4m3 + 128×128 blocks** (vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | ✅ layer-level numerics verified (48-layer self-check ≤1.4e-4) plus real end-to-end runs (Qwen3-30B-A3B-FP8 on one GPU, Qwen3.8-Flash-Next-FP8 on 2×A100 TP=2+EP) |
+| **FP8 e4m3 + 128×128 blocks** (vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | ✅ layer-level numerics verified (48-layer self-check ≤1.4e-4) |
 | **MXFP4** (e2m1 + e8m0 block 32) | `MOE_MXFP4` | ✅ |
 | **NVFP4** | `MOE_NVFP4` | ✅ engine side |
-| **INT4 / WNA16** (GPTQ / compressed-tensors group quantization) | `MOE_WNA16` | ✅ symmetric (zero point 8) works: the checkpoint layout is repacked once at engine construction, validated end to end on the real `Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4`; asymmetric zero points and AWQ's N-packed layout raise an explicit error, see `docs/KNOWN_LIMITATIONS.md` |
+| **INT4 / WNA16** (GPTQ / compressed-tensors group quantization) | `MOE_WNA16` | ✅ symmetric (zero point 8) works: the checkpoint layout is repacked once at engine construction; asymmetric zero points and AWQ's N-packed layout raise an explicit error, see `docs/KNOWN_LIMITATIONS.md` |
 | INT8 W8A8 | — | ❌ not implemented in the engine |
 
 **Routing**: the plugin reuses upstream vLLM's router objects (softmax,
 sigmoid + `noaux_tc`, `sqrtsoftplus`, grouped top-k, custom routing functions),
-so GLM, DeepSeek and Qwen style routing all select experts correctly.
+so GLM and DeepSeek style routing all select experts correctly.
 
 **Activations**: packed-layout gated activations (SILU, `SWIGLUOAI_UNINTERLEAVE`)
 plus `swiglu_limit` / `alpha` / `beta` (the clamped SwiGLU used by GLM-5.x,
@@ -84,15 +84,15 @@ VLLM_EXPERTS_LOAD_DEVICE=cpu python -m vllm_xiaotu_moe.mainline_shims
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py   # backend selection probe
 ```
 
-**Qwen3.8-Flash-Next runs on a single 40 GB card**: `XIAOTU_PLE_CPU=1` keeps its 51 GB
-PLE n-gram lookup table in pinned host memory (accessed over UVA, zero VRAM), leaving
-~14.7 GiB of weights plus KV cache — still 2.78x concurrency at a 262K context.
-Recommended parameters and all measurements: **[`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md)**.
+> ⏸️ **Support not claimed at this time**: this model's measurements predate the v0.2 changes (execution model / small-batch path / EP storage sharding) and have **not been re-verified on the current code**. See `docs/HANDOFF_v0.2.md` §5.1 for the re-verification plan.
+
+Recommended parameters and measurements for DeepSeek-V4-Flash:
+**[`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md)**.
 
 Full install notes and environment variables:
 **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)**.
-Step-by-step guides plus preliminary measurements for **DeepSeek-V4-Flash** and
-**Qwen3.8-Flash-Next-FP8**: **[`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md)**.
+Step-by-step guides plus preliminary measurements for **DeepSeek-V4-Flash**:
+**[`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md)**.
 
 ## How it works (one paragraph)
 
@@ -114,7 +114,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for details.
 | Document | Contents |
 |---|---|
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | install, env vars / CLI flags, per-model commands, troubleshooting |
-| [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) | **guides and preliminary measurements for DeepSeek-V4-Flash / Qwen3.8-Flash-Next-FP8** |
+| [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) | **guide and preliminary measurements for DeepSeek-V4-Flash** |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | mixed-mode and mainline integration design |
 | [`docs/GPU_PREFILL.md`](docs/GPU_PREFILL.md) | layerwise GPU prefill |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | measured hardware, throughput, latency, ablations |

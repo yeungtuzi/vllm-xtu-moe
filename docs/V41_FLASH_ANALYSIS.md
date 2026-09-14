@@ -147,7 +147,7 @@ Engram 的取数模式与专家权重**完全不同**:
 > **host memory** via background RDMA transfers, with prefetching for the first module
 > overlapping computation in the first Transformer block."
 
-这与我们为 Qwen3.8 实现的 `XIAOTU_PLE_CPU=1`(表 build 在 CPU → `load_weights` 后 pin +
+这与我们实现的 `XIAOTU_PLE_CPU=1`(表 build 在 CPU → `load_weights` 后 pin +
 `get_accelerator_view_from_cpu_tensor` UVA 视图)**是同一个设计**。官方把"主机内存 + 预取"
 写进了架构设计,等于给我们的路线背书。
 
@@ -206,7 +206,7 @@ Engram 的取数模式与专家权重**完全不同**:
 | 能力 | 现成资产 | 在 V4.1 上的角色 |
 |---|---|---|
 | CPU 专家引擎 | `xiaotu_moe`(MXFP4/FP8/BF16/INT4) | 269 GiB 路由专家的计算 |
-| 查找表放主机内存 | `ple_offload.py`(Qwen PLE,51.2 GB pin + UVA) | **Engram 183 GiB 的直接模板** |
+| 查找表放主机内存 | `ple_offload.py`(稀疏查找表 pin + UVA) | **Engram 183 GiB 的直接模板** |
 | 专家并行 | `XIAOTU_MOE_EP`(零权重掩码 + TP all-reduce) | TP=2 下每 rank 192 专家 |
 | GPU 流式 prefill | `gpu_prefill.py`(ping-pong slot + 预取) | 长 prompt 的专家权重 H2D |
 | 调参/测量基建 | `scripts/tune_serve.sh`、`tune_client.sh`、ShareGPT 协议 | 新模型加一个 `MODE=` 即可 |
@@ -245,7 +245,7 @@ Single-Pass mHC、视觉塔、DSpark 推理路径。我们的插件是 **OOT 覆
 **P0(现在,不等主线)**
 - 把本报告结论并入 `docs/MODEL_GUIDES.md` 的"后续模型"章节,明确 V4.1 的定位与前置条件。
 - 把 `ple_offload.py` 抽成通用"稀疏查找表 → 主机内存"钩子(PLE / Engram 共用),
-  并用 Qwen 单卡回归验证不退化。
+  并用单卡端到端冒烟回归验证不退化。
 - 在 `docs/TUNING_REPORT.md` 标注:0731 的 8192 nbt 限制**只由 KV 造成**,换模型后必须重扫。
 
 **P1(主线出现 `deepseek_v41` 之后,1–2 周)**

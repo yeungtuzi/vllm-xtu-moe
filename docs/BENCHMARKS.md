@@ -79,57 +79,30 @@
 
 > FP8 内核的瓶颈曾是**每 8 字节一次 LUT gather**(微码指令,吞吐极低)。
 > 改为**无 gather 的位运算解码**(AVX-512 16-wide / AVX2 8-wide)后,
-> 引擎吞吐 0.35–0.43 → **0.73–0.98 TFLOP/s**;真实模型(Qwen3-30B-A3B-FP8,单卡)
-> prefill 75 → **113 tok/s**,decode 1.1 → **5.8 tok/s**。
+> 引擎吞吐 0.35–0.43 → **0.73–0.98 TFLOP/s**。
 >
 > decode 的瓶颈随后变成**调度**:B=1 时每个 token 只有 top-k 个 (token, rank)
 > 指派,老的逐 token 循环只用一个线程,单层 7.1 ms。改为**把单个 token 的 GEMV
 > 按 N 行切片铺满线程池**(`split_range_n`),并按实测的池屏障代价
 > (~1.8 µs/worker)把参与 worker 数收敛到 30 左右(其余 worker 停靠而非自旋),
 > 单层降到 **0.745 ms(9.5×)**;同一份输入在新旧两条路径上**逐位一致**。
-> 端到端(Qwen3-30B-A3B-FP8,单卡,528-token 提示)prefill 113 → **182 tok/s**,
-> decode 5.8 → **11.6 tok/s**。
 > 剩余瓶颈是内核里 e4m3→fp32 的位运算解码(约 1.7 MAC/cycle/线程,峰值 16),
 > 下一步是**权重预转 bf16 镜像**(fp8 值在 bf16 中精确可表示,数值不变)。
 
-## 4.0 INT4(WNA16)端到端:`Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4`(单卡 A100)
+## 4.0 INT4(WNA16)端到端(单卡 A100)
 
 GPTQ 检查点在引擎构造时一次性重排(`w13 [E, K/8, 2I] int32` → `[E, 2I, K/2]` u8,
-缩放 `[E, K/g, N]` → `[E, N, K/g]`,`groupN=1 / groupK=128`):
+缩放 `[E, K/g, N]` → `[E, N, K/g]`,`groupN=1 / groupK=128`)。
 
-| 项 | 数值 |
-|---|---|
-| 模型 | 24 层 / 60 专家 / top-4 / H=2048 / I=1408,INT4 权重约 6.2 GB(CPU 侧) |
-| 加载 | **28.0 s**(对比同机 GPU 专家:更快,权重不走显存) |
-| 短问答 | 3 个问题 2.39 s,答案正确(北京 / 1+1=2 / MoE 解释) |
-| 长 prefill | 283 token:TTFT **1.44 s**(196 tok/s) |
-| decode | ≈**40.2 tok/s** |
-| 层内数值 | 真实权重 vs torch 参考 max_rel **1.3e-6**(`scripts/test_wna16_repack.py` 用合成权重做逐位校验) |
+> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `docs/HANDOFF_v0.2.md` §5.1。
 
-## 4.1 Qwen3.8-Flash-Next-FP8 端到端(目标模型,2×A100-40GB)
+## 4.1 FP8 端到端(2×A100-40GB)
 
-| 项 | 数值 |
-|---|---|
-| 配置 | `VLLM_EXPERTS_LOAD_DEVICE=cpu` + TP=2 + `--enable-expert-parallel` + `--cpu-offload-gb 12` |
-| 后端选择 | `Using CPU Fp8 MoE backend`;每 rank `local=256 / global=512` 专家 |
-| 权重加载 | **1583.8 s**(185 GB,2 rank 各自读全部 shard) |
-| GPU 侧 | 每 rank 非专家权重 6.25 GiB;KV cache 20.27 GiB |
-| 短问答 | 3 个问题 38.6 s(2026-09-09 复测 24.2 s),答案正确(北京 / 2 / MoE 解释) |
-| 长 prefill | 531 token:TTFT **12.21 s**(44 tok/s;复测 **8.66 s** / 61 tok/s) |
-| decode | ≈**0.7–1.3 tok/s**(512 专家 top-10;**瓶颈不在本引擎**,见下) |
-
-> 该模型非专家权重约 65 GB(其中 51 GB 是一张 PLE n-gram 嵌入表),
-> 单卡 40 GB 放不下,必须 TP=2 + 部分权重 offload 到 CPU。
-
-**为什么 decode 没随内核提速**:该模型的引擎形状是 `E=256(local)/H=2560/I=640/top-10`,
-引擎实测 **0.826 ms/层**(B=1,见 §4),而端到端 decode 实测约 **28 ms/层** —— 引擎只占 **3%**。
-其余开销来自 `--cpu-offload-gb 12` 每步把 offload 的权重搬回 GPU(≈12 GB/步,PCIe 上约 0.5–1 s/token)
-以及逐层 dense/超连接算子。**对这类"权重放不下、必须 offload"的模型,decode 的瓶颈是 offload 带宽,
-不是 CPU 专家计算**;缓解办法是减少 offload 量(加显存/加卡)而不是优化 MoE 内核。
+> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `docs/HANDOFF_v0.2.md` §5.1。
 
 ## 4.2 使用指南与其它模型
 
-DeepSeek-V4-Flash 与 Qwen3.8-Flash-Next-FP8 的**逐步使用指南、完整初步性能表
+DeepSeek-V4-Flash 的**逐步使用指南、完整初步性能表
 (含数据来源与复现命令)**见 [`MODEL_GUIDES.md`](MODEL_GUIDES.md)。
 
 ## 5. 服务端吞吐与时延(DeepSeek-V4-Flash,单卡)

@@ -1,6 +1,6 @@
 # 通用化路线图
 
-目标:让本插件对**任意 MoE 模型**(DeepSeek / GLM / Qwen / Mixtral / …)
+目标:让本插件对**任意 MoE 模型**(DeepSeek / GLM / Mixtral / …)
 和**任意 x86 指令集**(AVX2 → AVX-512 → AMX)都可用。
 
 ---

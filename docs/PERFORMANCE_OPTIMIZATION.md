@@ -319,7 +319,7 @@ CPU 层 15.9 ms(已优化)→ step = N×2.5 + (43−N)×18.6:
 2. **GDDR7 ≠ HBM**:带宽只 +15%,不要指望"专家全上卡"变快;
 3. 单卡失去双卡 prefill 分摊(1.76×),但 nbt 红利远大于此;
 4. 无 NVLink;600 W/PCIe 5.0 插槽要求;
-5. 容量仍不够:Qwen3.8(185 GB)、V4.1(475 GiB)依旧装不下。
+5. 容量仍不够:V4.1(475 GiB)依旧装不下。
 
 ---
 
@@ -332,7 +332,6 @@ CPU 层 15.9 ms(已优化)→ step = N×2.5 + (43−N)×18.6:
 | EP 正确性 | TP=2+EP 与 TP=1 的贪婪输出 3/5 完全一致、2/5 前 10+ token 一致后分叉(不同归约顺序的正常数值差异);未做逐层数值对齐 |
 | `--async-scheduling` / MTP 投机解码 | 未测 |
 | CUDA graph | 修好 use-after-free 后对 decode 无收益(48.8 vs 48.5 tok/s) |
-| Qwen3.8 单卡 prefill | 仍慢(TTFT 24.9 s),GPU prefill 通路未接通用后端 |
 
 License: Apache-2.0
 
