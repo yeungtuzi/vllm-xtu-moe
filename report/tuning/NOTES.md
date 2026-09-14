@@ -13048,3 +13048,36 @@ vLLM 自己的线程在争核(主线 GPU worker 与我们的 60 线程池同机)
 用 `XIAOTU_MOE_RANK_SPLIT=2`(强制 `_world=1`、`nshard_=8`、`rank_node_base_=0`,即 fork 式布局)
 实测:**服务能起来,但请求全部挂住(500 s 无返回)** ⇒ 该布局在本机不可用,
 **rank-split 是必需的**,这条假设关闭,不再往这个方向试。
+
+### 362. 【v0.2·第 26 轮】两个环境假设都被**实测否定**;并确认 fork 用的确实是我们的引擎
+
+#### (a) 先排掉一个会推翻全部 A/B 的疑点:fork 到底加载了哪个引擎?
+
+`Lvllmds4-x/.../routed_experts.py:38` 是 `import xiaotu_moe`(移植提交 `faf95dd5b` 把
+`lk_moe`→`xiaotu_moe` 改掉了);`lkxtu` env 里 `import lk_moe` = **NOT FOUND**,
+`xiaotu_moe` 指向仓库。⇒ **§358 的 A/B 成立:fork 跑的确实是我们的引擎。**
+
+#### (b) ❌ 假设一:"`numactl --interleave=all` 把引擎热数据摊到 8 个 node 才变慢"
+
+**实测否定**:fork + 我们的引擎 **加上** `--interleave=all`:
+
+| 配置 | 同一请求墙钟 |
+|---|---|
+| fork 不加 interleave | 1.88 s |
+| **fork + `--interleave=all`** | **1.18 s(反而更快)** |
+| 主线 + `--interleave=all` | 12.86 s |
+
+#### (c) ❌ 假设二:"主线设了 `SPIN_IDLE_US=0` 走 condvar,而 fork 用默认 5000 走自旋"
+
+**实测否定**:fork + `XIAOTU_MOE_SPIN_IDLE_US=0` = **1.18 s**,与 fork 默认**逐位相同**。
+
+⇒ **引擎侧我能想到的环境旋钮(`THREADS`/`RANK_SPLIT`/`NSLICE_SMALL`/`SPIN_IDLE_US`/interleave)
+全部试过,没有一个是原因。** 差异必然在**主线的调用路径**上:
+`hybrid_model.py` 每层在 `cpu_decode` 之前多做了 5 个 GPU 小算子
+(`topk_ids - _st` / `.clamp_` / `.to(int32)` / `torch.zeros(())` / `torch.where` / `.to(float32)`,
+fork 的 `_cpu_decode` 是**直接透传 `data_ptr()`**,不做任何重映射)。
+但这些算子合计只有 ~50 µs/层量级,**不足以解释 28 ms/层的等待**;
+唯一还能解释"28 ms 周期性等待"的,是**主线的 CUDA 图重放与这些逐调用新分配之间的交互**
+(每次新地址 ⇒ 图里记录的 D2H 源与 Python 侧不一致 ⇒ 引擎可能读到陈旧/未就绪数据而等待)。
+这正是 §348 那个"图安全持久缓冲"该覆盖、但我只覆盖了 `out` 而**没覆盖 ids/weights** 的地方 ——
+**下一轮第一件事:把 `ids_i32` / `wts_f32` 也换成持久缓冲,与 `out` 同一套机制。**
