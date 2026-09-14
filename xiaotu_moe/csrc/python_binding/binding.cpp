@@ -489,6 +489,20 @@ static void bind_moe_class(py::module& m, const char* name) {
             st->out = (float*)st->pin_out;   // pinned 计算输出(H2D 源)
             st->outg = outg_dev;             // 设备 H2D 目标
 
+            // 【诊断】XIAOTU_MOE_FAKE_COPY=1:跳过 D2H/H2D 拷贝但保留 host-func 与 CPU 计算
+            // ⇒ 与 FAKE_CPU(保留拷贝、跳过计算)/FAKE_ALL(全跳过)三者相减即可把
+            // marshalling 精确拆成"拷贝"与"host-func 派发"两项。
+            struct CpuDecodeCall {
+                MOE* engine;
+                int qlen;
+                int k;
+                const uint16_t* hid;
+                const uint32_t* ids;
+                const float* wts;
+                float* out;
+                bool graph_owned;   // true: 由 graph 节点持有,回调不得释放
+            };
+
             // 1) Async D2H copies on the caller stream (graph-capturable).
             cudaMemcpyAsync(st->pin_hidden, hid_dev, nh,
                             cudaMemcpyDeviceToHost, s);
@@ -513,16 +527,6 @@ static void bind_moe_class(py::module& m, const char* name) {
             // 因此 graph 捕获的块绝不能由回调释放 —— 否则第二个 replay 就是
             // use-after-free(实测 SIGSEGV 落在引擎的 forward 里,每个请求只出 2 个
             // token 引擎就死)。eager 路径下每个块只被调用一次,由回调释放。
-            struct CpuDecodeCall {
-                MOE* engine;
-                int qlen;
-                int k;
-                const uint16_t* hid;
-                const uint32_t* ids;
-                const float* wts;
-                float* out;
-                bool graph_owned;   // true: 由 graph 节点持有,回调不得释放
-            };
             auto* call = new CpuDecodeCall{
                 &self, qlen, top_k,
                 (const uint16_t*)st->pin_hidden,
