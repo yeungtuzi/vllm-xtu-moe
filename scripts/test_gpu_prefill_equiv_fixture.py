@@ -104,6 +104,8 @@ def main() -> int:
     GPUMODE = os.environ.get("GPUMODE", "bf16")
     if GPUMODE == "mxfp4":
         return _gpu_mxfp4(d, ids, wts, xf, M, K, E, I, H, golden)
+    if GPUMODE == "marlin":
+        return _gpu_marlin(d, ids, wts, xf, M, K, E, I, H, golden)
     # ---- GPU:上游 fused_experts(未量化,吃 gol13/gol2 的 bf16)----
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
@@ -194,6 +196,52 @@ def _gpu_mxfp4(d, ids, wts, x_bf16, M, K, E, I, H, golden):
           f"归一化 p50={np.percentile(ad,50)/scale:.2e} max={ad.max()/scale:.2e}")
     ok = np.percentile(ad, 50) / scale < 3.9e-3
     print("[fx] 判定(mxfp4):", "OK" if ok else "MISMATCH")
+    return 0 if ok else 1
+
+
+def _gpu_marlin(d, ids, wts, xf, M, K, E, I, H, golden):
+    """上游 **MARLIN MXFP4** 功能入口(`fused_marlin_moe`),吃显式打包权重 + e8m0 scales。
+
+    为什么是它:`MarlinExperts.apply()` 内部就是直接调这个函数;triton 那条(OAITriton)
+    只支持 SWIGLUOAI(实测断言),不适用 DS-V4。MARLIN 也正是 lk fork 在 A100 上用的内核。
+    """
+    import torch
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
+    from vllm.scalar_type import scalar_types
+
+    dev = torch.device("cuda:0")
+    w13, w2 = d["w13"], d["w2"]
+    def f32_to_e8m0(ss):
+        lg = np.round(np.log2(np.maximum(ss, 1e-30))).astype(np.int32) + 127
+        return np.clip(lg, 0, 255).astype(np.uint8)
+    t_w1 = torch.from_numpy(w13).to(dev)
+    t_w2 = torch.from_numpy(w2).to(dev)
+    t_s1 = torch.from_numpy(f32_to_e8m0(d["g13"])).to(dev)
+    t_s2 = torch.from_numpy(f32_to_e8m0(d["g2"])).to(dev)
+    hs = torch.from_numpy(xf.reshape(M, H)).to(dev).to(torch.bfloat16)
+    t_ids = torch.from_numpy(ids.astype(np.int32)).to(dev)
+    t_wts = torch.from_numpy(wts).to(dev)
+    # workspace_shapes(): ws13=(E*M, max(K,N*2)), ws2=(E*M, N);apply() 里两者是**交换**传的
+    N = 2 * I
+    ws13 = torch.empty((E * M, max(H, N)), dtype=torch.bfloat16, device=dev)
+    ws2 = torch.empty((E * M, N), dtype=torch.bfloat16, device=dev)
+    out = torch.empty(M, H, dtype=torch.bfloat16, device=dev)
+    fused_marlin_moe(
+        hs, t_w1, t_w2, None, None, t_s1, t_s2, t_wts, t_ids,
+        scalar_types.float4_e2m1f.id,
+        global_num_experts=E, activation=MoEActivation.SILU,
+        intermediate_cache13=ws2, intermediate_cache2=ws13,
+        output=out, input_dtype=torch.bfloat16,
+    )
+    y = out.float().cpu().numpy()
+    ad = np.abs(y - golden)
+    scale = float(np.abs(golden).mean()) or 1.0
+    print(f"[fx] gpu(marlin) vs golden: abs p50={np.percentile(ad,50):.2e} "
+          f"p99={np.percentile(ad,99):.2e} max={ad.max():.2e}  "
+          f"归一化 p50={np.percentile(ad,50)/scale:.2e} max={ad.max()/scale:.2e}")
+    ok = np.percentile(ad, 50) / scale < 3.9e-3
+    print("[fx] 判定(marlin):", "OK" if ok else "MISMATCH")
     return 0 if ok else 1
 
 

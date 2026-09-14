@@ -11929,3 +11929,58 @@ MARLIN 通常要求自己的 repack 布局(主线在 `process_weights_after_load
 
 **下一轮**:用裸构造的 `MarlinExperts` + staging 跑通单层,接进 §335f 的门禁脚本;
 若 repack 是必须的,就加一个"加载期预重排 + 缓存"的步骤。
+
+### 337. 【v0.2·第 13 轮】P2 的最后一块拼图:**A100 上主线选 MARLIN;它需要一次"重排",重排函数已找到**
+
+#### (a) ✅ 主线在 A100 上对 MXFP4 **确实选 MARLIN**(优先级实测)
+
+`oracle/mxfp4.py:_get_priority_backends()`:
+```
+FLASHINFER_TRTLLM_MXFP4_MXFP8   ← 需要 SM100/Blackwell
+DEEPGEMM_MXFP4                  ← 需要 SM90+
+MARLIN                          ← ✅ SM80(A100)可用
+BATCHED_MARLIN
+```
+⇒ **我们的 A100 上,主线的选择就是 MARLIN** —— 与 lk fork 用的内核一致,
+所以"把预填充切到上游 GPU MoE"这条路在**后端选择层面是通的**。
+
+#### (b) ✅ 找到了功能入口,也验证了它"吃显式权重"
+
+`MarlinExperts.apply()` 内部就是直接调 **`fused_marlin_moe(...)`**
+(`experts/marlin_moe.py:235`,同文件内定义),签名**吃显式 `w1/w2/w1_scale/w2_scale`**
++ `quant_type_id`;MXFP4 W4A16 的 `quant_type_id = scalar_types.float4_e2m1f.id`
+(见 `MarlinExpertsBase.quant_type_id`)。**⇒ staging 设计成立。**
+
+#### (c) ⚠️ 但**布局要重排**(正是设计文档 §5 里标的风险,现已证实并定位)
+
+`fused_marlin_moe` 的断言:
+```python
+M, K = hidden_states.size()
+assert w1.size(1) * 16 == K      # ⇒ w1 = [E, K/16, N],不是我们的 [E, N, K/2]
+assert w2.size(2) // 2 == K      # ⇒ w2 是 2 nibble/byte 的 K 维
+```
+我们的权重是 **checkpoint 原生布局** `w13 [E, 2I, H/2] uint8` + e8m0 `[E, 2I, H/32]`
+⇒ **MARLIN 需要另一套打包**。
+
+**重排函数已找到**:
+```
+vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py:311
+    def _repack_marlin_experts(...)
+```
+（另有 `marlin_utils.py:246 marlin_repacked_nk()` 给出重排后的 (N,K)。）
+
+#### (d) P2 的落地方案(下一步)
+
+```
+加载期(一次):
+    checkpoint 原生 MXFP4  ──_repack_marlin_experts──▶  MARLIN 布局
+                                                  └─ 缓存在**主机内存**(+69 GiB/rank,1.5 TB 放得下)
+每次预填充:
+    每层:重排后的 1.61 GiB/rank  H2D  ──▶  fused_marlin_moe(...) 用我们的 topk_weights/topk_ids
+    ⇒ DMA 预算不变(§2.2 的 ~3.4 s / 一次完整预填充)
+```
+**注意**:`fused_marlin_moe` **吃 precomputed topk**(不像 OAI Triton 那条自己路由)
+⇒ **DS-V4 的 sqrtsoftplus + group-topk 路由可以照用**,不需要动路由。
+
+**下一轮**:在 fixture 上跑通 `_repack_marlin_experts` + `fused_marlin_moe` 的单层对拍,
+接进 §335f 的门禁(判定口径同:归一化中位数 < bf16 eps)。
