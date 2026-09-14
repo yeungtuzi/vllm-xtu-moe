@@ -1,5 +1,7 @@
 # 里程碑:lvllm 编排链移植进 vLLM fork + 挂上 xiaotu_moe(实测版)
 
+> ⚠️ 性能/内存相关的**固定规则**见 [`report/tuning/IRON_RULES.md`](../report/tuning/IRON_RULES.md)。
+
 **日期**：2026-09-13 · **状态**：功能全绿、已实测、8070 上线冠军配置
 **目标**：`goal-36fc65c0-16b0-4da3-94e8-7c2f612b4e72`（第 210 轮用户指定,已 complete）
 

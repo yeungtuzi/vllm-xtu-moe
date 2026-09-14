@@ -1,3 +1,5 @@
+> ⚠️ **动手前先读 [`IRON_RULES.md`](./IRON_RULES.md)**(铁律:每 CCD 4–5 核 / 按 node 做 TP 式切片 / 每 node 只读写本地内存 / 跨 node all-reduce 式合并 / 本机带宽 740 GB/s)。
+
 # DS-V4-Flash / Qwen3.8-Flash-Next 调参记录(工作笔记)
 
 
