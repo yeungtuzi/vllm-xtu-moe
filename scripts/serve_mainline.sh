@@ -25,7 +25,14 @@ TP="${TP:-2}"
 GPU_UTIL="${GPU_UTIL:-0.80}"
 MAXLEN="${MAXLEN:-8192}"
 SEQS="${SEQS:-8}"
-MBT="${MBT:-}"                       # 空 = 用主线默认
+MBT="${MBT:-256}"                    # 与 fork 协议对齐(实测:不设时主线默认很大)
+# chunked prefill:**建议保持主线默认(开)**。
+#   * 关掉它时,主线要求 MBT >= max_model_len(否则直接报错),而且预填充会整段进
+#     我们的 CPU 引擎(qlen=MBT)⇒ 一次 256 token 的预填充就要 26 ms/层 × 43 ≈ 1.1 s;
+#   * 开着时,解码步里可能混进预填充块(qlen=257)⇒ 解码也会付这份钱。
+# ⇒ 两种都不理想,根因是**形态 B 没有"预填充专用路径"**(fork 里有 `_cpu_prefill` /
+#   `_gpu_prefill` 的分流)。见 NOTES §334s。默认先取主线默认(开)。
+CHUNKED_PREFILL="${CHUNKED_PREFILL:-1}"
 # 加载策略:实测插件路径读分片 2.5-4.8 s/片(fork 路径 0.6 s/片);
 # 主线日志明确建议 EXT4 上用 prefetch 强制预取。
 LOAD_STRATEGY="${LOAD_STRATEGY:-prefetch}"
@@ -55,6 +62,8 @@ ARGS=(
   --served-model-name DeepSeek-V4-Flash-xiaotu
 )
 if [ -n "$MBT" ]; then ARGS+=(--max-num-batched-tokens "$MBT"); fi
+if [ "$CHUNKED_PREFILL" = "0" ]; then ARGS+=(--no-enable-chunked-prefill); fi
+if [ "$CHUNKED_PREFILL" = "1" ]; then ARGS+=(--enable-chunked-prefill); fi
 if [ -n "$LOAD_STRATEGY" ]; then ARGS+=(--safetensors-load-strategy "$LOAD_STRATEGY"); fi
 if [ "$KERNEL_WARMUP" = "0" ]; then
   ARGS+=(--kernel-config '{"enable_jit_warmup": false}')
@@ -62,7 +71,7 @@ fi
 
 {
   echo "tag=$TAG port=$PORT tp=$TP gpus=$GPUS maxlen=$MAXLEN seqs=$SEQS gpu_util=$GPU_UTIL"
-  echo "mbt='$MBT' threads=$THREADS resident='$RESIDENT' oot=$OOT load_strategy='$LOAD_STRATEGY' extra_env='$EXTRA_ENV'"
+  echo "mbt='$MBT' chunked='$CHUNKED_PREFILL' threads=$THREADS resident='$RESIDENT' oot=$OOT load_strategy='$LOAD_STRATEGY' extra_env='$EXTRA_ENV'"
   echo "env=$ENV"; echo "ckpt=$CKPT"; date -Is
 } > "$OUTDIR/$TAG.env"
 
