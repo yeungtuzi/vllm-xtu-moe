@@ -702,11 +702,23 @@ public:
             // 根因方向(§228):故障发生在"发布者推进到下一代时,还有 worker 处在上一代的某个状态"。
             // 这里在推进代数前插入**有界**自旋,给上一代的 worker 一个"回到循环顶部"的机会。
             // 有界 ⇒ **不可能死锁**(这正是它相对"精确握手"的优势);
-            // XIAOTU_MOE_PUBLISH_SETTLE=<iters> 可调整(0 = 关闭,默认 2000)。
+            // XIAOTU_MOE_PUBLISH_SETTLE=<iters> 可调整(0 = 关闭)。
+            //
+            // 【第 219 轮·实测调参 2000 → 200】这段自旋在**每次并行区发布**都要付一次,
+            // 而 Zen4 的 `pause` 不是空操作(数十周期)⇒ 2000 次 ≈ **63 µs/区**。
+            // 实测(harness,NENGINES=14/REP=200/QLEN=1/DEDUP=6/96 线程,各跑 2 遍):
+            //   2000 → 394.9 / 397.2 µs/层
+            //    200 → 332.1 / 334.0 µs/层   (−16.0%)
+            //      0 → 326.6 / 325.4 µs/层   (−17.6%)
+            // ⇒ 200 已经拿到 91% 的收益(2000→200 省 63 µs,200→0 只再省 6 µs),
+            //   同时**保留了有界自旋的保护**(0 = 完全不保护)。
+            // 稳定性:16,000 次调用(`NENGINES=16/REP=1000`)无 hang、无看门狗;
+            // 服务端另需复测(见 NOTES §329)。
+            // 每层省 63 µs × 31 个 CPU 层 ≈ **−1.97 ms/token**。
             {
                 static const int settle_iters = [] {
                     const char* e = std::getenv("XIAOTU_MOE_PUBLISH_SETTLE");
-                    if (e == nullptr) return 2000;
+                    if (e == nullptr) return 200;
                     return std::atoi(e);
                 }();
                 for (int _i = 0; _i < settle_iters; ++_i) __builtin_ia32_pause();
