@@ -12901,3 +12901,48 @@ WLIMIT=4   (无输出,挂死;600s 超时被杀)
    说明是**vLLM 调度侧**(chunked prefill / 采样)而不是我们的 MoE;
 3. 特别注意 bench_lat **不设 temperature**(用 generation_config 的 1.0)且**不设 ignore_eos**
    —— 随机采样会让每步路由完全不同,可能与"60 个 worker 参与"耦合出病态。
+
+### 358. 🎯🎯【v0.2·第 22 轮】同机 A/B 定案:fork **26.81 ms**,主线 **1225 ms** —— 差 47× 全在主线侧;并更正我的计时方法
+
+#### (a) 终于做了目标里一直写着的"同机对照"
+
+起 fork + **我们的引擎**(`ENV=lkxtu`,`serve_lk_port.sh`,`TP=2/GPU_UTIL=0.80/MAXLEN=8192/
+SEQS=8/MBT=256/MINBATCH=0/PREFETCH=1/EAGER=0/THREADS=60/SPEC=0/RESIDENT=0-11`),
+**同一份 `scripts/bench_lat.sh`**:
+
+| 配置 | `bench_lat` C=1 TPOT | 我的直连探针(32tok) |
+|---|---|---|
+| **fork + 我们的引擎(`lkxtu`)** | **26.81 ms**(22.42 t/s)✅ —— 与 0.1.0 文档值 26.11–26.40 **吻合** | 33.1–38.6 ms |
+| 主线 + 我们的插件 | **~1225 ms** ❌ | 37.7 ms(干净窗口) |
+
+⇒ **引擎无罪**:同一个引擎在 fork 上就是 26.81 ms。
+⇒ **`bench_lat.sh` 也没问题**:它在 fork 上跑得出 26.81 ms。
+⇒ **47× 的差是主线侧的**(编排/调度/宿主环境),不是引擎、不是基准脚本、不是我们的 MoE 算术。
+
+#### (b) ⚠️ 更正我的计时方法(这是我前几轮反复被误导的根源)
+
+`wall / out_tokens` **把预填充算进了"每 token"**。fork 上那条
+"自然 ~512tok → 168.2 ms/token"就是假象:512-token 预填充约 2.0 s + 16×38 ms 解码 ≈ 2.69 s,
+**解码其实只有 ~38 ms/token**,与 `bench_lat` 的 TPOT 26.81 ms 同量级。
+
+**正确写法**:用服务端回报的 `ttft` 与 `completion_tokens`:
+`decode_ms_per_tok = (wall - ttft) / max(n_out - 1, 1)`,
+或者直接读 `bench_lat`/`vllm bench` 的 **TPOT**(它本来就是 steady-state 每 token 时间)。
+
+**⇒ 结论**:§350–§357 里凡是拿 `wall/out_tok` 下的
+"1.2 s/token"结论,都**要按此复核**;不过主线那条经得起复核 ——
+`bench_lat` 自己的 `mean_tpot=1225.04 ms`(TPOT,已排除预填充)与
+`(21.8 s - 3.43 s)/15 = 1225 ms` **两条独立路径一致**,所以"主线解码 1225 ms"成立。
+
+#### (c) 下一轮:抓主线在 `bench_lat` 负载下的 qlen 谱
+
+只剩一个具体假设:**主线的 chunked-prefill 调度把预填充块与解码混在同一步**
+(于是每个解码步的 MoE 看到 `qlen≈257`),而我们的 CPU MoE 成本随 qlen 线性增长
+⇒ 43 层 × 257 token ≈ 1.2 s ——**与 NOTES §334u 记的 `qlen=257 × 200/200` 签名完全一致**。
+fork 之所以没事,正是因为它的编排**把预填充与解码分开**(`_cpu_prefill` 分流,
+这也是当初把 `MBT=256` + `MINBATCH=0` 配成"分开两者"的原因)。
+
+验证手段(下一轮第一件事):主线挂 `XIAOTU_DEBUG_QLEN=1`,在 `bench_lat` 负载下看 qlen 谱;
+若是 257,则解法有二 ——
+1. `CHUNKED_PREFILL=0` + `MBT ≥ max_model_len`(主线要求),让预填充整段一次进;
+2. 或把 `GP_MIN` 降到 ≤ 256,让那个预填充块走 GPU 预填充路径(但每 chunk 重传 43 层,需实测)。
