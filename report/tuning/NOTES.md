@@ -11620,3 +11620,23 @@ A(gate/up)=7.2 ms、B(down)=4.5 ms —— 而 fork 路径是 **0.135 / 0.105 ms*
 ⚠️ 仍未回到 0.24 ms ⇒ 还有**第二个原因**待查(下一轮:`XIAOTU_MOE_POOL_DEBUG=1` 看池的
 线程数与绑核;`M>8` 桶的 `setup=35 ms` 也异常,那是预填充路径)。
 ⇒ 这条与集群设计**直接相关**,已作为 **N4 约束**写进 `docs/CLUSTER_SCALE_DESIGN.md §2.1`。
+
+### (p) 第二个原因:每层成本**双峰**(MIN 0.41 ms vs 典型 9.5 ms)⇒ 是**偶发停顿**,不是内核慢
+
+`SPIN_IDLE=600000` 之后仍慢,但相位数据给出了关键线索:
+
+```
+[NS-PROF] bucket=M<=2 calls=119 na=6.0 | setup=25 A=4892 B=4565 C=10 TOTAL=9491 (µs)
+[cd-timing] MIN period=1.13ms compute=0.41ms   ← 最好的一次与 fork 路径同量级
+            period=15.6ms compute=9.1-13.6ms   ← 典型值
+```
+
+* **内核本身不慢**(MIN 0.41 ms ≈ fork 的 0.24-0.5 ms),慢的是**偶发停顿**;
+* 指向**核争抢**:形态 B 里 vLLM 的 worker 进程自己在跑模型前向,而引擎的 60 个 worker 线程
+  被钉在**同一批核**上(且 `num_processes=1` 让池横跨全部 24 CCD)⇒ 互相抢占;
+  fork 路径没有这个问题,**因为引擎在独立的 worker 进程里**。
+* ⇒ **这对集群设计是利好**:专家节点上只跑引擎,争抢天然消失(已写入
+  `docs/CLUSTER_SCALE_DESIGN.md §2.2`)。
+* **单机形态 B 的修法**(下一轮验证):把引擎的池限制到一半 CCD。
+  现成旋钮是 `RANK_SPLIT=1`,但它要求 `world≥2`;形态 B 里 `cfg.num_processes=1`(mainline 自己做
+  EP),所以要么给插件加"池只用一半 node"的选项,要么用 `taskset` 把模型主线程与池隔离。
