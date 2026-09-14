@@ -85,9 +85,9 @@ def save(fig, name):
 # =============================================================================
 def fig_main_result():
     conc = ["C=1", "C=2", "C=4"]
-    ours_tpot = [26.48, 28.81, 31.79]
+    ours_tpot = [26.17, 28.41, 31.27]
     ref_tpot = [23.11, 31.75, 41.88]
-    ours_agg = [34.53, 63.19, 104.98]
+    ours_agg = [35.03, 64.27, 107.34]
     ref_agg = [41.04, 59.73, 86.92]
 
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.3))
@@ -193,10 +193,10 @@ def fig_history():
         T("② +5 层常驻", "2. +5 GPU-resident"),
         T("③ +11 层常驻\n+PERMV 解码", "3. +11 resident\n+PERMV decode"),
         T("④ +12 层常驻\n+异步握手", "4. +12 resident\n+async handshake"),
-        T("⑤ +并行区自旋\n2000→200", "5. +publish spin\n2000->200"),
+        T("⑤ +自旋 2000→200\n+每 CCD 5 核", "5. +spin 2000->200\n+5 cores/CCD"),
     ]
-    tpot = [37.33, 33.82, 31.78, 28.13, 26.48]
-    agg = [34.29, 55.23, 60.17, 100.16, 104.98]
+    tpot = [37.33, 33.82, 31.78, 28.13, 26.17]
+    agg = [34.29, 55.23, 60.17, 100.16, 107.34]
 
     fig, ax = plt.subplots(figsize=(10.6, 4.5))
     x = range(len(stages))
@@ -259,13 +259,13 @@ def fig_cost_breakdown():
 # =============================================================================
 def fig_step_cost():
     C = [1, 2, 4]
-    ours = [26.48, 28.81, 31.79]
+    ours = [26.17, 28.41, 31.27]
     ref = [23.11, 31.75, 41.88]
     fig, ax = plt.subplots(figsize=(8.4, 4.4))
     ax.plot(C, ours, "o-", lw=2.4, ms=8, color=C_OURS, label=T("本项目", "ours"))
     ax.plot(C, ref, "s--", lw=2.4, ms=8, color=C_REF, label=T("lk_moe(专有)", "lk_moe (proprietary)"))
     # 拟合线
-    F_o, V_o = 26.48 - (31.79 - 26.48) / 3, (31.79 - 26.48) / 3
+    F_o, V_o = 26.17 - (31.27 - 26.17) / 3, (31.27 - 26.17) / 3
     F_r, V_r = 23.11 - (41.88 - 23.11) / 3, (41.88 - 23.11) / 3
     xs = [1, 2, 3, 4]
     ax.plot(xs, [F_o + V_o * c for c in xs], ":", lw=1.6, color=C_OURS, alpha=0.8,
@@ -317,9 +317,9 @@ def fig_rest_compute():
     labels = [T("历史\n(43 层全 CPU)", "historical\n(43 CPU layers)"),
               T("异步握手\n(settle=2000,均值)", "async\n(settle=2000, mean)"),
               T("异步+自旋 200\n(均值)", "async + spin 200\n(mean)"),
-              T("异步+自旋 200\n(稳态最小)", "async + spin 200\n(min)")]
-    compute = [0.41, 0.304, 0.262, 0.239]
-    rest = [0.60, 0.601, 0.664, 0.335]
+              T("异步+自旋 200\n+5 核/CCD(稳态最小)", "async + spin 200\n+5 cores/CCD (min)")]
+    compute = [0.41, 0.304, 0.250, 0.195]
+    rest = [0.60, 0.601, 0.666, 0.339]
     fig, ax = plt.subplots(figsize=(9.2, 4.3))
     x = range(4)
     b1 = ax.bar(x, compute, 0.6, color=C_ACC, label=T("compute(CPU MoE+EP)", "compute (CPU MoE + EP)"))
@@ -335,7 +335,7 @@ def fig_rest_compute():
     ax.set_xticks(list(x)); ax.set_xticklabels(labels, fontsize=9.5)
     ax.set_ylabel(T("每次 cpu_decode 调用 (ms)", "per cpu_decode call (ms)"))
     ax.set_ylim(0, 1.20)
-    ax.set_title(T("每层开销拆分:compute 0.41→0.239(不退化且更快),rest 稳态最小 0.335 达标",
+    ax.set_title(T("每层开销拆分:compute 0.41→0.195,rest 稳态最小 0.339 达标",
                    "Per-layer split: compute improved (0.41 -> 0.318), steady-state rest meets target"),
                  fontsize=10.5, fontweight="bold")
     ax.legend(fontsize=9, frameon=False)
