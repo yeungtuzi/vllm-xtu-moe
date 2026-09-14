@@ -189,3 +189,52 @@ python scripts/probe_greedy.py /tmp/greedy.json 8071
 ---
 
 *本文件的每一步都在本机执行并记录;执行日志见 `report/tuning/logs/` 与 `report/tuning/NOTES.md §334`。*
+
+---
+
+## 9. 纯插件路径(`LEVEL=0`):能用到什么程度
+
+```bash
+LEVEL=0 bash scripts/install_mainline.sh    # 一个补丁都不打,只装插件
+```
+
+只走 `vllm.general_plugins` 入口 + OOT 注册表覆盖(即 `docs/UPSTREAM_DRIFT.md` 的**形态 0**)。
+
+| 能力 | `LEVEL=0`(纯插件) | `LEVEL=1`(默认,pr0+pr1) |
+|---|---|---|
+| 插件对主线 **可 import / 可注册 / 可覆盖** | ✅ | ✅ |
+| `import vllm_xiaotu_moe` + 入口点被发现 | ✅ | ✅ |
+| 数值门禁(`test_block23_equiv.py`,纯引擎) | ✅ | ✅ |
+| **真实起服务(DS-V4 / 138 GB 专家)** | ❌ | ✅ |
+| 引擎逐层构造不撞握手超时 | ❌ | ✅ |
+
+**为什么 `LEVEL=0` 在本机不能用于真实服务** —— 两件上游还没有的能力,恰好都只能靠补丁:
+
+1. **`VLLM_EXPERTS_LOAD_DEVICE=cpu`(pr1,3 个文件)**
+   没有它,138 GB 的 routed-expert 权重无处安放(2×A100-40GB 装不下)。
+   这是本方案能成立的前提,主线目前没有等价的公开开关。
+2. **可配置的引擎握手超时(pr0,1 个文件)**
+   上游把 `HANDSHAKE_TIMEOUT_MINS` 硬编码成 5 分钟;而 CPU 引擎要逐层构造 43 层,
+   必然超时。pr0 只是把这个常量变成可配置 —— **不改变任何默认行为**。
+
+⇒ 所以 v0.2 的"最小补丁集"就是 **pr0 + pr1 = 4 个文件**;
+`pr2`/`pr3` 是 **A100/SM80 专属**(非 A100 机器不需要),
+按 `LEVEL=2/3` 选装。逐块理由见 `patches/upstream/*.patch` 头部注释与 `docs/UPSTREAM_DRIFT.md`。
+
+## 10. 装完之后:起服务前先过一遍宿主契约自检
+
+`install_mainline.sh` 结束时已自动调用,也可以随时手动跑:
+
+```bash
+bash scripts/check_mainline_env.sh              # 检查当前 shell
+TAG=myrun bash scripts/check_mainline_env.sh    # 检查某个已启动实例的 .env 记录
+```
+
+它断言的是**那些缺失时不会报错、只会静默变慢(实测可达 30×)的开关**
+—— 完整清单与证据见 **`docs/PLUGIN_INTERFACE.md`**。最要紧的两个:
+
+* `XIAOTU_MOE_SPIN_IDLE_US=0`(缺失 ⇒ 解码从 37 ms 漂到 1225 ms/token)
+* `XIAOTU_MOE_NSLICE_SMALL=0`(缺失 ⇒ 60 个 worker 全部参与每一相)
+
+`serve_mainline.sh` **已默认带上这两个**,所以正常路径不用管;
+但你自己拼命令行时一定要带上,否则会得到一个"能跑但慢 30×"的服务。
