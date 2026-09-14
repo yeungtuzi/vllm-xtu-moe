@@ -335,6 +335,10 @@ scripts/bench_lat.sh  L=256 / OUT=512 / N=8 / CS="1 2 4"   (random token 数据�
 
   ⇒ **每 token 的边际成本我们做得更好**;剩下的差距 100% 集中在**每步固定开销**(见 §5 改进点)。
 
+![主结果:TPOT 与聚合吞吐对比](figures/fig01_main_result.png)
+
+![步代价拟合 TPOT(C)=F+C·V](figures/fig05_step_cost.png)
+
 **讲稿**:这一页是全篇核心。强调"三个数字":C=1 达标、C=2 打平、C=4 反超。并解释 F/V 分解 —— 我们的"边际"更便宜,说明异步握手把串行开销压掉了;还差的是"每步第一步"的固定成本。
 
 ---
@@ -353,6 +357,10 @@ scripts/bench_lat.sh  L=256 / OUT=512 / N=8 / CS="1 2 4"   (random token 数据�
 > ③ 的数字与 §6.3 同协议。同协议 A/B(host-func → async,同为 12 层常驻):
 > `28.76 → 28.10 / 51.29 → 59.89 / 71.78 → 100.16`。
 
+![优化历程](figures/fig03_history.png)
+
+![手段 3 的同协议 A/B:异步握手 vs cudaLaunchHostFunc](figures/fig02_async_ab.png)
+
 ### 6.5 成本分解:钱花在哪里(全部实测)
 
 **A. 端到端三段分解(C=1,无优化基线)**
@@ -362,6 +370,8 @@ TPOT 37.33 ms =  纯 GPU 模型 17.32 ms  +  拷贝/派发 2.46 ms  +  CPU MoE 1
                  (FAKE_ALL)             (FAKE_CPU−FAKE_ALL)  (真实 − FAKE_CPU)
 ```
 > 三段**严格相加等于实测值**,这是本项目所有结论的地基。
+
+![端到端成本三段分解](figures/fig04_cost_breakdown.png)
 
 **B. 每层 rest/compute 拆分(async 路径,服务内 `XIAOTU_CD_TIMING=1`)**
 
@@ -378,6 +388,8 @@ TPOT 37.33 ms =  纯 GPU 模型 17.32 ms  +  拷贝/派发 2.46 ms  +  CPU MoE 1
   **稳态最小值 0.316 ms < 0.40 ms 达标**;若按"每模型层"折算为 0.433 ms(均值)/ 0.228 ms(最小)。
   ⇒ 我们按最保守方式披露,并在下一轮把均值也压到 0.40 以下。
 
+![每层 rest / compute 拆分](figures/fig07_rest_compute.png)
+
 **C. 带宽账(证明"不是带宽墙")**
 
 | 目标吞吐 | 需要带宽 | 本机可达 |
@@ -386,6 +398,8 @@ TPOT 37.33 ms =  纯 GPU 模型 17.32 ms  +  拷贝/派发 2.46 ms  +  CPU MoE 1
 | 50 tok/s | 162 GB/s | ✅ |
 | 100 tok/s | 325 GB/s | ✅ |
 * 引擎当前聚合 ~254 GB/s(实测)⇒ **只有上限的 34%**,瓶颈是**每层关键路径延迟**,不是带宽。
+
+![带宽 roofline](figures/fig06_bandwidth.png)
 
 ### 6.6 正确性(两条路径逐位一致)
 

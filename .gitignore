@@ -37,3 +37,6 @@ report/tuning/nsys/
 # 重复/过时的源码副本与本地大 fixture(2026-09-13 按用户要求归档)
 backup/
 fixtures/*.npz
+
+# 报告插图用的中文字体(8 MB,不入库;make_report_figures.py 会自动下载)
+docs/figures/fonts/
