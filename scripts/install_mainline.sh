@@ -5,7 +5,7 @@
 #   TREE=/path/to/vllm bash scripts/install_mainline.sh     # 指定 vLLM 源码树
 #   LEVEL=0 bash scripts/install_mainline.sh    # **纯插件路径**:一个补丁都不打(受限,见下)
 #   LEVEL=2 bash scripts/install_mainline.sh    # + PR2(A100/SM80 的 FP8 o_proj)
-#   LEVEL=3 bash scripts/install_mainline.sh    # + PR3(SM80 DS-V4 完整移植,21 文件)
+#   LEVEL=3 bash scripts/install_mainline.sh    # + PR3(SM80 DS-V4 移植,21 文件)
 #
 # 补丁级别(逐块"为什么主线做不到"的理由见 docs/UPSTREAM_DRIFT.md):
 #   L0  零补丁(纯插件):只走 `vllm.general_plugins` 入口 + OOT 注册表覆盖。
@@ -13,7 +13,7 @@
 #         - VLLM_EXPERTS_LOAD_DEVICE=cpu(pr1):没有它,138 GB 专家权重无处安放;
 #         - 可配置的引擎握手超时(pr0):没有它,逐层构造 CPU 引擎会撞上硬编码 5 分钟。
 #       它能证明的是:插件对主线可 import / 可注册 / 可覆盖(CI 冒烟级)。
-#   L1(默认) pr0 + pr1 = "能用"的最小集(4 个文件)。
+#   L1(默认) pr0 + pr1 = "能用"的最小集(7 个文件;基线 dabc4362b)。
 #   DRY=1 bash scripts/install_mainline.sh      # 只打印将要做什么
 #
 # 三种模式(自动选择):

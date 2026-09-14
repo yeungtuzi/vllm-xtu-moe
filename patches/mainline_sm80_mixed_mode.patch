@@ -1,10 +1,10 @@
 diff --git a/vllm/envs.py b/vllm/envs.py
-index a3ef86d..40763e3 100755
+index 6158f86f89..2d11b225f6 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -88,6 +88,14 @@ if TYPE_CHECKING:
+@@ -87,6 +87,14 @@ if TYPE_CHECKING:
+     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
      VLLM_MEDIA_CONNECTOR: str = "http"
-     VLLM_MM_HASHER_ALGORITHM: str = "blake3"
      VLLM_TARGET_DEVICE: str = "cuda"
 +    VLLM_EXPERTS_LOAD_DEVICE: Literal["gpu", "cpu"] = "gpu"
 +    VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL: bool = True
@@ -17,7 +17,7 @@ index a3ef86d..40763e3 100755
      VLLM_MAIN_CUDA_VERSION: str = "13.0"
      VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
      VLLM_BATCH_INVARIANT: bool = False
-@@ -614,6 +622,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -602,6 +610,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
      # Target device of vLLM, supporting [cuda (by default),
      # rocm, cpu]
      "VLLM_TARGET_DEVICE": lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda").lower(),
@@ -61,118 +61,173 @@ index a3ef86d..40763e3 100755
      "VLLM_MAIN_CUDA_VERSION": lambda: (
          os.getenv("VLLM_MAIN_CUDA_VERSION", "").lower() or "13.0"
 diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
-index c3c773d..f58a52f 100644
+index cea186e49e..1b70ce534c 100644
 --- a/vllm/model_executor/kernels/mhc/tilelang.py
 +++ b/vllm/model_executor/kernels/mhc/tilelang.py
-@@ -348,7 +348,17 @@ def mhc_pre_broadcast_tilelang(
-     residual_flat = residual
-     num_tokens = residual.shape[0]
- 
--    n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
-+    from vllm.utils.deep_gemm import is_deep_gemm_supported
-+
-+    use_deep_gemm = is_deep_gemm_supported()
-+    # The torch prenorm path only supports a single split (its buffers are
-+    # indexed at [0]); match the split count to the chosen backend like
-+    # mhc_pre_tilelang does.
-+    n_splits = (
-+        compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
-+        if use_deep_gemm
-+        else 1
-+    )
- 
-     residual_out = torch.empty(
-         num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
-@@ -369,15 +379,22 @@ def mhc_pre_broadcast_tilelang(
-         n_splits, num_tokens, dtype=torch.float32, device=residual.device
+@@ -753,13 +753,35 @@ def mhc_pre_broadcast_tilelang(
+         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
      )
  
--    from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
--
--    tf32_hc_prenorm_gemm(
+-    gemm_out_mul, gemm_out_sqrsum = _hc_prenorm_gemm_outputs(
 -        residual_flat,
 -        fn_broadcast,
--        gemm_out_mul,
--        gemm_out_sqrsum,
--        n_splits,
+-        hidden_size=hidden_size,
+-        hc_mult=hc_mult,
+-        use_tilelang_fallback=False,
 -    )
-+    if use_deep_gemm:
-+        from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
-+        tf32_hc_prenorm_gemm(
++    # `_hc_prenorm_gemm_outputs` picks `use_deep_gemm = is_deep_gemm_supported()
++    # or not use_tilelang_fallback`. Upstream passes use_tilelang_fallback=False
++    # because this *broadcast* variant passes x = residual of shape (T, H),
++    # while the helper's tilelang fallback asserts x.shape[1] == hc_mult * H.
++    # DeepGEMM's tf32_hc_prenorm_gemm handles the (T, H) x (hc_mult3, H) shape,
++    # but DeepGEMM has no hyperconnection kernels on A100 (SM80) and aborts with
++    # "Unsupported architecture" (hyperconnection.hpp). So on such devices use
++    # the torch reference, which produces the same (1, T, hc_mult3) / (1, T)
++    # layout that the fused tilelang kernel below consumes.
++    from vllm.utils.deep_gemm import is_deep_gemm_supported
++
++    if is_deep_gemm_supported():
++        gemm_out_mul, gemm_out_sqrsum = _hc_prenorm_gemm_outputs(
 +            residual_flat,
 +            fn_broadcast,
-+            gemm_out_mul,
-+            gemm_out_sqrsum,
-+            n_splits,
++            hidden_size=hidden_size,
++            hc_mult=hc_mult,
++            use_tilelang_fallback=False,
 +        )
 +    else:
-+        # A100 (SM80) and below have no DeepGEMM hyperconnection kernels; fall
-+        # back to the same torch prenorm used by mhc_pre_tilelang. (This was an
-+        # upstream parity gap: every other mHC pre path already gates on
-+        # is_deep_gemm_supported(); only the first-layer broadcast variant
-+        # called tf32_hc_prenorm_gemm unconditionally.)
-+        _torch_hc_prenorm_gemm(residual_flat, fn_broadcast, gemm_out_mul, gemm_out_sqrsum)
-     mhc_pre_big_fuse_broadcast_with_norm_tilelang(
++        gemm_out_mul = torch.empty(
++            1, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
++        )
++        gemm_out_sqrsum = torch.empty(
++            1, num_tokens, dtype=torch.float32, device=residual.device
++        )
++        _torch_hc_prenorm_gemm(
++            residual_flat, fn_broadcast, gemm_out_mul, gemm_out_sqrsum
++        )
+     _MHC_PRE_BIG_FUSE_TILELANG_KERNEL(
          gemm_out_mul,
          gemm_out_sqrsum,
-diff --git a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
-index 1fa2f63..17d126d 100644
---- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
-+++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
-@@ -577,6 +577,19 @@ def select_mxfp4_moe_backend(
-         assert last_error is not None
-         raise last_error
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/fp8.py b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+index abe47373de..a824016f8d 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/fp8.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+@@ -131,6 +131,12 @@ def _get_priority_backends(
+         # CPU platform uses FP8 W8A16 fused MoE kernel.
+         _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU)
  
 +    # GPU/CPU mixed mode: expert weights live on the host (see
-+    # VLLM_EXPERTS_LOAD_DEVICE), so a GPU expert kernel cannot consume them.
-+    # Select the CPU backend unconditionally rather than preferring the GPU
-+    # kernels (Marlin WNA16 etc.), which would only fail with "not on GPU".
++    # VLLM_EXPERTS_LOAD_DEVICE), so only the CPU backend can consume them.
++    # Prefer it on a GPU platform as well.
 +    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
-+        return _return_or_raise(
-+            Mxfp4MoeBackend.CPU,
-+            config,
-+            kMxfp4Static,
-+            None,
-+            activation_format,
-+        )
++        _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU)
 +
-     if _requires_qwen38_tep8_emulation(config, requested_activation_key):
-         backend = Mxfp4MoeBackend.EMULATION
-         logger.warning_once(
-@@ -627,7 +640,10 @@ def select_mxfp4_moe_backend(
-             activation_format,
+     return _AVAILABLE_BACKENDS
+ 
+ 
+@@ -579,7 +585,14 @@ def convert_to_fp8_moe_kernel_format(
+             prepare_fp8_moe_layer_for_cpu,
          )
  
--    if current_platform.is_cpu():
-+    # CPU/GPU mixed mode: the expert weights live on the host while the rest of
-+    # the model runs on the GPU, so the CPU backend is a valid fallback even
-+    # though the platform is not CPU-only.
-+    if current_platform.is_cpu() or envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
-         backend = Mxfp4MoeBackend.CPU
-         logger.info_once(_make_log_backend(backend))
-         return _return_or_raise(
-@@ -1303,6 +1319,19 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
-             prepare_mxfp4_moe_layer_for_cpu,
-         )
- 
+-        w13, w2 = prepare_fp8_moe_layer_for_cpu(w13, w2)
 +        if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
 +            # GPU/CPU mixed mode: the CPU backend is an out-of-tree engine that
-+            # consumes the raw [E, 2I, H//2] / [E, H, I//2] uint8 weights and
-+            # raw e8m0 scales directly, so skip the AMX prepack.
-+            return (
-+                w13_weight.data,
-+                w2_weight.data,
-+                w13_weight_scale.data,
-+                w2_weight_scale.data,
-+                w13_bias,
-+                w2_bias,
-+            )
++            # consumes the raw [E, 2I, H] fp8 weights + block scales directly,
++            # so skip the AMX prepack (which also needs torch.ops._C packing
++            # kernels that may not be built for every deployment).
++            pass
++        else:
++            w13, w2 = prepare_fp8_moe_layer_for_cpu(w13, w2)
+     else:
+         if fp8_backend not in [
+             Fp8MoeBackend.TRITON,
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+index d47ad9c97e..5c00f3c357 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+@@ -11,6 +11,7 @@ from compressed_tensors.quantization import (
+ )
+ 
+ import vllm._custom_ops as ops
++import vllm.envs as envs
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm.config.kernel import MoEBackend
+ from vllm.logger import init_logger
+@@ -120,6 +121,10 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
+     """
+     if current_platform.is_cpu():
+         return [WNA16MoEBackend.CPU]
++    # GPU/CPU mixed mode: expert weights live on the host (see
++    # VLLM_EXPERTS_LOAD_DEVICE), so only the CPU backend can consume them.
++    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++        return [WNA16MoEBackend.CPU]
+     if current_platform.is_xpu():
+         return [WNA16MoEBackend.XPU]
+ 
+@@ -983,6 +988,27 @@ def _process_weights_cpu(
+             else w2_qzeros.data
+         )
+ 
++    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++        # GPU/CPU mixed mode: the CPU backend is an out-of-tree engine that
++        # consumes the raw packed int4 weights + scales directly, so skip the
++        # AMX blocked repack.
++        return (
++            w13,
++            w2,
++            w13_scale,
++            w2_scale,
++            w13_g_idx,
++            w2_g_idx,
++            None,  # w13_g_idx_sort_indices
++            None,  # w2_g_idx_sort_indices
++            w13_zeros,
++            w2_zeros,
++            None,  # w13_input_global_scale
++            None,  # w2_input_global_scale
++            w13_bias,
++            w2_bias,
++        )
 +
-         packed_w13, packed_w2, packed_w13_scale, packed_w2_scale = (
-             prepare_mxfp4_moe_layer_for_cpu(
-                 w13_weight.data,
+     (
+         blocked_w13,
+         blocked_w2,
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/unquantized.py b/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
+index b24f2a9a79..0ca58845ee 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
+@@ -58,6 +58,17 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
+     ) -> None:
+         backends.append(backends.pop(backends.index(backend)))
+ 
++    def _move_to_front(
++        backends: list[UnquantizedMoeBackend],
++        backend: UnquantizedMoeBackend,
++    ) -> None:
++        # The CUDA/ROCm priority lists do not contain CPU, so insert instead of
++        # assuming membership (mixed mode needs CPU first on a GPU platform).
++        if backend in backends:
++            backends.insert(0, backends.pop(backends.index(backend)))
++        else:
++            backends.insert(0, backend)
++
+     if current_platform.is_rocm():
+         _AVAILABLE_BACKENDS = [
+             UnquantizedMoeBackend.AITER,
+@@ -96,6 +107,12 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
+         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.XPU]
+     elif current_platform.is_cpu():
+         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
++
++    # GPU/CPU mixed mode: expert weights live on the host (see
++    # VLLM_EXPERTS_LOAD_DEVICE), so only the CPU backend can consume them.
++    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++        _move_to_front(_AVAILABLE_BACKENDS, UnquantizedMoeBackend.CPU)
++
+     return _AVAILABLE_BACKENDS
+ 
+ 
 diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
-index e9a7fc4..f1c429c 100644
+index 2dafb6c493..bf8f3c9aa8 100644
 --- a/vllm/model_executor/layers/fused_moe/routed_experts.py
 +++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
 @@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
@@ -183,9 +238,9 @@ index e9a7fc4..f1c429c 100644
  from vllm.distributed.eplb.eplb_state import EplbState
  from vllm.logger import init_logger
  from vllm.model_executor.custom_op import PluggableLayer
-@@ -174,7 +175,19 @@ class RoutedExperts(PluggableLayer):
-                 self.moe_config.intermediate_size
-             )
+@@ -168,7 +169,19 @@ class RoutedExperts(PluggableLayer):
+             "global_num_experts": moe_config.num_experts,
+         }
  
 -        self.quant_method.create_weights(layer=self, **moe_quant_params)
 +        # GPU/CPU mixed mode: construct the expert weights on the host when
@@ -205,7 +260,7 @@ index e9a7fc4..f1c429c 100644
          self.lora_base_layer_prefix = ""
  
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
-index 2cf7168..5522631 100644
+index d8bef7347d..1b449d9654 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
 +++ b/vllm/model_executor/layers/quantization/fp8.py
 @@ -50,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -216,7 +271,7 @@ index 2cf7168..5522631 100644
      process_fp8_weight_tensor_strategy,
      process_fp8_weight_tensor_strategy_moe,
      validate_fp8_block_shape,
-@@ -385,6 +386,28 @@ class Fp8LinearMethod(LinearMethodBase):
+@@ -386,6 +387,28 @@ class Fp8LinearMethod(LinearMethodBase):
                  self.fp8_linear.marlin_input_dtype = self.marlin_input_dtype
              return
  
@@ -245,11 +300,28 @@ index 2cf7168..5522631 100644
          if self.use_marlin:
              if not self.block_quant:
                  # Canonicalize to (K, N) for the kernel.
+@@ -739,6 +762,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+             routing_tables=layer._expert_routing_tables(),
+         )
+ 
++        # GPU/CPU mixed mode: an out-of-tree CPU experts backend (e.g.
++        # vllm-xtu-moe) captures the layer in its own
++        # process_weights_after_loading. The in-tree CPU prepack that would
++        # normally run inside convert_to_fp8_moe_kernel_format is skipped in
++        # mixed mode, so notify the experts explicitly.
++        if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++            experts = getattr(self.moe_kernel, "fused_experts", None)
++            if experts is not None:
++                experts.process_weights_after_loading(layer)
++
+     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         if is_weights_pre_processed():
+             # Weights are already in kernel format; rebuild the kernel only.
 diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
-index 451ae3a..b18e55e 100644
+index e42f43b39c..c993547d23 100644
 --- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 +++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
-@@ -1477,3 +1477,61 @@ def process_fp8_input_tensor_strategy_moe(
+@@ -1498,3 +1498,61 @@ def process_fp8_input_tensor_strategy_moe(
          amax_for_moe_activation_quant(w13_input_scale, enable_eplb),
          amax_for_moe_activation_quant(w2_input_scale, enable_eplb),
      )
@@ -312,7 +384,7 @@ index 451ae3a..b18e55e 100644
 +
 +
 diff --git a/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py b/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py
-index 80dfd51..38ed407 100644
+index 91ae7c44c2..3d35617fac 100644
 --- a/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py
 +++ b/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py
 @@ -12,6 +12,7 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
@@ -323,7 +395,7 @@ index 80dfd51..38ed407 100644
  from vllm.utils.flashinfer import autotune as flashinfer_autotune
  from vllm.utils.flashinfer import has_flashinfer
  from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
-@@ -53,6 +54,10 @@ def _attention_backend_name(backend: object) -> str | None:
+@@ -87,6 +88,10 @@ def _attention_backend_name(backend: object) -> str | None:
  
  
  def _has_deepseek_v4_sparse_mla_backend(runner: "GPUModelRunner") -> bool:
@@ -335,7 +407,7 @@ index 80dfd51..38ed407 100644
          for group in groups:
              name = _attention_backend_name(getattr(group, "backend", None))
 diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
-index d62e4d5..db03537 100644
+index 9c77980965..8ac03ecd6c 100644
 --- a/vllm/models/deepseek_v4/attention.py
 +++ b/vllm/models/deepseek_v4/attention.py
 @@ -4,6 +4,8 @@
@@ -347,7 +419,7 @@ index d62e4d5..db03537 100644
  from abc import ABC, abstractmethod
  from collections.abc import Callable
  from typing import TYPE_CHECKING, Any, ClassVar, cast
-@@ -125,6 +127,9 @@ def _resolve_dsv4_kv_cache_dtype(
+@@ -129,6 +131,9 @@ def _resolve_dsv4_kv_cache_dtype(
      return kv_cache_dtype, torch.bfloat16
  
  
@@ -357,7 +429,7 @@ index d62e4d5..db03537 100644
  class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
      """DeepseekV4 MLA attention layer.
  
-@@ -423,6 +428,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+@@ -469,6 +474,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
          hidden_states: torch.Tensor,
          llama_4_scaling: torch.Tensor | None = None,
      ) -> torch.Tensor:
@@ -366,7 +438,7 @@ index d62e4d5..db03537 100644
          # Pre-allocate attention output with FlashMLA-padded head count.
          # The op writes into `o_padded`; we slice to n_local_heads after.
          num_tokens = hidden_states.shape[0]
-@@ -452,8 +459,37 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+@@ -498,8 +505,37 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
          )
          o = o_padded[:, : self.n_local_heads, :]
  
@@ -406,7 +478,7 @@ index d62e4d5..db03537 100644
      def _split_qkv_and_norm(
          self, qr_kv: torch.Tensor
 diff --git a/vllm/models/deepseek_v4/common/ops/__init__.py b/vllm/models/deepseek_v4/common/ops/__init__.py
-index b7899f0..e595b1d 100644
+index 89209e7e41..400fd318c4 100644
 --- a/vllm/models/deepseek_v4/common/ops/__init__.py
 +++ b/vllm/models/deepseek_v4/common/ops/__init__.py
 @@ -6,7 +6,10 @@ from .cache_utils import (
@@ -420,7 +492,7 @@ index b7899f0..e595b1d 100644
  )
  from .fused_indexer_q import MXFP4_BLOCK_SIZE, fused_indexer_q_rope_quant
  from .fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
-@@ -19,6 +22,9 @@ __all__ = [
+@@ -17,6 +20,9 @@ __all__ = [
      "combine_topk_swa_indices",
      "compute_global_topk_indices_and_lens",
      "dequantize_and_gather_k_cache",
@@ -429,13 +501,13 @@ index b7899f0..e595b1d 100644
 +    "sparse_prefill_combined_topk_size",
      "fused_indexer_q_rope_quant",
      "fused_inv_rope_fp8_quant",
-     "fused_mtp_input_rmsnorm",
+     "quantize_and_insert_k_cache",
 diff --git a/vllm/models/deepseek_v4/common/ops/cache_utils.py b/vllm/models/deepseek_v4/common/ops/cache_utils.py
-index fefc10e..e6716a3 100644
+index d98d6a297a..304999d8ca 100644
 --- a/vllm/models/deepseek_v4/common/ops/cache_utils.py
 +++ b/vllm/models/deepseek_v4/common/ops/cache_utils.py
-@@ -28,8 +28,13 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-     TritonWarmupTensor,
+@@ -35,8 +35,13 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+     triton_scalar_specialization_rep,
  )
  from vllm.platforms import current_platform
 +from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -448,7 +520,7 @@ index fefc10e..e6716a3 100644
  from vllm.utils.math_utils import next_power_of_2
  
  
-@@ -131,10 +136,10 @@ def quantize_and_insert_k_kernel(
+@@ -138,10 +143,10 @@ def quantize_and_insert_k_kernel(
  
              # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
              if use_fnuz:
@@ -462,23 +534,26 @@ index fefc10e..e6716a3 100644
  
              # Store as uint8 (1 byte each)
              tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
-@@ -307,12 +312,10 @@ def _dequantize_and_gather_k_kernel(
+@@ -331,14 +336,12 @@ class DequantizeAndGatherKCacheKernel(
+                     # Load quantized fp8 values (stored as uint8)
+                     x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
  
-                 # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
-                 if use_fnuz:
--                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-+                    x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
-                 else:
--                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+-                    # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
++                    # Decode uint8 back to fp32 (FNUZ on gfx942, OCP elsewhere).
+                     if use_fnuz:
+-                        x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
++                        x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
+                     else:
+-                        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
 -
--                # Convert fp8 to float32 for computation
--                x_float = x_fp8.to(tl.float32)
-+                    # Ampere (SM80) has no fp8e4nv type; decode e4m3 bytes.
-+                    x_float = _e4m3_uint8_to_f32(x_uint8)
+-                    # Convert fp8 to float32 for computation
+-                    x_float = x_fp8.to(tl.float32)
++                        # Ampere (SM80) has no fp8e4nv type; decode e4m3 bytes.
++                        x_float = _e4m3_uint8_to_f32(x_uint8)
  
-                 # Load and decode UE8M0 scale
-                 # UE8M0: scale = 2^(stored_value - 127)
-@@ -409,7 +412,7 @@ def dequantize_and_gather_k_cache(
+                     # Load and decode UE8M0 scale
+                     # UE8M0: scale = 2^(stored_value - 127)
+@@ -518,7 +521,7 @@ def dequantize_and_gather_k_cache(
      ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
      writes FNUZ on gfx942 and OCP on gfx950).
      """
@@ -486,11 +561,12 @@ index fefc10e..e6716a3 100644
 +    if has_cutedsl() and not is_ampere_or_ada():
          # lazily import, otherwise some tests fail due to CUDA driver init failure.
          from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
-             dequantize_and_gather_k_cache_cutedsl,
-@@ -1231,3 +1234,165 @@ def _build_flashinfer_mixed_sparse_indices_kernel(
-         )
- 
-     tl.store(sparse_topk_lens_ptr + token_idx, SWA_TOTAL_WIDTH + topk_len)
+             _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,
+@@ -1686,3 +1689,163 @@ class BuildFlashinferMixedSparseIndicesKernel(
+ _BUILD_FLASHINFER_MIXED_SPARSE_INDICES_KERNEL = (
+     BuildFlashinferMixedSparseIndicesKernel()
+ )
++
 +
 +# --- ported from fork (Lvllmds4-x) for SM80 Triton sparse-MLA ---
 +@triton.jit
@@ -644,30 +720,27 @@ index fefc10e..e6716a3 100644
 +    )
 +
 +
-+
 +def sparse_prefill_combined_topk_size(topk: int, window_size: int) -> int:
 +    return (
 +        (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
 +        // _SPARSE_PREFILL_TOPK_ALIGNMENT
 +        * _SPARSE_PREFILL_TOPK_ALIGNMENT
 +    )
-+
-+
 diff --git a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
-index 4c9f464..8acd213 100644
+index 326a94f4f4..84b5a7e09c 100644
 --- a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
 +++ b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
-@@ -25,6 +25,9 @@ from typing import Any
- import torch
- 
+@@ -33,6 +33,9 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+     VllmTritonJitKernel,
+ )
  from vllm.platforms import current_platform
 +from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 +    _f32_to_e4m3_uint8,
 +)
  from vllm.triton_utils import tl, triton
+ from vllm.utils.math_utils import round_up
  
- if current_platform.is_rocm():
-@@ -263,8 +266,8 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
+@@ -290,8 +293,8 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
      inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
      x_scaled = quant_2d * inv_scales_col
      x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
@@ -678,7 +751,7 @@ index 4c9f464..8acd213 100644
      x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
  
      nope_mask = block < NOPE_HEAD_DIM
-@@ -483,7 +486,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
+@@ -510,7 +513,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
      x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
      x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
      x_uint8 = tl.reshape(
@@ -687,7 +760,7 @@ index 4c9f464..8acd213 100644
          (TRITON_BLOCK_SIZE,),
      )
      tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
-@@ -837,8 +840,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
+@@ -872,8 +875,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
  
      x_scaled = result_bf16 * inv_scale
      x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
@@ -699,50 +772,69 @@ index 4c9f464..8acd213 100644
      tl.store(fp8_ptr + block, x_uint8, mask=mask)
  
 diff --git a/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py b/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
-index 9ae34de..e32f00b 100644
+index cf6e7235f9..f09e45450f 100644
 --- a/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
 +++ b/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
-@@ -4,8 +4,12 @@
+@@ -6,6 +6,9 @@ from typing import Any
+ 
  import torch
  
- from vllm.platforms import current_platform
 +from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 +    _f32_to_e4m3_uint8,
 +)
+ from vllm.model_executor.warmup.jit_warmup import kernel_launcher
+ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+     LaunchSpec,
+@@ -15,6 +18,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+ from vllm.platforms import current_platform
  from vllm.triton_utils import tl, triton
  from vllm.utils.import_utils import has_cutedsl
 +from vllm.v1.attention.backends.mla.sparse_mla_env import is_ampere_or_ada
  
  # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
  MXFP4_BLOCK_SIZE = 32
-@@ -142,23 +146,22 @@ def _fused_indexer_q_rope_quant_kernel(
+@@ -164,8 +168,9 @@ class FusedIndexerQRopeQuantTritonKernel(
+         index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
  
-     # Store quantized values to index_q_fp8. FNUZ (e4m3fnuz) on gfx942, OCP
-     # (e4m3fn) elsewhere -- matches the K cache.
--    fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
-     fp8_base_ptr = (
-         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
-     )
-     if INDEX_Q_NOPE_DIM > 0:
+         # Store quantized values to index_q_fp8. FNUZ (e4m3fnuz) on gfx942, OCP
+-        # (e4m3fn) elsewhere -- matches the K cache.
+-        fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
++        # (e4m3fn) elsewhere -- matches the K cache. On Ampere (SM80/SM86) Triton
++        # lacks fp8e4nv, so encode the raw e4m3fn uint8 bits ourselves; the launch
++        # therefore passes index_q_fp8.view(torch.uint8).
+         fp8_base_ptr = (
+             index_q_fp8_ptr
+             + tok_idx * index_q_fp8_stride0
+@@ -174,16 +179,16 @@ class FusedIndexerQRopeQuantTritonKernel(
+         if INDEX_Q_NOPE_DIM > 0:
+             tl.store(
+                 fp8_base_ptr + nope_offset,
+-                tl.div_rn(x_nope, index_q_scale).to(fp8_dtype),
++                _f32_to_e4m3_uint8(tl.div_rn(x_nope, index_q_scale)),
+             )
+         fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
          tl.store(
-             fp8_base_ptr + nope_offset,
--            tl.div_rn(x_nope, index_q_scale).to(fp8_dtype),
-+            _f32_to_e4m3_uint8(tl.div_rn(x_nope, index_q_scale)),
+             fp8_rot_base + half_offset * 2,
+-            tl.div_rn(r_even, index_q_scale).to(fp8_dtype),
++            _f32_to_e4m3_uint8(tl.div_rn(r_even, index_q_scale)),
          )
-     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
-     tl.store(
-         fp8_rot_base + half_offset * 2,
--        tl.div_rn(r_even, index_q_scale).to(fp8_dtype),
-+        _f32_to_e4m3_uint8(tl.div_rn(r_even, index_q_scale)),
-     )
-     tl.store(
-         fp8_rot_base + half_offset * 2 + 1,
--        tl.div_rn(r_odd, index_q_scale).to(fp8_dtype),
-+        _f32_to_e4m3_uint8(tl.div_rn(r_odd, index_q_scale)),
-     )
+         tl.store(
+             fp8_rot_base + half_offset * 2 + 1,
+-            tl.div_rn(r_odd, index_q_scale).to(fp8_dtype),
++            _f32_to_e4m3_uint8(tl.div_rn(r_odd, index_q_scale)),
+         )
  
-     # FP8 weight-fold contract:
-@@ -356,7 +359,7 @@ def fused_indexer_q_rope_quant(
+         # FP8 weight-fold contract:
+@@ -261,7 +266,7 @@ class FusedIndexerQRopeQuantTritonKernel(
+             index_weights_softmax_scale=1.0,
+             index_weights_head_scale=1.0,
+             index_q_fp8=TritonWarmupTensor(
+-                current_platform.fp8_dtype(),
++                torch.uint8,
+                 shape=(1, compile_key.num_heads, compile_key.index_q_head_dim),
+                 strides=(q_stride0, compile_key.index_q_head_dim, 1),
+             ),
+@@ -595,7 +600,7 @@ def fused_indexer_q_rope_quant(
              dtype=torch.uint8,
              device=index_q.device,
          )
@@ -750,8 +842,8 @@ index 9ae34de..e32f00b 100644
 +        if has_cutedsl() and not is_ampere_or_ada():
              # lazily import, otherwise some tests fail due to CUDA driver init failure.
              from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
-                 fused_indexer_q_rope_quant_mxfp4_cutedsl,
-@@ -425,7 +428,7 @@ def fused_indexer_q_rope_quant(
+                 _INDEXER_Q_MXFP4_KERNEL,
+@@ -651,7 +656,7 @@ def fused_indexer_q_rope_quant(
      use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
      fp8_max = 224.0 if use_fnuz else 448.0
      index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
@@ -759,74 +851,84 @@ index 9ae34de..e32f00b 100644
 +    if has_cutedsl() and not is_ampere_or_ada():
          # lazily import, otherwise some tests fail due to CUDA driver init failure.
          from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
-             fused_indexer_q_rope_quant_fp8_cutedsl,
-@@ -461,7 +464,7 @@ def fused_indexer_q_rope_quant(
-             index_q_cos_sin_cache,
-             index_q_cos_sin_cache.stride(0),
-             index_q_cos_sin_cache.shape[-1] // 2,
+             _INDEXER_Q_FP8_KERNEL,
+@@ -699,7 +704,7 @@ def fused_indexer_q_rope_quant(
+             index_weights,
+             index_weights_softmax_scale,
+             index_weights_head_scale,
 -            index_q_fp8,
 +            index_q_fp8.view(torch.uint8),
-             index_q_fp8.stride(0),
-             index_q_fp8.stride(1),
-             index_q_head_dim,
+             index_weights_out,
+             fp8_max=fp8_max,
+             use_fnuz=use_fnuz,
 diff --git a/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py b/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
-index aa87505..851c3e8 100644
+index 77b1aa2236..25c142b50b 100644
 --- a/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
 +++ b/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
-@@ -9,6 +9,10 @@ INT32-packed UE8M0 on SM100) so fp8_einsum skips transform_sf_into_required_layo
+@@ -12,6 +12,9 @@ from typing import Any
  
  import torch
  
 +from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 +    _f32_to_e4m3_uint8,
 +)
-+
- from vllm.platforms import current_platform
- from vllm.triton_utils import tl, triton
- from vllm.utils.torch_utils import direct_register_custom_op
-@@ -118,7 +122,9 @@ def _fused_inv_rope_fp8_quant_per_head(
-         ),
-         (HEAD_DIM,),
-     )
--    x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
-+    # Ampere (SM80/SM86) lacks the Triton fp8e4nv type; encode e4m3 bytes and
-+    # store through a uint8 view of the output (identical 1-byte layout).
-+    x_quant = _f32_to_e4m3_uint8(tl.clamp(x / scales_exp, -fp8_max, fp8_max))
+ from vllm.model_executor.warmup.jit_warmup import kernel_launcher
+ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+     LaunchSpec,
+@@ -160,7 +163,9 @@ class FusedInvRopeFP8QuantKernel(
+             ),
+             (HEAD_DIM,),
+         )
+-        x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
++        # Ampere (SM80/SM86) lacks the Triton fp8e4nv type; encode e4m3 bytes and
++        # store through a uint8 view of the output (identical 1-byte layout).
++        x_quant = _f32_to_e4m3_uint8(tl.clamp(x / scales_exp, -fp8_max, fp8_max))
  
-     fp8_base = (
-         fp8_ptr
-@@ -261,7 +267,7 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
+         out_base = (
+             out_ptr
+@@ -284,7 +289,9 @@ class FusedInvRopeFP8QuantKernel(
+                 shape=(1, compile_key.half_rope * 2),
+             ),
+             out_buf=TritonWarmupTensor(
+-                torch.float8_e4m3fn if compile_key.quantize else torch.bfloat16,
++                # Kernel writes e4m3 bytes through a uint8 view (SM80-safe), so
++                # the warmup pointer must specialize as uint8 too.
++                torch.uint8 if compile_key.quantize else torch.bfloat16,
+                 shape=(compile_key.heads_per_group, 1, out_dim),
+                 strides=(out_dim, out_dim, 1),
+             ),
+@@ -474,7 +481,7 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
          o,
          positions,
          cos_sin_cache,
--        fp8_buf,
-+        fp8_buf.view(torch.uint8),
+-        out_buf,
++        out_buf.view(torch.uint8) if quantize else out_buf,
          scale_buf,
          num_tokens,
          heads_per_group=heads_per_group,
 diff --git a/vllm/models/deepseek_v4/compressor.py b/vllm/models/deepseek_v4/compressor.py
-index ccfdbea..a36d127 100644
+index 41af0c7660..f821fcdb41 100644
 --- a/vllm/models/deepseek_v4/compressor.py
 +++ b/vllm/models/deepseek_v4/compressor.py
 @@ -21,6 +21,7 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
-     save_partial_states,
+     _SAVE_PARTIAL_STATES_KERNEL,
  )
  from vllm.platforms import current_platform
 +from vllm.v1.attention.backends.mla.sparse_mla_env import is_ampere_or_ada
  from vllm.v1.attention.backend import (
      AttentionBackend,
      AttentionCGSupport,
-@@ -399,7 +400,7 @@ class DeepseekCompressor(nn.Module):
+@@ -443,7 +444,7 @@ class DeepseekCompressor(nn.Module):
          # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
          # does not, so the two callables have different signatures.
          compress_norm_rope_store_fn: Any
 -        if current_platform.is_cuda() and self.head_dim == 512:
 +        if current_platform.is_cuda() and self.head_dim == 512 and not is_ampere_or_ada():
              from .nvidia.ops.sparse_attn_compress_cutedsl import (
-                 compress_norm_rope_store_cutedsl,
+                 _SPARSE_ATTN_COMPRESSOR_CUTEDSL_KERNEL,
              )
 diff --git a/vllm/models/deepseek_v4/nvidia/flashmla.py b/vllm/models/deepseek_v4/nvidia/flashmla.py
-index 0ae0d87..a5e8b8e 100644
+index 0ae0d87a14..a5e8b8ec5c 100644
 --- a/vllm/models/deepseek_v4/nvidia/flashmla.py
 +++ b/vllm/models/deepseek_v4/nvidia/flashmla.py
 @@ -1,16 +1,20 @@
@@ -1887,7 +1989,7 @@ index 0ae0d87..a5e8b8e 100644
 +                    flush=True,
 +                )
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index be4e87e..badaa3f 100644
+index b1379cc9eb..cb527e5917 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -1,6 +1,8 @@
@@ -1899,7 +2001,7 @@ index be4e87e..badaa3f 100644
  from collections.abc import Callable, Iterable
  from inspect import signature
  from itertools import islice
-@@ -1093,6 +1095,9 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+@@ -1128,6 +1130,9 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
      )
  
  
@@ -1909,7 +2011,7 @@ index be4e87e..badaa3f 100644
  class DeepseekV4DecoderLayer(nn.Module):
      def __init__(
          self,
-@@ -1105,6 +1110,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -1140,6 +1145,7 @@ class DeepseekV4DecoderLayer(nn.Module):
  
          config = vllm_config.model_config.hf_config
          self.hidden_size = config.hidden_size
@@ -1917,7 +2019,7 @@ index be4e87e..badaa3f 100644
          self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
  
          self.rms_norm_eps = config.rms_norm_eps
-@@ -1183,10 +1189,18 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -1266,10 +1272,18 @@ class DeepseekV4DecoderLayer(nn.Module):
          res_mix: torch.Tensor | None = None,
          residual: torch.Tensor | None = None,
      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1936,7 +2038,7 @@ index be4e87e..badaa3f 100644
              if x.dim() == 2:
                  assert self.hc_attn_fn_broadcast is not None
                  residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
-@@ -1241,9 +1255,22 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -1324,9 +1338,22 @@ class DeepseekV4DecoderLayer(nn.Module):
          if self.use_sequence_parallel:
              x = sp_all_gather(x)[: positions.shape[0]]
  
@@ -1959,7 +2061,7 @@ index be4e87e..badaa3f 100644
  
          ffn_norm_weight = self.ffn_norm.weight.data
          ffn_norm_eps = self.ffn_norm.variance_epsilon
-@@ -1267,6 +1294,25 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -1350,6 +1377,25 @@ class DeepseekV4DecoderLayer(nn.Module):
          )
  
          x = self.ffn(x, input_ids)
@@ -1985,7 +2087,7 @@ index be4e87e..badaa3f 100644
          return x, residual, post_mix, res_mix
  
  
-@@ -1409,6 +1455,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1504,6 +1550,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              input_ids = input_ids.to(torch.int64)
  
          full_num_tokens = positions.shape[0]
@@ -1999,7 +2101,7 @@ index be4e87e..badaa3f 100644
          if self.use_sequence_parallel:
              if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                  forward_context = get_forward_context()
-@@ -1468,6 +1521,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1563,6 +1616,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              num_tokens = hidden_states.shape[0]
              self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
  
@@ -2012,7 +2114,7 @@ index be4e87e..badaa3f 100644
          hidden_states = hc_head_fused_kernel_tilelang(
              hidden_states,
              self.hc_head_fn,
-@@ -1823,13 +1882,30 @@ class DeepseekV4ForCausalLM(
+@@ -1919,13 +1978,30 @@ class DeepseekV4ForCausalLM(
          hidden_states: torch.Tensor,
      ) -> torch.Tensor | None:
          logits = self.logits_processor(self.lm_head, hidden_states)
@@ -2046,7 +2148,7 @@ index be4e87e..badaa3f 100644
          self,
 diff --git a/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py b/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py
 new file mode 100644
-index 0000000..f61ddf3
+index 0000000000..f61ddf310b
 --- /dev/null
 +++ b/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py
 @@ -0,0 +1,320 @@
@@ -2371,10 +2473,10 @@ index 0000000..f61ddf3
 +
 +    fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
 diff --git a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
-index b064fbe..04af223 100644
+index 72ce43b46c..9287c6bcd8 100644
 --- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 +++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
-@@ -3,23 +3,30 @@
+@@ -3,8 +3,10 @@
  import torch
  import torch.nn as nn
  
@@ -2386,15 +2488,11 @@ index b064fbe..04af223 100644
 +    deepseek_v4_fp8_einsum_config,
  )
  from vllm.platforms import current_platform
--from vllm.utils.deep_gemm import fp8_einsum
- 
- 
- def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
+ from vllm.utils.deep_gemm import fp8_einsum
+@@ -16,11 +18,17 @@ def compute_fp8_einsum_recipe(
      """fp8_einsum recipe + scale layout for the current GPU arch.
  
-     SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128.
--    SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.
-+    SM100/SM110: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.
+     SM90 keeps block-row FP32 scales. SM100 uses packed per-row E8M0 scales.
 +    SM12x: RTX PRO / GB10 does not expose the same TMA/TCGEN05 path, so keep
 +    the legacy FP32 block-scale layout expected by DeepGEMM.
 +    SM 8.x (Ampere/Ada): no DeepGEMM fp8_einsum; the portable Triton kernel in
@@ -2406,39 +2504,61 @@ index b064fbe..04af223 100644
      assert cap is not None, "DeepseekV4 attention requires a CUDA device"
 +    if cap.major in (8, 12):
 +        return deepseek_v4_fp8_einsum_config(cap.major)
-     einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
+     einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, block_size)
      tma_aligned_scales = cap.major >= 10
      return einsum_recipe, tma_aligned_scales
-@@ -60,14 +67,18 @@ def deep_gemm_fp8_o_proj(
-         device=o.device,
+@@ -65,18 +73,36 @@ def deep_gemm_fp8_o_proj(
          dtype=torch.bfloat16,
      )
--    weight_scale = (
--        wo_a.weight_scale if hasattr(wo_a, "weight_scale") else wo_a.weight_scale_inv
--    )
--    fp8_einsum(
--        "bhr,hdr->bhd",
--        (o_fp8, o_scale),
--        (wo_a.weight, weight_scale),
-+    # MarlinFP8.process_weights_after_loading renames block-FP8 scales to
-+    # weight_scale_inv. Non-Marlin kernels keep the on-disk weight_scale name.
-+    wo_a_scale = getattr(wo_a, "weight_scale_inv", None)
-+    if wo_a_scale is None:
-+        wo_a_scale = wo_a.weight_scale
-+    deepseek_v4_fp8_einsum(
-+        o_fp8,
-+        o_scale,
-+        wo_a.weight,
-+        wo_a_scale,
-         z,
--        recipe=einsum_recipe,
-+        "bhr,hdr->bhd",
-+        list(einsum_recipe),
-     )
-     return wo_b(z.flatten(1))
+     if use_fp8:
+-        weight_scale = (
+-            wo_a.weight_scale
+-            if hasattr(wo_a, "weight_scale")
+-            else wo_a.weight_scale_inv
+-        )
+-        fp8_einsum(
+-            "bhr,hdr->bhd",
+-            (o_proj_input, o_scale),
+-            (wo_a.weight, weight_scale),
+-            z,
+-            recipe=einsum_recipe,
+-        )
++        cap = current_platform.get_device_capability()
++        if cap is not None and cap.major in (8, 12):
++            # DeepGEMM's fp8_einsum is SM90+ only, so Ampere/Ada and SM12x use
++            # the portable Triton kernel. MarlinFP8 renames block-FP8 scales to
++            # weight_scale_inv; other kernels keep the weight_scale name.
++            weight_scale = getattr(wo_a, "weight_scale_inv", None)
++            if weight_scale is None:
++                weight_scale = wo_a.weight_scale
++            deepseek_v4_fp8_einsum(
++                o_proj_input,
++                o_scale,
++                wo_a.weight,
++                weight_scale,
++                z,
++                "bhr,hdr->bhd",
++                list(einsum_recipe),
++            )
++        else:
++            weight_scale = (
++                wo_a.weight_scale
++                if hasattr(wo_a, "weight_scale")
++                else wo_a.weight_scale_inv
++            )
++            fp8_einsum(
++                "bhr,hdr->bhd",
++                (o_proj_input, o_scale),
++                (wo_a.weight, weight_scale),
++                z,
++                recipe=einsum_recipe,
++            )
+     else:
+         grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
+         torch.bmm(
 diff --git a/vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py b/vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py
 new file mode 100644
-index 0000000..9580c43
+index 0000000000..9580c434fe
 --- /dev/null
 +++ b/vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py
 @@ -0,0 +1,711 @@
@@ -3155,7 +3275,7 @@ index 0000000..9580c43
 +    return _tf32_hc_prenorm_gemm_torch(x, fn, out, sqrsum, num_split)
 diff --git a/vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py b/vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py
 new file mode 100644
-index 0000000..4da459d
+index 0000000000..4da459d8cc
 --- /dev/null
 +++ b/vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py
 @@ -0,0 +1,756 @@
@@ -3916,10 +4036,10 @@ index 0000000..4da459d
 +        num_warps=4,
 +    )
 diff --git a/vllm/models/deepseek_v4/sparse_mla.py b/vllm/models/deepseek_v4/sparse_mla.py
-index 7f371c3..e6fe11c 100644
+index 4953bdc925..26ecdb7ff0 100644
 --- a/vllm/models/deepseek_v4/sparse_mla.py
 +++ b/vllm/models/deepseek_v4/sparse_mla.py
-@@ -87,7 +87,13 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
+@@ -93,7 +93,13 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
  
      @classmethod
      def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
@@ -3935,7 +4055,7 @@ index 7f371c3..e6fe11c 100644
  
  @dataclass
 diff --git a/vllm/utils/deep_gemm.py b/vllm/utils/deep_gemm.py
-index 3fc70c0..f14a309 100644
+index 3fc70c0f5d..f14a309fc1 100644
 --- a/vllm/utils/deep_gemm.py
 +++ b/vllm/utils/deep_gemm.py
 @@ -544,6 +544,10 @@ def fp8_fp4_mqa_logits(
@@ -4070,7 +4190,7 @@ index 3fc70c0..f14a309 100644
 +        x, fn, out, sqrsum, num_split
 +    )
 diff --git a/vllm/utils/import_utils.py b/vllm/utils/import_utils.py
-index 20c510e..6b621ae 100644
+index 20c510edc0..6b621ae5da 100644
 --- a/vllm/utils/import_utils.py
 +++ b/vllm/utils/import_utils.py
 @@ -596,9 +596,21 @@ def has_fbgemm_gpu() -> bool:
@@ -4098,10 +4218,10 @@ index 20c510e..6b621ae 100644
  
  def has_humming() -> bool:
 diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
-index 6198c14..f4ff6e4 100644
+index 2321cf8d13..5bfe1e9b92 100644
 --- a/vllm/v1/attention/backends/mla/indexer.py
 +++ b/vllm/v1/attention/backends/mla/indexer.py
-@@ -69,6 +69,22 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
+@@ -74,6 +74,22 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
      return use_fp4
  
  
@@ -4124,7 +4244,7 @@ index 6198c14..f4ff6e4 100644
  class PrepareUniformDecodeKernel(
      VllmTritonJitKernel["PrepareUniformDecodeKernel.CompileKey"]
  ):
-@@ -1264,7 +1280,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -1463,7 +1479,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
  
              # DeepGEMM is required for the paged MQA logits on CUDA devices
              schedule_metadata = self.scheduler_metadata_buffer
@@ -4135,7 +4255,7 @@ index 6198c14..f4ff6e4 100644
                      self.kv_cache_spec.num_states,
 diff --git a/vllm/v1/attention/backends/mla/sparse_mla_env.py b/vllm/v1/attention/backends/mla/sparse_mla_env.py
 new file mode 100644
-index 0000000..ff22b14
+index 0000000000..ff22b14cde
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/sparse_mla_env.py
 @@ -0,0 +1,119 @@
@@ -4260,7 +4380,7 @@ index 0000000..ff22b14
 +    return current_platform.is_device_capability_family(120) or is_ampere_or_ada()
 diff --git a/vllm/v1/attention/backends/mla/sparse_mla_kernels.py b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
 new file mode 100644
-index 0000000..bd3986c
+index 0000000000..bd3986c971
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
 @@ -0,0 +1,3517 @@
@@ -7782,10 +7902,10 @@ index 0000000..bd3986c
 +        num_warps=4,
 +    )
 diff --git a/vllm/v1/attention/backends/mla/sparse_swa.py b/vllm/v1/attention/backends/mla/sparse_swa.py
-index ccdf47f..5a228c3 100644
+index 62c3921b5e..9eddefda9a 100644
 --- a/vllm/v1/attention/backends/mla/sparse_swa.py
 +++ b/vllm/v1/attention/backends/mla/sparse_swa.py
-@@ -189,6 +189,7 @@ class DeepseekSparseSWAMetadata:
+@@ -201,6 +201,7 @@ class DeepseekSparseSWAMetadata:
      prefill_seq_lens: torch.Tensor | None = None
      prefill_seq_lens_cpu: torch.Tensor | None = None
      prefill_gather_lens: torch.Tensor | None = None
@@ -7793,7 +7913,7 @@ index ccdf47f..5a228c3 100644
      prefill_query_lens_cpu: torch.Tensor | None = None
      prefill_window_size: int = 0
      prefill_max_model_len: int = 0
-@@ -862,10 +863,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
+@@ -888,10 +889,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
              result["prefill_seq_lens"] = seq_lens[num_decodes:]
              result["prefill_seq_lens_cpu"] = seq_lens_cpu[num_decodes:]
              result["prefill_gather_lens"] = pfx_gather_lens
@@ -7812,3 +7932,20 @@ index ccdf47f..5a228c3 100644
              result["prefill_window_size"] = self.window_size
              result["prefill_max_model_len"] = self.max_model_len
              result["prefill_max_num_batched_tokens"] = self.max_num_batched_tokens
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index ffc9a5de7e..80f943d297 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -97,7 +97,11 @@ from vllm.version import __version__ as VLLM_VERSION
+ logger = init_logger(__name__)
+ 
+ 
+-HANDSHAKE_TIMEOUT_MINS = 5
++# EngineCore <-> front-end handshake budget.  A CPU/GPU hybrid MoE deployment
++# (routed-expert weights in host memory) builds one CPU MoE engine per layer
++# during weight loading, which can exceed 5 minutes for a 40+ layer model; the
++# timeout is therefore overridable.  Defaults to the upstream 5 minutes.
++HANDSHAKE_TIMEOUT_MINS = int(os.environ.get("VLLM_HANDSHAKE_TIMEOUT_MINS", "5"))
+ 
+ _R = TypeVar("_R")  # Return type for collective_rpc
+ 

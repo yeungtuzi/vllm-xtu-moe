@@ -7,16 +7,38 @@ v0.1.0 的性能数字全部来自 **lk 编排链 fork**(`Lvllmds4-x`);用户要
 
 ---
 
+## ⚠️ 重切说明(2026-09-14 晚,同名 `v0.2.0`)
+
+**同日重建发行物**:初版 v0.2.0 针对主线 `6c73b08dec`(2026-09-08);当晚主线已前进
+**346 commits**,初版 wheel **在新主线上不能工作**。本次把发行物重建到新基线
+**`dabc4362b`(2026-09-14)**,版本号仍为 0.2.0(tag/release 覆写)。
+
+| | 初版 v0.2.0 | **重切 v0.2.0** |
+|---|---|---|
+| 针对的主线 commit | `6c73b08dec`(2026-09-08) | **`dabc4362b`(2026-09-14,+346 commits)** |
+| 插件在新主线上 | ❌ `select_experts` ImportError / `num_hash_layers` TypeError / PLE 静默失效 | ✅ 已适配 4 类 API 漂移 |
+| `patches/upstream/pr0..pr3` | 只适用旧基线(pr1 有 1 个 hunk 失败) | ✅ **重新生成,在 `dabc4362b` 上 0 failed hunks** |
+| C=1 TPOT / 相对 fork | 35.97 ms / 1.34× | **33.46 ms / 1.25×** |
+| 每 worker 内存 | 190 GB | **192.7 GB** |
+| 数值门禁 | `OK=7 BAD=1`,1.873e-02 | **逐位一致** |
+
+> 如果你已经装了初版 v0.2.0 的 wheel 且**停留在旧主线 `6c73b08dec`**,可以继续用;
+> 一旦升级主线,请换用本次重切的 wheel。完整过程见
+> [`report/tuning/NOTES.md`](report/tuning/NOTES.md) §368 与
+> [`report/tuning/IRON_RULES.md`](report/tuning/IRON_RULES.md) R10。
+
+---
+
 ## 摘要
 
 | | v0.1.0 | **v0.2.0** |
 |---|---|---|
 | 运行方式 | lvllm fork + lk 编排链 + 插件 | **vLLM 主线 + 插件**(零编排补丁 / 极少数补丁) |
 | 安装 | 两套(fork + 插件) | **一条命令** `install_mainline.sh`(纯插件 / +补丁 分档) |
-| 解码(同机同协议 C=1 TPOT) | 26.81 ms(fork) | **35.97 ms** ⇒ 相对 fork **1.34×** |
-| 内存(每 worker) | 105 GB(fork) | **190 GB** |
+| 解码(同机同协议 C=1 TPOT) | 26.81 ms(fork) | **33.46 ms** ⇒ 相对 fork **1.25×** |
+| 内存(每 worker) | 105 GB(fork) | **192.7 GB** |
 | 数值门禁 | `OK=7 BAD=1` | **`OK=7 BAD=1`**(me=1 max_rel **1.873e-02**,逐位保持) |
-| 启动自检 | 无 | **9 条断言**,把"静默变慢 30×"的配置错误变成启动时失败 |
+| 启动自检 | 无 | **10 条断言**,把"静默变慢 30×"的配置错误变成启动时失败 |
 
 ---
 

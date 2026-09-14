@@ -1,14 +1,5 @@
-# GPU/CPU mixed mode: generic CPU experts backend support (mainline worktree snapshot)
-# 2026-09-09 night. Files:
-#   oracle/fp8.py        - prefer CPU backend in mixed mode + skip AMX prepack
-#   oracle/int_wna16.py  - same (priority + skip blocked repack)
-#   oracle/unquantized.py- same (priority; BF16 experts)
-#   quantization/fp8.py  - notify experts.process_weights_after_loading in mixed mode
-#     NOTE: this file also carries the earlier is_bmm SM80 fix (PR2).
-# Apply with: git apply -p1 (from the vllm repo root)
-
 diff --git a/vllm/model_executor/layers/fused_moe/oracle/fp8.py b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
-index abe4737..a824016 100644
+index abe47373de..a824016f8d 100644
 --- a/vllm/model_executor/layers/fused_moe/oracle/fp8.py
 +++ b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
 @@ -131,6 +131,12 @@ def _get_priority_backends(
@@ -41,10 +32,10 @@ index abe4737..a824016 100644
          if fp8_backend not in [
              Fp8MoeBackend.TRITON,
 diff --git a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
-index 5d3212a..c322711 100644
+index d47ad9c97e..5c00f3c357 100644
 --- a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
 +++ b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
-@@ -10,6 +10,7 @@ from compressed_tensors.quantization import (
+@@ -11,6 +11,7 @@ from compressed_tensors.quantization import (
  )
  
  import vllm._custom_ops as ops
@@ -52,7 +43,7 @@ index 5d3212a..c322711 100644
  import vllm.model_executor.layers.fused_moe.modular_kernel as mk
  from vllm.config.kernel import MoEBackend
  from vllm.logger import init_logger
-@@ -111,6 +112,10 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
+@@ -120,6 +121,10 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
      """
      if current_platform.is_cpu():
          return [WNA16MoEBackend.CPU]
@@ -63,7 +54,7 @@ index 5d3212a..c322711 100644
      if current_platform.is_xpu():
          return [WNA16MoEBackend.XPU]
  
-@@ -988,6 +993,23 @@ def _process_weights_cpu(
+@@ -983,6 +988,27 @@ def _process_weights_cpu(
              else w2_qzeros.data
          )
  
@@ -92,7 +83,7 @@ index 5d3212a..c322711 100644
          blocked_w13,
          blocked_w2,
 diff --git a/vllm/model_executor/layers/fused_moe/oracle/unquantized.py b/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
-index b24f2a9..0ca5884 100644
+index b24f2a9a79..0ca58845ee 100644
 --- a/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
 +++ b/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
 @@ -58,6 +58,17 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
@@ -127,7 +118,7 @@ index b24f2a9..0ca5884 100644
  
  
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
-index 2cf7168..8d2924b 100644
+index d8bef7347d..1b449d9654 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
 +++ b/vllm/model_executor/layers/quantization/fp8.py
 @@ -50,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -138,7 +129,7 @@ index 2cf7168..8d2924b 100644
      process_fp8_weight_tensor_strategy,
      process_fp8_weight_tensor_strategy_moe,
      validate_fp8_block_shape,
-@@ -385,6 +386,28 @@ class Fp8LinearMethod(LinearMethodBase):
+@@ -386,6 +387,28 @@ class Fp8LinearMethod(LinearMethodBase):
                  self.fp8_linear.marlin_input_dtype = self.marlin_input_dtype
              return
  
@@ -167,7 +158,7 @@ index 2cf7168..8d2924b 100644
          if self.use_marlin:
              if not self.block_quant:
                  # Canonicalize to (K, N) for the kernel.
-@@ -749,6 +772,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -739,6 +762,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              routing_tables=layer._expert_routing_tables(),
          )
  

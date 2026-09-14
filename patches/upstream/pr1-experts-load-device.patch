@@ -1,16 +1,23 @@
 diff --git a/vllm/envs.py b/vllm/envs.py
-index a3ef86d..e3d267c 100755
+index 6158f86f89..2d11b225f6 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -88,6 +88,7 @@ if TYPE_CHECKING:
+@@ -87,6 +87,14 @@ if TYPE_CHECKING:
+     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
      VLLM_MEDIA_CONNECTOR: str = "http"
-     VLLM_MM_HASHER_ALGORITHM: str = "blake3"
      VLLM_TARGET_DEVICE: str = "cuda"
 +    VLLM_EXPERTS_LOAD_DEVICE: Literal["gpu", "cpu"] = "gpu"
++    VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL: bool = True
++    VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL: bool = True
++    VLLM_TRITON_MLA_SPARSE: bool | None = None
++    VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
++    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int = 256
++    VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: int | None = None
++    VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE: bool | None = None
      VLLM_MAIN_CUDA_VERSION: str = "13.0"
      VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
      VLLM_BATCH_INVARIANT: bool = False
-@@ -614,6 +615,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -602,6 +610,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
      # Target device of vLLM, supporting [cuda (by default),
      # rocm, cpu]
      "VLLM_TARGET_DEVICE": lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda").lower(),
@@ -22,67 +29,158 @@ index a3ef86d..e3d267c 100755
 +    "VLLM_EXPERTS_LOAD_DEVICE": env_with_choices(
 +        "VLLM_EXPERTS_LOAD_DEVICE", "gpu", ["gpu", "cpu"], case_sensitive=False
 +    ),
++    "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL": lambda: bool(
++        int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL", "1"))
++    ),
++    "VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL": lambda: bool(
++        int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL", "1"))
++    ),
++    # Experimental portable Triton sparse-MLA fallback (SM8.x/Ampere+Ada and
++    # SM12x). Unset means auto-select where the FlashMLA sparse kernels are
++    # unavailable; set 0/1 to force-disable/force-enable.
++    "VLLM_TRITON_MLA_SPARSE": lambda: (
++        None
++        if os.getenv("VLLM_TRITON_MLA_SPARSE") is None
++        else bool(int(os.getenv("VLLM_TRITON_MLA_SPARSE", "0")))
++    ),
++    "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE": lambda: int(
++        os.getenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", "512")
++    ),
++    "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE": lambda: int(
++        os.getenv("VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE", "256")
++    ),
++    "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE": lambda: maybe_convert_int(
++        os.getenv("VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE")
++    ),
++    "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE": lambda: (
++        None
++        if os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE") is None
++        else bool(int(os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE", "0")))
++    ),
      # Main CUDA version of vLLM. This follows PyTorch but can be overridden.
      "VLLM_MAIN_CUDA_VERSION": lambda: (
          os.getenv("VLLM_MAIN_CUDA_VERSION", "").lower() or "13.0"
-diff --git a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
-index 1fa2f63..17d126d 100644
---- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
-+++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
-@@ -577,6 +577,19 @@ def select_mxfp4_moe_backend(
-         assert last_error is not None
-         raise last_error
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/fp8.py b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+index abe47373de..a824016f8d 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/fp8.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+@@ -131,6 +131,12 @@ def _get_priority_backends(
+         # CPU platform uses FP8 W8A16 fused MoE kernel.
+         _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU)
  
 +    # GPU/CPU mixed mode: expert weights live on the host (see
-+    # VLLM_EXPERTS_LOAD_DEVICE), so a GPU expert kernel cannot consume them.
-+    # Select the CPU backend unconditionally rather than preferring the GPU
-+    # kernels (Marlin WNA16 etc.), which would only fail with "not on GPU".
++    # VLLM_EXPERTS_LOAD_DEVICE), so only the CPU backend can consume them.
++    # Prefer it on a GPU platform as well.
 +    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
-+        return _return_or_raise(
-+            Mxfp4MoeBackend.CPU,
-+            config,
-+            kMxfp4Static,
-+            None,
-+            activation_format,
-+        )
++        _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU)
 +
-     if _requires_qwen38_tep8_emulation(config, requested_activation_key):
-         backend = Mxfp4MoeBackend.EMULATION
-         logger.warning_once(
-@@ -627,7 +640,10 @@ def select_mxfp4_moe_backend(
-             activation_format,
+     return _AVAILABLE_BACKENDS
+ 
+ 
+@@ -579,7 +585,14 @@ def convert_to_fp8_moe_kernel_format(
+             prepare_fp8_moe_layer_for_cpu,
          )
  
--    if current_platform.is_cpu():
-+    # CPU/GPU mixed mode: the expert weights live on the host while the rest of
-+    # the model runs on the GPU, so the CPU backend is a valid fallback even
-+    # though the platform is not CPU-only.
-+    if current_platform.is_cpu() or envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
-         backend = Mxfp4MoeBackend.CPU
-         logger.info_once(_make_log_backend(backend))
-         return _return_or_raise(
-@@ -1303,6 +1319,19 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
-             prepare_mxfp4_moe_layer_for_cpu,
-         )
- 
+-        w13, w2 = prepare_fp8_moe_layer_for_cpu(w13, w2)
 +        if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
 +            # GPU/CPU mixed mode: the CPU backend is an out-of-tree engine that
-+            # consumes the raw [E, 2I, H//2] / [E, H, I//2] uint8 weights and
-+            # raw e8m0 scales directly, so skip the AMX prepack.
-+            return (
-+                w13_weight.data,
-+                w2_weight.data,
-+                w13_weight_scale.data,
-+                w2_weight_scale.data,
-+                w13_bias,
-+                w2_bias,
-+            )
++            # consumes the raw [E, 2I, H] fp8 weights + block scales directly,
++            # so skip the AMX prepack (which also needs torch.ops._C packing
++            # kernels that may not be built for every deployment).
++            pass
++        else:
++            w13, w2 = prepare_fp8_moe_layer_for_cpu(w13, w2)
+     else:
+         if fp8_backend not in [
+             Fp8MoeBackend.TRITON,
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+index d47ad9c97e..5c00f3c357 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+@@ -11,6 +11,7 @@ from compressed_tensors.quantization import (
+ )
+ 
+ import vllm._custom_ops as ops
++import vllm.envs as envs
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm.config.kernel import MoEBackend
+ from vllm.logger import init_logger
+@@ -120,6 +121,10 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
+     """
+     if current_platform.is_cpu():
+         return [WNA16MoEBackend.CPU]
++    # GPU/CPU mixed mode: expert weights live on the host (see
++    # VLLM_EXPERTS_LOAD_DEVICE), so only the CPU backend can consume them.
++    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++        return [WNA16MoEBackend.CPU]
+     if current_platform.is_xpu():
+         return [WNA16MoEBackend.XPU]
+ 
+@@ -983,6 +988,27 @@ def _process_weights_cpu(
+             else w2_qzeros.data
+         )
+ 
++    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++        # GPU/CPU mixed mode: the CPU backend is an out-of-tree engine that
++        # consumes the raw packed int4 weights + scales directly, so skip the
++        # AMX blocked repack.
++        return (
++            w13,
++            w2,
++            w13_scale,
++            w2_scale,
++            w13_g_idx,
++            w2_g_idx,
++            None,  # w13_g_idx_sort_indices
++            None,  # w2_g_idx_sort_indices
++            w13_zeros,
++            w2_zeros,
++            None,  # w13_input_global_scale
++            None,  # w2_input_global_scale
++            w13_bias,
++            w2_bias,
++        )
 +
-         packed_w13, packed_w2, packed_w13_scale, packed_w2_scale = (
-             prepare_mxfp4_moe_layer_for_cpu(
-                 w13_weight.data,
+     (
+         blocked_w13,
+         blocked_w2,
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/unquantized.py b/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
+index b24f2a9a79..0ca58845ee 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
+@@ -58,6 +58,17 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
+     ) -> None:
+         backends.append(backends.pop(backends.index(backend)))
+ 
++    def _move_to_front(
++        backends: list[UnquantizedMoeBackend],
++        backend: UnquantizedMoeBackend,
++    ) -> None:
++        # The CUDA/ROCm priority lists do not contain CPU, so insert instead of
++        # assuming membership (mixed mode needs CPU first on a GPU platform).
++        if backend in backends:
++            backends.insert(0, backends.pop(backends.index(backend)))
++        else:
++            backends.insert(0, backend)
++
+     if current_platform.is_rocm():
+         _AVAILABLE_BACKENDS = [
+             UnquantizedMoeBackend.AITER,
+@@ -96,6 +107,12 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
+         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.XPU]
+     elif current_platform.is_cpu():
+         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
++
++    # GPU/CPU mixed mode: expert weights live on the host (see
++    # VLLM_EXPERTS_LOAD_DEVICE), so only the CPU backend can consume them.
++    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++        _move_to_front(_AVAILABLE_BACKENDS, UnquantizedMoeBackend.CPU)
++
+     return _AVAILABLE_BACKENDS
+ 
+ 
 diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
-index e9a7fc4..f1c429c 100644
+index 2dafb6c493..bf8f3c9aa8 100644
 --- a/vllm/model_executor/layers/fused_moe/routed_experts.py
 +++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
 @@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
@@ -93,9 +191,9 @@ index e9a7fc4..f1c429c 100644
  from vllm.distributed.eplb.eplb_state import EplbState
  from vllm.logger import init_logger
  from vllm.model_executor.custom_op import PluggableLayer
-@@ -174,7 +175,19 @@ class RoutedExperts(PluggableLayer):
-                 self.moe_config.intermediate_size
-             )
+@@ -168,7 +169,19 @@ class RoutedExperts(PluggableLayer):
+             "global_num_experts": moe_config.num_experts,
+         }
  
 -        self.quant_method.create_weights(layer=self, **moe_quant_params)
 +        # GPU/CPU mixed mode: construct the expert weights on the host when
@@ -114,3 +212,61 @@ index e9a7fc4..f1c429c 100644
  
          self.lora_base_layer_prefix = ""
  
+diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
+index d8bef7347d..1b449d9654 100644
+--- a/vllm/model_executor/layers/quantization/fp8.py
++++ b/vllm/model_executor/layers/quantization/fp8.py
+@@ -50,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+     create_fp8_scale_parameter,
+     create_fp8_weight_parameter,
+     process_fp8_input_tensor_strategy_moe,
++    process_fp8_weight_block_strategy,
+     process_fp8_weight_tensor_strategy,
+     process_fp8_weight_tensor_strategy_moe,
+     validate_fp8_block_shape,
+@@ -386,6 +387,28 @@ class Fp8LinearMethod(LinearMethodBase):
+                 self.fp8_linear.marlin_input_dtype = self.marlin_input_dtype
+             return
+ 
++        if self.use_marlin and getattr(layer, "is_bmm", False):
++            # DSv4 o_proj `wo_a` is consumed by a fused per-group einsum that
++            # reads its weight directly (apply_weights is bypassed). Marlin
++            # would repack the weight into its opaque int32 layout and break
++            # that einsum, so pre-dequantize the FP8 block weight to bf16 while
++            # keeping the original [N, K] layout.
++            assert self.block_quant
++            weight, weight_scale_inv = process_fp8_weight_block_strategy(
++                layer.weight, layer.weight_scale_inv
++            )
++            block_m, block_k = self.weight_block_size
++            scale = weight_scale_inv.to(torch.float32)
++            scale = torch.repeat_interleave(scale, block_m, dim=-2)
++            scale = torch.repeat_interleave(scale, block_k, dim=-1)
++            scale = scale[: weight.shape[-2], : weight.shape[-1]]
++            weight = (weight.to(torch.float32) * scale).to(torch.bfloat16)
++            replace_parameter(layer, "weight", weight.data)
++            replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
++            layer.input_scale = None
++            self.use_marlin = False
++            return
++
+         if self.use_marlin:
+             if not self.block_quant:
+                 # Canonicalize to (K, N) for the kernel.
+@@ -739,6 +762,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+             routing_tables=layer._expert_routing_tables(),
+         )
+ 
++        # GPU/CPU mixed mode: an out-of-tree CPU experts backend (e.g.
++        # vllm-xtu-moe) captures the layer in its own
++        # process_weights_after_loading. The in-tree CPU prepack that would
++        # normally run inside convert_to_fp8_moe_kernel_format is skipped in
++        # mixed mode, so notify the experts explicitly.
++        if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++            experts = getattr(self.moe_kernel, "fused_experts", None)
++            if experts is not None:
++                experts.process_weights_after_loading(layer)
++
+     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         if is_weights_pre_processed():
+             # Weights are already in kernel format; rebuild the kernel only.

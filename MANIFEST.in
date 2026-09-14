@@ -1,0 +1,41 @@
+# Source distribution contents.
+#
+# Without this file the sdist depends on the ambient setuptools VCS file-finder:
+# if `setuptools_scm` happens to be installed in the build environment it adds
+# *every* git-tracked file, which drags in the measurement tree (report/),
+# presentations (docs/*.pdf, *.pptx) and datasets -> ~32 MB instead of ~2 MB.
+# Pin it explicitly so the sdist is small and reproducible.
+#
+# License: Apache-2.0
+
+include README.md
+include README_EN.md
+include LICENSE
+include NOTICE
+include THIRD_PARTY_NOTICES.md
+include pyproject.toml
+include setup.py
+include setup.cfg
+include RELEASE_NOTES_v0.1.0.md
+include RELEASE_NOTES_v0.2.0.md
+
+# packages (native engine variants ship as package data: xiaotu_moe/build/*.so)
+recursive-include xiaotu_moe *.py *.so
+recursive-include vllm_xiaotu_moe *.py
+
+# user-facing install material
+recursive-include scripts *.sh *.py *.md
+recursive-include patches *.patch *.md
+
+# never ship these
+prune report
+prune docs
+prune backup
+prune fixtures
+prune logs
+prune dist
+prune build
+
+global-exclude __pycache__
+global-exclude *.pyc
+global-exclude *.pyo

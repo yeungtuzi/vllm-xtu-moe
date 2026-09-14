@@ -4,8 +4,13 @@
 参考启动命令 ⑤自检与排错。
 
 参考环境(验证组合):Python 3.12 · torch 2.13.0+cu130 · vLLM 主线
-`0.1.dev1+g6c73b08de` · NVIDIA A100-PCIE-40GB(SM 8.0)· AMD EPYC 9654(无 AMX)。
-较新的 vLLM mainline 一般同样可用;若集成点发生变化,插件会打印明确的告警。
+**`0.29.1rc1.dev95+gdabc4362b`(commit `dabc4362b`,2026-09-14)** ·
+NVIDIA A100-PCIE-40GB(SM 8.0)· AMD EPYC 9654(无 AMX)。
+
+> 上一版针对 `0.1.dev1+g6c73b08de`(2026-09-08)。**本机不能从源码编译**
+> (nvcc 12.1 与 torch cu130 不匹配、且无 Rust 工具链),所以升级主线**必须挑一个
+> 已发布 precompiled wheel 的 commit**;`scripts/check_upstream_drift.sh` 会直接告诉你
+> 当前上游 HEAD 有没有轮子。若集成点变化,插件会打印明确的告警(见 IRON_RULES R10)。
 
 ---
 
@@ -29,7 +34,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 
 git clone https://github.com/vllm-project/vllm.git
-cd vllm && git checkout 6c73b08          # 已验证提交;更新的 main 通常也可以
+cd vllm && git checkout dabc4362b       # 已验证提交(需有 precompiled wheel;见上方说明)
 VLLM_USE_PRECOMPILED=1 pip install -e .  # 复用预编译算子,避免长时间编译
 ```
 

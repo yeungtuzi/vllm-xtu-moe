@@ -63,13 +63,20 @@ VLLM_USE_PRECOMPILED=1 pip install -e .     # 复用官方预编译二进制,避
 
 ## 3. 应用 vllm-xtu-moe 补丁
 
-补丁位于本仓库 `patches/upstream/`,**按"上游 PR"组织**:
+补丁位于本仓库 `patches/upstream/`,**按"上游 PR"组织**,并针对 vLLM 主线
+**`dabc4362b`(2026-09-14)** 重新生成:
 
-| 补丁 | 文件 | +/− | 作用 | 什么时候需要 |
-|---|---|---|---|---|
-| `pr1-experts-load-device.patch` | 3 | +56 / −5 | `VLLM_EXPERTS_LOAD_DEVICE=cpu`:让 routed-expert 权重**从构造期就落在主机**;MXFP4 oracle 在 GPU 主机上把 CPU 后端前置。**不改默认行为** | **总是需要**(方式 A 与 B 都要) |
-| `pr2-fp8-sm80-o-proj.patch` | 4 | — | A100(SM80)的 FP8 o_proj 支持 | 只在 A100 上跑 FP8 注意力时需要 |
-| `pr3-sm80-port.patch` | 21 | — | SM80 的 DS-V4 完整移植 | 只在主线对 A100 支持不足时需要 |
+| 补丁 | 文件 | 作用 | 什么时候需要 |
+|---|---|---|---|
+| `pr0-handshake-timeout.patch` | 1 | 把硬编码的 `HANDSHAKE_TIMEOUT_MINS = 5` 变成可用 `VLLM_HANDSHAKE_TIMEOUT_MINS` 配置(CPU 引擎逐层构造 ~6 min,否则健康加载会被掐断) | **总是需要** |
+| `pr1-experts-load-device.patch` | 6 | `VLLM_EXPERTS_LOAD_DEVICE=cpu`:让 routed-expert 权重**从构造期就落在主机**;FP8/INT4/BF16 oracle 在 GPU 主机上把 CPU 后端前置;混合模式下跳过 AMX prepack。**不改默认行为** | **总是需要**(方式 A 与 B 都要) |
+| `pr2-fp8-sm80-o-proj.patch` | 2 | A100(SM80)的 FP8 o_proj + e4m3 字节编解码 helper | 只在 A100 上跑 FP8 注意力时需要 |
+| `pr3-sm80-port.patch` | 21 | SM80 的 DS-V4 移植(mHC / sparse-MLA / indexer / rope-quant / 新内核文件) | 只在主线对 A100 支持不足时需要 |
+
+> ⚠️ **`mxfp4` 的那部分补丁已被上游吸收** —— 新版主线自带 native
+> `Mxfp4MoeBackend.CPU` 与 `prepare_mxfp4_moe_layer_for_cpu`,
+> 所以旧 `pr1` 里的 3 个 hunk 只剩 2 个需要打。**每次升级主线都要重问"这条上游做了吗"**,
+> 见 `report/tuning/IRON_RULES.md` R10.5。
 
 用仓库自带脚本一键应用(它会自己找 `<tree>/vllm`):
 
@@ -85,8 +92,10 @@ bash scripts/apply_xtu_patches.sh /path/to/vllm
 DRY=1 bash scripts/apply_xtu_patches.sh "$TREE"
 ```
 
-**实测(补丁对主线的可用性)**:在干净主线 `6c73b08dec` 上 `patch -p1 --dry-run`,
-**pr1=3 文件 / pr2=4 文件 / pr3=21 文件,失败 hunk 全部为 0**。见 `docs/UPSTREAM_DRIFT.md §7`。
+**实测(补丁对主线的可用性)**:在干净主线 `dabc4362b` 的 `git archive` 导出上,
+按 `pr0 → pr1 → pr2 → pr3` **顺序全部干净应用,0 个失败 hunk**;应用后的源码树与我们的
+开发树 **逐文件一致**(`diff -rq` 只剩编译产物 `.so`)。
+复现:`scripts/check_upstream_drift.sh`(会同时报告"当前上游 HEAD 有没有 precompiled wheel")。
 
 ---
 

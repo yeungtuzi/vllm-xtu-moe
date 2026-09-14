@@ -219,3 +219,46 @@ patch -p1 --dry-run < patches/upstream/pr1-experts-load-device.patch
 
 ⇒ **补丁集对当前主线 HEAD 是 rebase-clean 的**,不需要人工改行。
 这直接支撑 v0.2 的第 4 条目标(一条命令安装):`git clone mainline → patch -p1 → pip install wheel`。
+
+---
+
+## 八、新基线 `dabc4362b`(2026-09-14)的补丁清单 —— **当前有效**
+
+> 上表(§2.4 / §7)是 `6c73b08dec` 旧基线的审计结果。主线在 6 天内前进 **346 commits / 300 文件**,
+> 已于 2026-09-14 完成升级(过程与复验见 `report/tuning/NOTES.md` §368)。**以下是现行数字。**
+
+### 8.1 补丁规模(重新生成,实测全部干净应用)
+
+| 补丁 | 文件 | 体积 | 作用 | 与旧基线的差异 |
+|---|---|---|---|---|
+| `pr0-handshake-timeout.patch` | **1** | 17 行 | 握手超时可配置 | 不变(上游仍硬编码 5 分钟) |
+| `pr1-experts-load-device.patch` | **6** | 272 行 | 主机侧专家权重 + CPU 后端前置 + 跳过 AMX prepack | **缩小**:`oracle/mxfp4.py` 的 3 个 hunk 已被上游吸收(native `Mxfp4MoeBackend.CPU`) |
+| `pr2-fp8-sm80-o-proj.patch` | **2** | 150 行 | A100 的 FP8 o_proj + e4m3 字节 helper | 重写(上游把 `fp8_einsum` 重构了) |
+| `pr3-sm80-port.patch` | **21** | 7512 行 | SM80 DS-V4 移植(mHC/sparse-MLA/indexer/rope-quant + 新内核文件) | 重写;**其中 mHC 那处从 43 行冲突简化为 ~20 行门闸**,但整体仍大(含 `sparse_mla_kernels.py` 3517 行等新文件) |
+
+### 8.2 可用性实测(强于 dry-run)
+
+```bash
+M=/path/to/vllm && cd $M && git archive dabc4362b | tar -x -C /tmp/ml_base
+cd /tmp/ml_base
+for p in pr0 pr1 pr2 pr3; do patch -p1 --forward < patches/upstream/$p-*.patch; done
+diff -rq /tmp/ml_base/vllm $M/vllm | grep -v __pycache__
+```
+
+结果:**4 个补丁全部干净应用(0 failed hunks)**,应用后的源码树与开发树
+**逐文件一致** —— `diff` 只剩编译产物(`*.so`、`vllm-rs`、`third_party/` 下由 wheel 解出的目录)。
+
+### 8.3 新增前置约束:**必须挑"有 precompiled wheel 的 commit"**
+
+本机 `nvcc` = CUDA 12.1 而 torch = 2.13.0+cu130,且无 Rust 工具链 ⇒ **不能从源码编译**;
+这 346 个 commit 改了 **43 个 csrc 文件 + 5 个 cmake + 126 个 rust 文件** ⇒ 旧 `.so` 不可复用。
+所以"升级到上游 HEAD"在本机**做不到**,只能升级到**已发布 cu130 轮子**的 commit:
+
+| commit | 日期 | 有 cu130 轮子? |
+|---|---|---|
+| `6c73b08dec` | 2026-09-08 | ✅(旧基线) |
+| **`dabc4362b`** | 2026-09-14 20:47 | ✅ **采用** |
+| `d392ac836` | 2026-09-14 晚 | ✅ **下一次跟进目标** |
+| `00972dfd72`(当时 HEAD) | 2026-09-14 21:44 | ❌ 404 |
+
+判定命令见 `report/tuning/IRON_RULES.md` R10.2,或直接跑 `scripts/check_upstream_drift.sh`。

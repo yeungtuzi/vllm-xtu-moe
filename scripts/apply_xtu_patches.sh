@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # 把 vllm-xtu-moe 的补丁打到一棵 vLLM 主线上(源码树或已安装的 site-packages 树)。
 #
-# 补丁是**纯 Python**(3 个文件 / +56 −5),所以既能打在源码树上,也能直接打在
+# 补丁是**纯 Python**(不碰 csrc/rust),所以既能打在源码树上,也能直接打在
 # `pip install vllm` 之后的 site-packages 里 —— 后者不需要编译任何东西。
+#
+# 基线:以下补丁针对 vLLM 主线 **dabc4362b**(2026-09-14)重新生成并实测全部干净应用。
+# 规模:pr0=1 文件 / pr1=6 文件 / pr2=2 文件 / pr3=21 文件。
 #
 # 用法:
 #   scripts/apply_xtu_patches.sh <vllm_tree>            # 只打 PR1(最小使能补丁)
 #   LEVEL=1 scripts/apply_xtu_patches.sh <vllm_tree>    # 同上(默认)
 #   LEVEL=2 scripts/apply_xtu_patches.sh <vllm_tree>    # + PR2(A100/SM80 的 FP8 o_proj)
-#   LEVEL=3 scripts/apply_xtu_patches.sh <vllm_tree>    # + PR3(SM80 DS-V4 完整移植)
+#   LEVEL=3 scripts/apply_xtu_patches.sh <vllm_tree>    # + PR3(SM80 DS-V4 移植,含新内核文件)
 #   DRY=1 ...                                           # 只 --dry-run
 #
 # <vllm_tree> 是**包含 `vllm/` 目录**的那一层,例如:
