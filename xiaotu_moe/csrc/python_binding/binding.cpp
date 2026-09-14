@@ -213,6 +213,87 @@ bool auto_ep_setup(const void* key, const MOEConfigV2& cfg) {
 std::mutex g_cd_mtx;
 std::unordered_map<const void*, std::unique_ptr<CpuDecodeState>> g_cd_state;
 
+// 【第 217 轮】"CPU MoE + EP 归约"抽成独立函数:host-func 路径与异步握手
+// 路径(worker 线程)共用同一份实现,避免两份代码漂移。
+template <typename MOET>
+static void run_moe_and_ep(MOET* engine, int qlen, int k, const uint16_t* hid,
+                           const uint32_t* ids, const float* wts, float* out,
+                           double* ep_ms_out) {
+        static const bool fake_cpu = std::getenv("XIAOTU_MOE_FAKE_CPU") != nullptr;
+        if (!fake_cpu) engine->forward_many(qlen, k, ids, wts, hid, out);
+        // ---- EP:把本 rank 的部分和与对端相加(共享内存,不进 GPU) ----
+        {
+            EpShmState* ep = nullptr;
+            {
+                std::lock_guard<std::mutex> lg(g_ep_mtx);
+                auto it = g_ep_state.find(engine);
+                if (it != g_ep_state.end()) ep = it->second.get();
+            }
+            auto t_ep0 = std::chrono::steady_clock::now();
+            if (ep && ep->hdr && ep->world > 1) {
+                const size_t bytes = (size_t)qlen * (size_t)engine->config().hidden_size
+                                     * sizeof(float);
+                if (bytes <= ep->capacity) {
+                    EpShmHeader* h = ep->hdr;
+                    // 1) 写自己的部分和(写进 shm 中本 rank 的槽位)
+                    std::memcpy(ep->parts + (size_t)ep->rank * ep->capacity,
+                                out, bytes);
+                    // 2) 到达 barrier:最后一个到达者复位计数并推进 gen
+                    const unsigned long long gen =
+                        h->gen.load(std::memory_order_acquire);
+                    if (h->arrive.fetch_add(1, std::memory_order_acq_rel) + 1
+                        == ep->world) {
+                        h->arrive.store(0, std::memory_order_release);
+                        h->gen.fetch_add(1, std::memory_order_release);
+                    } else {
+                        // 【第 132 轮】自旋退避:原为 `std::this_thread::yield()` ——
+                        // 那是系统调用,且在本机 120 个 MoE 线程 + 48 OMP 线程满负荷时
+                        // 很容易把本线程排到队尾(等待被放大成毫秒级)。
+                        // 改为:先纯 PAUSE 自旋(无系统调用),久等才退到 nano-sleep。
+                        // 每层两处 barrier ⇒ 43 层 ×2 的收益。
+                        int _spin = 0;
+                        while (h->gen.load(std::memory_order_acquire) == gen) {
+                            if (++_spin < 8192) __builtin_ia32_pause();
+                            else std::this_thread::sleep_for(
+                                std::chrono::nanoseconds(200));
+                        }
+                    }
+                    // 3) 求和到自己的 pinned out(H2D 会把它送回 GPU)
+                    //    通用 world(=TP 大小,2 或 3)个部分和相加
+                    const float* base = (const float*)ep->parts;
+                    const size_t stride_f = ep->capacity / sizeof(float);
+                    const size_t n = bytes / sizeof(float);
+                    for (size_t i = 0; i < n; ++i) {
+                        float acc = base[i];
+                        for (int r = 1; r < ep->world; ++r)
+                            acc += base[(size_t)r * stride_f + i];
+                        out[i] = acc;
+                    }
+                    // 4) 读完成 barrier:确保双方都读完再允许下一轮覆写
+                    const unsigned long long g2 =
+                        h->gen2.load(std::memory_order_acquire);
+                    if (h->read_done.fetch_add(1, std::memory_order_acq_rel) + 1
+                        == ep->world) {
+                        h->read_done.store(0, std::memory_order_release);
+                        h->gen2.fetch_add(1, std::memory_order_release);
+                    } else {
+                        // 【第 132 轮】同 barrier 1:PAUSE 自旋优先,久等才 nano-sleep。
+                        int _spin2 = 0;
+                        while (h->gen2.load(std::memory_order_acquire) == g2) {
+                            if (++_spin2 < 8192) __builtin_ia32_pause();
+                            else std::this_thread::sleep_for(
+                                std::chrono::nanoseconds(200));
+                        }
+                    }
+                }
+            }
+            auto t_ep1 = std::chrono::steady_clock::now();
+            *ep_ms_out = std::chrono::duration<double, std::milli>(t_ep1 - t_ep0).count();
+        }
+}
+
+
+
 // ---- 解码 pinned 缓冲的"捕获前预分配"(2026-09-13,R103)--------------------
 // 背景:lk 链**从不调用** prepare_decode_buffers(`routed_experts.py:1694`
 // `_initialize_cuda_graph_buffers()` 只设 `cuda_graphs`/`RoutedExperts.output_gpu`),
@@ -579,77 +660,7 @@ static void bind_moe_class(py::module& m, const char* name) {
                 // 【诊断专用】XIAOTU_MOE_FAKE_CPU=1:跳过 CPU MoE 计算(输出保持原值)。
                 // 用途:在服务里量出"该层纯 GPU 侧(注意力/dense+拷贝+派发)每层耗多少",
                 // 从而把 period 精确拆成 GPU 部分 与 CPU 部分。**绝不能用于正确性测试**。
-                static const bool fake_cpu = std::getenv("XIAOTU_MOE_FAKE_CPU") != nullptr;
-                if (!fake_cpu) engine->forward_many(qlen, k, ids, wts, hid, out);
-                // ---- EP:把本 rank 的部分和与对端相加(共享内存,不进 GPU) ----
-                {
-                    EpShmState* ep = nullptr;
-                    {
-                        std::lock_guard<std::mutex> lg(g_ep_mtx);
-                        auto it = g_ep_state.find(engine);
-                        if (it != g_ep_state.end()) ep = it->second.get();
-                    }
-                    auto t_ep0 = std::chrono::steady_clock::now();
-                    if (ep && ep->hdr && ep->world > 1) {
-                        const size_t bytes = (size_t)qlen * (size_t)engine->config().hidden_size
-                                             * sizeof(float);
-                        if (bytes <= ep->capacity) {
-                            EpShmHeader* h = ep->hdr;
-                            // 1) 写自己的部分和(写进 shm 中本 rank 的槽位)
-                            std::memcpy(ep->parts + (size_t)ep->rank * ep->capacity,
-                                        out, bytes);
-                            // 2) 到达 barrier:最后一个到达者复位计数并推进 gen
-                            const unsigned long long gen =
-                                h->gen.load(std::memory_order_acquire);
-                            if (h->arrive.fetch_add(1, std::memory_order_acq_rel) + 1
-                                == ep->world) {
-                                h->arrive.store(0, std::memory_order_release);
-                                h->gen.fetch_add(1, std::memory_order_release);
-                            } else {
-                                // 【第 132 轮】自旋退避:原为 `std::this_thread::yield()` ——
-                                // 那是系统调用,且在本机 120 个 MoE 线程 + 48 OMP 线程满负荷时
-                                // 很容易把本线程排到队尾(等待被放大成毫秒级)。
-                                // 改为:先纯 PAUSE 自旋(无系统调用),久等才退到 nano-sleep。
-                                // 每层两处 barrier ⇒ 43 层 ×2 的收益。
-                                int _spin = 0;
-                                while (h->gen.load(std::memory_order_acquire) == gen) {
-                                    if (++_spin < 8192) __builtin_ia32_pause();
-                                    else std::this_thread::sleep_for(
-                                        std::chrono::nanoseconds(200));
-                                }
-                            }
-                            // 3) 求和到自己的 pinned out(H2D 会把它送回 GPU)
-                            //    通用 world(=TP 大小,2 或 3)个部分和相加
-                            const float* base = (const float*)ep->parts;
-                            const size_t stride_f = ep->capacity / sizeof(float);
-                            const size_t n = bytes / sizeof(float);
-                            for (size_t i = 0; i < n; ++i) {
-                                float acc = base[i];
-                                for (int r = 1; r < ep->world; ++r)
-                                    acc += base[(size_t)r * stride_f + i];
-                                out[i] = acc;
-                            }
-                            // 4) 读完成 barrier:确保双方都读完再允许下一轮覆写
-                            const unsigned long long g2 =
-                                h->gen2.load(std::memory_order_acquire);
-                            if (h->read_done.fetch_add(1, std::memory_order_acq_rel) + 1
-                                == ep->world) {
-                                h->read_done.store(0, std::memory_order_release);
-                                h->gen2.fetch_add(1, std::memory_order_release);
-                            } else {
-                                // 【第 132 轮】同 barrier 1:PAUSE 自旋优先,久等才 nano-sleep。
-                                int _spin2 = 0;
-                                while (h->gen2.load(std::memory_order_acquire) == g2) {
-                                    if (++_spin2 < 8192) __builtin_ia32_pause();
-                                    else std::this_thread::sleep_for(
-                                        std::chrono::nanoseconds(200));
-                                }
-                            }
-                        }
-                    }
-                    auto t_ep1 = std::chrono::steady_clock::now();
-                    ep_ms_last = std::chrono::duration<double, std::milli>(t_ep1 - t_ep0).count();
-                }
+                run_moe_and_ep(engine, qlen, k, hid, ids, wts, out, &ep_ms_last);
                 if (timing) {
                     auto t_end = std::chrono::steady_clock::now();
                     const double compute_ms =

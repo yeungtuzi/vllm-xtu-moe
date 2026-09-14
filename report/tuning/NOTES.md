@@ -10865,3 +10865,16 @@ PREFETCH=1 / EAGER=0(图) / THREADS=48 / SPEC=0 / RESIDENT=0-10(11 层常驻)
 * 期望收益:去掉每层 host-func 派发(~10-20 µs/层 ⇒ **0.4-0.9 ms/token**),
   而**拷贝本身(~30 µs/层)留在原地** ⇒ 这就是本条手段的天花板。
 * 用 `XIAOTU_MOE_ASYNC=1` 启用,host-func 路径保留为回退。
+
+---
+
+## 323. 【第 217 轮·配置陷阱】`MINBATCH > MBT` 其实**关闭了 gpu_prefill**(省显存);夹平它反而把 KV 挤没了
+
+* `lkport51`(最优配置,11 层常驻,**MINBATCH=1024 > MBT=256**)能跑:K V 2.19 GiB ✅
+  —— 因为 lk 在初始化时对 `gpu_prefill_min_batch_size > max_num_batched_tokens` **报错并跳过**
+  GPU 预填充(实测日志有 `ERROR routed_experts.py:144`),**省下了 gpu_prefill 的 GPU 暂存**。
+* `lkport56`(我按 §319c"修"成 MINBATCH=256 ≤ MBT)⇒ **gpu_prefill 真的开了**,
+  暂存吃掉显存 ⇒ `No available memory for the cache blocks` ❌。
+* ⇒ **解码优先的配置应该显式 `MINBATCH=0`(关闭 gpu_prefill)**,而不是靠报错路径;
+  这样既省显存(可能多放常驻层),也避免"靠 bug 运行"。
+* (prefill 变慢是代价;本目标是解码,先这么配,prefill 用另一套配置跑。)
