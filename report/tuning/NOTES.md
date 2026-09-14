@@ -12400,3 +12400,61 @@ pin 缓存强引用住**,与 Parameter 是否被替换无关 —— 这正好解
    (即 (b) 的改动**提前**到 profiling 之前),这样切片视图的 storage 本身就是 1.6 GB;
 2. **让 pin 缓存不持有源 storage**:`_pin_key` 只保留 `data_ptr` 用于失效判断,
    值里只放转置副本,靠"源参数在模型生命周期内不会被释放"这一事实(需配合弱引用/显式失效)。
+
+### 347. 【v0.2·第 17 轮】主线 E2E:数值门禁**通过**;延迟基准暴露**解码 1.25 s/token** —— 是已知的 CUDA 图契约 bug
+
+#### (a) ✅ 数值门禁(纯引擎,无服务)在主线上**逐位复现 0.1.0 基线**
+
+```
+XIAOTU_LAYER1_NPZ=fixtures/real_layer1_model.npz \
+  /home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python scripts/test_block23_equiv.py
+
+[BAD] me=1(6 个专家)   M=1 me分布=[1,1,1,1,1,1]              max_abs=4.379e-03 max_rel=1.873e-02
+[OK ] me=2(9 个专家)   M=3 me分布=[2×9]                      max_abs=1.221e-04 max_rel=2.948e-04
+[OK ] me=3(12 个专家)  M=6 me分布=[3×12]                     max_abs=1.221e-04 max_rel=3.400e-04
+[OK ] me=2/3 混合      M=4 me分布=[2,2,2,3,3,3,3,3,3]       max_abs=9.155e-05 max_rel=2.075e-04
+[OK ] me=4(旧快路径)   M=2 me分布=[4,4,4]                    max_abs=7.057e-05 max_rel=5.090e-04
+[OK ] me=5(4+1)        M=5 me分布=[5×6]                      max_abs=8.011e-05 max_rel=4.956e-04
+[OK ] me=6(4+2)        M=6 me分布=[6×6]                      max_abs=1.221e-04 max_rel=6.602e-04
+[OK ] me=7(4+3)        M=7 me分布=[7×6]                      max_abs=1.526e-04 max_rel=2.924e-04
+```
+
+⇒ **`OK=7 BAD=1`,且 `me=1 max_rel = 1.873e-02`** —— 与目标要求的基线**完全一致**(目标写的就是
+`OK=7 BAD=1` / `me=1 max_rel 1.873e-02`)。这是 v0.2 主线化的一项硬性验收证据,已拿到。
+
+#### (b) ❌ 延迟基准:`bench_lat.sh` C=1 跑到 **159.86 s / 请求**(512 in / 128 out)
+
+```
+0%|  | 0/8 [00:00<?]  12%|█▎| 1/8 [02:39<18:39, 159.86s/it]  25%|██▌| 2/8 [05:17<15:51, 158.57s/it]
+```
+
+128 个输出 token 用 159.86 s ⇒ **1.25 s/token**,而 0.1.0 同协议是 **26 ms/token**(慢 **47×**)。
+
+**🔑 这个数字可辨识**:NOTES §334u 记录的"无限重做预填充"是
+`1136.8 ms/token (qlen=257 × 200/200,开着 CUDA 图)` —— 与这里的 1.25 s/token **对上了**。
+机制也一致:`hybrid_model.apply()` 每次调用都 `torch.empty` 新输出 + `.to(dtype)`,
+违反 CUDA 图契约 ⇒ 图内每步都重做一遍 257-token 的预填充。
+⇒ **这就是我早先列的 P0(图契约 bug),它才是主线模式 A 解码的拦路虎,不是引擎。**
+
+#### (c) 排除法:CPU 引擎的 plumbing **没问题**(无模型加载微基准)
+
+用 `scripts/bench_cd_plumbing.py`(真实一层权重造 8 个引擎,按服务方式轮转 `cpu_decode`):
+
+| `CFG_WORLD` | serial | pipe |
+|---|---|---|
+| 1 | **323.4 µs/layer** | **317.6 µs/layer** |
+| 2 | 384.2 µs/layer | 371.6 µs/layer |
+
+* 31 个非常驻层 × 0.32 ms ≈ **9.9 ms/pass** ⇒ 引擎侧完全正常,**1.25 s 不可能是它**。
+* ⚠️ 同时暴露:**我第 15 轮把 `cfg.num_processes` 从 1 改成 2 让解码慢了 ~19%**
+  (384 vs 323 µs/layer)。原因是 `shared_numa_pool(process_id, num_processes)` 也被
+  `num_processes` 切分 ⇒ 每个 rank 只拿到 4 个 node / 12 个 CCD 的线程。
+  **下一轮要解耦**:`num_processes/process_id` 只用于**权重 NUMA 放置**,
+  线程池仍给每个 rank 完整的核表 —— 否则修了 OOM 却赔了解码。
+
+#### (d) 本轮的下一步(按优先级)
+
+1. **修 CUDA 图契约(P0)**:`apply()` 预分配 `[max_num_batched_tokens, H]` 输出缓冲并返回视图,
+   或对预填充形状强制 eager —— 先让 `qlen=1` 的解码真正生效,`bench_lat.sh` 才有意义;
+2. **解耦线程池与 `num_processes`**(见 (c)),把 19% 拿回来;
+3. 然后重跑 `bench_lat.sh` C=1/2/4 + greedy 一致性,补上 0.1.0 对照表(目标第 3 条)。
