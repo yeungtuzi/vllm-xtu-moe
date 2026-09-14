@@ -11348,3 +11348,58 @@ total=128 exec=128 dup=0 miss=0 abandoned=96 inrange=128 issued=224
 参考同机:23.11 ms  ⇒ 剩余差距 3.0 ms = 引擎每层 54 µs × 31 + 拷发
 起点:37.33 ms ⇒ 累计 −30%
 ```
+
+---
+
+## 333. 【v0.2·第 1 轮】上游漂移审计完成:**最小使能补丁只有 3 文件 / +56 −5**
+
+### (a) 三棵树血缘(全部由 git 对象实测)
+
+```
+vLLM mainline(本机 HEAD = 6c73b08dec,2026-09-08,已提交态 = A)
+  └─ jasl/vllm(deepseek-v4)          ← Lvllmds4-x 历史里可见 2026-06 的 jasl 提交
+       └─ yhfgyyf/vllm-deepseek-v4-sm89
+            └─ guqiong96/Lvllmds4-x(lk_moe 混合,2026-07-19 起)
+                 └─ faf95dd5b  ← 【我们】重绑 lk_moe → xiaotu_moe
+```
+* **A 已经原生带 `vllm/models/deepseek_v4/`(nvidia/amd/xpu)** ⇒ "让主线支持 DS-V4"本身不需要补丁。
+* B(工作树)= A + **未提交的 30 文件 / +7044 本地 DS-V4/SM12x 补丁**。
+
+### (b) 量化
+
+| 比较 | 差异条目 |
+|---|---|
+| A → B | 52 |
+| A → C | **1631** ← ⚠️ **不能当补丁量**:C 基于较早主线,这 1631 里绝大多数是 vLLM 自身演进 |
+
+**隔离出"CPU-GPU 混合推理"这一系列**(`92c9b76bb^..a9f97ec09`):**29 文件 / +1192 −562**,其中
+`routed_experts.py +620`、`envs.py +191`、`moe_runner.py +74`、量化钩子 9 文件 ~+170、
+NUMA/系统 ~+80,**非代码(README/CI/CLI/config)约 490 行**。
+
+**我们自己的移植只有 2 文件 / +68 −54**(`faf95dd5b`):把 lk 自研 `_gpu_prefill`
+换成**上游** `forward_monolithic` / `forward_modular`。
+
+### (c) 🎯 仓库里已有的补丁清单(实测行数)
+
+| 补丁 | 文件 | +/− | 体积 |
+|---|---|---|---|
+| **`patches/upstream/pr1-experts-load-device.patch`** | **3** | **+56 / −5** | 5.4 KB |
+| `patches/upstream/pr2-fp8-sm80-o-proj.patch` | — | — | 19.8 KB |
+| `patches/upstream/pr3-sm80-port.patch` | — | — | 251 KB |
+| `patches/mainline_mixed_mode_generic.patch` | 4 | +94 / −5 | 8.4 KB |
+| `patches/mainline_sm80_mixed_mode.patch` | 27 | +7004 | 285 KB(= §1 表 B 的快照) |
+
+⇒ **"让 CPU 专家后端在 GPU 主机上可被选中"= PR1 的 3 文件 / +56 −5**,且设计成
+**不改默认行为**(可上游化)。v0.2 的核心就是它 + 插件 wheel。
+
+### (d) V0.2 的三种交付形态(结论)
+
+```
+形态 0(默认,零补丁)  mainline + wheel,XIAOTU_OOT_OVERRIDE=1
+形态 1(推荐)          mainline + pr1(3 文件/61 行)+ wheel   ← 保留主线原生图/前缀缓存/投机
+形态 2(A100 专用)     + pr2 + pr3
+```
+**不进补丁**:`envs.py` 的 LVLLM_* 登记(插件直接读 `os.environ`)、README/CI/CLI/config、
+NUMA 辅助(引擎自带 per-shard mbind)。
+
+审计全文见 **`docs/UPSTREAM_DRIFT.md`**。下一步:在主线最新版上实测形态 0 与形态 1 的端到端。
