@@ -397,6 +397,11 @@ static void bind_moe_class(py::module& m, const char* name) {
             // an async H2D memcpy into out_gpu.
             const int H = self.config().hidden_size;
             if (qlen <= 0 || top_k <= 0 || H <= 0) return;
+            // 【诊断专用】XIAOTU_MOE_FAKE_ALL=1:整个 cpu_decode 立即返回(不做 D2H/
+            // host-func/H2D)⇒ 服务里量出的就是"纯 GPU 模型"每 token 时间。
+            // 与 FAKE_CPU(只跳计算、仍做拷贝)相减 = 拷贝+host-func 的真实成本。
+            static const bool fake_all = std::getenv("XIAOTU_MOE_FAKE_ALL") != nullptr;
+            if (fake_all) return;
 
             cudaStream_t s = nullptr;
             if (!stream_obj.is_none()) {
