@@ -135,6 +135,21 @@ else:
 
 **⇒ P1 通过。** P2 起把本脚本接成**回归门禁**。
 
+## 4.6 P2 后端选型(2026-09-14 实测)
+
+主线对 MXFP4 的优先级(`oracle/mxfp4.py:_get_priority_backends`):
+`FLASHINFER_TRTLLM_MXFP8`(SM100)→ `DEEPGEMM_MXFP4`(SM90)→ **`MARLIN`(SM80 ✅)** → `BATCHED_MARLIN`。
+⇒ **A100 上主线选的就是 MARLIN**,与 lk fork 一致;功能入口是
+**`fused_marlin_moe(...)`**(`experts/marlin_moe.py:235`,吃显式
+`w1/w2/w1_scale/w2_scale/topk_weights/topk_ids`,**内部不重做路由** ⇒ DS-V4 路由可照用);
+MXFP4 W4A16 的 `quant_type_id = scalar_types.float4_e2m1f.id`。
+
+⚠️ **唯一需要额外做的是"加载期一次权重重排"**:`fused_marlin_moe` 断言
+`w1.size(1)*16 == K`,而 checkpoint 原生是 `[E, N, K/2]`。
+重排函数已找到:**`marlin_utils_fp4.py:311 _repack_marlin_experts`**。
+方案 = 加载期重排一次并**缓存在主机内存**(+69 GiB/rank,1.5 TB 放得下),
+每次预填充 H2D 搬重排后的 1.61 GiB/rank ⇒ **DMA 预算不变(§2.2 的 ~3.4 s)**。
+
 ## 5. 风险
 
 | 风险 | 说明 | 缓解 |
