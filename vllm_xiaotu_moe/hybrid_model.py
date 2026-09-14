@@ -626,6 +626,9 @@ class CpuXiaotuMoE(nn.Module):
         # ---- expert parallelism state (see ep_enabled()) ----
         self._ep = False
         self._ep_start = 0
+        # 图安全的输出缓冲(见 _graph_out_buffers);cap 在 finalize 里定
+        self._out_buf = None
+        self._out_cap = 8
         self._ep_local = int(self.n_routed_experts)
         try:
             # 只登记**第一份**(目标模型)。draft 模型层名相同,若覆盖会让
@@ -638,6 +641,30 @@ class CpuXiaotuMoE(nn.Module):
             pass
 
     # ---- long-prefill GPU path helpers ----
+    def _graph_out_buffers(self, qlen: int, device):
+        """CUDA 图安全的输出缓冲(地址**跨调用稳定**)。
+
+        背景(第 18 轮,NOTES §347/§348):CPU 路径原先每次调用都
+        `torch.empty(qlen,H,fp32)` 再 `out.to(bf16)`,**每次拿到新地址**。
+        图捕获时内核把结果写到捕获期的地址,而 Python 侧返回的是新分配的张量
+        ⇒ vLLM 读到的是未初始化数据 ⇒ 序列永远"没前进" ⇒ 每步重做整段预填充
+        (`qlen=257 × 200/200`,1136.8 ms/token,实测 1.25 s/token)。
+        修法:按**捕获范围内**的最大尺寸预分配两块持久缓冲,fp32 结果先 `copy_`
+        成 bf16 再以**视图**返回(视图基址固定,replay 命中同一地址)。
+
+        超过 `cap` 的形状(超长预填充)不会进图,退回临时分配即可,不浪费显存。
+        """
+        cap = self._out_cap
+        if qlen > cap:
+            return None
+        buf = self._out_buf
+        if buf is None or buf[0].device != device:
+            f32 = torch.empty(cap, self.hidden_size, dtype=torch.float32, device=device)
+            bf16 = torch.empty(cap, self.hidden_size, dtype=torch.bfloat16, device=device)
+            buf = (f32, bf16)
+            self._out_buf = buf
+        return buf[0][:qlen], buf[1][:qlen]
+
     def _gpu_shard(self):
         """(w13, s13, w2, s2, start, local_E, tp) CPU views for the GPU path."""
         ex = self.experts
@@ -867,6 +894,20 @@ class CpuXiaotuMoE(nn.Module):
                 "is informational).",
                 flush=True,
             )
+        # ---- 图安全输出缓冲的上界(见 _graph_out_buffers)------------------
+        # 只需要覆盖"会被 CUDA 图捕获"的形状:
+        #   * 显式限了 --cudagraph-capture-sizes ⇒ max_cudagraph_capture_size 即上界;
+        #   * 否则主线 PIECEWISE 会捕获到 MBT,取 MBT(MBT=256 时仅 6.3 MB/层)。
+        # XIAOTU_MOE_GRAPH_OUT_MAX>0 可再兜一层显存(cap×H×(4+2)B×层数×rank)。
+        _env_cap = int(os.environ.get("XIAOTU_MOE_GRAPH_OUT_MAX", "0") or 0)
+        _cap = int(_mnbt)
+        _cc = getattr(self._vllm_config, "compilation_config", None)
+        _mcs = getattr(_cc, "max_cudagraph_capture_size", None) if _cc is not None else None
+        if _mcs:
+            _cap = int(_mcs)
+        if _env_cap > 0:
+            _cap = min(_cap, _env_cap)
+        self._out_cap = max(8, _cap)
         cfg.activation_type = 0
         cfg.use_gpu_prefill = False
         cfg.groupN = 1
@@ -1093,9 +1134,17 @@ class CpuXiaotuMoE(nn.Module):
             return gpu_out
 
         # routed experts:xiaotu 引擎(CPU)。engine.cpu_decode 内部 D2H->CPU forward_many->H2D。
-        out = torch.empty(
-            qlen, self.hidden_size, dtype=torch.float32, device=hidden_states.device
-        )
+        # 【图契约】优先用地址稳定的持久缓冲(见 _graph_out_buffers);超出捕获范围
+        # 的形状(超长预填充)才临时分配。
+        _gb = self._graph_out_buffers(qlen, hidden_states.device)
+        if _gb is not None:
+            out, _out_bf16 = _gb
+        else:
+            out = torch.empty(
+                qlen, self.hidden_size, dtype=torch.float32,
+                device=hidden_states.device
+            )
+            _out_bf16 = None
         stream = torch.cuda.current_stream()
         # 引擎 binding 的指针提取只认 numpy 数组或整数 data_ptr()(对 torch 张量返回
         # nullptr → cudaMemcpyAsync(nullptr) → invalid argument),故传 data_ptr()。
@@ -1141,7 +1190,12 @@ class CpuXiaotuMoE(nn.Module):
                 )
                 _T["eng"] = 0.0
                 _T["t0"] = _now
-        final_hidden_states = out.to(hidden_states.dtype)
+        if _out_bf16 is not None:
+            # 就地 dtyped copy ⇒ 结果落在**固定地址**的持久缓冲上,返回其视图。
+            _out_bf16.copy_(out)
+            final_hidden_states = _out_bf16
+        else:
+            final_hidden_states = out.to(hidden_states.dtype)
         # EP 的跨 rank 求和:默认已在引擎的 host 回调里用 /dev/shm 完成
         # (`XIAOTU_MOE_EP_SHM=1`,qlen ≤ _ep_shm_tokens 时);只有超出该容量
         # (极长 prefill 走 CPU 路径)才回退到 NCCL all-reduce。
@@ -1168,9 +1222,12 @@ class CpuXiaotuMoE(nn.Module):
                   f"topk={tids} wts={tw}", flush=True)
 
         if self.shared_experts is not None:
-            final_hidden_states = final_hidden_states + self.shared_experts(
-                hidden_states
-            )
+            _sh = self.shared_experts(hidden_states)
+            if _out_bf16 is not None:
+                # 就地累加(缓冲区是持久视图,不能再产生新张量)
+                final_hidden_states.add_(_sh)
+            else:
+                final_hidden_states = final_hidden_states + _sh
         return final_hidden_states
 
 

@@ -12458,3 +12458,68 @@ XIAOTU_LAYER1_NPZ=fixtures/real_layer1_model.npz \
    或对预填充形状强制 eager —— 先让 `qlen=1` 的解码真正生效,`bench_lat.sh` 才有意义;
 2. **解耦线程池与 `num_processes`**(见 (c)),把 19% 拿回来;
 3. 然后重跑 `bench_lat.sh` C=1/2/4 + greedy 一致性,补上 0.1.0 对照表(目标第 3 条)。
+
+### 348. 【v0.2·第 18 轮】图契约修复**没解决** 160 s/it;但计时证明**引擎只占 1%** —— 战场在层流水线
+
+#### (a) 已落地的修复:`_graph_out_buffers()`(正确但**不是**本问题的解)
+
+定位到 CPU 路径确实有**两处逐调用分配**(契约违规的教科书形态):
+
+```python
+out = torch.empty(qlen, H, fp32, device)     # 每次新地址
+final_hidden_states = out.to(hidden_states.dtype)   # 又一次新地址
+```
+
+修法(已提交):按捕获范围内最大尺寸预分配两块持久缓冲,
+`_out_bf16.copy_(out)` 后就地返回**视图**(基址固定),`shared_experts` 改成 `add_` 就地累加。
+上界 `_out_cap` 从 `max_cudagraph_capture_size`(限了捕获尺寸时)或 `MBT` 取。
+
+**结果:实测仍是 `1/8 [02:40, 160.31s/it]` —— 没变。** 说明这两处分配不是主因
+(它们确实该修,属于必要的图安全隐患清除,但另有更大的一块)。
+
+#### (b) 🎯 决定性的计时(`XIAOTU_TIMING=1`,qlen=1 单 token)
+
+```
+[xiaotu-timing] engine=0.002s step_wall=0.169s other=0.167s qlen=1 engine_frac=0.01
+[xiaotu-timing] attn_43layers=0.052s ntok=1
+[xiaotu-timing] layer_43x=0.089s ntok=1
+```
+
+| 项 | 每 token | 每层 |
+|---|---|---|
+| **引擎(`cpu_decode` enqueue)** | **0.002 s(1%)** | 0.05 ms |
+| attention(43 层) | 0.052 s | 1.2 ms |
+| MoE 层总计(43 层) | 0.089 s | 2.1 ms |
+| step_wall | **0.169 s** | 3.9 ms |
+
+⇒ **CPU 引擎只占每步的 1%,完全不是瓶颈。**(与 (c) 的微基准互证。)
+⇒ 但 `169 ms/token` 仍是 0.1.0 目标(26 ms)的 **6.5×**,缺口在:
+`attn_43layers` 52 ms(qlen=1 时 1.2 ms/层,A100 上明显偏高)+ MoE 层 89 ms 里
+**引擎之外**的部分(引擎 enqueue 只有 2 ms)。
+
+⚠️ 注意 `engine=0.002s` 只量了**入队**耗时:真正的 CPU 计算在引擎的 host 回调里
+**异步**发生,它的时间被算进了 `other/step_wall`。所以"引擎只占 1%"是"入队占 1%",
+**不能**据此说 CPU 计算不慢 —— 下一轮要在 host 回调侧加计时(或在 `cpu_decode` 后
+插一个显式同步)才能把这块量出来。
+
+#### (c) 微基准再次确认引擎本身正常(无模型加载)
+
+`bench_cd_plumbing.py`(真实一层,8 引擎轮转,含 D2H/H2D):
+
+| `CFG_WORLD` | serial | pipe |
+|---|---|---|
+| 1 | 314.1 µs/layer | 315.5 µs/layer |
+| 2 | (第 17 轮)384.2 | 371.6 |
+
+⇒ 单层 marshalling+compute 约 0.32 ms;31 个非常驻层 ≈ 10 ms/pass。
+与 (b) 的 "engine enqueue 2 ms/43 层" 一致 —— **引擎侧没有 6.5× 的空间**。
+
+#### (d) 下一轮:把 169 ms 拆开量
+
+1. 在 `cpu_decode` **之后**插一次性 `torch.cuda.synchronize()` 的量测(仅诊断),
+   分离"CPU 计算真实耗时"与"enqueue";
+2. 量 `attn_43layers=52 ms` 为何在 qlen=1 时这么高(是否没走 CUDA 图 / 每层都 eager);
+3. 用 `XIAOTU_DEBUG_QLEN=1` 确认 512-token 输入下解码步的 qlen **确实是 1**(而不是 257
+   的"无限重做预填充")—— 这是 160 s/it 与 21.6 s(128×169 ms)之间 7× 差距的关键;
+4. 用**同样的 `MBT=256`** 在参考 fork 上跑同一协议,确认 26 ms 是否真的可达
+   (0.1.0 的数字来自 fork,主线模式 A 的解码此前**从未**被测过)。
