@@ -43,8 +43,19 @@ from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
     CPUExpertsInt4,
     CPUExpertsMxfp4,
     CPUUnquantizedExperts,
-    select_experts,
 )
+
+# Upstream moved the monolithic routing helper out of `experts/cpu_moe.py` into
+# `router/cpu_router.py` (mainline >= 0.29.1rc1.dev95, commit dabc4362b). Keep
+# both paths so the plugin works on older and newer mainline trees alike.
+try:
+    from vllm.model_executor.layers.fused_moe.router.cpu_router import (
+        select_experts,
+    )
+except ImportError:  # mainline <= 6c73b08dec
+    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
+        select_experts,
+    )
 
 
 _VERIFY_LAYER = os.environ.get("XIAOTU_VERIFY_LAYER", "") == "1"

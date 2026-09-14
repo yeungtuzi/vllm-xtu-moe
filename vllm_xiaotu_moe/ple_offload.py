@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import functools
+import importlib
 import os
 
 import torch
@@ -64,19 +65,48 @@ def _to_uva(layer: torch.nn.Module) -> None:
         )
 
 
+def _import_ple_classes():
+    """Locate the PLE embedding classes across upstream layouts.
+
+    Mainline moved them from `qwen4_exp/nvidia/ple_layer.py` to
+    `qwen4_exp/nvidia/ngram_embedding.py` (commit dabc4362b), where upstream also
+    grew its own host-offload path (`Qwen4ExpPLEPinnedHostEmbedding`, selected by
+    `engram_config.cpu_offload`). Try the new module first, then the old one.
+    """
+    for module in (
+        "vllm.models.qwen4_exp.nvidia.ngram_embedding",
+        "vllm.models.qwen4_exp.nvidia.ple_layer",
+    ):
+        try:
+            mod = importlib.import_module(module)
+        except Exception:  # noqa: BLE001 - not every vLLM has qwen4_exp
+            continue
+        method = getattr(mod, "Qwen4ExpPLEFp8EmbeddingMethod", None)
+        ngram = getattr(mod, "Qwen4ExpNGramEmbedding", None)
+        if method is not None:
+            return method, ngram
+    return None, None
+
+
 def install() -> list[str]:
     """包装 PLE 嵌入的量化方法;返回已安装的钩子名(便于日志/自检)。"""
     if not ple_cpu_enabled():
         return []
-    try:
-        from vllm.models.qwen4_exp.nvidia.ple_layer import (
-            Qwen4ExpPLEFp8EmbeddingMethod,
+    method_cls, ngram_cls = _import_ple_classes()
+    if method_cls is None:
+        # Fail LOUD. Silently returning [] here means a single 40 GB card OOMs
+        # ~48 GiB later during create_weights, far from the real cause.
+        print(
+            "[vllm-xtu-moe/ple] WARNING: XIAOTU_PLE_CPU=1 was requested but "
+            "Qwen4ExpPLEFp8EmbeddingMethod was not found in this vLLM - PLE "
+            "offload is NOT installed. Upstream now provides "
+            "`Qwen4ExpPLEPinnedHostEmbedding` via engram_config.cpu_offload.",
+            flush=True,
         )
-    except Exception:          # noqa: BLE001 —— 非 Qwen4Exp 版本没有这个模块
         return []
 
     applied: list[str] = []
-    for cls in (Qwen4ExpPLEFp8EmbeddingMethod,):
+    for cls in (method_cls,):
         cw = cls.__dict__.get("create_weights")
         if cw is not None and not getattr(cw, "_xtu_ple", False):
             @functools.wraps(cw)
@@ -93,11 +123,9 @@ def install() -> list[str]:
     # 目标设备("量化方法期望参数在目标设备上")——51 GB 的表会在这一步 OOM。
     # 只要参数已经变成 UVA 视图(p.device 是 cuda、物理内存在主机),该上下文就
     # 不会搬它,显存也不占。因此挂在 `Qwen4ExpNGramEmbedding.load_weights` 后面。
-    try:
-        from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpNGramEmbedding
-    except Exception:          # noqa: BLE001
+    if ngram_cls is None:
         return applied
-    lw = Qwen4ExpNGramEmbedding.__dict__.get("load_weights")
+    lw = ngram_cls.__dict__.get("load_weights")
     if lw is not None and not getattr(lw, "_xtu_ple", False):
         @functools.wraps(lw)
         def load_weights(self, weights, *a, **kw):
@@ -106,6 +134,6 @@ def install() -> list[str]:
             return res
 
         load_weights._xtu_ple = True  # type: ignore[attr-defined]
-        Qwen4ExpNGramEmbedding.load_weights = load_weights
-        applied.append("Qwen4ExpNGramEmbedding.load_weights")
+        ngram_cls.load_weights = load_weights
+        applied.append(f"{ngram_cls.__name__}.load_weights")
     return applied

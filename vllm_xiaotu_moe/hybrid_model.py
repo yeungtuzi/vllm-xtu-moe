@@ -514,7 +514,21 @@ class CpuXiaotuMoE(nn.Module):
     - forward: 路由(GPU)+ engine.cpu_decode + 共享专家(GPU)。
     """
 
-    def __init__(self, vllm_config, prefix: str = "", use_sequence_parallel: bool = False):
+    def __init__(
+        self,
+        vllm_config,
+        prefix: str = "",
+        use_sequence_parallel: bool = False,
+        *,
+        num_hash_layers: int | None = None,
+        n_routed_experts: int | None = None,
+        n_activated_experts: int | None = None,
+        image_sentinel_lo: int | None = None,
+    ):
+        # Upstream's `DeepseekV4MoE` grew these keyword-only args (mainline
+        # dabc4362b, DS-V4 hash routing). Accept them and fall back to the
+        # config, so the plugin still works on the older tree
+        # (<= 6c73b08dec) that constructed us positionally.
         super().__init__()
         config = vllm_config.model_config.hf_config
         self._vllm_config = vllm_config
@@ -527,9 +541,20 @@ class CpuXiaotuMoE(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
-        self.n_routed_experts = config.n_routed_experts
-        self.n_activated_experts = config.num_experts_per_tok
-        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = (
+            config.n_routed_experts if n_routed_experts is None else n_routed_experts
+        )
+        self.n_activated_experts = (
+            config.num_experts_per_tok
+            if n_activated_experts is None
+            else n_activated_experts
+        )
+        self.top_k = self.n_activated_experts
+        self.num_hash_layers = (
+            getattr(config, "num_hash_layers", 0)
+            if num_hash_layers is None
+            else num_hash_layers
+        )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.swiglu_limit = getattr(config, "swiglu_limit", None)
         self.renormalize = config.norm_topk_prob
@@ -553,18 +578,18 @@ class CpuXiaotuMoE(nn.Module):
         if not self._shard_storage:
             _tp, _rk = 1, 0
         self._ep_tp, self._ep_rank = max(1, _tp), max(0, _rk)
-        self._stor_local = config.n_routed_experts // self._ep_tp
+        self._stor_local = self.n_routed_experts // self._ep_tp
         self._stor_start = self._ep_rank * self._stor_local
         self.n_local_experts = self._stor_local
-        self.n_logical_experts = config.n_routed_experts
-        self.n_physical_experts = config.n_routed_experts  # 无 redundant
+        self.n_logical_experts = self.n_routed_experts
+        self.n_physical_experts = self.n_routed_experts  # 无 redundant
         self.n_local_physical_experts = self._stor_local
         self.n_redundant_experts = 0
         self.experts_start_idx = self._stor_start
         self.experts_end_idx = self._stor_start + self._stor_local
         self.hash_indices_dtype = torch.int64  # mega 语义
         self.image_sentinel_lo = (
-            IMAGE_SENTINEL_BASE_ID
+            (IMAGE_SENTINEL_BASE_ID if image_sentinel_lo is None else image_sentinel_lo)
             if getattr(config, "vision_n_layers", 0) > 0
             else 0
         )
@@ -572,7 +597,7 @@ class CpuXiaotuMoE(nn.Module):
         # ---- gate(GPU,小)— 与主线一致(含 hash / biased 专家) ----
         self.gate = GateLinear(
             input_size=config.hidden_size,
-            output_size=config.n_routed_experts,
+            output_size=self.n_routed_experts,
             bias=False,
             out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
@@ -580,20 +605,20 @@ class CpuXiaotuMoE(nn.Module):
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
         self.gate.bias_vl = None
-        is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
+        is_hash_moe = extract_layer_index(prefix) < self.num_hash_layers
         if is_hash_moe:
             self.gate.tid2eid = nn.Parameter(
                 torch.randint(
                     0,
-                    config.n_routed_experts,
-                    (config.vocab_size, config.num_experts_per_tok),
+                    self.n_routed_experts,
+                    (config.vocab_size, self.n_activated_experts),
                     dtype=self.hash_indices_dtype,
                 ),
                 requires_grad=False,
             )
         if getattr(config, "topk_method", None) == "noaux_tc" and not is_hash_moe:
             self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                torch.empty(self.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
 

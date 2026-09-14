@@ -150,3 +150,101 @@
   ⇒ 单层实测 RSS 3.67(源)+ 3.29(分片)= **6.96 GiB ≈ 2×**;服务里 worker RSS **114 GB/rank ≈ 2.2×**。
   这是**主机内存浪费**(不影响热路径带宽,因为热路径只读绑定的分片),
   但省下来的内存**换不到显存**,所以对"常驻层"没有直接帮助 —— 记下来避免重复误判。
+
+---
+
+## R10. **上游主线漂移:周期性检查 + 及时跟进**(用户 2026-09-14 定为开发原则)
+
+> 用户原话:「你要周期性检查上游主线是否升级,并及时跟进,把这条作为开发原则」。
+> 入口脚本:**`scripts/check_upstream_drift.sh`**(每次开工先跑,`--full` 看逐文件热度)。
+
+### 10.1 为什么必须周期做(实测,不是担心)
+
+* vLLM 主线移动**极快**:我们上次的基线 `6c73b08dec`(2026-09-08)→ `dabc4362b`(**2026-09-14**)
+  只有 6 天,却差了 **346 个 commit / 300 个文件 / 1307 个文件被上游改过**。
+* **DS-V4.1-Flash 的支持就是在这 6 天里落地的**(`deepseek_v41` 包 + registry +
+  `DSparkV41DraftModel`,PR #56503 起)。**不跟进 = 白写别人已经写完的东西。**
+* 典型漂移形态(两条都真实打断过服务):
+  1. **符号搬家**:`cpu_moe.select_experts` → `router/cpu_router.select_experts`
+     (模块还在,名字没了 ⇒ `ImportError`);
+  2. **构造函数加参数**:`DeepseekV4MoE.__init__` 新增 `num_hash_layers=`
+     ⇒ `TypeError: CpuXiaotuMoE.__init__() got an unexpected keyword argument`。
+  ⇒ 插件侧的固定写法:**能兼容两版就兼容两版**(`try/except ImportError`、
+  `*` 关键字参数带 `None` 默认并回退到 config),而不是绑死一个版本。
+
+### 10.2 ⚠️ 本机最硬的约束:**不能从源码编译**,"上游支持 X" ≠ "我们能跑 X"
+
+* 本机 `nvcc` 是 **CUDA 12.1**,而 torch 是 **2.13.0+cu130**(CUDA 13.0)⇒ **版本不匹配**;
+  且**没有 Rust 工具链**(`cargo`/`rustc` 缺失),而主线有上百个 rust 文件。
+* 当前 env 的 vLLM 是 **editable + precompiled wheel** 安装(`.so` 由官方 nightly 轮子提供)。
+* ⇒ **升级目标必须是"已发布 precompiled wheel 的 commit"**,不是"上游 HEAD"。
+  查询方式:
+  ```bash
+  curl -s https://wheels.vllm.ai/nightly/cu130/vllm/metadata.json | grep -o '+g[0-9a-f]*'
+  # 某个具体 commit 有没有轮子:
+  curl -s -o /dev/null -w '%{http_code}\n' https://wheels.vllm.ai/<full-sha>/cu130/vllm/metadata.json
+  ```
+  实测:`bdad63c9`(当时 HEAD)= **404 无轮子**;`dabc4362b`(nightly)= **有 cu130 轮子**。
+
+### 10.3 标准跟进流程(每次升级照做)
+
+```bash
+R=/home/user/lvllm/vllm-xiaotu-moe; M=/home/user/lvllm/process_data/ref/repos/vllm-mainline
+
+# 0) 先跑漂移检查(会告诉你 HEAD 能不能装、补丁还打不打得动、API 面是否完好)
+bash $R/scripts/check_upstream_drift.sh
+
+# 1) **先做安全快照**(本地补丁是未提交的工作树改动,极易丢!)
+cd $M && git diff > $R/backup/<date>/xtu-working-tree-<base>.diff
+git checkout -b xtu/snapshot-<base> && git add -u && git commit -m "snapshot: <base>"
+
+# 2) 切到目标 commit(必须是有轮子的那个)
+git fetch origin main && git checkout -b xtu/upgrade-<target> <target-full-sha>
+
+# 3) 用官方轮子刷新二进制(不改依赖;缺 setuptools-rust 就补装,它是官方 build 依赖)
+VLLM_PRECOMPILED_WHEEL_LOCATION=/tmp/vllm-<target>.whl \
+  pip install -e . --no-deps --no-build-isolation
+
+# 4) 复验(顺序:便宜 → 贵)
+python -m vllm_xiaotu_moe.mainline_shims    # 垫片是否全部命中
+python scripts/probe_oracle.py             # oracle 是否仍选中我们的 CPU 后端
+bash scripts/check_mainline_env.sh         # 9 条宿主契约断言
+python scripts/test_block23_equiv.py       # 数值门禁 OK=7 BAD=1
+ENV=... TAG=... bash scripts/serve_mainline.sh   # 端到端(最贵,最后做)
+```
+
+### 10.4 升级后必须写下的三件事
+
+1. `report/tuning/NOTES.md` 追加章节:**旧基线 → 新基线、差多少 commit、打断了什么、
+   怎么修的、before/after 数字**;
+2. `docs/UPSTREAM_DRIFT.md` 的 **BASE 与"三棵树"表**跟着更新(否则下次审计读到过期基线);
+3. 本文件 R10.2 的**轮子可用性**结论(哪个 commit 能装、哪个不能)。
+
+### 10.5 补丁集随漂移"减法优先"
+
+上游每往前一步,我们自己要背的补丁就应当**变少而不是变多**。实测例子:
+
+* `pr0`(握手超时)在 `dabc4362b` 上**仍然必需** —— 上游还是硬编码
+  `HANDSHAKE_TIMEOUT_MINS = 5`,而 CPU 引擎逐层构造要 ~6 min;
+* `pr1` 的 **mxfp4 oracle 分派**已被上游自己吸收(native `Mxfp4MoeBackend.CPU`
+  分支 + `prepare_mxfp4_moe_layer_for_cpu`),只剩 plug in 侧的 shim 还需要;
+* `pr2`/`pr3`(SM80 移植)是否还必需,**取决于主线对 A100 的支持现状**,每次升级都要重问。
+
+⇒ **不要默认"补丁越多越安全";每升一次就问一次"这条上游做了吗"。**
+
+
+### 10.6 首次执行的实测记录(2026-09-14,可直接照抄)
+
+| 步骤 | 结果 |
+|---|---|
+| 漂移检查 | `6c73b08dec → dabc4362b` = **346 commits / 300 文件**;上游 HEAD `bdad63c9` **无轮子** |
+| 升级目标 | `dabc4362b`(nightly,有 cu130 轮子);装完 = `vllm 0.29.1rc1.dev95+gdabc4362b` |
+| 冲突面 | 31 个自研文件里 **21 个与上游冲突**;**7 个** `cherry-pick` 冲突 |
+| 真被打断的 API | 4 类(符号搬家 / 构造函数加参 / kernel 重构 / **上游自己实现了同一功能**) |
+| 补丁净效果 | `pr3` 7001 行 ⇒ 真正必需的只有 **~20 行**(mHC broadcast 的 DeepGEMM 门闸) |
+| 复验 | 自检 10/10 · `OK=7 BAD=1 max_rel=1.873e-02`(**逐位一致**) · 确定性 11/11 · C=1/2/4 8/8 完成 |
+| 性能 | C=1 TPOT **35.97 → 33.46 ms(−7%)**;相对 fork 的移植税 **1.34× → 1.25×** |
+| 内存 | 每 worker **192.7 GB**(旧 190)⇒ EP 存储分片未退化 |
+
+**下一次跟进的起点**:最新有轮子的 commit 已是 `d392ac836`(比 `dabc4362b` 又新 4 个 commit);
+`upstream main HEAD` 仍**无轮子**。跑 `scripts/check_upstream_drift.sh` 即可看到当前值。

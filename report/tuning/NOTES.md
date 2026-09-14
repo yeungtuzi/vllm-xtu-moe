@@ -13297,3 +13297,106 @@ torch.zeros(num_experts, 2*I, H//2)                            # ⇒ 每 rank 13
   **`INTERLEAVE=0` 也能正常加载了**(默认 NSHARD=8 下实测无 OOM)
   ⇒ **`numactl --interleave=all` 从"必需"降级为"可选"**(带它 1.47 s / 不带 1.58 s,差 7%)。
   默认仍保留它(更快),但文档与自检里要改成"可选优化"而非"必需",去掉一个脆弱依赖。
+
+### 368. ✅【v0.3·第 1 轮】**主线升级 6c73b08dec → dabc4362b(346 commits / 6 天)**,DS-V4-Flash 端到端复验通过 + 三方性能对照
+
+用户 2026-09-14 指令:「升级 mainline,并快速确认我们之前完成的工作是否可以完整工作」+
+「周期性检查上游主线是否升级,并及时跟进,把这条作为开发原则」。本轮把两件事都做完。
+
+#### (a) 升级目标不是"上游 HEAD",而是"有 precompiled wheel 的那个 commit"(本轮最硬的约束)
+
+本机**不能从源码编译**:`nvcc` 是 **CUDA 12.1**,torch 是 **2.13.0+cu130**,主版本不匹配;
+且**没有 Rust 工具链**(主线有 126 个 rust 文件被这 346 个 commit 改过)。
+主线的 csrc 也被改了 **43 个文件** + 5 个 cmake ⇒ 旧 `.so` 不可能继续用。
+
+⇒ 只能走官方 **precompiled wheel** 路径,而 wheel 是**按 commit 发布**的:
+
+| commit | 日期 | 有 cu130 轮子? |
+|---|---|---|
+| `6c73b08dec`(旧基线) | 2026-09-08 | ✅(旧装就是这个) |
+| `bdad63c9`(当时 HEAD) | 2026-09-14 | ❌ 404 |
+| **`dabc4362b`(nightly)** | **2026-09-14 20:47** | ✅ **采用** |
+| `00972dfd72`(几小时后 HEAD) | 2026-09-14 21:44 | ❌(只差 3 个 commit) |
+
+安装方式(不改依赖):
+`VLLM_PRECOMPILED_WHEEL_LOCATION=/tmp/vllm-dabc4362b.whl pip install -e . --no-deps --no-build-isolation`
+—— 缺 `setuptools_rust` 先补装(它是官方 `requirements/build/cuda.txt` 的依赖)。
+结果:`vllm 0.29.1rc1.dev95+gdabc4362b`,新增 `_deepselect_C.abi3.so`,**DeepseekV41ForCausalLM 已注册**。
+
+#### (b) 我们的补丁:减法优先,但仍然必需
+
+| 补丁 | 结论 |
+|---|---|
+| `pr0`(握手超时) | ✅ **仍然必需**:上游还是硬编码 `HANDSHAKE_TIMEOUT_MINS = 5`,CPU 引擎逐层构造 ~6 min ⇒ 干净打上 |
+| `pr1`(experts-load-device) | 🟡 envs + routed_experts 仍要;`mxfp4.py` 的 hunk **已被上游吸收**(上游自己加了 native `Mxfp4MoeBackend.CPU` 分支)⇒ 删掉不再打 |
+| `pr2`/`pr3`(SM80 移植) | ✅ **仍然必需**,但**大幅简化**(见 (d)) |
+
+`git cherry-pick` 快照到新基线:**30 文件 / +7021 −131**(原 31 文件 / +7049),**21 个文件与上游冲突**。
+
+#### (c) 打断我们的 4 类 API 漂移(每条都真实拦住过服务)
+
+| # | 漂移形态 | 具体 | 修法 |
+|---|---|---|---|
+| 1 | **符号搬家** | `cpu_moe.select_experts` → `router/cpu_router.select_experts` | 插件改成 `try: 新路径 / except: 旧路径`(两版都能跑) |
+| 2 | **构造函数加关键字** | `DeepseekV4MoE.__init__` 新增 `num_hash_layers=`(还有 `n_routed_experts`/`n_activated_experts`/`image_sentinel_lo`) | `CpuXiaotuMoE.__init__` 加 `*` 关键字参数,默认 `None` 时回退到 config |
+| 3 | **逻辑重构**(最险) | 上游把 Triton kernel 重构成 `@kernel_launcher` 类(`LaunchParameters`/`LaunchSpec`)、`fp8_buf`→`out_buf`、新增 `quantize` 标志 | 按上游新结构逐文件重放我们的 SM80 intent(子代理并行做,见 (d)) |
+| 4 | **上游自己实现了同一功能** | `Qwen4ExpPLEFp8EmbeddingMethod` 从 `ple_layer.py` **移到** `ngram_embedding.py`,并新增 **`Qwen4ExpPLEPinnedHostEmbedding`**(pinned host + UVA + prefetch stream,由 `engram_config.cpu_offload` 选择) | 插件补 importlib 双路径查找;**并且发现 `XIAOTU_PLE_CPU=1` 会静默失效** ⇒ 改成**大声警告**(否则单卡会在 create_weights 时 OOM 48 GiB,离真因很远) |
+
+#### (d) SM80 移植被**大幅简化**:7001 行 → 净增 ~20 行
+
+- **mHC(第 1 个真拦路虎)**:上游 `_hc_prenorm_gemm_outputs` **本来就有** fallback
+  (`use_deep_gemm = is_deep_gemm_supported() or not use_tilelang_fallback`),
+  只是 broadcast 变体的调用方**硬写 `use_tilelang_fallback=False`** ⇒ A100 上必走 DeepGEMM
+  `hyperconnection.hpp` 的 `Unsupported architecture`。
+  **但**直接把 flag 翻成 True 也不行:tilelang fallback 断言 `x.shape[1] == hc_mult*H`,
+  而 broadcast 变体传的是 `x = residual (T, H)`。
+  ⇒ 正解:按 `is_deep_gemm_supported()` 分支,非 DeepGEMM 走**同文件的 torch 参考**
+  `_torch_hc_prenorm_gemm`(它本来就是为 n_splits=1 写的,输出 `(1,T,hc_mult3)/(1,T)` 与融合 kernel 匹配)。
+  最终 **净增 ~20 行**,替代了原来 7001 行的 pr3 主体。
+- 其余 3 个文件(`o_proj` / `fused_indexer_q` / `fused_inv_rope_fp8_quant` / `cache_utils`)
+  的核心 intent 都是"**Ampere 没有 Triton `fp8e4nv`,改用 `_f32_to_e4m3_uint8` 直接编 e4m3 字节 + uint8 视图**"
+  + `has_cutedsl() and not is_ampere_or_ada()` 门闸 + 4 个 fork 移植函数。
+  `fused_inv_rope_fp8_quant` 还额外做了**真机 SM80 GPU 冒烟**:与独立 torch 参考逐字节对比
+  (5/512 个 fp8 字节差 1 LSB,即 helper 文档写明的 round-half-up vs RNE;per-block scale 逐位一致)。
+
+#### (e) 复验结果(全部通过)
+
+| 项 | 结果 |
+|---|---|
+| 启动自检 `check_mainline_env.sh` | **10/10 全通过** |
+| 插件 shim | 26 条全部命中;OOT override 注册成功 |
+| `probe_oracle.py` | bf16 / fp8-glm53 / fp8-dsv4 / wna16-int4 → **CPU(xiaotu)** ✅(`mxfp4-dsv4` 的 ERR 是**探针缺 vLLM config 上下文**,改前也一样,非回归) |
+| 数值门禁 `test_block23_equiv.py` | **`OK=7 BAD=1`,`me=1 max_rel = 1.873e-02`** —— 与 0.1.0/0.2.0 **逐位一致** |
+| 引擎确定性 | **11/11** bit-identical |
+| 端到端 | 服务起来(greedy "capital of France" → 含 `Paris`),`bench_lat` C=1/2/4 **8/8 completed** |
+| KV cache | **176,682 tokens**(旧主线同命令 ~113k ⇒ 新主线 KV 更省) |
+| 每 worker RSS | **192.7 / 192.8 GB**(旧主线 190 GB)⇒ **C3 EP 存储分片未退化** |
+
+#### (f) 🎯 三方性能对照(同机同协议:L=512 / out=128 / N=8 / random;TPOT 口径)
+
+| 配置 | C=1 TPOT | C=1 agg | C=2 agg | C=4 agg | C=1 TTFT | 相对 fork |
+|---|---|---|---|---|---|---|
+| **lk fork + 我们的引擎** | **26.81 ms** | 22.42 t/s | — | — | — | 1.00× |
+| 旧主线 `6c73b08dec` + 插件 | 35.97 ms | 16.95 t/s | 29.32 t/s | 38.55 t/s | 2983 ms | 1.34× |
+| **新主线 `dabc4362b` + 插件** | **33.46 ms** | 16.81 t/s | **30.00 t/s** | **38.84 t/s** | 3366 ms | **1.25×** |
+
+- **TPOT:C=1 35.97 → 33.46 ms(−7%)**;C=2 53.90 → 51.90;C=4 72.80 → 71.98 ⇒ 移植税 **1.34× → 1.25×**。
+- **C=1 agg 基本持平**(16.95 → 16.81):TPOT 变好被 **TTFT 变差**(2983 → 3366 ms,+13%)抵消。
+  单次 8 请求的读数,TTFT 差异**需要在下一轮用多次重复确认**(暂不下结论)。
+- C=2/C=4 agg 略升(29.32→30.00、38.55→38.84)。
+
+#### (g) 结论与遗留
+
+1. **升级成功**:主线 6 天 346 个 commit 全部吃下,DS-V4-Flash 端到端 + 数值门禁 + 确定性全绿,
+   且**性能比旧主线还好 7%**(TPOT),移植税从 1.34× 收到 **1.25×**。
+2. **上游正在把我们的"护城河"做进去**:PLE 表 pinned-host offload(`Qwen4ExpPLEPinnedHostEmbedding`)、
+   Engram 主机内存 + RDMA 预取(`deepseek_v41/nvidia/engram.py`)、native `Mxfp4MoeBackend.CPU`。
+   ⇒ 我们剩下的差异化越来越集中在 **"CPU 路由专家引擎"本身**(和它的 NUMA/线程几何)。
+3. 🔴 **`pr2`/`pr3` 每升一次都要重问**:本轮 pr3 的 7001 行里**绝大部分已不需要**(上游自己重构+适配了),
+   真正必需的只有 ~20 行。**不要再默认"补丁越多越安全"。**
+4. 🟡 **遗留 1**:`XIAOTU_PLE_CPU=1` 已被上游 `engram_config.cpu_offload` 取代 ——
+   应实测上游原生路径能否单卡跑 Qwen3.8-Flash-Next,能则**删掉我们的 `ple_offload.py`**。
+5. 🟡 **遗留 2**:`fused_indexer_q`/`fused_inv_rope` 用 `_f32_to_e4m3_uint8` 时**无 FNUZ 分支**
+   (gfx942 会写错格式)。这是**我们补丁自带的**、非本次引入;本机是 NVIDIA,**不影响 A100**,但应在 ROCm 上补门闸。
+6. 🟡 **遗留 3**:C=1 TTFT 变差 13% 需重复测量确认;`upstream main HEAD` 又往前走了 3 个 commit
+   (**无轮子**),下次跟进目标已变成 `d392ac836`。

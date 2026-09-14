@@ -3,6 +3,14 @@
 > **目的**:为「让 vllm-xtu-moe 完全支持 vLLM 主线最新版,并提供简化的 patch / 安装方式」提供可核对的数字。
 > **方法**:全部用本机三棵树的 git 对象与工作树实测,命令写在每节末尾;**不引用任何估算**。
 > **日期**:2026-09-14(审计时主线 HEAD = `6c73b08dec`,2026-09-08)
+>
+> ⚠️ **本文档的基线已于 2026-09-14 晚更新**:主线基线从 `6c73b08dec` 升到 **`dabc4362b`**
+> (346 commits / 6 天)。**第二节起的所有数字仍是旧基线的审计结果,尚未重算**;
+> 升级过程、新的漂移形态与复验结果见 `report/tuning/NOTES.md` §368。
+> 下次重算请先跑 `scripts/check_upstream_drift.sh --full`,并注意
+> **"上游 HEAD"不等于"我们能装的 commit"**(本机不能从源码编译,必须挑有 precompiled wheel 的 commit,
+> 见 `report/tuning/IRON_RULES.md` R10.2)。
+
 
 ---
 
