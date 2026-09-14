@@ -120,6 +120,21 @@ RESIDENT="${RESIDENT-0-11}"
 OOT="${XIAOTU_OOT_OVERRIDE:-1}"
 EXTRA_ENV="${EXTRA_ENV:-}"
 
+# ---- 启动前自检:把"宿主节奏决定引擎行为"的隐式契约变成显式断言 ----
+# 这些开关缺失时**不报错、只静默变慢**(实测可达 30×),所以必须在起服务前拦住。
+# CHECK=0 可跳过(仅供诊断);CHECK_STRICT=1 时自检不通过直接拒绝启动。
+if [ "${CHECK:-1}" = "1" ]; then
+  # 注意:TAG= 置空 ⇒ 自检读「当前 shell 的 env」而不是某个已启动实例的记录
+  if ! TAG= MBT="$MBT" GP_MIN="$GP_MIN" CUDAGRAPH_SIZES="$CUDAGRAPH_SIZES" \
+       INTERLEAVE="$INTERLEAVE" SPIN_IDLE_US="$SPIN_IDLE_US" \
+       NSLICE_SMALL="$NSLICE_SMALL" THREADS="$THREADS" RESIDENT="$RESIDENT" \
+       OOT="$OOT" ENV="$ENV" bash "$ROOT/scripts/check_mainline_env.sh"; then
+    if [ "${CHECK_STRICT:-0}" = "1" ]; then
+      echo "[mainline] 启动自检未通过,拒绝启动(CHECK_STRICT=1)"; exit 1
+    fi
+    echo "[mainline] ⚠️ 自检有未通过项,仍继续启动(CHECK_STRICT=1 可改为拒绝)"
+  fi
+fi
 OUTDIR="$ROOT/report/tuning/logs"; mkdir -p "$OUTDIR"
 LOG="$OUTDIR/$TAG.log"
 rm -f /dev/shm/xiaotu_ep_*.bin 2>/dev/null || true
