@@ -11716,3 +11716,38 @@ A(gate/up)=7.2 ms、B(down)=4.5 ms —— 而 fork 路径是 **0.135 / 0.105 ms*
   插件要补齐它,需要一份 GPU 上的权重副本 —— 那正是"常驻层/GPU 预填充"这套编排的职责。
 * **可用的过渡配置**:保持主线默认(chunked prefill **开**)并把 `MBT` 设小(256),
   让预填充块尽可能与解码分离;纯解码负载(如投机/长输出)表现正常。
+
+### (t) 🎯 定位到最后一个真 bug 的**形状** + 下一轮的首要假设
+
+**干净的对照实验**(同一台服务器、同一份权重,只换 prompt 长度):
+
+| prompt | token 数 | 实测 | `qlen` 分布 |
+|---|---|---|---|
+| `"The history of computing"` | **4** | **31.5 ms/token** | **qlen=1** × 224(纯解码)✅ |
+| `'word '*256` | **257** | **1136.8 ms/token** | **qlen=257** × 200/200 ❌ |
+| 同上,MBT=256 | 257 | 1.1 s/token | qlen=256 × 3432 ❌ |
+
+* 两种配置(MBT=256 / MBT=2048)都是**每一步都排一个"整段 prompt 大小"的批**;
+* API 日志:`Running: 1 reqs, Waiting: 0 reqs` ⇒ **只有一个序列**,不是并发问题;
+* ⇒ **这条序列的预填充"永远完不成"**:每一步都重新按 257 个 token 跑一遍。
+
+**🔑 与 fork 路径的关键契约差异(下一轮首要假设)**:
+
+| | fork 的 `_cpu_decode` | 形态 B 的 `XiaotuCPUExperts.apply` |
+|---|---|---|
+| 输出缓冲 | 写进 **`RoutedExperts.output_gpu`(全层共享、预分配、地址稳定)** | **每次 `torch.empty(qlen, H)` 新建** |
+| 返回 | `output_gpu[:num_tokens]`(视图) | `out.to(hidden_states.dtype)`(新张量) |
+| 图捕获 | 地址稳定 ⇒ 可被图引用 | **每次新地址** ⇒ 图重放写向陈旧指针 |
+
+⇒ **强假设**:形态 B 的 `apply()` **每次分配新输出**破坏了主线 runner 的缓冲契约(尤其 chunked prefill
+的 piecewise 图),使预填充状态无法推进 ⇒ 无限重做。
+
+**下一轮实验(便宜且决定性)**:
+1. 在 `apply()` 里加 `XIAOTU_DEBUG_QLEN`(已有该 env 名占位)打印 `(qlen, 是否capturing, out.data_ptr())`,
+   看 257 的调用是否发生在 capture 区、指针是否每次都变;
+2. 改成**写进预分配缓冲**(每个 expert 层一个,形状 `[max_num_batched_tokens, H]`),
+   返回 `buf[:qlen].to(dtype)`,与 fork 契约对齐;
+3. 复测同一对 prompt。
+
+**当前可用结论(写进 v0.2)**:**形态 B 在"短 prompt / 纯解码"下与 fork 打平(31.5 vs 26.1 ms,
+且我们这次是 0 层常驻、fork 是 12 层常驻 ⇒ 折算后我们其实更好)**;长 prompt 的预填充路径有 bug。
