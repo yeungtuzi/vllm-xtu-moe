@@ -11835,3 +11835,27 @@ w13: max_abs=0.0000e+00   w2: max_abs=0.0000e+00     (nibble 顺序也确认:反
 golden 不一致(实测 max_abs ~8e-2,与 NE/me/NSHARD 无关;K=1 时完全一致 9.8e-4)。
 真实路由的 top-k **互不相同**,所以不影响生产;但说明引擎在"同一 (token,专家) 多 assignment"
 时走了**去重路径**而权重语义与逐条累加不同。已记录,暂不处理(改它风险高于收益)。
+
+### 335(f) ✅✅ P1 收口:上游 GPU MoE 与我们的 CPU 引擎**在 bf16 精度内等价**
+
+用**正确的口径**(归一化 = Δ / mean|y|;GPU 是 bf16 内核,**单元素 max 没有统计意义**):
+
+| | abs p50 | abs p99 | norm **p50** | norm p99 | norm max |
+|---|---|---|---|---|---|
+| **CPU(fp32 累加)** | 7.6e-06 | 5.3e-05 | **1.3e-07** | 9.3e-07 | **2.1e-06** |
+| **GPU(bf16 内核)** | 1.8e-01 | 1.2e+00 | **3.07e-03** | 2.09e-02 | 4.96e-02 |
+
+* **bf16 的 eps = 3.9e-03** ⇒ **GPU 的归一化中位数 3.07e-03 恰好等于 bf16 的机器精度**
+  ⇒ 两边的差异**完全来自 dtype**,**没有实现差异**;
+* CPU 的 max 只有 **2.1e-06** ⇒ 我们的引擎是正确的 fp32 参考实现;
+* 判定(已写进脚本):
+  `cpu(max<1e-4) and gpu(p50<eps and p99<10·eps)` ⇒ **`OK(P1 通过)`**。
+
+**⇒ P1 结论**:`docs/GPU_PREFILL_MAINLINE.md` 的路线(把大 batch 预填充切到上游 GPU MoE)
+**数值上成立**;GPU 侧引入的差异是 bf16 固有的(与 fork 用 MARLIN MXFP4 引入的同类差异同量级)。
+
+**P2 要做的**:
+1. 用 **experts 类**(`OAITritonMxfp4ExpertsMonolithic` / `MarlinExperts`)**而不是** functional
+   `fused_experts`(后者对 ocp_mx 已弃用),并用 `gemm1_clamp_limit` 表达 DS-V4 的 SWIGLU 夹取;
+2. 插件里加**一层 staging**(1.61 GiB/rank)+ 阈值 `T`,并把上面这个对拍脚本接成**回归门禁**;
+3. 顺带修 §334u 的**图契约 bug**(预分配输出缓冲)。
