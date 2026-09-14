@@ -85,9 +85,9 @@ def save(fig, name):
 # =============================================================================
 def fig_main_result():
     conc = ["C=1", "C=2", "C=4"]
-    ours_tpot = [28.13, 30.55, 33.60]
+    ours_tpot = [26.48, 28.81, 31.79]
     ref_tpot = [23.11, 31.75, 41.88]
-    ours_agg = [32.67, 59.89, 100.16]
+    ours_agg = [34.53, 63.19, 104.98]
     ref_agg = [41.04, 59.73, 86.92]
 
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.3))
@@ -193,9 +193,10 @@ def fig_history():
         T("② +5 层常驻", "2. +5 GPU-resident"),
         T("③ +11 层常驻\n+PERMV 解码", "3. +11 resident\n+PERMV decode"),
         T("④ +12 层常驻\n+异步握手", "4. +12 resident\n+async handshake"),
+        T("⑤ +并行区自旋\n2000→200", "5. +publish spin\n2000->200"),
     ]
-    tpot = [37.33, 33.82, 31.78, 28.13]
-    agg = [34.29, 55.23, 60.17, 100.16]
+    tpot = [37.33, 33.82, 31.78, 28.13, 26.48]
+    agg = [34.29, 55.23, 60.17, 100.16, 104.98]
 
     fig, ax = plt.subplots(figsize=(10.6, 4.5))
     x = range(len(stages))
@@ -216,7 +217,7 @@ def fig_history():
                 label=T("验收线:C=4 聚合 ≥ 50 t/s", "target: C=4 agg >= 50 t/s"))
 
     ax.set_xticks(list(x)); ax.set_xticklabels(stages, fontsize=9.5)
-    ax.set_title(T("优化历程:① ② ③ 为历史口径(客户端协议不同,仅看趋势);④ 为本轮同协议实测",
+    ax.set_title(T("优化历程:① ② ③ 为历史口径(客户端协议不同,仅看趋势);④ ⑤ 为本轮同协议实测",
                    "Optimization history: stages 1-3 use a legacy client protocol (trend only); stage 4 is current"),
                  fontsize=10.5, fontweight="bold")
     h1, l1 = ax.get_legend_handles_labels()
@@ -258,13 +259,13 @@ def fig_cost_breakdown():
 # =============================================================================
 def fig_step_cost():
     C = [1, 2, 4]
-    ours = [28.13, 30.55, 33.60]
+    ours = [26.48, 28.81, 31.79]
     ref = [23.11, 31.75, 41.88]
     fig, ax = plt.subplots(figsize=(8.4, 4.4))
     ax.plot(C, ours, "o-", lw=2.4, ms=8, color=C_OURS, label=T("本项目", "ours"))
     ax.plot(C, ref, "s--", lw=2.4, ms=8, color=C_REF, label=T("lk_moe(专有)", "lk_moe (proprietary)"))
     # 拟合线
-    F_o, V_o = 28.13 - (33.60 - 28.13) / 3, (33.60 - 28.13) / 3
+    F_o, V_o = 26.48 - (31.79 - 26.48) / 3, (31.79 - 26.48) / 3
     F_r, V_r = 23.11 - (41.88 - 23.11) / 3, (41.88 - 23.11) / 3
     xs = [1, 2, 3, 4]
     ax.plot(xs, [F_o + V_o * c for c in xs], ":", lw=1.6, color=C_OURS, alpha=0.8,
@@ -313,27 +314,28 @@ def fig_bandwidth():
 # 图 7:每层 rest / compute 拆分
 # =============================================================================
 def fig_rest_compute():
-    labels = [T("历史(43 层全 CPU)", "historical\n(43 CPU layers)"),
-              T("本轮 async(均值)", "this round\n(async, mean)"),
-              T("本轮 async(稳态最小)", "this round\n(async, min)")]
-    compute = [0.41, 0.318, 0.318]
-    rest = [0.60, 0.601, 0.316]
+    labels = [T("历史\n(43 层全 CPU)", "historical\n(43 CPU layers)"),
+              T("异步握手\n(settle=2000,均值)", "async\n(settle=2000, mean)"),
+              T("异步+自旋 200\n(均值)", "async + spin 200\n(mean)"),
+              T("异步+自旋 200\n(稳态最小)", "async + spin 200\n(min)")]
+    compute = [0.41, 0.304, 0.262, 0.239]
+    rest = [0.60, 0.601, 0.664, 0.335]
     fig, ax = plt.subplots(figsize=(9.2, 4.3))
-    x = range(3)
-    b1 = ax.bar(x, compute, 0.5, color=C_ACC, label=T("compute(CPU MoE+EP)", "compute (CPU MoE + EP)"))
-    b2 = ax.bar(x, rest, 0.5, bottom=compute, color="#9DBEF5",
+    x = range(4)
+    b1 = ax.bar(x, compute, 0.6, color=C_ACC, label=T("compute(CPU MoE+EP)", "compute (CPU MoE + EP)"))
+    b2 = ax.bar(x, rest, 0.6, bottom=compute, color="#9DBEF5",
                 label=T("rest(GPU+拷贝+握手)", "rest (GPU + copies + handshake)"))
     for i, (c, r) in enumerate(zip(compute, rest)):
         tot = c + r
         ax.text(i, tot + 0.02, f"period {tot:.2f} ms", ha="center", fontsize=9.5, fontweight="bold")
     ax.axhline(0.40, ls="--", lw=1.5, color=C_OK)
-    ax.text(2.45, 0.415, T("rest 验收线 0.40 ms", "rest target 0.40 ms"), color=C_OK, fontsize=9, ha="right")
+    ax.text(3.45, 0.415, T("rest 验收线 0.40 ms", "rest target 0.40 ms"), color=C_OK, fontsize=9, ha="right")
     ax.bar_label(b1, fmt="%.3f", fontsize=9, label_type="center", color="white")
     ax.bar_label(b2, fmt="%.3f", fontsize=9, label_type="center", color="#14315E")
     ax.set_xticks(list(x)); ax.set_xticklabels(labels, fontsize=9.5)
     ax.set_ylabel(T("每次 cpu_decode 调用 (ms)", "per cpu_decode call (ms)"))
-    ax.set_ylim(0, 1.15)
-    ax.set_title(T("每层开销拆分:compute 不退化(0.41→0.318),rest 稳态最小值已达标",
+    ax.set_ylim(0, 1.20)
+    ax.set_title(T("每层开销拆分:compute 0.41→0.239(不退化且更快),rest 稳态最小 0.335 达标",
                    "Per-layer split: compute improved (0.41 -> 0.318), steady-state rest meets target"),
                  fontsize=10.5, fontweight="bold")
     ax.legend(fontsize=9, frameon=False)
