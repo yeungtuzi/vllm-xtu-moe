@@ -897,3 +897,19 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
   (每 node 12 线程)。见 `lkport36tp2rank3`。
 - **教训**:"按 rank 切资源"在**已经做过拓扑交错排序**的核表上,正确操作是过滤,
   不是排序后切片;否则会破坏交错性,把并行度压到少数 node 上。
+
+## R107. `XIAOTU_MOE_RANK_SPLIT=2`(CCD 交错切分 + nshard=8)—— 反而慢 80 倍
+- **做法**:两个 rank 按 CCD 奇偶交错切核(核互不重叠,但每个 rank 覆盖全部 8 个 NUMA node),
+  期望既能不抢核、又能保住 harness 里最快的 `nshard=8`。
+- **结果**(`lkport50interleave`,TP=2 / THREADS=48 / util 0.80 / 图 / SPEC=0):
+  `compute=33.3 ms/层`(engine 33.2),C=1 TPOT **425 ms**(1.96 t/s)——
+  对比 mode 1 的 `compute=0.41 ms/层`、TPOT 37.33 ms。
+- **分析**:每个 rank 的权重按 8 shard 铺满**全部 8 个 node**(含对端 socket),
+  而 worker 只有 12 线程/node;两 rank 同时对 8 个 node 的稀疏 stride 区域发起访问 ⇒
+  带宽/页局部性彻底崩掉(详见 §314 的带宽测量)。**此模式作废,默认仍是 mode 1。**
+- **教训**:内存放置与线程放置必须**同构**;把"切核"和"切 node"拆成两套不同划分,只会制造跨 socket 流量。
+
+## R108. `XIAOTU_MOE_RANK_SPLIT=0`(不切核,两 rank 共用核表)—— compute 9.8 ms/层
+- **结果**:TPOT 244 ms(C=1 3.96 t/s),`compute=9.80ms(engine=7.55 ep=1.88)`。
+- **根因**:两个进程各自把 worker pin 在 `cores_[0..47]`(**同一批物理核**)⇒ 2× 超订 + 抢同 node。
+- **结论**:rank 切分(mode 1)必须保留;它是把 TP=2 的 compute 从 7.4-9.8 ms 打到 0.41 ms 的关键。
