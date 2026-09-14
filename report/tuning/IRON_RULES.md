@@ -30,13 +30,18 @@
 | **用户实测** | **~740 GB/s** |
 | 我方 `numactl --interleave=all` 复测(48/96/192 线程) | 447 / 420 / 465 GB/s |
 | ⚠️ 历史报告 `process_data/decomp/NUMA_BANDWIDTH_CCD.md`(2026-09-05) | 24 CCD **73.7 GB/s** |
+| ⚠️ `mb/bandwidth_ccd` 空载复测(2026-09-14) | 12 CCD **178 GB/s**、24 CCD **238 GB/s** ← **同样是错的** |
 | 我 2026-09-14 自写单节点探针 | 83–129 GB/s |
 
 **⚠️ 上面两个"低数字"都是测量方式的错,不许再引用它们当上限**:
 
 * 历史报告的测量环境写明 **`loadavg=155`,`机器共享,prod GPU0/1 正在跑 CPU-MoE 竞争`**
   ⇒ 那个 73.7 GB/s 是**被抢空后的**结果;
-* 我自写探针在**单节点**上 `malloc+memset` 单线程首次触碰 ⇒ 所有页落在 1 个 node,读全跨 node。
+* 我自写探针在**单节点**上 `malloc+memset` 单线程首次触碰 ⇒ 所有页落在 1 个 node,读全跨 node;
+* **`mb/bandwidth_ccd` 也有同样的缺陷**(用户 2026-09-14 指出):它的缓冲区由**主线程**分配,
+  页面全部落在主线程所在 node,worker 只是"读"⇒ 量到的是**跨 socket 流量**,
+  所以 178/238 GB/s 是"单 node 被跨 socket 读"的结果,**不是机器上限**。
+  **正确做法:每个线程自己分配 + 自己首次触碰(写一遍)自己的缓冲,页才会落在本地 node。**
 
 **正确测法**:`numactl --interleave=all`(或按 node 显式分片 + 线程绑到本 node),
 然后对比 `4-5 核/CCD` 与"按 node 切片"两种配置。
@@ -84,3 +89,34 @@
   worker 用该 socket 的 12 个 CCD(48-60 线程,4-5 核/CCD)。
 * 代码待办:`shard_region(total, node)` → 支持"node 集合 + 交织策略"(`XIAOTU_MOE_SOCKET_SHARD=1`),
   然后 A/B:`socket 2 片交织` vs `node 8 片各自绑定`。
+
+---
+
+## R8. **decode 的带宽账与本机真实上限**(来自 `process_data/ref/fork_vs_mainline_plugin_decision.md`,2026-09-08)
+
+* DS-V4-Flash 单层全专家 fp4 = **3.221 GB**;单层激活(topk6)= **75.5 MB**;
+  **每 token decode 读激活权重 ≈ 3.246 GB**(43 层)。
+* 需要的 DRAM 读带宽:**21.5 tok/s ≈ 70 GB/s;50 tok/s ≈ 162 GB/s;100 tok/s ≈ 325 GB/s**。
+* 本机上限:理论 921 GB/s;**现实 ~600-690 GB/s**;用户补充:**只读实测约 800 GB/s**。
+  ⇒ **100 tok/s 只需要现实峰值的 ~50%,是完全可行的**。
+* **重要区分(当年就写明了,别再搞混)**:
+  - **原理上** decode 是"带宽受限 + 是否批处理"决定的;
+  - **但当前实现并不是带宽受限**:实测只用到 ~45-200 GB/s,真正卡住的是
+    **每层一次调用的延迟**(当年 2.3 ms/层 × 43 ≈ 100 ms/step;rank 切分修好后是 0.41 ms/层)
+    加上 GPU 侧的 dense/attention。
+  ⇒ **优化方向**:(a) 降每层关键路径延迟(MLP/指令数/pinned 往返);
+  (b) 批处理(并发 = 每次调用吃更多字节,摊薄延迟);(c) 提高每线程 MLP。
+* 任何"我们已经到带宽上限"的结论**必须先算出用了多少 GB/s 并与 600-800 GB/s 对比**,
+  低于 400 GB/s 就不要说"到顶了"。
+
+### 8.1 微基准工具(本仓/参考仓自带,别再自己造)
+
+`process_data/ref/mb/`: `bandwidth_ccd`(⚠️ 主线程分配 ⇒ 量的是跨 node,**不可作上限**)、
+`micro_mt_dram`、`micro_ilp`/`micro_ilp2`(ILP/MLP)、`micro_parallel`、`micro_multi`、
+`micro_dram`(prefetch 距离)、`micro_ntile`、`micro_fanout`、`micro_gateup`、`test_sharded`。
+**先跑这些,再谈结论。**
+
+### 8.2 我自己写的探针也有同类陷阱
+
+`malloc` + 单线程首次触碰 ⇒ 单 node;依赖链累加 ⇒ 只有 1 个在途 load ⇒ 量到的是**延迟**不是带宽。
+写带宽探针必须:**每线程自己分配并首次触碰 + ≥8 条独立累加链**(`/tmp/bw6.c` 是正确写法)。
