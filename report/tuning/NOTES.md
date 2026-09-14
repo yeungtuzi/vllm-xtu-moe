@@ -11859,3 +11859,27 @@ golden 不一致(实测 max_abs ~8e-2,与 NE/me/NSHARD 无关;K=1 时完全一�
    `fused_experts`(后者对 ocp_mx 已弃用),并用 `gemm1_clamp_limit` 表达 DS-V4 的 SWIGLU 夹取;
 2. 插件里加**一层 staging**(1.61 GiB/rank)+ 阈值 `T`,并把上面这个对拍脚本接成**回归门禁**;
 3. 顺带修 §334u 的**图契约 bug**(预分配输出缓冲)。
+
+### 335(g) P2 的入口找到了:**`triton_kernel_moe_forward()` —— 吃显式权重的 MXFP4 功能入口**
+
+上一轮查到"functional `fused_experts` 对 ocp_mx 已弃用、emulation 类又要 AMD Quark",
+本轮把**正确的门**找到了:
+
+```python
+# vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py:541
+def triton_kernel_moe_forward(
+    hidden_states, w1, w2, gating_output, topk, renormalize,
+    activation=MoEActivation.SWIGLUOAI, quant_config=None, ...) -> torch.Tensor
+```
+
+* **吃显式 `w1`/`w2`**(MXFP4 packed,`triton_kernels.Tensor` 或普通 Tensor)
+  ⇒ **正是 staging 需要的形态**,而且**不需要构造 `FusedMoEConfig`/`FusedMoEParallelConfig`**
+  (那两个才是 `OAITritonMxfp4ExpertsMonolithic` / `MarlinExperts` 的构造负担);
+* 它内部自己路由(`gating_output` = router logits)⇒ ⚠️ **DS-V4 的路由是 sqrtsoftplus + 夹取 +
+  group topk,必须确认与主线该入口的 `routing()` 语义一致**,否则要改走 modular 路径
+  (显式 `topk_weights/topk_ids`)。
+* P2 的落地顺序(更新):
+  1. 先用 `triton_kernel_moe_forward` + **staging** 跑通**单层**的 MXFP4 GPU 前向,
+     与本引擎的 `cpu_prefill` 对拍(**复用 §335f 的门禁脚本,只换 GPU 侧入口**);
+  2. 确认 DS-V4 路由语义一致(或改用显式 topk 的 modular 路径);
+  3. 再接进插件的 `apply()` + 阈值 `T` + 显存预算。
