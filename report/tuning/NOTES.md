@@ -11415,3 +11415,47 @@ NUMA 辅助(引擎自带 per-shard mbind)。
 | `pr3-sm80-port.patch` | 21 | **0** |
 
 ⇒ 三个补丁**全部干净可用**,无需人工改行。v0.2 的"一条命令安装"路径成立。
+
+---
+
+## 334. 【v0.2·第 2 轮】mainline + 插件(零补丁路径)打通中:踩到**两个**启动看门狗;安装说明成稿
+
+### (a) 零补丁路径确实能起来(实测证据)
+
+`scripts/serve_mainline.sh`(新写)在 **mainline vLLM + `vllm_xiaotu_moe` 插件**上启动,
+日志里出现(全部实测):
+
+```
+[vllm-xtu-moe/shims] mainline shims applied (26): … mxfp4._get_priority_backends, mxfp4.convert_weight_to_mxfp4_moe_kernel_format,
+                     cpu_moe.prepare_mxfp4_moe_layer_for_cpu, FusedMoEFactory, …        ← 全部是**猴补丁**,不碰主线源码
+[vllm-xtu-moe] registered OOT override of DeepseekV4ForCausalLM (DeepseekV4MoE -> CpuXiaotuMoE)
+[xiaotu] GPU-resident model.layers.5.ffn: 1.59 GiB on cuda:0 (tp=2, experts=128)
+[xiaotu] EP model.layers.24.ffn: rank 0/2 owns experts [0, 128) of 256
+[xiaotu] engine built model.layers.28.ffn E=256 topk=6          ← 逐层构造 CPU 引擎成功
+```
+⇒ **43 层 CPU 引擎全部构造成功**(两次运行分别到 layer 28 / 50 个引擎),说明
+"主线 + 插件"在**不改任何主线文件**的前提下能把模型建起来。
+
+### (b) 🔴 卡点是**两个启动看门狗**,不是功能问题(必须写进安装说明)
+
+| 看门狗 | 默认 | 谁等谁 | 症状 |
+|---|---|---|---|
+| `VLLM_ENGINE_READY_TIMEOUT_S` | 600 s | API server 等 EngineCore | 首次失败 |
+| **`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`** | **300 s** | EngineCore 等 worker 响应 | **第二次失败的真凶**:worker 05:43:43 初始化 → 05:48:56 被掐(≈313 s) |
+
+* 43 层 CPU 引擎**逐层构造要 ~6 分钟**,期间 worker 不响应任何 RPC ⇒ 300 s 看门狗必杀。
+* **启动器已把两者都设为 3600**,并写进 `docs/INSTALL_MAINLINE.md` 的失败回退表。
+* 这是"用户从零安装"最容易踩的坑之一 —— 正是本目标要沉淀的东西。
+
+### (c) 另一个必须记的坑:`pkill -f` 自杀(第 4 次复发)
+
+* 我两次用 `pkill -f "vllm.entrypoints"` / `pgrep -f "VLLM::"` 清理进程,
+  **命令行里就含这个字符串** ⇒ 把自己(以及后台 job)一起杀掉(job 报 `killed, SIGTERM/SIGKILL`)。
+* 正确做法:按 `report/tuning/logs/*.pid` 里的 PID 杀,或用 `VLLM::Worke[r]` 这种括号技巧。
+  `scripts/kill_serve.sh` 就是为此写的(按 `argv[0]` 精确匹配)。
+
+### (d) 安装说明成稿
+
+新增 **`docs/INSTALL_MAINLINE.md`** —— 八节:前置条件 / 建环境 / 装 vLLM(方式 A 官方 wheel、
+方式 B 源码)/ **打补丁** / 装插件 / 自检 / 起服务 / 验证 / **失败回退表**。
+配套新增 **`scripts/apply_xtu_patches.sh`**(一键打补丁,支持 `LEVEL=1/2/3` 与 `DRY=1` 干跑)。
