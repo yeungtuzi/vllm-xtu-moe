@@ -137,6 +137,29 @@ TAG=myrun PORT=8071 bash scripts/serve_mainline.sh
 
 ---
 
+## 6.5 已在主线跑通的两条路径(实测,2026-09-14)
+
+| | 形态 A(`XIAOTU_OOT_OVERRIDE=1`,默认) | **形态 B(`=0`)** |
+|---|---|---|
+| 机制 | `ModelRegistry` 覆盖 `DeepseekV4ForCausalLM` + `dv4_nvidia.DeepseekV4MoE = CpuXiaotuMoE` | 主线 `RoutedExperts` 原样 + `mixed_experts` 把 CPU 后端指向我们的引擎 |
+| 启动 | ❌ 加载期被掐(见"失败回退") | ✅ **`Application startup complete`** |
+| KV | — | **22.04 GiB / 112,304 token** |
+| 输出 | — | ✅ `"The capital of France is"` → `" Paris. The capital of Spain is Madrid"` |
+| 引擎 | 逐层构造成功(日志 `[xiaotu] engine built`) | 被调用(日志 `xiaotu MOE_MXFP4 engine: E=256 H=4096 I=1024 …`) |
+| 性能 | — | ⚠️ **2.2 s/token(待修)** |
+
+**三个必须的环境修复**(启动器已默认,踩过一次就别再踩):
+
+```bash
+--safetensors-load-strategy prefetch          # 分片读取 2.5-4.8 s/片 → 330 s 总加载
+                                              # 加这个后 133 s(实测)
+--kernel-config '{"enable_jit_warmup": false}' # A100 无 fp8e4nv,Triton 预热会 ValueError
+VLLM_USE_FLASHINFER_SAMPLER=0                  # FlashInfer 用 --compress-mode=size(需 CUDA≥12.8)
+                                               # 本机 CUDA 12.1 ⇒ nvcc fatal,worker 猝死
+```
+
+---
+
 ## 7. 验证
 
 ```bash
@@ -157,6 +180,8 @@ python scripts/probe_greedy.py /tmp/greedy.json 8071
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `Free memory on device ... less than desired GPU memory utilization` | 上一次的 EngineCore/Worker 变成孤儿进程占着显存 | `bash scripts/kill_serve.sh`(按 argv[0] 精确匹配;**不要**用 `pkill -f "vllm..."`,会把自己杀掉) |
+| `Worker proc VllmWorker-N died unexpectedly` + `nvcc fatal: Unknown option '--compress-mode=size'` | FlashInfer 0.6.18 需要 CUDA ≥ 12.8,本机是 12.1 | `VLLM_USE_FLASHINFER_SAMPLER=0` |
+| `ValueError: type fp8e4nv not supported in this architecture` | A100(SM80)没有 fp8e4nv,被 Triton JIT warmup 触发 | `--kernel-config '{"enable_jit_warmup": false}'`(或打 `pr2/pr3`) |
 | 启动超时(worker 还在建引擎) | **两个**看门狗都可能先到:① `VLLM_ENGINE_READY_TIMEOUT_S`(默认 600 s,API server 等 EngineCore);② **`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`(默认 300 s,EngineCore 等 worker 响应)** | 启动器已把两者都设为 **3600**。43 层 CPU 引擎逐层构造需要 ~6 分钟,不调大必然在加载中途被杀(实测:05:43:43 worker 初始化 → 05:48:56 被 300 s 那个看门狗掐掉) |
 | 显存不足放不下常驻层 | 常驻层每层 1.6 GiB/rank | 调小 `RESIDENT`(如 `0-9`) |
 | 长上下文 OOM | 12 层常驻只剩 ~0.6 GiB KV | 用 `RESIDENT=0-10`(11 层)换回 KV |
