@@ -550,7 +550,11 @@ static void bind_moe_class(py::module& m, const char* name) {
                 static auto last_cb = std::chrono::steady_clock::now();
                 auto t_cb = std::chrono::steady_clock::now();
                 if (c->graph_owned) c.release();   // graph 还会再 replay 它
-                engine->forward_many(qlen, k, ids, wts, hid, out);
+                // 【诊断专用】XIAOTU_MOE_FAKE_CPU=1:跳过 CPU MoE 计算(输出保持原值)。
+                // 用途:在服务里量出"该层纯 GPU 侧(注意力/dense+拷贝+派发)每层耗多少",
+                // 从而把 period 精确拆成 GPU 部分 与 CPU 部分。**绝不能用于正确性测试**。
+                static const bool fake_cpu = std::getenv("XIAOTU_MOE_FAKE_CPU") != nullptr;
+                if (!fake_cpu) engine->forward_many(qlen, k, ids, wts, hid, out);
                 // ---- EP:把本 rank 的部分和与对端相加(共享内存,不进 GPU) ----
                 {
                     EpShmState* ep = nullptr;

@@ -10406,3 +10406,41 @@ CPU 上只有目标模型的 43 层专家(那是 lk 的设计)。
 `SPEC=0 / MBT=256 / RESIDENT=0-9`(10 层常驻 GPU,TP=2 ⇒ 16 GiB/rank):
 用 TPOT 的斜率分离"一层 CPU 专家"与"一层 GPU 常驻"的真实成本差
 ⇒ 直接量化"每加一层常驻能省多少 ms/token",同时给出"CPU 路径相对 GPU 路径的净开销"。
+
+---
+
+## 308. 【第 214 轮·结构性结论】**每层 = GPU 工作 + CPU 计算,严格相加;我们的 marshalling 只有 0.05 ms/层**
+
+用 `bench_cd_plumbing.py` 在**无模型**条件下复现服务结构(每层前插一个 GPU matmul 模拟注意力):
+
+| 配置 | period | compute(engine) | rest(=GPU 工作) |
+|---|---|---|---|
+| GPU_MM=2048,真算 | **0.65 ms** | 0.39 | 0.25 |
+| GPU_MM=2048,**FAKE_CPU=1**(跳过 CPU 计算) | **0.25 ms** | 0.00 | 0.25 |
+
+⇒ **period = CPU 计算 + GPU 工作 + ~0.01 ms**,即两者**严格串行、没有重叠**;
+marshalling(D2H+host-func 派发+H2D)在 8/43 引擎下都只有 **0.05 ms/层**。
+
+用 CUDA 图把整串调用捕获再 replay:**435.7 µs/层 vs 非图 441 µs/层** ⇒
+"host-func 节点在图里排空流水线"这个假设**也否掉了**(图模式没有额外成本)。
+
+### 由此得到的优化不等式(服务里 TPOT/层 = 0.87 ms,参考 = 0.59 ms)
+
+```
+ours : 0.87 = CPU(0.37) + GPU(0.50) + marshalling(0.05)
+参考 : 0.59 = CPU(?)    + GPU(?)    + marshalling(?)
+```
+
+我们能动的是 **CPU(0.37)**、**marshalling(0.05)**、以及**把层转成 GPU 常驻**(用 KV 换)。
+参考比我们快 0.28 ms/层,在"代码同源、GPU 工作相同、两者都串行"的前提下,
+**唯一解释是参考的 CPU 计算/搬运比我们便宜**(它的 `moe_v2_gpu_memory.cu` 说明它内部
+有 GPU 显存管理与搬运,很可能做了**分块流水**:把 MoE 拆成几个 chunk,
+chunk k 的 CPU 计算与 chunk k+1 的 H2D/GPU 工作重叠)。
+
+### 下一步(按此顺序做实测)
+
+1. **分块流水(pipeline chunks)**:`cpu_decode` 里把 qlen 个 token(或把专家集合)拆成 2-3 块,
+   chunk k 的 H2D 与 chunk k+1 的 CPU 计算重叠 ⇒ 在"GPU 工作 + CPU 计算"之间**制造重叠窗口**
+   (这是唯一能在严格依赖下把 0.87 压向 0.6 的方向);
+2. **KV 换常驻层**:`lkport44resident5b` 实测"每层常驻值多少 ms/token"(TB 中);
+3. 用 `XIAOTU_MOE_FAKE_CPU=1` 在**服务里**直接量出我们每层的纯 GPU 时间(诊断专用,不可用于正确性)。

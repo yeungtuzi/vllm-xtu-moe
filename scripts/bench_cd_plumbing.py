@@ -120,20 +120,52 @@ def main() -> int:
     wts = torch.rand(qlen, K, dtype=torch.float32, device=dev)
     out = torch.zeros(max(qlen, 64), H, dtype=torch.float32, device=dev)   # 行数要 >= qlen
 
+    # GPU_MM>0:每层前插一个 GPU 矩阵乘,模拟服务里"该层注意力/dense"占用 GPU 的时间
+    # (用来复现"96 个 worker 自旋 + GPU 工作"同时发生时 cpu_decode 往返变慢"的现象)
+    mm_n = int(os.environ.get("GPU_MM", "0"))
+    A = B = Cm = None
+    if mm_n:
+        A = torch.randn(mm_n, mm_n, dtype=torch.bfloat16, device=dev)
+        B = torch.randn(mm_n, mm_n, dtype=torch.bfloat16, device=dev)
+        Cm = torch.empty(mm_n, mm_n, dtype=torch.bfloat16, device=dev)
+        torch.mm(A, B, out=Cm); torch.cuda.synchronize()
+
+    def do_calls(sp):
+        for e in engines:
+            if mm_n:
+                torch.mm(A, B, out=Cm)          # 模拟该层 GPU 侧工作
+            e.cpu_decode(sp, qlen, K, x.data_ptr(), ids.data_ptr(), wts.data_ptr(), out.data_ptr())
+
     def one_pass(sync_each: bool):
         t = time.perf_counter()
-        for e in engines:
-            e.cpu_decode(stream, qlen, K, x.data_ptr(), ids.data_ptr(), wts.data_ptr(), out.data_ptr())
-            if sync_each:
-                torch.cuda.synchronize()
-        if not sync_each:
+        do_calls(stream)
+        if sync_each:
             torch.cuda.synchronize()
+        torch.cuda.synchronize()
         return time.perf_counter() - t
 
     # warmup
     for _ in range(3):
         one_pass(False)
     print(f"{'mode':>7} {'ms/pass':>9} {'us/layer':>9} {'t/s(N=layers)':>14}", flush=True)
+    # GPU_GRAPH=1:把整串调用**捕获进一张 CUDA 图**再 replay —— 直接检验
+    # "host-func 节点在图里会排空流水线(43 次/步)"这个假设(服务里就是图模式)。
+    if os.environ.get("GPU_GRAPH"):
+        sside = torch.cuda.Stream()
+        sside.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(sside):
+            do_calls(sside.cuda_stream)
+        torch.cuda.current_stream().wait_stream(sside)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            do_calls(torch.cuda.current_stream().cuda_stream)
+        best = None
+        for _ in range(rep):
+            t = time.perf_counter(); g.replay(); torch.cuda.synchronize()
+            dt = time.perf_counter() - t
+            best = dt if best is None else min(best, dt)
+        print(f"{'graph':>7} {best*1e3:9.2f} {best*1e6/neng:9.1f} {neng/best:14.1f}", flush=True)
     for m in (["serial", "pipe"] if mode == "both" else [mode]):
         best = min(one_pass(m == "serial") for _ in range(rep))
         print(f"{m:>7} {best*1e3:9.2f} {best*1e6/neng:9.1f} {neng/best:14.1f}", flush=True)
