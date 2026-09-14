@@ -36,7 +36,7 @@ CPU 后端槽位,于是:
 | 权重格式 | 引擎内核 | 状态 |
 |---|---|---|
 | **BF16 / FP16**(无量化) | `MOE_BF16` / `MOE_FP16` | ✅ |
-| **FP8 e4m3 + block 128×128**(vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | ✅ 层内数值已验证(48 层自校验 ≤1.4e-4)+ 真实模型端到端(Qwen3-30B-A3B-FP8 单卡、Qwen3.8-Flash-Next-FP8 2×A100 TP=2+EP) |
+| **FP8 e4m3 + block 128×128**(vLLM `kFp8Static128BlockSym`) | `MOE_FP8` | ✅ 层内数值已验证(48 层自校验 ≤1.4e-4)+ 真实模型端到端:`Qwen3-30B-A3B-FP8` 单卡、`Qwen3.8-Flash-Next-FP8` 2×A100 TP=2+EP <br>⚠️ **这些实测早于 v0.2.0 的改动**(执行模型 / 小 batch 路径 / **EP 存储分片**)**未复验** —— 见下方"验证时点" |
 | **MXFP4**(e2m1 + e8m0 block 32) | `MOE_MXFP4` | ✅ |
 | **NVFP4** | `MOE_NVFP4` | ✅ 引擎侧 |
 | **INT4 / WNA16**(GPTQ / compressed-tensors 组量化) | `MOE_WNA16` | ✅ 对称量化(zero point 8)已通:检查点布局在引擎构造时一次性重排,真实 `Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4` 端到端答案正确;非对称零点与 AWQ 的 N-packed 布局会**显式报错**,详见 `docs/KNOWN_LIMITATIONS.md` |
@@ -83,7 +83,7 @@ VLLM_EXPERTS_LOAD_DEVICE=cpu python -m vllm_xiaotu_moe.mainline_shims
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py   # 后端选择探测,秒级
 ```
 
-**Qwen3.8-Flash-Next 可在单张 40 GB 卡上运行**:`XIAOTU_PLE_CPU=1` 把 51 GB 的 PLE
+**Qwen3.8-Flash-Next 可在单张 40 GB 卡上运行**(⚠️ 实测时点为 v0.2.0 **之前**,未在 v0.2 代码上复验):`XIAOTU_PLE_CPU=1` 把 51 GB 的 PLE
 n-gram 查找表放进主机内存(锁页 + UVA 访问,显存不占),显存只剩 ~14.7 GiB 权重 + KV,
 262K 上下文仍有 2.78× 并发。两个已验证模型的**推荐参数与实测数据**见
 **[`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md)**。
@@ -91,6 +91,20 @@ n-gram 查找表放进主机内存(锁页 + UVA 访问,显存不占),显存只�
 完整安装、环境变量见 **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)**;
 **DeepSeek-V4-Flash 与 Qwen3.8-Flash-Next-FP8 的逐步使用指南 + 初步性能实测**见
 **[`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md)**。
+
+> ### ⚠️ 验证时点(重要)
+>
+> 本文档里的**实测数据不是同一时点的**,请按此判读:
+>
+> | 结论 | 验证于 | 在 v0.2.0 代码上复验? |
+> |---|---|---|
+> | **DeepSeek-V4-Flash 主线端到端**(服务、`bench_lat` C=1/2/4、数值门禁 `OK=7 BAD=1`、启动自检) | **v0.2.0**(2026-09-14) | ✅ **是** |
+> | Qwen3.8-Flash-Next-FP8(单卡 PLE offload) | v0.2.0 **之前**(mainline + 插件) | ❌ **否** |
+> | Qwen3-30B-A3B-FP8 / Qwen1.5-MoE-GPTQ-Int4 / 其它引擎内数值 | v0.2.0 **之前** | ❌ **否** |
+>
+> 原因:v0.2 改动了**所有模型都会走的路径**(执行模型 `XIAOTU_MOE_ASYNC=0`、
+> 小 batch 路径 `NSLICE_SMALL=0`、**EP 存储分片**)。**除 DeepSeek-V4-Flash 外均需复验**,
+> 复验清单与命令见 **[`docs/HANDOFF_v0.2.md`](docs/HANDOFF_v0.2.md)** §5.1。
 
 > **新模型提示**:**DeepSeek-V4.1-Flash**(748B,2026-09-10 发布)的资源账与可行性分析见
 > **[`docs/V41_FLASH_ANALYSIS.md`](docs/V41_FLASH_ANALYSIS.md)**:它的 38.5% 权重是**纯查找表**
