@@ -33,7 +33,7 @@ SEQS="${SEQS:-8}"
 if [ "${PREFILL:-0}" = "1" ]; then
   MBT="${MBT:-8192}"
   GP_MIN="${GP_MIN:-1024}"
-  CUDAGRAPH_SIZES="${CUDAGRAPH_SIZES:-1,2,4,8}"
+  CUDAGRAPH_SIZES="${CUDAGRAPH_SIZES:-1 2 4 8}"
 fi
 MBT="${MBT:-256}"                    # 与 fork 协议对齐(实测:不设时主线默认很大)
 # GPU 预填充阈值(fork 里叫 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE,生产值 1024)。
@@ -41,7 +41,7 @@ MBT="${MBT:-256}"                    # 与 fork 协议对齐(实测:不设时主
 #   (hybrid_model.py:982 的 _gp_min 分支)。**必须同时满足 MBT >= N**,
 #   否则 batch 永远到不了阈值 —— 与 fork 把 MINBATCH 夹到 MBT 的语义一致。
 GP_MIN="${GP_MIN:-0}"
-# 只给这些 batch size 捕获 CUDA 图(逗号分隔)。**这是让 GPU 预填充生效的关键**:
+# 只给这些 batch size 捕获 CUDA 图(**空格分隔**,对应 --cudagraph-capture-sizes 的 nargs='+')。**这是让 GPU 预填充生效的关键**:
 #   预填充形状若不在捕获集里就不走图、直接 eager ⇒ hybrid_model 的 GPU 分支才会被选中;
 #   同时解码(size<=SEQS)仍然享有 CUDA 图。留空 = 用主线默认(PIECEWISE 会把预填充
 #   形状也捕获掉,重放永远走捕获时的 CPU 分支 ⇒ GPU 预填充形同虚设)。见 NOTES §340(c)。
@@ -95,7 +95,8 @@ if [ -n "$MBT" ]; then ARGS+=(--max-num-batched-tokens "$MBT"); fi
 if [ "$CHUNKED_PREFILL" = "0" ]; then ARGS+=(--no-enable-chunked-prefill); fi
 if [ "$CHUNKED_PREFILL" = "1" ]; then ARGS+=(--enable-chunked-prefill); fi
 if [ "$EAGER" = "1" ]; then ARGS+=(--enforce-eager); fi
-if [ -n "$CUDAGRAPH_SIZES" ]; then ARGS+=(--cudagraph-capture-sizes "$CUDAGRAPH_SIZES"); fi
+# 注意:`--cudagraph-capture-sizes` 是 nargs='+'(**空格分隔**,不是逗号)
+if [ -n "$CUDAGRAPH_SIZES" ]; then ARGS+=(--cudagraph-capture-sizes $CUDAGRAPH_SIZES); fi
 if [ -n "$LOAD_STRATEGY" ]; then ARGS+=(--safetensors-load-strategy "$LOAD_STRATEGY"); fi
 if [ "$KERNEL_WARMUP" = "0" ]; then
   ARGS+=(--kernel-config '{"enable_jit_warmup": false}')

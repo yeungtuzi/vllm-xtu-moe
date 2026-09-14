@@ -216,7 +216,7 @@ TP=2(`report/curve_tp2.jsonl`):4096 → **3.993 s / 1036 t/s**;16000 → **13.95
 | 2 | `MBT ≥ N` | batch 永远到不了阈值(fork 会把 `MINBATCH` 夹到 `MBT`,同一语义) |
 | 3 | 预填充形状**不被 CUDA 图捕获** | `is_current_stream_capturing()` 只挡"捕获中"、挡不住"**重放**";主线默认 `PIECEWISE` 会把预填充形状也捕获,重放永远走捕获时的 CPU 分支 ⇒ GPU 路径形同虚设 |
 
-第 3 条的上游原生解法:**`--cudagraph-capture-sizes` 只列解码尺寸**(`1,2,4,8`),
+第 3 条的上游原生解法:**`--cudagraph-capture-sizes` 只列解码尺寸**(空格分隔:`1 2 4 8`)**,
 预填充形状(qlen ≥ 256)不在捕获集里 ⇒ 自动 eager ⇒ GPU 分支生效,**同时解码仍享有 CUDA 图**。
 这正是主线 `CUDAGraphMode.FULL_DECODE_ONLY = (FULL, NONE)` 的语义。
 
@@ -224,5 +224,5 @@ TP=2(`report/curve_tp2.jsonl`):4096 → **3.993 s / 1036 t/s**;16000 → **13.95
 
 ```bash
 ENV=/home/user/anaconda3/envs/vllm-xiaotu-moe PREFILL=1 bash scripts/serve_mainline.sh
-# 等价于 MBT=8192 / GP_MIN=1024 / CUDAGRAPH_SIZES=1,2,4,8
+# 等价于 MBT=8192 / GP_MIN=1024 / CUDAGRAPH_SIZES="1 2 4 8"
 ```
