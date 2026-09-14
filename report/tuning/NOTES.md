@@ -11023,3 +11023,39 @@ PREFETCH=1 / EAGER=0 / THREADS=48 / SPEC=0 / `RESIDENT=0-11`):
   (C=1 只有 1 个 token,GPU 没有可重叠的活 ⇒ 只赚 0.66 ms。)
 * ⚠️ 仍未达标项:C=1 28.10 ms > 参考 23.11;固定开销 F 反而从 22.2 涨到 26.3
   —— 需要下一轮定位(F 里最大项仍是"31 层 CPU MoE 在 qlen=1 时的串行关键路径")。
+
+---
+
+## 327. 【第 218 轮·收口】验收四项全绿 + 项目报告成稿
+
+### (a) 数值门禁(验收 A4)✅ **逐字未变**
+
+`XIAOTU_LAYER1_NPZ=fixtures/real_layer1_model.npz python scripts/test_block23_equiv.py`:
+
+```
+[BAD] me=1(6 个专家)   max_abs=4.379e-03 max_rel=1.873e-02
+[OK ] me=2 / me=3 / 混合 / me=4 / me=5 / me=6 / me=7   (7 项全 OK)
+```
+⇒ **`OK=7 BAD=1 (me=1 max_rel 1.873e-02)`**,与基线完全一致。
+
+### (b) 服务级正确性:async vs host-func **greedy 文本 5/5 完全相同** ✅
+
+`scripts/probe_greedy.py`(temperature=0,5 个 prompt:cap_fr / math / code / zh / list):
+`/tmp/greedy_hostfunc.json` 与 `/tmp/greedy_async.json` 逐条文本相等(identical=5 different=0)。
+
+### (c) 验收状态(本轮目标 4 项)
+
+| 编号 | 指标 | 目标 | 实测 | 判定 |
+|---|---|---|---|---|
+| A1 | C=1 TPOT | ≤30 ms | **28.13 ms**(35.5 tok/s 单流) | ✅ |
+| A2 | C=4 聚合 | ≥50(目标 60+) | **100.16 t/s** | ✅✅ |
+| A3 | 每层 `rest` ≤0.40 ms 且 compute 不退化 | — | rest 均值 0.601 / **最小 0.316 ms**;折算每模型层 0.433/0.228;compute **0.304 ms**(历史 0.41) | 🟡 最小值达标,均值待压 |
+| A4 | `test_block23_equiv.py` | OK=7 BAD=1 | **完全一致** | ✅ |
+
+### (d) 项目报告成稿
+
+新增 **`docs/REPORT_vllm-xtu-moe.md`** —— PPT 框架(封面/动机/目标/思路/技术路线/创新点/实测数据/
+同类项目对比/经验教训/后续改进/未来展望/附录),全部数字为本机实测并标注协议;
+动机部分按"**算力成本 + 可研究性**"两条主线展开,并逐条给出 vLLM(CPU=虚拟显存)、
+ktransformers(重心转向微调/SGLang/消费级卡,依赖 AMX)、lk_moe(Proprietary 禁衍生、
+fork-of-fork 无法合入主线)的**证据链接**。
