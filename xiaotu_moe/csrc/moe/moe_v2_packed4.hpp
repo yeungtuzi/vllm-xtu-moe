@@ -413,39 +413,27 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
             if constexpr (E8M0) return e8m0_table()[Sbytes[srow + gi]];
             return Sflt[srow + gi];
         };
+        // PERMV 解码用的 fp32 LUT(16 项,恰好一个 zmm);见 XIAOTU_DECODE_GROUP_AVX512
+        const __m512 permv_tbl_ = _mm512_loadu_ps(lut);
         const __m256i lut_lo256_ = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_lo));
         const __m256i lut_hi256_ = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_hi));
         const __m128i nib_mask = _mm_set1_epi8(0x0F);
         // Decode one 32-value K-group (16 packed bytes at b_row+g*16) into
         // 32 bf16(u16) in NATURAL column order [W0..W31] (nibble c%2 of byte c/2).
 #define XIAOTU_DECODE_GROUP_AVX512(b_row, g_in)                                        \
+        /* 【第 215 轮·PERMV 解码】把 4bit 码经 fp32 LUT 直接 permute 成 fp32 权重:        \
+           load(1)+and(1)+srli(1)+and(1)+unpack(2)+cvt(2)+permutexvar(2) = 10 条/32 权重,   \
+           替代原来 19 条的 bf16-LUT+shuffle+extract/insert+移位链。                          \
+           数值:直接用 fp32 LUT 值 ⇒ **比原来的 bf16 截断更精确**(不再丢 bf16 的低位)。 */   \
         const __m128i raw_ = _mm_loadu_si128((const __m128i*)((b_row) + (size_t)(g_in) * 16)); \
         const __m128i lo_ = _mm_and_si128(raw_, nib_mask);                            \
         const __m128i hi_ = _mm_and_si128(_mm_srli_epi16(raw_, 4), nib_mask);         \
-        const __m128i sello_ = _mm_unpacklo_epi8(lo_, hi_);  /* nibbles, cols 0..15 */ \
-        const __m128i selhi_ = _mm_unpackhi_epi8(lo_, hi_);  /* nibbles, cols16..31 */ \
-        const __m256i sel_ = _mm256_inserti128_si256(_mm256_castsi128_si256(sello_), selhi_, 1); \
-        const __m256i bl_ = _mm256_shuffle_epi8(lut_lo256_, sel_); /* lo byte/col */  \
-        const __m256i bh_ = _mm256_shuffle_epi8(lut_hi256_, sel_); /* hi byte/col */  \
-        /* NOTE: _mm256_unpack*_epi8 operate per 128-bit lane, so the interleaved
-           u16 land split as [lo-lane(u_lo=cols0-7) | hi-lane(u_lo=cols16-23)] and
-           u_hi=[cols8-15 | cols24-31]. Recombine the two lane-halves into
-           contiguous natural halves before the word->zmm widen:                */ \
-        const __m256i u_lo_ = _mm256_unpacklo_epi8(bl_, bh_);  /* [c0..7 | c16..23] */ \
-        const __m256i u_hi_ = _mm256_unpackhi_epi8(bl_, bh_);  /* [c8..15 | c24..31] */ \
-        const __m256i A_ = _mm256_inserti128_si256(                                 \
-            _mm256_castsi128_si256(_mm256_extracti128_si256(u_lo_, 0)),             \
-            _mm256_extracti128_si256(u_hi_, 0), 1);  /* [c0..7 | c8..15] = c0..15 */ \
-        const __m256i B_ = _mm256_inserti128_si256(                                 \
-            _mm256_castsi128_si256(_mm256_extracti128_si256(u_lo_, 1)),             \
-            _mm256_extracti128_si256(u_hi_, 1), 1);  /* [c16..23 | c24..31]        */ \
-        const __m512i ilo_ = _mm512_cvtepu16_epi32(A_); /* u32 = 0x0000_XXXX */    \
-        /* bf16->fp32 = pattern<<16 (round-toward-zero), matching the AVX2 path's
-           _mm256_unpacklo_epi16(zero,u16). Shift (NOT vcvtdq2ps) keeps the numeric
-           value: vcvtdq2ps would reinterpret the bf16 pattern as an integer. */   \
-        const __m512 wlo_ = _mm512_castsi512_ps(_mm512_slli_epi32(ilo_, 16));      \
-        const __m512i ihi_ = _mm512_cvtepu16_epi32(B_);                            \
-        const __m512 whi_ = _mm512_castsi512_ps(_mm512_slli_epi32(ihi_, 16));
+        const __m128i sello_ = _mm_unpacklo_epi8(lo_, hi_);  /* cols 0..15 自然序 */  \
+        const __m128i selhi_ = _mm_unpackhi_epi8(lo_, hi_);  /* cols 16..31 */        \
+        const __m512i idxlo_ = _mm512_cvtepu8_epi32(sello_);                          \
+        const __m512i idxhi_ = _mm512_cvtepu8_epi32(selhi_);                          \
+        const __m512 wlo_ = _mm512_permutexvar_ps(idxlo_, permv_tbl_);                \
+        const __m512 whi_ = _mm512_permutexvar_ps(idxhi_, permv_tbl_);
 
         const int group_count = K / 32;
         // =====================================================================

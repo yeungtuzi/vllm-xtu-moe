@@ -67,3 +67,20 @@
 2. 测内存必须**已经按 node 分片/交错**;单点分配测出来的数字只反映**一个 node**;
 3. 结论要么进 NOTES(章节号)+ 本文件,要么不进 —— **不许只存在于上下文里**;
 4. 每次"回退/失败"必须进 `report/tuning/TRIED_AND_REVERTED.md`。
+
+---
+
+## R7. **NPS=4 是本机 BIOS 选择,不是局部性边界;真正的边界是 socket**(用户 2026-09-14 提醒)
+
+* 本机 8 个 NUMA node 来自 **NPS=4**;ACPI 距离矩阵:**同 socket 内 10/12/12/12,跨 socket 32**。
+* NPS=4 相对 NPS=1 只是把**同 socket 内的本地距离**从 12 降到 10(收益很小),
+  却把"同 socket 的 3 个 CCD 分成 4 个 node" ⇒ **增加了节点间(其实是同 socket 内)的通信/协调开销**。
+  ⇒ **NPS=1 很可能更优**;而我们在不能重启改 BIOS 的前提下应当**用配置等价实现 NPS=1**:
+  **按 socket 切片(2 份),每份内存交织在自己 socket 的 4 个 node 上**,而不是按 8 个 node 切。
+* ⚠️ **注意一个曾经的误用**:`XIAOTU_MOE_NSHARD=2` 在 NPS=4 下**并不等于 NPS=1** ——
+  现有实现是 `mask = 1UL << node`,即"shard n → 单个 node n";NSHARD=2 只会用 node0/node1
+  (只用掉 1/4 内存通道)⇒ harness 实测 0.90 ms/层(比 NSHARD=8 的 0.38 慢 2.4×)。
+  **正确做法**:shard 的内存用 **nodemask = 本 socket 的 4 个 node + MPOL_INTERLEAVE**,
+  worker 用该 socket 的 12 个 CCD(48-60 线程,4-5 核/CCD)。
+* 代码待办:`shard_region(total, node)` → 支持"node 集合 + 交织策略"(`XIAOTU_MOE_SOCKET_SHARD=1`),
+  然后 A/B:`socket 2 片交织` vs `node 8 片各自绑定`。
