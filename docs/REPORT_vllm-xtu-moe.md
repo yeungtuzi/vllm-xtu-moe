@@ -619,6 +619,22 @@ TPOT 37.33 ms =  纯 GPU 模型 17.32 ms  +  拷贝/派发 2.46 ms  +  CPU MoE 1
 
 ---
 
+## 12. 发布状态(v0.1.0 · 2026-09-14)
+
+* **Git tag**:`v0.1.0`(annotated)
+* **GitHub Release**:https://github.com/yeungtuzi/vllm-xtu-moe/releases/tag/v0.1.0
+* **发行物**:
+  | 文件 | 大小 | 说明 |
+  |---|---|---|
+  | `vllm_xtu_moe-0.1.0-cp312-cp312-manylinux_2_34_x86_64.whl` | 2.15 MB | 二进制 wheel(含 5 个 ISA 变体引擎 `.so`,无需编译) |
+  | `vllm-xtu-moe-0.1.0.tar.gz` | 3.21 MB | 完整源码包 |
+* **Release Notes**:仓库根 `RELEASE_NOTES_v0.1.0.md`(功能 / 性能 / 安装 / 参考运行命令 / 兼容性与限制)
+* **验收**:四项全部达标(见 §2.2 与 `NOTES §332`);数值门禁 `OK=7 BAD=1` 逐字不变
+* **下一版本目标(0.2)**:让 fork 完全支持 **vLLM 主线最新版**,并提供**简化的 patch / 安装方式**
+  (当前是把编排链移植进 fork;插件路径已可对 mainline 使用)
+
+---
+
 ## 附录
 
 ### A. 关键产物清单
