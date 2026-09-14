@@ -800,8 +800,35 @@ class CpuXiaotuMoE(nn.Module):
                 )
 
         cfg = xiaotu_moe.MOEConfigV2()
-        cfg.num_processes = 1
-        cfg.process_id = 0
+        # 【v0.2·第 15 轮·NUMA 放置修复】把真实的 TP rank/world 告诉引擎,
+        # **只用于 NUMA 权重分片与线程池核表切分**(归约仍走下面的 configure_ep
+        # 共享内存,所以必须同时关掉引擎自建的 auto EP,否则重复归约)。
+        #
+        # 原先硬编码 `1 / 0` ⇒ `moe_v2.hpp` 里 `_world = num_processes = 1` ⇒
+        #   `nshard_ = numa_node_count()/_world = 8`,
+        #   `rank_node_base_ = process_id * (numnodes/_world) = 0`
+        # ⇒ **两个 rank 都把各自那份权重分片绑到全部 8 个 NUMA node** ⇒ 每个 node
+        # 承受两个 rank 的量。本机每个 node 只有 193 GB,而单 worker 需要 219–242 GB:
+        #   oom-kill: constraint=CONSTRAINT_MEMORY_POLICY, nodemask=0,
+        #             task=VLLM::Worker_TP, anon-rss:218866316kB
+        # 进程**静默死亡**(无 Traceback)⇒ 表现为"日志只加载到一半就没了"。
+        # 同一个 process_id 还决定 `shared_numa_pool(process_id, num_processes)` 的核表,
+        # 硬编码 1 会让两个 rank 的线程池都横跨全部 24 CCD 互抢核(与 mode B 的
+        # NOTES §334p "compute 双峰 0.41 vs 9.5 ms" 同源)。
+        # 修法与 `mixed_experts.py`(mode B)完全一致,两处务必保持同步。
+        os.environ.setdefault("XIAOTU_MOE_NO_AUTO_EP", "1")
+        _tp, _rank = 1, 0
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            _tp = int(get_tensor_model_parallel_world_size())
+            _rank = int(get_tensor_model_parallel_rank())
+        except Exception:  # noqa: BLE001
+            _tp, _rank = 1, 0
+        cfg.num_processes = max(1, _tp)
+        cfg.process_id = max(0, _rank)
         cfg.gpu_id = torch.cuda.current_device()
         cfg.has_gate_proj = True
         cfg.expert_num = int(w13.shape[0])

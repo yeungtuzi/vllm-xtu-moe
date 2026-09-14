@@ -12248,3 +12248,67 @@ expert 权重按 TP/EP 真正分片 ⇒ 552 GB → 160 GB,顺带把 interleave �
 * `MBT` 大 ⇒ GPU 预填充能"整段一次过" ⇒ **少付 DMA**(每个 chunk 都要重传 43 层权重)。
 ⇒ **两者取舍的最优点需要单独扫**(`MBT` = 256 / 512 / 1024 / 2048),这是下一轮的第一件事。
 本轮已确认的是:**`MBT=1024` 时 GPU 值 2.46×,且能稳定启动**(配 `numactl --interleave=all`)。
+
+### 344. 🔧【v0.2·第 15 轮】真因定位:`hybrid_model` 硬编码 `cfg.num_processes=1` ⇒ **两个 rank 的 NUMA 分片与线程池都铺满全部 8 个 node**
+
+#### (a) 先更正 §342 的机制描述(结论方向对,数字错)
+
+我 §342 说"引擎又复制一份全量 3.3 GB/层 ⇒ 存了 4 份"。**这是错的。** 打开引擎的
+`XIAOTU_MOE_SHARD_DIAG=1` 后拿到权威字节数:
+
+```
+[SHARD-DIAG] w13 sharding OK NS=8 total=1.0GiB
+[SHARD-DIAG] w2  sharding OK NS=8 total=0.5GiB
+[xiaotu] EP model.layers.0.ffn: rank 0/2 owns experts [0, 128) of 256
+[SHARD-DIAG] region node=0 rc=0 vmasize=1.0GiB (mbind)     # mbind 成功,0 次 FAILED
+```
+
+⇒ 引擎**只持有自己那半个 EP 分片**(`w13 1.0 GiB + w2 0.5 GiB ≈ 1.6 GiB/层`),而且
+**用 `mbind(MPOL_BIND)` 正确按 node 铺开**(每层 `NS=8` 个 region,每个只 touch 1/8)。
+每 worker 的真实占用是:
+
+| 组成 | 每 worker |
+|---|---|
+| vLLM 加载(EP **没有**切分存储,每个 rank 装全部 256 专家) | **138 GB**(实测平台期) |
+| 我们的引擎(EP 分片 + mbind 铺开) | **≈74 GB**(43 层 × 1.6 GiB) |
+| 合计 | **≈212 GB** ←→ 实测 199–242 GB ✓ |
+
+所以我测到的"+3.29 GB/层"**把 vLLM 自己的逐层权重加载和引擎构建混在一起了**,不是引擎复制全量。
+**教训:没有引擎自身的字节数就不要反推它的内存。**
+
+#### (b) 真正杀死进程的是**放置失衡**,不是总量
+
+在**不开 interleave** 的那次(已加载 38/43 层)抓 `numactl --hardware`:
+
+```
+node 0 free:  7220 MB   ← 185 GB 已用      node 4 free: 168037 MB
+node 2 free:  7951 MB   ← 185 GB 已用      node 7 free: 169973 MB
+```
+
+**总空闲还有 863 GB,但 node 0 / node 2 已经 96% 满** ⇒ 下一次落在它们上面的分配就 OOM。
+这就是 `oom-kill: constraint=CONSTRAINT_MEMORY_POLICY, nodemask=0` 的确切含义。
+
+#### (c) 🎯 根因:`hybrid_model.py` 把 rank/world 硬编码成 1/0
+
+```python
+cfg.num_processes = 1     # ← 永远是 1
+cfg.process_id = 0        # ← 永远是 0
+```
+
+而 `moe_v2.hpp` 正是用它们做**按 rank 切开**的放置:
+
+```cpp
+const int _world = std::max(1, cfg_.num_processes);
+rank_node_base_ = std::max(0, cfg_.process_id) * (numa_node_count() / _world);
+nshard_ = std::max(1, numa_node_count() / _world);
+```
+
+`num_processes=1` ⇒ `_world=1` ⇒ **`nshard_=8`、`rank_node_base_=0` 对两个 rank 都一样**
+⇒ 两个 rank 的分片都绑到 node 0–7、两个 rank 的线程池都横跨全部 24 CCD。
+代码注释里写的 "【第 212 轮】多 rank 同机:分片数与 node 基址都按 rank 切开" **正是为此设计的,
+但 mode A 从来没把真实的 rank 传进来**。
+
+⇒ **修法与 `mixed_experts.py`(mode B)完全一致**:传真实 `tp/rank` + `XIAOTU_MOE_NO_AUTO_EP=1`
+(mode A 的归约走 `configure_ep` 共享内存,不能让引擎 auto-EP 重复归约)。
+**这是 mode A / mode B 的 parity bug** —— mode B 早前已修(否则它的池也会抢核,NOTES §334p),
+mode A 漏了。修好后:rank 0 用 node 0–3 + CCD 0–11,rank 1 用 node 4–7 + CCD 12–23,互不重叠。
