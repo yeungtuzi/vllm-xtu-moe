@@ -70,6 +70,18 @@ INTERLEAVE="${INTERLEAVE:-1}"
 # 所以**不设为默认**。真正的修法见 NOTES §353(针对 park/wake 本身,
 # 以及解码只需 top_k 个线程却起 60 个线程的池同步开销)。
 SPIN_IDLE_US="${SPIN_IDLE_US:-}"
+# 🎯 解码性能的**真正开关**(NOTES §354):关掉"小 batch N-slice"路径。
+# 原因:`MOE_V2::small_batch_workers()` 按 `single_us = NASS*3*I*H/(8*3e3)` 估线程数,
+# 假设 fp8 8 MAC/cycle;DS-V4 维度下 qlen=1/top_k=6 算出 **6292 µs**(实际单线程 ~百 µs 级)
+# ⇒ `wlimit = 59 / nt=60` ⇒ `stride = 60/59 = 1` ⇒ **没有任何 worker 去 park,60 个全自旋**,
+# 而且走的是 `parallel_for_limited` 那条**代码里明确警告过有边界竞态**的路径;
+# 调用方每相还要先自旋 `spin_idle_us`(默认 5 ms)再退回 condvar。
+# 实测(TP=2/MBT=256/RESIDENT=0-11,512-token prompt,ignore_eos):
+#     默认            : **1225 ms/token**,worker 3242% CPU ×2 ⇒ load 119
+#     NSLICE_SMALL=0  : **36–44 ms/token**,worker 146% CPU   ⇒ load 9
+# 即 **28–33× 且 CPU 降到 1/22**。(对比:`SPIN_IDLE_US=600000` 只是把 park 换成
+# 整机自旋,几分钟后反而退化 —— 那是掩盖,这才是修。)
+NSLICE_SMALL="${NSLICE_SMALL:-0}"
 if [ "$GP_MIN" -gt 0 ] && [ "$GP_MIN" -gt "$MBT" ]; then
   echo "[mainline] GP_MIN=$GP_MIN > MBT=$MBT ⇒ 夹到 MBT(否则预填充永远够不到阈值;NOTES §319c)"
   GP_MIN="$MBT"
@@ -129,7 +141,7 @@ fi
 {
   echo "tag=$TAG port=$PORT tp=$TP gpus=$GPUS maxlen=$MAXLEN seqs=$SEQS gpu_util=$GPU_UTIL"
   echo "mbt='$MBT' chunked='$CHUNKED_PREFILL' threads=$THREADS resident='$RESIDENT' oot=$OOT load_strategy='$LOAD_STRATEGY' extra_env='$EXTRA_ENV'"
-echo "gp_min=$GP_MIN cudagraph_sizes='$CUDAGRAPH_SIZES' prefill_preset='${PREFILL:-0}' interleave='$INTERLEAVE' spin_idle_us='$SPIN_IDLE_US'"
+echo "gp_min=$GP_MIN cudagraph_sizes='$CUDAGRAPH_SIZES' prefill_preset='${PREFILL:-0}' interleave='$INTERLEAVE' spin_idle_us='$SPIN_IDLE_US' nslice_small='$NSLICE_SMALL'"
   echo "env=$ENV"; echo "ckpt=$CKPT"; date -Is
 } > "$OUTDIR/$TAG.env"
 
@@ -161,6 +173,7 @@ nohup env \
   XIAOTU_OOT_OVERRIDE="$OOT" \
   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$GP_MIN" \
   XIAOTU_MOE_THREADS="$THREADS" \
+  XIAOTU_MOE_NSLICE_SMALL="$NSLICE_SMALL" \
   ${SPIN_IDLE_US:+XIAOTU_MOE_SPIN_IDLE_US="$SPIN_IDLE_US"} \
   XIAOTU_MOE_GPU_RESIDENT_LAYERS="$RESIDENT" \
   OMP_NUM_THREADS=1 \

@@ -12720,3 +12720,58 @@ worker 1600577: threads=115  cpu=3212%    ← ≈32 核
 3. **对照组**:用同样的 `THREADS=60` 在参考 fork(`ENV=lvllmds4-x`)上跑同一协议 ——
    0.1.0 的 26 ms 就是在那条链上测的。**如果 fork 也不慢,说明差异在 mode A 的调用方式**
    (主线的 host-func/异步握手)而不是池本身。
+
+### 354. 🎉🎉🎉【v0.2·第 20 轮·真正的修】**`XIAOTU_MOE_NSLICE_SMALL=0` ⇒ 1225 → 36–44 ms/token(28–33×),且 CPU 降到 1/22**
+
+#### (a) 根因:`small_batch_workers()` 的线程数估算在 DS-V4 维度上离谱
+
+`moe_v2.hpp` 的小 batch 路径:
+
+```cpp
+size_t small_batch_workers(size_t NASS, int inter, int hidden) const {
+    const double macs = (double)NASS * 3.0 * inter * hidden;
+    const double single_us = macs / (8.0 * 3.0e3);   // 假设 8 MAC/cycle(标称 fp8)
+    double t = std::sqrt(single_us / 1.8);           // 1.8us/worker 的 barrier 成本
+    size_t lim = (size_t)(t + 0.5);
+    if (lim < 4) lim = 4;  if (lim > nt) lim = nt;  return lim;
+}
+```
+
+解码实际取值:`NASS = M*k = 1*6 = 6`,`inter=2048`,`hidden=4096` ⇒
+`macs = 1.51e8` ⇒ `single_us = 6292 µs`(单线程估算值;真实是**百 µs 量级**,高估 ~50×)
+⇒ `t = sqrt(6292/1.8) = 59` ⇒ **`wlimit = 59`,而 `nt = 60`**。
+
+于是 `numa_pool` 里的 worker 门闸:
+
+```cpp
+const size_t wl = worker_limit_.load();          // 59
+if (wl > 0 && wl < nt_) { size_t stride = nt_/wl;   // 60/59 = 1
+                          if (w % stride != 0) goto park; }   // w%1==0 ⇒ **没人 park**
+```
+
+**⇒ 全部 60 个 worker 都自旋**(×2 个 rank = 120 个自旋线程),而且走的是
+`parallel_for_limited` —— **代码里(line 509)明确警告过"会卡死/有边界竞态、
+要先把 limited 路径修好"的那条路**;调用方每相还要先自旋 `spin_idle_us`(默认 **5 ms**)
+再退回 condvar。43 层 × ~3 相 × 5 ms ≈ 645 ms,再叠加 120 线程的争抢
+(注释原话:"with 192 spinning threads the ~30 participants run at half speed")
+⇒ 与实测的 **1225 ms/token** 量级一致。
+
+#### (b) 修法:一行 env,绕开这条路径
+
+| 配置 | 每 token | worker CPU | load average |
+|---|---|---|---|
+| 默认 | **1225 ms** | 3242% ×2 | **119.7** |
+| `SPIN_IDLE_US=600000`(§352 的错误尝试) | 43.5 ms → 几分钟后 **1313 ms** | 3242% ×2 | 119.7 |
+| **`XIAOTU_MOE_NSLICE_SMALL=0`** | **43.7 / 36.4 ms** | **146% / 137%** | **8.98** |
+
+⇒ **真的修了:28–33× 提速,同时 CPU 从 3242% 掉到 146%(1/22),load 从 119 掉到 9。**
+`NSLICE_SMALL=0` 让解码走 legacy 路径,不再进 `wlimit/limited`。
+
+**已设为 `serve_mainline.sh` 默认。**
+
+#### (c) 与 0.1.0 的对照
+
+0.1.0(fork)同协议是 **26 ms/token**;我们主线现在是 **36–44 ms/token** ⇒ **1.4–1.7×**。
+差距的合理归因:legacy 路径对 qlen=1 没用上 N-slice 的并行;
+正解是**把 `small_batch_workers()` 的 `single_us` 估准**(用实测单线程时间而不是标称 MAC 率),
+让 `wlimit` 落在"真的该用的线程数"(个位数),而不是 59。**这是下一轮的引擎侧改动。**
