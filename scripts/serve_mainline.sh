@@ -46,6 +46,19 @@ GP_MIN="${GP_MIN:-0}"
 #   同时解码(size<=SEQS)仍然享有 CUDA 图。留空 = 用主线默认(PIECEWISE 会把预填充
 #   形状也捕获掉,重放永远走捕获时的 CPU 分支 ⇒ GPU 预填充形同虚设)。见 NOTES §340(c)。
 CUDAGRAPH_SIZES="${CUDAGRAPH_SIZES:-}"
+# NUMA 交错(**默认开,不要关**)。
+# 为什么必须:vLLM 加载权重时每个 rank 装**全部 256 个专家**(≈138 GB/worker,
+# EP 不在加载期切分存储),这部分是**未绑定**的 first-touch 分配,会顺着加载线程
+# 所在的 node 堆下去。实测(2026-09-14,已加载 38/43 层时):
+#     node 0 free:  7220 MB   ← 185 GB 已用      node 4 free: 168037 MB
+#     node 2 free:  7951 MB   ← 185 GB 已用      node 7 free: 169973 MB
+# **总空闲还有 863 GB,但 node 0/2 已 96% 满** ⇒ 下一次落上去的分配就:
+#     oom-kill: constraint=CONSTRAINT_MEMORY_POLICY, nodemask=0,
+#               task=VLLM::Worker_TP, anon-rss:236289496kB
+# 进程**静默死亡**(无 Traceback,日志"只加载到一半就没了")。
+# 引擎自身的权重分片已由 mbind 正确铺开(见 moe_v2.hpp shard_region),但管不到
+# vLLM 那 138 GB,所以必须在进程级交错。INTERLEAVE=0 仅在你自己已绑核/绑节点时用。
+INTERLEAVE="${INTERLEAVE:-1}"
 if [ "$GP_MIN" -gt 0 ] && [ "$GP_MIN" -gt "$MBT" ]; then
   echo "[mainline] GP_MIN=$GP_MIN > MBT=$MBT ⇒ 夹到 MBT(否则预填充永远够不到阈值;NOTES §319c)"
   GP_MIN="$MBT"
@@ -105,7 +118,7 @@ fi
 {
   echo "tag=$TAG port=$PORT tp=$TP gpus=$GPUS maxlen=$MAXLEN seqs=$SEQS gpu_util=$GPU_UTIL"
   echo "mbt='$MBT' chunked='$CHUNKED_PREFILL' threads=$THREADS resident='$RESIDENT' oot=$OOT load_strategy='$LOAD_STRATEGY' extra_env='$EXTRA_ENV'"
-echo "gp_min=$GP_MIN cudagraph_sizes='$CUDAGRAPH_SIZES' prefill_preset='${PREFILL:-0}'"
+echo "gp_min=$GP_MIN cudagraph_sizes='$CUDAGRAPH_SIZES' prefill_preset='${PREFILL:-0}' interleave='$INTERLEAVE'"
   echo "env=$ENV"; echo "ckpt=$CKPT"; date -Is
 } > "$OUTDIR/$TAG.env"
 
@@ -120,6 +133,10 @@ done
 
 cd /tmp
 export PATH="$ENV/bin:$PATH"
+NCTL=()
+if [ "$INTERLEAVE" = "1" ] && command -v numactl >/dev/null 2>&1; then
+  NCTL=(numactl --interleave=all)
+fi
 export CUDA_VISIBLE_DEVICES="$GPUS"
 nohup env \
   HF_HUB_OFFLINE=1 \
@@ -136,7 +153,7 @@ nohup env \
   XIAOTU_MOE_GPU_RESIDENT_LAYERS="$RESIDENT" \
   OMP_NUM_THREADS=1 \
   $EXTRA_ENV \
-  "$PY" -m vllm.entrypoints.openai.api_server "${ARGS[@]}" > "$LOG" 2>&1 &
+  "${NCTL[@]}" "$PY" -m vllm.entrypoints.openai.api_server "${ARGS[@]}" > "$LOG" 2>&1 &
 echo $! > "$OUTDIR/$TAG.pid"
 echo "[mainline] tag=$TAG pid=$(cat "$OUTDIR/$TAG.pid") log=$LOG"
 

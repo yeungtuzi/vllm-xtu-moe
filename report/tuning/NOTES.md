@@ -12312,3 +12312,31 @@ nshard_ = std::max(1, numa_node_count() / _world);
 (mode A 的归约走 `configure_ep` 共享内存,不能让引擎 auto-EP 重复归约)。
 **这是 mode A / mode B 的 parity bug** —— mode B 早前已修(否则它的池也会抢核,NOTES §334p),
 mode A 漏了。修好后:rank 0 用 node 0–3 + CCD 0–11,rank 1 用 node 4–7 + CCD 12–23,互不重叠。
+
+### 345. ✅【v0.2·第 15 轮·验证】`serve_mainline.sh` 默认路径 + mode A 放置修复 = 端到端通过
+
+用**全默认**(`PREFILL=1 MBT=1024 GP_MIN=1024 RESIDENT=` ⇒ `INTERLEAVE=1` 自动生效)
++ `hybrid_model` 的 rank 放置修复,重新起服务:
+
+```
+[mainline] READY tag=ml_ok            (285 s)
+Available KV cache memory: 18.32 GiB
+GPU KV cache size: 180,582 tokens, Maximum concurrency for 8,192 tokens per request: 22.04x
+```
+
+* **节点不再失衡**(总空闲 ≈ 575 GB,分布 101/55/102/35/85/43/61/90 GB,没有 node 逼近 193 GB)
+  —— 对比修复前"总空闲 863 GB 但 node 0/2 已用 185/193 GB"。
+* **无新 OOM**(`kern.log` 最后一条仍是 09:58 那次预修复的)。
+* **GPU 预填充仍生效**:1750 真实 token → **TTFT 3.379 s = 606 t/s**
+  (`report/tuning/ttft_mainline_fixed.jsonl`),与修复前 3.544 s 一致,
+  是纯 CPU 基线(8.711 s)的 **2.6×**。
+
+#### 本轮关于"为什么要那么多内存"的最终结论(回答用户的质疑)
+
+1. **引擎侧没有浪费**:每个 rank 只持有自己的 EP 分片(`w13 1.0GiB + w2 0.5GiB`/层,
+   且用 `mbind` 按 node 铺开,0 次失败)⇒ 74 GB/worker。§342 说的"引擎又复制一份全量"**是我测错了**。
+2. **真正的浪费在 vLLM 加载期**:每个 rank 装了**全部 256 个专家**(138 GB/worker),
+   EP **没有**在加载期切分存储 ⇒ 2 个 rank 就是 276 GB 装同一份东西。
+   **这是下一轮应该修的**:加载期按 EP 切分 ⇒ 138 → 69 GB/worker,
+   总占用从 ≈424 GB 降到 ≈286 GB,而且很可能**不再需要 interleave**。
+3. 在那之前,**`INTERLEAVE=1` 是必须的**(已设为默认),因为那 138 GB 是未绑定分配。
