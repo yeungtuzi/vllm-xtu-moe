@@ -20,8 +20,27 @@ sys.path.insert(0, REPO)
 MODEL = os.environ.get("XIAOTU_LAYER1_NPZ", "")
 if not MODEL:
     raise SystemExit("set XIAOTU_LAYER1_NPZ=<real layer-1 npz fixture> (see docs/BENCHMARKS.md)")
-H, I, GK, E, K = 4096, 2048, 32, 256, 6
-N_LAYERS = 43
+# ---- dimensions -----------------------------------------------------------
+# Auto-detect from the checkpoint's config.json instead of hardcoding V4's
+# (H=4096, I=2048, E=256, 43 layers).  V4.1-Flash is H=5120, I=2304, E=384,
+# 40 layers -- the old constants made this bench die on the first tensor with
+# "could not broadcast input array from shape (2304,2560) into shape (2048,2048)",
+# so V4.1 could not be micro-benched at all.  Every value stays overridable by
+# env (HID/I/E/K/GK/NLAYERS) so V3/V4 runs are bit-unchanged.
+_cfg_path = os.path.join(MODEL, "config.json")
+_tc = {}
+if os.path.isfile(_cfg_path):
+    with open(_cfg_path) as _f:
+        _j = json.load(_f)
+    _tc = _j.get("text_config", _j) or {}
+H = int(os.environ.get("HID") or _tc.get("hidden_size") or 4096)
+I = int(os.environ.get("I") or _tc.get("moe_intermediate_size")
+        or _tc.get("intermediate_size") or 2048)
+E = int(os.environ.get("E") or _tc.get("n_routed_experts")
+        or _tc.get("num_experts") or 256)
+K = int(os.environ.get("K") or _tc.get("num_experts_per_tok") or 6)
+GK = int(os.environ.get("GK") or 32)
+N_LAYERS = int(os.environ.get("NLAYERS") or _tc.get("num_hidden_layers") or 43)
 
 
 def f32_to_bf16_bits(x):
@@ -85,14 +104,38 @@ def main():
     # 引擎的 scratch 缓冲在一次调用后就被换掉 ⇒ scratch 常驻缓存的效果消失。
     # 用来验证"服务内单次调用比单实例微基准慢 2x"是否来自 scratch 变冷。
     rr = int(os.environ.get("ROUNDROBIN", "0"))
-    print(f"[cpu-bench] variant={xiaotu_moe.__variant__} layer={layer} nengines={len(keep)}",
+    # Did the engine's NUMA shards actually become huge pages? The engine only
+    # calls madvise(MADV_HUGEPAGE) behind XIAOTU_MOE_SHARD_HUGEPAGE=1, and it does
+    # so BEFORE mbind(). mbind() rebuilds/splits the VMA, which is a classic way to
+    # lose the VM_HUGEPAGE flag, and /proc/meminfo reported AnonHugePages=0 even
+    # with the flag on -- so report it from inside the process that owns the map.
+    # Cheap: this is the difference between "THP is a no-op here" and "THP is
+    # working but the win was already taken".
+    def _smaps(field):
+        for f in ("/proc/self/smaps_rollup",):
+            try:
+                with open(f) as fh:
+                    for line in fh:
+                        if line.startswith(field):
+                            return int(line.split()[1])
+            except OSError:
+                pass
+        return -1
+    print(f"[cpu-bench] shard_hugepage_env="
+          f"{os.environ.get('XIAOTU_MOE_SHARD_HUGEPAGE', '<unset>')} "
+          f"AnonHugePages={_smaps('AnonHugePages')} kB "
+          f"Rss={_smaps('Rss')} kB", flush=True)
+
+    print(f"[cpu-bench] variant={xiaotu_moe.__variant__} layer={layer} nengines={len(keep)} "
+          f"H={H} I={I} E={E} K={K} GK={GK} NLAYERS={N_LAYERS} threads="
+          f"{os.environ.get('XIAOTU_MOE_THREADS', '<engine-default>')}",
           flush=True)
 
     rng = np.random.default_rng(7)
     ids = rng.integers(0, E, size=(1, K)).astype(np.int32)
     wts = rng.uniform(-1, 1, size=(1, K)).astype(np.float32)
 
-    print(f"{'B':>6} {'ms/layer':>10} {'43L ms':>9} {'tok/s':>8} {'TFLOP/s':>8}",
+    print(f"{'B':>6} {'ms/layer':>10} {'NL ms':>9} {'tok/s':>8} {'TFLOP/s':>8}",
           flush=True)
     for B in bs:
         x = f32_to_bf16_bits(rng.standard_normal((B, H)).astype(np.float32))
@@ -116,6 +159,15 @@ def main():
             ids_b = rng.integers(0, E, size=(B, K)).astype(np.int32)
         wts_b = rng.uniform(-1, 1, size=(B, K)).astype(np.float32)
         engine.cpu_prefill(B, K, ids_b, wts_b, x, out)
+        if rr:
+            # Warm EVERY engine once BEFORE timing. Without this the timed loop
+            # charges the first call on each engine with its one-off scratch
+            # allocation + first-touch page faults (at B=1400 the scratch is
+            # ~425 MB, i.e. ~100k faults), which is NOT what the service pays on
+            # a steady prefill. A full cycle re-reads 6.8 GB per engine while L3 is
+            # only 384 MB, so the timed calls remain genuinely weight-cold.
+            for _e in keep:
+                _e.cpu_prefill(B, K, ids_b, wts_b, x, out)
         t0 = time.perf_counter()
         if rr:
             for i in range(rep):
