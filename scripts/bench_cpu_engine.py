@@ -151,7 +151,26 @@ def main():
         # "解码一次喂 4 行"的快路径,me=1..3 走单行路径(每行都把权重重新解码一遍)
         # ⇒ 不设 DEDUP 就测不到真实情形。
         dedup = int(os.environ.get("DEDUP", "0"))
-        if dedup > 0:
+        # SKEW=<n_hot> [POOL=<n>]: reproduce the REAL routing shape measured in the
+        # service (NOTES §442): one "hot" expert owning a big share of assignments
+        # plus many small ones (real @M=2048: 147.7 active, mean_me 83, max_me 2048).
+        # DEDUP cannot express this -- it makes the picked experts EQUAL, and that
+        # equality is exactly what makes DEDUP look fast: the adaptive row split
+        # `subA` is derived from the ACTIVE COUNT (need ~ 4*nthreads/na), so FEW
+        # experts each get MANY row-jobs and the load balances itself. With many
+        # active experts subA collapses to ~3, so one 25x-mean expert becomes the
+        # critical path -- which DEDUP can never reveal.
+        skew = int(os.environ.get("SKEW", "0"))
+        if skew > 0:
+            pool = int(os.environ.get("POOL", "0")) or (E - 1)
+            pool = max(1, min(pool, E - 1))
+            n_hot = min(skew, B * K)
+            nrest = B * K - n_hot
+            rest = np.tile(np.arange(1, pool + 1, dtype=np.int32),
+                           nrest // pool + 1)[:nrest]
+            ids_flat = np.concatenate([np.zeros(n_hot, dtype=np.int32), rest])
+            ids_b = ids_flat[rng.permutation(B * K)].reshape(B, K)
+        elif dedup > 0:
             picks = rng.integers(0, E, size=(dedup,)).astype(np.int32)
             ids_b = np.tile(picks, (B * K) // dedup + 1)[: B * K].reshape(B, K)
             ids_b = ids_b.reshape(-1)[rng.permutation(B * K)].reshape(B, K)

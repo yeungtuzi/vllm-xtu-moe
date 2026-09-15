@@ -911,34 +911,67 @@ public:
             }
         }
 
-        // Sub-split for the SHARDED weight-read phases (A and B). Unlike the flat
-        // path (nc_gu/nc_d chunks), the sharded path launches exactly `na` jobs per
-        // node -- na*NS total (e.g. 6*8=48) -- so each node's ~nthreads/NS workers
-        // (168/8=21) have only 6 tickets and ~15 of them sit idle during the
-        // bandwidth-critical w13/w2 reads. Sub-splitting each node's row span into
-        // ~threads-per-node tickets engages ALL worker threads on its node-local
-        // shard. Env XIAOTU_MOE_SHARDSPLIT=N forces sub; =0 disables (A/B toggle);
-        // default picks ceil(tpn/na) capped to keep >=32 rows/job.
-        int subA = 1, subB = 1;
+        // Sub-split for the SHARDED weight-read phases (A and B).
+        //
+        // 【轮 422】以前 subA 只看**活跃专家个数**:
+        //     need = ceil(4*tpn/na);  subA = min(need, spanA/32)
+        // 专家一多 subA 就塌到 ~3 —— 而真实路由是**长尾**的,不只是"多":
+        //   NOTES §442 实测 qlen=2048 时 active=147.7、mean_me=83、**max_me=2048**,
+        // 即一个热点专家独占 16.7% 的 assignment,却只被切成 3 刀 ⇒ 它单枪匹马
+        // 成为整层的关键路径。微基准里可以精确复现这个形状:
+        //   uniform(384 专家, me≈32) 175.8 ms  vs  SKEW=2048/POOL=147 → **552.7 ms**
+        // 而服务实测正是 511 ms。**DEDUP 永远测不出这一条**,因为它让被选中的专家
+        // 彼此**相等**,而"相等"恰恰会让按 na 推出来的 subA 自动均衡。
+        //
+        // 改为按**工作量**给每个专家分配刀数:subA_e ∝ me_e / NASS,让每个 job 的
+        // 工作量大致相等(target = 4 jobs/worker 合计)。均匀路由下
+        // me_e ≈ NASS/na ⇒ subA_e = ceil(4*tpn/na),与原公式**同阶**,
+        // 所以均匀情形没有退化。
+        //
+        // Env XIAOTU_MOE_SHARDSPLIT=N(>0) 仍然强制所有专家都用 N(逐字保留原语义);
+        // =0 关闭;不设/负数 = 上面的自适应。
+        std::vector<int> subAe, subBe;
+        std::vector<size_t> eoffA, eoffB;   // 每个活跃专家的 job 前缀和
         {
             const char* eov = std::getenv("XIAOTU_MOE_SHARDSPLIT");
-            if (eov && std::atoi(eov) > 0) { subA = std::atoi(eov); subB = subA; }
-            else if (nshard_ >= 2 && pool_.nthreads() > 1 && (!eov || std::atoi(eov) < 0)) {
-                const int NS = nshard_;
-                size_t tpn = std::max<size_t>(1, pool_.nthreads() / (size_t)NS);
-                // 每 worker 约 4 个 job(原来 ceil(tpn/na) 在 na≈tpn 时只有 1 个
-                // job/worker ⇒ 一个掉队 job 就拖慢整个阶段:实测 auto(=1) 时
-                // A+B=1448-1469 µs、subA=2→1217、4→1166-1199、8→1174-1236,
-                // 即 1.2x,每核带宽 1.15→1.44 GB/s)。仍受 spanA/32 的上限约束。
-                size_t need = (4 * tpn + na - 1) / na;                // ≈ 4 jobs/worker
-                if (need < 2) need = 2;
-                size_t spanA = (size_t)(inter / NS);
-                subA = (int)std::min<size_t>(need, std::max<size_t>(1, spanA / 32));
-                if (subA < 1) subA = 1;
-                size_t spanB = (size_t)(hidden / NS);
-                subB = (int)std::min<size_t>(need, std::max<size_t>(1, spanB / 32));
-                if (subB < 1) subB = 1;
+            const long ov = eov ? std::atol(eov) : -1L;
+            const bool sharded = (nshard_ >= 2) && (pool_.nthreads() > 1);
+            const int NS = nshard_ > 0 ? nshard_ : 1;
+            const size_t tpn = std::max<size_t>(1, pool_.nthreads() / (size_t)NS);
+            const size_t spanA = (size_t)std::max(1, inter / NS);
+            const size_t spanB = (size_t)std::max(1, hidden / NS);
+            const size_t maxA = std::max<size_t>(1, spanA / 32);   // >=32 rows/job
+            const size_t maxB = std::max<size_t>(1, spanB / 32);
+            const size_t nass = NASS ? NASS : 1;
+            const size_t target = 4 * tpn;                          // ~4 jobs/worker
+            const bool auto_split = sharded && (ov < 0);
+            subAe.assign(na, 1); subBe.assign(na, 1);
+            eoffA.assign(na + 1, 0); eoffB.assign(na + 1, 0);
+            size_t ta = 0, tb = 0;
+            for (size_t e = 0; e < na; ++e) {
+                const size_t me = exp_[active_[e]].ai_list.size();
+                int ra, rb;
+                if (ov > 0) {                       // 显式覆盖:所有专家同一刀数
+                    ra = rb = (int)std::min<size_t>((size_t)ov, std::max(maxA, maxB) * 64);
+                } else if (auto_split) {
+                    size_t want = (target * me + nass - 1) / nass;
+                    // Keep the old >=2 floor: measured, uniform routing at B=2048 is
+                    // 174.2-178.8 ms at 2 slices vs 180.6-184.1 ms at 1 slice, i.e.
+                    // the original `need<2 -> 2` was load-bearing (768 jobs vs 384).
+                    // With this floor the UNIFORM case reproduces the old splitting
+                    // exactly, so only the skewed case changes.
+                    if (want < 2) want = 2;
+                    ra = (int)std::min<size_t>(maxA, want);
+                    rb = (int)std::min<size_t>(maxB, want);
+                } else {
+                    ra = rb = 1;
+                }
+                subAe[e] = ra; subBe[e] = rb;
+                eoffA[e] = ta; ta += (size_t)ra;
+                eoffB[e] = tb; tb += (size_t)rb;
             }
+            eoffA[na] = ta; eoffB[na] = tb;
+
         }
 
         // Flattened job index for A2/B0 = sum over active experts of me*nc_gu.
@@ -1007,11 +1040,15 @@ public:
             const size_t gu_crows = (size_t)inter / NS;
             const size_t gu_rb = (size_t)hidden / 2;
             const size_t gu_cbytes = gu_crows * gu_rb;
-            std::vector<size_t> jc(NS, (size_t)active_.size() * (size_t)subA);
+            std::vector<size_t> jc(NS, eoffA[na]);
             pfor_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
-                size_t e_idx = job / (size_t)subA;
-                size_t s = job % (size_t)subA;
+                // job -> (expert, slice) via the per-expert prefix sums (eoffA is
+                // strictly increasing because every subAe >= 1).
+                size_t e_idx = (size_t)(std::upper_bound(eoffA.begin(), eoffA.end(), job)
+                                        - eoffA.begin()) - 1;
                 if (e_idx >= active_.size()) return;
+                const int subA_e = subAe[e_idx];
+                size_t s = job - eoffA[e_idx];
                 int eid = active_[e_idx];
                 ExpBuf& g = exp_[eid];
                 const size_t me = g.ai_list.size();
@@ -1020,8 +1057,8 @@ public:
                 int n1 = (int)((n + 1) * inter / NS);
                 if (n1 > inter) n1 = inter;
                 if (n0 >= n1) return;
-                if (subA > 1) {           // sub-split node span across node's threads
-                    int sep = (n1 - n0 + subA - 1) / subA;
+                if (subA_e > 1) {         // sub-split node span across node's threads
+                    int sep = (n1 - n0 + subA_e - 1) / subA_e;
                     n0 = n0 + (int)s * sep;
                     n1 = std::min<int>(n1, n0 + sep);
                     if (n0 >= n1) return;
@@ -1106,11 +1143,13 @@ public:
             const size_t d_crows = (size_t)hidden / NS;
             const size_t d_rb = (size_t)inter / 2;
             const size_t d_cbytes = d_crows * d_rb;
-            std::vector<size_t> jc(NS, (size_t)active_.size() * (size_t)subB);
+            std::vector<size_t> jc(NS, eoffB[na]);
             pfor_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
-                size_t e_idx = job / (size_t)subB;
-                size_t s = job % (size_t)subB;
+                size_t e_idx = (size_t)(std::upper_bound(eoffB.begin(), eoffB.end(), job)
+                                        - eoffB.begin()) - 1;
                 if (e_idx >= active_.size()) return;
+                const int subB_e = subBe[e_idx];
+                size_t s = job - eoffB[e_idx];
                 int eid = active_[e_idx];
                 ExpBuf& g = exp_[eid];
                 const size_t me = g.ai_list.size();
@@ -1119,8 +1158,8 @@ public:
                 int n1 = (int)((n + 1) * hidden / NS);
                 if (n1 > hidden) n1 = hidden;
                 if (n0 >= n1) return;
-                if (subB > 1) {           // sub-split node span across node's threads
-                    int sep = (n1 - n0 + subB - 1) / subB;
+                if (subB_e > 1) {         // sub-split node span across node's threads
+                    int sep = (n1 - n0 + subB_e - 1) / subB_e;
                     n0 = n0 + (int)s * sep;
                     n1 = std::min<int>(n1, n0 + sep);
                     if (n0 >= n1) return;
