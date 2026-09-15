@@ -23,6 +23,10 @@
 #
 # Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS
 #
+# 【性能默认已调】SPIN_IDLE_US 默认 5000(原 0):实测把 perf 里 ~42% 的 futex
+#   (lll_lock_wait/wake)降到 ~0%,compute 0.43->0.37 ms/层,单流 25.7->27.5 tok/s。
+#   见 NOTES §412。可用 SPIN 环境变量覆盖。
+#
 # EAGER(默认 **0** = 启用 CUDA graph):是否加 --enforce-eager。
 #   **实测 +80%**:单流 14.31 -> 25.71 tok/s;每层 period 1.84 -> 0.95 ms,
 #   其中 rest(GPU 侧算子)1.27 -> 0.52 ms —— 关掉 eager 省下的正是 batch=1 时
@@ -117,7 +121,7 @@ nohup env \
   XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-60}" \
   XIAOTU_MOE_NSLICE_SMALL="${XIAOTU_MOE_NSLICE_SMALL:-0}" \
   XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
-  XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-0}" \
+  XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-5000}" \
   OMP_NUM_THREADS=1 \
   $EXTRA_ENV \
   numactl --interleave=all "$PY" -m vllm.entrypoints.openai.api_server \

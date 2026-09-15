@@ -15529,3 +15529,79 @@ TypeError: make_mxfp4_moe_kernel() takes from 4 to 5 positional arguments but 8 
 之前只对比过 0 vs 300(+3.5%),**没有试过远大于 300 的值**。
 
 判据:`[cd-timing]` 的 `compute`(现 0.43 ms/层)是否下降,以及单流 tok/s 是否上升。
+
+### 412. 🏆【新目标·第 1 轮】`SPIN_IDLE_US=5000` 把 **42% 的 futex 消到 ~0**,单流 25.7 → 27.5 tok/s
+
+| 指标 | `SPIN=300` | **`SPIN=5000`** |
+|---|---|---|
+| 单流 tok/s | 25.71 | **27.46** |
+| `compute` / 层 | 0.43 ms | **0.37 ms**(−14%) |
+| `period` / 层 | 0.95 ms | **0.89 ms** |
+| perf 中 futex 占比 | **~42%** | **~0%**(`lll_lock_wake` 0.00 / `futex_abstimed_wait` 0.00) |
+| perf 首位用户态符号 | — | `matmul_packed4_group` 16.69%、`worker_loop` 8.11% |
+
+⇒ **诊断成立**:worker 在并行区之间反复 park,每个区被 `notify_all` 唤醒 ~120 次;
+把自旋从 300 µs 提到 5000 µs 后不再 park,futex 归零,`compute` −14%。
+
+**注意口径**:那 42% 是**各线程的 CPU 时间**,不是墙钟;所以墙钟收益(+7%)小于 CPU 收益。
+但它确实回收了大量被浪费的 CPU(对并发/能耗有意义),且 `compute` 实质下降。
+
+**已把 `serve_v41.sh` 的 `SPIN_IDLE_US` 默认从 0 改为 5000**(可用 `SPIN` 覆盖回退)。
+
+#### 412.1 下一个杠杆:`rest` 现在是多数(0.52 / 0.89 = 59%)
+
+`rest = period − compute`,包含 GPU 侧算子 + CPU↔GPU 交接 + vLLM/Python 每层开销。
+已排除:`XIAOTU_MOE_GRAPH_OUT_MAX` / `XIAOTU_MOE_PREFETCH_SLOTS` / `XIAOTU_GPU_PREFETCH_AHEAD`
+都是 **GPU 预填充**路径的旋钮,与 CPU-decode 的 `rest` 无关。
+
+`rest` 的特征(来自已有数据):`qlen=1` 时 0.52 ms,`qlen=8` 时 0.88 ms
+⇒ **有一个 ~0.4–0.5 ms/层的固定分量**,43 层就是 **~20 ms/token 的固定开销**,
+正是单流的主要损耗。下一步要把它拆开(用插件自带的 `XIAOTU_TIMING` /
+`XIAOTU_TORCH_PROFILE`,或把 `apply()` 包一层计时)。
+
+### 413. 🎯🎯🎯【新目标·第 1 轮】`rest` 的**确切语义**找到了,并找到对应手段:**GPU 常驻层**
+
+#### 413.1 binding 里的计时语义(原文)
+
+`python_binding/binding.cpp:836-845` 的注释写得很清楚:
+
+```
+period  = callback-entry 到 callback-entry:真正的**每层串行**时间
+          (decode 路径是严格的逐层链:GPU -> D2H -> CPU -> H2D -> GPU)
+compute = CPU MoE 本身
+period - compute = GPU 工作 + 拷贝 + host-fn 派发延迟,
+                   **即"把这一层放到 GPU 就能省掉的那部分"**
+```
+
+* 我们实测:`period 0.89 ms/层,compute 0.37,rest 0.52` ⇒ **rest 已占 59%**;
+* 43 层 × 0.89 = 38 ms/token ⇒ 27.5 tok/s(`SPIN=5000` 之后);
+* 另有诊断开关 **`XIAOTU_MOE_FAKE_CPU=1`**(跳过 CPU MoE、保留原输出)可量"纯 GPU 侧每层",
+  以及 **`XIAOTU_MOE_DIAG_BARRIER`**;都标了"绝不能用于正确性测试"。
+
+#### 413.2 手段本来就有:`XIAOTU_MOE_GPU_RESIDENT_LAYERS`
+
+`hybrid_model.py:51 gpu_resident_layers()`:
+
+> 常驻 GPU 的专家层(`XIAOTU_MOE_GPU_RESIDENT_LAYERS`,逗号+区间,如 `"0-4,10"`)。
+> 这些层的专家权重**一次性**放进显存并常驻(不再每步走 CPU 引擎),
+> 因此它们**贡献 0 往返、0 DRAM 权重流量**;剩下的层仍在 CPU。
+> **对齐 lk-moe 的 `LVLLM_GPU_RESIDENT_MOE_LAYERS`。** 默认空 = 全部走 CPU。
+
+**项目里已积累的实测**:
+* §320:常驻层上限 **11 层**(TP=2 / MBT=256 / util 0.90);
+* §10917:**"常驻层是唯一能'删掉 CPU 层'的手段,11 层 × 0.41 ≈ 4.5 ms/token 已拿到"**;
+* §12514:单层 marshalling+compute ≈ **0.32 ms**;31 个非常驻层 ≈ 10 ms/pass。
+
+⇒ 与我们现在的 0.89 ms/层 相比,**这是最大的单项杠杆**。
+
+#### 413.3 实验设计(结合用户转述的 lk-moe 结论)
+
+用户的 lk-moe 结论:**要放"后 20 层"(decode 侧)的层**,放 prefill 侧没有同样效果。
+我们的 MoE 层是 `layers.0..39`,**decode 侧 = 编号靠后的层** ⇒ 先试 `38,39`。
+
+显存预算(单卡 39.5 GiB):非专家 ≈14.4 GiB;每层常驻 ≈6.33 GiB(TP=1)。
+* `util=0.60` 时 KV 只有 9.31 GiB 的额度,加 2 层常驻(12.66)会超 ⇒ 必须提 util;
+* 我们 `maxlen=1024 / max_num_seqs=1`,KV 需求极小 ⇒ 用 `GPU_UTIL=0.85` + 2 层常驻
+  (14.4 + 12.66 ≈ 27 ⇒ 仍留 ~6.6 GiB 给 KV)。
+  **注意**:以前 util=0.85 会 OOM 是因为 `device_loading_context` 把专家搬上 GPU,
+  **那个已被我们的 shim 修掉**,所以现在应该可行。
