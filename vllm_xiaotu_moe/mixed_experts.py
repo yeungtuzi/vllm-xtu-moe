@@ -423,6 +423,14 @@ class _XiaotuExpertsMixin:
                 + ", ".join(seen),
                 flush=True,
             )
+        # ⚠️ **必须清掉"钩子前快照"**。它持有**原始**专家张量的引用,而上面的
+        # 释放只是把参数指向了 1 字节的 `empty_strided` —— 不清引用,那
+        # 6.33 GiB/层(40 层 = 264 GiB)就永远回不到 OS。
+        # 这正是 cellJ/cellK 里 RSS(1064~1116 GB)比账面(~467 GiB)高出几百 GB 的主因。
+        try:
+            layer._xiaotu_pre_pwal_src = None
+        except Exception:  # noqa: BLE001
+            pass
         return freed
 
     # ---- routing -------------------------------------------------------

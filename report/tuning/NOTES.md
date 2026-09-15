@@ -14759,3 +14759,59 @@ GPU KV cache size: 315,007 tokens  (最大并发 307.62 @1024 tokens)
   全程无 GPU OOM、无 SIGSEGV、无形状断言。
 * **未达成**:走不到 `Application startup complete`,因此**还没有端到端出数**;
   新的唯一阻塞点是这个 `rwsem` 冻结。
+
+### 394. 🎯【v0.4·第 32 轮】按用户指示转向:先把权重路径做对,ngram **最后**做
+
+#### 394.1 用户的决策(2026-09-15)
+
+* **不要纠缠内存峰值**,先把**权重**加载/切片/释放这条路做通;
+* **ngram 最后做**(先不碰这个大头),权重处理完、内存释放完,再去处理 ngram;
+* **以后凡带 ngram 的模型都这么处理**(ngram 最后加载)——已写成 **IRON_RULES R11**;
+* 若 vLLM 坚持一次性加载全部权重,则**给 vLLM 打 patch**(识别我们的标记参数后逐层
+  加载/切片/释放),**作为单独的 PR 提交**。
+
+#### 394.2 为什么"ngram 最后"是对的:实测顺序证据
+
+`cellK` 的日志顺序(行号即时间顺序):
+
+```
+行 44  10:08:40  [engram.py:255] Engram table offloaded ... 94.42 GiB per rank
+行 46  10:10:17  [engram.py:255] Engram table offloaded ... 94.42 GiB per rank
+行 47  10:11:34  [engram.py:435] Built engram token map (129280 -> 99092 ids)
+行 53            released 6.59 GiB (language_model.model.layers.0.ffn.experts)
+ ...             ...
+行147            released 6.59 GiB (language_model.model.layers.39.ffn.experts)
+```
+
+* Engram 的 **188.8 GiB pinned** 在**专家阶段之前**就已就位;而 pinned 不可回收、不可换出;
+* 根因位置:`vllm/models/deepseek_v41/nvidia/engram.py:217` 的
+  `ParallelEngramEmbedding.__init__` —— `cpu_offload=True` 时**在模块构造期**
+  就把表分配出来了,比 `load_weights` 还早。
+* ⇒ 把它推迟到"所有专家层处理完并释放之后",峰值直接减 188.8 GiB。
+
+#### 394.3 自我更正(重要)
+
+我在本轮前半段说"钩子前快照 `_xiaotu_pre_pwal_src` 扣住了 264 GiB、是那 600 GB 差额的主因"
+—— **这是错的,已收回**。实测(真尺寸):
+
+```
+lay.w13_weight is orig      : True      # .data 赋值不换对象
+lay.w13_weight storage bytes: 1         # 但底层 storage 已换成 1 字节 ⇒ 原存储确实已释放
+```
+
+即 `p.data = empty_strided(...)` **已经把原始存储还掉了**,快照持有的只是同一个对象。
+清快照(`_release_source_weights` 末尾置 None)**仍然保留**,因为它少一个引用、让对象可回收
+(而且对 `nn.Parameter` 之外的路径更稳),但它**不是**那几百 GB 的来源。
+
+⇒ **那 ~600 GiB 差额至今未点名。** 已知的账面是:Engram pinned 189 + 引擎分片 253
++ 非专家 ~25 ≈ 467 GiB,而实测 RSS 1064~1116 GB。缺口需要下一轮用
+"逐层 RSS 增量 + 释放后 RSS 是否回落"来定位;用户的指示(ngram 最后 + 逐层加载/切片/释放)
+本身就是缩小这个缺口的方向。
+
+#### 394.4 待写的两个 patch(用户已定的方向)
+
+1. **Engram 最后加载**:让 `ParallelEngramEmbedding` 的 pinned 表**延迟到**
+   `load_weights` 结束(或所有专家层处理+释放完成)之后再物化 —— 例如构造期只放
+   meta/占位,在 post-load 钩子里 materialize。
+2. **逐层 load/slice/release**:在 vLLM 里识别 `_xiaotu_cpu_expert` 标记的参数,
+   按层完成 加载→切片→释放,避免"一次性全量"。**作为单独 PR 提交。**

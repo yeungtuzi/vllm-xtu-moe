@@ -248,3 +248,30 @@ ENV=... TAG=... bash scripts/serve_mainline.sh   # 端到端(最贵,最后做)
 
 **下一次跟进的起点**:最新有轮子的 commit 已是 `d392ac836`(比 `dabc4362b` 又新 4 个 commit);
 `upstream main HEAD` 仍**无轮子**。跑 `scripts/check_upstream_drift.sh` 即可看到当前值。
+
+## R11. **ngram/Engram 一律"最后加载";大权重必须"逐层加载、切片、释放"**(用户 2026-09-15 定为开发原则)
+
+用户原话要求,分两条:
+
+1. **凡是带 ngram(Engram)的模型,ngram 必须放到**最后**才加载进内存。**
+   理由(本机实测,`cellK`,见 NOTES §394):`ParallelEngramEmbedding.__init__` 在
+   **模块构造期**就分配了 `94.42 GiB × 2 = 188.8 GiB` 的 **pinned**(不可回收、不可换出)表,
+   而专家层是在那之后才逐层处理的:
+   ```
+   行44/46  engram.py:255  Engram table offloaded ... 94.42 GiB ×2   (10:08:40 / 10:10:17)
+   行53…147 released 6.59 GiB × 40 layers (layers.0 … layers.39)      (专家阶段在其后)
+   ```
+   ⇒ 整个**内存最吃紧的专家阶段**,白白多扛 188.8 GiB 不可回收内存。
+   把 ngram 挪到最后,峰值直接少 188.8 GiB。
+
+2. **大权重不允许"一次性全量加载"。** 必须**逐层** load → slice → release。
+   用户明确:如果 vLLM 一定要一次性把全部权重读进来(对我们不合适),
+   就**给 vLLM 打 patch**:识别到我们标记的参数时,按层做 加载/切片/释放,
+   并**作为单独的 PR 提交**。
+
+配套(已具备的基础):
+* 标记机制:`create_weights` shim 会给混合模式下建在 CPU 的**大**参数(≥64 MiB)打上
+  `_xiaotu_cpu_expert`(见 `mainline_shims.py`),这正是 patch 里识别"我们的参数"的依据;
+* `device_loading_context` shim 已经阻止了主线把 CPU 专家搬上 GPU(NOTES §390);
+* 逐层释放已在 `apply()`/`process_weights_after_loading` 两处生效,实测 40/40 层
+  各释放 6.59 GiB(NOTES §391/§392)。
