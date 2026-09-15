@@ -15721,3 +15721,42 @@ launcher 里有的 `XIAOTU_MOE_THREADS` / `_SPIN_IDLE_US` / `_GPU_RESIDENT_LAYER
 **有效手段(均已实测)**:`EAGER=0`(CUDA graph,+80%)、`SPIN_IDLE_US=5000`(消 futex),
 `MAXSEQS=8`(并发)、`THREADS=128`/`NSLICE_SMALL=1`(小增益)、`ASYNC=0`(**必须**)。
 **未走通**:GPU 常驻层(§416.2)、`FAKE_CPU` 定量(§415)。
+
+### 417. 🎯🎯🎯【新目标·第 2 轮】**常驻层"没生效"的真正原因:V4.1 模块化路径上根本没实现**
+
+#### 417.1 根因(干净且确定)
+
+```
+mixed_experts.py 里 gpu_resident / resident / _gpu_shard 出现次数 = 0
+gpu_resident_layers() / _gpu_resident 只存在于 hybrid_model.py(DeepSeek-V4 的 OOT 路径)
+mixed_experts.py:690           cfg.use_gpu_prefill = False
+```
+
+* `hybrid_model.py:1393` 注册的是 `MODEL_ARCH`(DeepSeek-**V4**)的 OOT override,
+  把 `DeepseekV4MoE` 换成 `CpuXiaotuMoE`;V4.1 走的是**模块化**的 `XiaotuCPUExpertsMxfp4`;
+* 已加 `[xtu-resident]` 诊断打印(`XIAOTU_RESIDENT_DIAG=1`),但**一条都没打** ——
+  因为那段代码在 `hybrid_model` 的 `__init__` 里,**V4.1 根本不构造这个类**。
+
+⇒ **`XIAOTU_MOE_GPU_RESIDENT_LAYERS` 对 V4.1 完全无效**,不是环境变量问题、不是层号解析问题,
+而是**这条路没有这个功能**。(§414/§416 的两轮排查到此收敛。)
+
+#### 417.2 好消息:要复用的东西都在
+
+* `gpu_prefill.gpu_moe_layer(x, topk_ids, topk_weights, w13, s13, w2, s2, H, I, K, device=, slot=)`
+  就是"一层 MoE 跑在 GPU"的完整实现(MXFP4 内核内反量化);
+* **`w13.device == device` 时它不做 H2D**;而 `slot=` 接口正是为**常驻槽位**准备的
+  (`hybrid_model` 的 `self._resident_slot` 就用法如此),并且**已处理 CUDA graph 捕获**
+  (注释:`常驻层的 slot.ready 在捕获外 record,图内不 wait_event`,见 TRIED_AND_REVERTED R14);
+* V4 路径里"常驻层 → 永远走 GPU;非常驻层 → 只在长 prefill 走 GPU"的判定逻辑可照搬。
+
+#### 417.3 实现方案(V4.1 模块化路径,opt-in 不影响既有行为)
+
+1. 在 `_XiaotuExpertsMixin` 上判定本层是否常驻(复用 `hybrid_model.gpu_resident_layers()`);
+2. `_ensure_engine`:**常驻层不建 CPU 引擎**,改为构造一个"常驻槽位"
+   —— 把该层 `w13/s13/w2/s2` 一次性搬到 GPU 并转成 K-major,存进 slot;
+3. `apply()`:常驻层走 `gpu_moe_layer(..., slot=...)`,非常驻层走原 CPU 引擎;
+4. `_maybe_release_source`:常驻层**不释放**源张量(它还要用);
+5. 默认空集合 ⇒ **非常驻路径逐字不变**(满足"不破坏已有模型"的红线)。
+
+**验收**:① 不设常驻时行为/数值与现在一致;② 设 2–3 个 decode 侧层后
+`[cd-timing]` 的 `period` 与 `rest` 应出现**超出噪声**的下降;③ 输出仍正确。
