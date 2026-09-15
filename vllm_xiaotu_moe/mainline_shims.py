@@ -257,6 +257,57 @@ def _install_engram_materialize_shim() -> list[str]:
     return [f"process_weights_after_loading(+engram materialize; rebound={rebound})"]
 
 
+_UPSTREAM_SEG = {"n": 0}
+
+
+def _seg_sample(tag: str, before: dict) -> dict:
+    now = _host_mem_mib()
+    if _mem_diag_on():
+        d_a = now.get("RssAnon", 0) - before.get("RssAnon", 0)
+        d_s = now.get("RssShmem", 0) - before.get("RssShmem", 0)
+        if abs(d_a) > 64 or abs(d_s) > 64:      # 只报 >64MiB 的分段,避免刷屏
+            print(f"[xtu-seg] l#{_UPSTREAM_SEG['n']} {tag}: "
+                  f"dAnon={d_a:+d}MiB dShmem={d_s:+d}MiB", flush=True)
+    return now
+
+
+def _install_upstream_seg_shims() -> list[str]:
+    """把上游 `process_weights_after_loading` 再切细,定位每层 +9.18 GiB 匿名内存。
+
+    `[xtu-diag-split]` 已证明这 9.18 GiB 完全落在**上游钩子**里(NOTES §407/§408),
+    而该钩子体量很小:`Mxfp4MoEMethod.process_weights_after_loading` → `_setup_kernel`
+    → `make_mxfp4_moe_kernel`。这里在三处各采一次样,把它落到具体一行。
+    """
+    applied: list[str] = []
+    # (1) _setup_kernel:类属性,直接换不会踩"按名导入"的坑
+    try:
+        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip _setup_kernel seg: {type(exc).__name__}: {exc}")
+        Mxfp4MoEMethod = None
+    if Mxfp4MoEMethod is not None:
+        orig = Mxfp4MoEMethod.__dict__.get("_setup_kernel")
+        if orig is not None and not getattr(orig, "_xtu_shim", False):
+            @functools.wraps(orig)
+            def _setup_kernel(self, layer, *a, **kw):
+                b = _host_mem_mib()
+                res = orig(self, layer, *a, **kw)
+                _seg_sample("_setup_kernel", b)
+                return res
+
+            _setup_kernel._xtu_shim = True  # type: ignore[attr-defined]
+            Mxfp4MoEMethod._setup_kernel = _setup_kernel
+            applied.append("Mxfp4MoEMethod._setup_kernel")
+
+    # (2) 【已移除】`make_mxfp4_moe_kernel` 的包装:实测会让引擎初始化直接抛
+    #     `TypeError: make_mxfp4_moe_kernel() takes from 4 to 5 positional arguments
+    #      but 8 were given`,而绑定与签名检查都正常、机制未查明。
+    #     它是"锦上添花"的二级细分,不值得为一个未查明的失败冒破坏可跑通路径的风险。
+    #     `_setup_kernel` 这一级已足够二分(见 NOTES §409)。若日后要恢复,
+    #     务必先用一次真实启动验证,而不是只做 import 级检查。
+    return applied
+
+
 def _install_engram_last_shim() -> list[str]:
     """构造期只放 meta 占位,把 188.8 GiB pinned 表推迟到专家阶段之后(IRON_RULES R11)。
 
@@ -428,6 +479,7 @@ def _patch_quant_method_cls(cls) -> list[str]:
                 _notify_experts(self, layer)
             a2 = _host_mem_mib() if _mem_diag_on() else {}
             _PWAL_DIAG["split"] = _PWAL_DIAG.get("split", 0) + 1
+            _UPSTREAM_SEG["n"] = _PWAL_DIAG["split"]
             if _mem_diag_on() and (
                 _PWAL_DIAG["split"] == 1 or _PWAL_DIAG["split"] % 8 == 0
             ):
@@ -739,6 +791,7 @@ def apply_mainline_shims() -> list[str]:
         _install_quant_method_shims,
         _install_device_loading_shim,
         _install_engram_last_shim,
+        _install_upstream_seg_shims,
         _install_engram_materialize_shim,
         _install_oracle_shims,
         _install_prepack_shims,
