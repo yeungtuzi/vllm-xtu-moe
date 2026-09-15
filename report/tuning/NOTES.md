@@ -16840,3 +16840,60 @@ prefill 每 token 只激活 ~8B 参数、decode 才激活 ~16B;解码器的全�
 关掉 SMT 后 `nproc` 变 192,`THREADS=384` 不再可选。
 ⇒ **待办:关完 SMT 后重跑 §424 曲线的 60/120/192 三点复核**(预计数值接近,
 但省电/热预算变化可能让 192 更快)。**在切换期间不要采信任何时间敏感的数字。**
+
+---
+
+## §459 【设计缺陷,用户指出】GPU prefill 不该强迫 `XIAOTU_RELEASE_SOURCE=0`
+
+用户质疑:"不能从切片后的内存里读权重吗?" —— **对,现在这个要求是设计缺陷,不是必须的。**
+
+### 现状为什么需要源权重
+`gpu_moe_layer` 消费的是**规范布局** `[E, 2I, H/2]`(raw、行主序),然后在**设备上**
+做 K-major 转置(`_kmajor_bytes(_pinned(w13).to(device))`)。而引擎的内存是
+**另一种布局**:按 NUMA node 的**紧凑分片**,每专家 `[gate cbytes][up cbytes]`,
+node n 持有 gate 行 `[n·I/NS,(n+1)·I/NS)`、up 行 `[I+n·I/NS, I+(n+1)·I/NS)`
+(就是 C++ 引擎里已经实现的那套 `cstride/row0/up_off` 几何)。
+两个分片**合起来恰好是一份完整拷贝**(253 GiB),只是**重排 + 分在 2 个 socket 上**
+—— 但今天的内核读不了这个几何。所以只能留着 checkpoint 源张量(269 GiB)。
+
+### 代价(实测,不是估算)
+刚才带 `XIAOTU_RELEASE_SOURCE=0` + 阈值 2048 的启动:
+**EngineCore RSS 1073 GB 时还没加载完**,`node0 free 3.5 GB / node1 free 2.1 GB`。
+对比开着释放时同样的模型只需要 ~830-915 GB。
+**本机 1.5 TB 里可用约 1.1 TB,装不下 522(源+分片)+189(Engram)+非专家。**
+(已及时 kill —— 本机 OOM-killer 有可能挑中 `dsh web`,那是本会话自己,1.39 TB。)
+
+### 正确修法:直接流式**分片**,K-major 改在**设备上重建**
+关键认识:现有的 K-major 转置**本来就在设备上做** ⇒ 主机侧根本不需要规范布局,
+只需要字节。所以:
+
+1. 把两个紧凑分片**原样 H2D**(体积不变,仍是 6.72 GiB/层;而且它们本来就是
+   pin 好、连续、NUMA 本地的一段,比源张量更靠近正确的 socket);
+2. 在设备上做一次 **gather** 得到规范 K-major `[E, H/2, 2I]`,纯索引计算:
+   * 全局行 `n ∈ [0,I)` ⇒ node `n // rowsplit`,偏移 `(n % rowsplit)*(H/2)`;
+   * 全局行 `n ∈ [I,2I)` ⇒ up 行 `ju=n-I` ⇒ node `ju // rowsplit`,
+     偏移 `cbytes + (ju % rowsplit)*(H/2)`;
+   (每个 `pid_n` 的 BN=64 块整体落在一个 node 里,因为 `rowsplit=I/NS=1152` 是 64 的整数倍
+   ⇒ 每块只需**一次**选择,不是每元素选择。)
+3. 代价:设备上 6.72 GiB 读 + 6.72 GiB 写 ≈ **9 ms/层**(~1.5 TB/s),相对 269 ms 的
+   H2D 可忽略。
+4. ⇒ `XIAOTU_RELEASE_SOURCE` 可以保持 **1**,主机专家内存从 **522 GiB 降到 253 GiB**。
+
+这是自然扩展:C++ 引擎里那套紧凑几何(`shard_fill_w13` / `gate_up_slice_batched`)已经存在。
+
+### 退而求其次(都不如上面)
+* **一个可复用的 pinned 暂存缓冲**(~7 GiB)+ 主机侧 gather:省掉 269 GiB,但每层多
+  ~224 ms 的主机 memcpy(6.72 GiB @ ~30 GB/s),几乎把收益抵消 ⇒ 不划算。
+* **干脆不建 CPU 引擎**(解码也走 GPU:常驻层 / DSpark)⇒ 只需要源(269 GiB)、
+  不需要分片。常驻覆盖率越高越划算 —— 与用户"剩余显存放常驻 MoE 层"的次序一致。
+
+### 与目标项的耦合
+内存账说明:**V4.1 的 GPU prefill 与 `XIAOTU_ENGRAM_LAST`(目标项 1)是耦合的** ——
+单是把 189 GiB pinned Engram 推后,就能腾出空间。两条要一起做。
+
+### 当前代码状态(安全)
+Mode B(`mixed_experts.py`)已接上阈值门控的流式路径(`elif _gpu_pf` 分支),
+但**默认阈值仍是 0 = 关闭** ⇒ 对既有模型/既有行为**零影响**。
+若用户显式开启而源已被释放,会**显式报错**(而不是静默算错)。
+遗留:该分支目前用 `slot=None`(同步 H2D,无预取重叠,~400 ms/层),
+以及 `docs/GPU_PREFILL.md` 里 V4 的"137 GiB / 5.9 s"与新测的 V4.1 数字需要分模型写清。

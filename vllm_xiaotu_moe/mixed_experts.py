@@ -1048,12 +1048,38 @@ class _XiaotuExpertsMixin:
             )
         # GPU 常驻层:不建 CPU 引擎、也不释放源张量(它还要被常驻槽位用)。
         _resident = self._is_resident_layer(layer)
-        engine = None if _resident else self._ensure_engine(layer)
-        if not _resident:
+        qlen = hidden_states.size(0)
+        # ---- 长 prefill 的 GPU **流式**路径(阈值门控) ----------------------
+        # 与"常驻层"是两件事:常驻层把权重永久留在显存;这里每次 forward 把本层
+        # 原始 MXFP4 权重 H2D 一遍、算完即弃(V4.1 = 6.72 GiB/层)。
+        # 因此它只在 batch 足够大、能把这次**固定 DMA** 摊薄时才划算 ⇒ 必须阈值门控;
+        # 阈值怎么按 PCIe 带宽/显卡能力选,见 docs/GPU_PREFILL.md。
+        # 三个硬性前提(任一不满足就留在 CPU):
+        #   * 只是 MXFP4 后端 —— gpu_moe_layer 的 Triton 内核只实现了 fp4+e8m0;
+        #   * 不能在图捕获里(V4.1 走图,捕获期开新 H2D 会作废捕获);
+        #   * 源权重必须还在(见下面 storage 校验)。
+        _gp_min = 0
+        _gp_on = False          # 本模块是否启用了 GPU prefill(与本次 qlen 无关)
+        _gpu_pf = False         # 本次调用是否真的走 GPU
+        if getattr(self, "_engine_attr", "") == "MOE_MXFP4" and not _resident:
+            from vllm_xiaotu_moe.gpu_prefill import gpu_prefill_min_tokens
+
+            _gp_min = gpu_prefill_min_tokens()
+            _gp_on = _gp_min > 0
+            _gpu_pf = (
+                _gp_on
+                and qlen >= _gp_min
+                and not torch.cuda.is_current_stream_capturing()
+            )
+        # ⚠️ 释放条件是 `_gp_on`,不是 `_gpu_pf`。引擎是**惰性**建的:第一个请求
+        # 若是长 prefill 就走 GPU、不建引擎;而紧接着的解码步(qlen < 阈值)会把引擎
+        # 建起来 —— 那一刻若把源权重释放掉,下一次长 prefill 就没得流式读了。
+        # 所以只要这个模块启用了 GPU prefill,就**永不释放**源权重。
+        engine = None if (_resident or _gpu_pf) else self._ensure_engine(layer)
+        if not _resident and not _gp_on:
             # 惰性建引擎的这一刻,主机源张量已经没有任何消费者了 —— 立即释放。
             # 这是 V4.1(模块化路径)上唯一真正会执行的释放点,见 NOTES §378。
             self._maybe_release_source(layer)
-        qlen = hidden_states.size(0)
         # Use the tensor the ENGINE was built from: for formats whose checkpoint
         # layout differs (INT4/WNA16), the `w2` argument is the raw packed tensor
         # ([E, I/8, H]) and its dim 1 is NOT the hidden size.
@@ -1117,6 +1143,55 @@ class _XiaotuExpertsMixin:
                 K=int(self.moe_config.experts_per_token),
                 device=h_bf16.device, slot=_slot,
             )
+        elif _gpu_pf:
+            # ---- 长 prefill:本层专家在 GPU 上算(逐层流式权重) ----------------
+            # slot=None ⇒ 同步 H2D + 设备侧 K-major 转置。`_pinned` 是**就地**
+            # cudaHostRegister(不复制),转置在设备上做 ⇒ 不产生累积的 pinned 驻留,
+            # 代价是 H2D 不能与计算重叠(~400 ms/层 vs 重叠后的 ~270)。
+            from vllm_xiaotu_moe.gpu_prefill import gpu_moe_layer
+
+            self._prepare_weights(layer)
+            w13h = getattr(self, "_engine_w13", None)
+            if w13h is None:
+                w13h = layer.w13_weight
+            w2h = getattr(self, "_engine_w2", None)
+            if w2h is None:
+                w2h = layer.w2_weight
+            s13h, s2h = self._scales
+            if s13h is None:
+                s13h = self._find_scale(layer, (self._scale_attrs[0],))
+            if s2h is None:
+                s2h = self._find_scale(layer, (self._scale_attrs[1],))
+            for _nm, _t in (("w13", w13h), ("w2", w2h), ("s13", s13h), ("s2", s2h)):
+                if not isinstance(_t, torch.Tensor):
+                    raise RuntimeError(
+                        f"xiaotu gpu-prefill needs a host tensor for {_nm}; got "
+                        f"{type(_t).__name__}"
+                    )
+                # 同常驻层:必须确认源 storage 没被 XIAOTU_RELEASE_SOURCE 换成
+                # 1 字节空壳,否则会拿垃圾数据算(这里会**静默算错**,比崩更糟)。
+                _need = _t.numel() * _t.element_size()
+                _have = _t.untyped_storage().nbytes()
+                if _have < _need:
+                    raise RuntimeError(
+                        f"xiaotu gpu-prefill {_nm} has a released/undersized storage "
+                        f"(need {_need} bytes, storage {_have} bytes, "
+                        f"shape={tuple(_t.shape)}); XIAOTU_RELEASE_SOURCE must be 0 "
+                        "when VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS is enabled"
+                    )
+            out = gpu_moe_layer(
+                h_bf16, ids_i32, wts_f32, w13h, s13h, w2h, s2h,
+                H=hidden_size, I=int(w13h.shape[1]) // 2,
+                K=int(self.moe_config.experts_per_token),
+                device=h_bf16.device, slot=None,
+            )
+            if not getattr(self, "_gpu_pf_dbg", False):
+                self._gpu_pf_dbg = True
+                print(
+                    f"[vllm-xtu-moe] GPU prefill ACTIVE: first layer={qlen} tokens "
+                    f">= threshold {_gp_min} -> layer MoE on GPU (streaming fp4)",
+                    flush=True,
+                )
         else:
             engine.cpu_decode(
                 stream.cuda_stream, qlen, self.moe_config.experts_per_token,
