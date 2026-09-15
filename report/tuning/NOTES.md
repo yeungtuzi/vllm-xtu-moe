@@ -15483,3 +15483,49 @@ TypeError: make_mxfp4_moe_kernel() takes from 4 to 5 positional arguments but 8 
 
 **当前决定**:这条线**暂时挂起**(它不是用户当前最关心的),先把精力放到用户点名的
 **性能**上——`perf` 已安装可用,可做 CPU 热点归因。
+
+### 411. 🎯🎯🎯【新目标·第 1 轮】perf 归因:**~42% 的 CPU 花在 futex 锁等待/唤醒上**,不是算数
+
+`perf` 已可用(5.15.209)。真实权重、`EAGER=0`、单流解码时采样 12 s
+(1,148,906 samples):
+
+| 占比 | 位置 |
+|---|---|
+| **~42%** | **内核 futex:`__GI___lll_lock_wait`(20.35%)+ `__GI___lll_lock_wake`(21.34%)** |
+| **~30%** | 引擎真正的计算 `packed4::matmul_packed4_group<true,true>` |
+| ~5% | `NumaWorkPool::worker_loop` |
+| 其余 | 内核其它 + 杂项 |
+
+⇒ **单发"还有很大空间"就在这里:将近一半的 CPU 时间不是在做矩阵乘,而是在等/唤醒锁。**
+
+#### 411.1 逐条排查锁来源(含一次自我修正)
+
+* `moe_v2.hpp:522` 的 `std::lock_guard<std::mutex> lock(mtx_)`:每次 `forward_many`
+  一次,**不是**热点;
+* worker 侧的 `work_mtx_` 已被"轮 69 去锚定锁"改成 seqlock(`numa_pool.hpp:1041-1067`),
+  注释记录了旧版每个并行区固定 **~113 µs** 的代价 —— 该优化已在源码里;
+* **worker 完成路径其实是最优形式**(`:1137-1142`):
+  ```cpp
+  if (remaining_sh_[...].fetch_sub(1, acq_rel) == 1) {   // 只有最后一个
+      std::lock_guard<std::mutex> gl(done_mtx_);
+      done_cv_.notify_all();
+  }
+  ```
+  ⇒ **不是**"每个 worker 抢 done_mtx_"(我最初的猜测,已修正)。
+* **剩下的嫌疑**:`:491` 的
+  ```cpp
+  const bool limited = (limit > 0 && limit < nt_);
+  if (!limited) cv_.notify_all();
+  ```
+  在 `limit==0`(默认)时**每个并行区都 `notify_all`**。上方注释说"参与者通常仍在自旋,
+  所以快路径无系统调用",但**那取决于 worker 没有 park** —— 而
+  `XIAOTU_MOE_SPIN_IDLE_US=300`(300 µs)很可能短于层内并行区之间的间隔
+  ⇒ worker 反复 park ⇒ 每个区 ~120 次唤醒 syscall。
+
+#### 411.2 由此得到的实验(便宜、单变量)
+
+**把 `XIAOTU_MOE_SPIN_IDLE_US` 显著调大**(如 5000),让 worker 跨并行区保持自旋、
+不再 park;若 42% 的 futex 因此显著下降,就是它。
+之前只对比过 0 vs 300(+3.5%),**没有试过远大于 300 的值**。
+
+判据:`[cd-timing]` 的 `compute`(现 0.43 ms/层)是否下降,以及单流 tok/s 是否上升。
