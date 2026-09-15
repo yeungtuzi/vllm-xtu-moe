@@ -655,15 +655,31 @@ class _XiaotuExpertsMixin:
         if s2 is None:
             s2 = self._find_scale(layer, (self._scale_attrs[1],))
         for _nm, _t in (("w13", w13), ("w2", w2), ("s13", s13), ("s2", s2)):
-            if (
-                not isinstance(_t, torch.Tensor)
-                or _t.device.type != "cpu"
-                or not _t.is_contiguous()
-            ):
+            if not isinstance(_t, torch.Tensor) or _t.device.type != "cpu":
                 raise RuntimeError(
-                    f"xiaotu resident layer needs contiguous host {_nm}; got "
-                    f"{type(_t).__name__} device="
-                    f"{getattr(_t, 'device', None)}"
+                    f"xiaotu resident layer needs a host tensor for {_nm}; got "
+                    f"{type(_t).__name__} device={getattr(_t, 'device', None)}"
+                )
+            # ⚠️ 这里**不能**要求 `is_contiguous()`:`_kmajor_bytes` 内部会
+            # `transpose(1,2).contiguous()`,本来就容忍非连续输入;而实测
+            # `w13_weight` 恰恰是非连续的(带 stride 的视图)。但必须确认它不是
+            # 已被 `_release_source_weights` 换成 1 字节 storage 的空壳,否则常驻层
+            # 会拿垃圾数据算。所以打印/校验 storage 大小。
+            _need = _t.numel() * _t.element_size()
+            _have = _t.untyped_storage().nbytes()
+            if _have < _need:
+                raise RuntimeError(
+                    f"xiaotu resident layer {_nm} has a released/undersized storage: "
+                    f"need {_need} bytes, storage {_have} bytes "
+                    f"(shape={tuple(_t.shape)} stride={tuple(_t.stride())})"
+                )
+            if not getattr(self, "_resident_dbg", False):
+                self._resident_dbg = True
+                print(
+                    f"[vllm-xtu-moe] resident src probe: {_nm} "
+                    f"shape={tuple(_t.shape)} stride={tuple(_t.stride())} "
+                    f"storage={_have} contiguous={_t.is_contiguous()}",
+                    flush=True,
                 )
 
         dev = torch.device("cuda", torch.cuda.current_device())
