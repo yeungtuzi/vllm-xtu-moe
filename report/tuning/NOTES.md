@@ -13660,3 +13660,75 @@ $ ls /dev/nvidia*          -> 不存在
 
 ⚠️ **诚实标注**:`XIAOTU_RELEASE_SOURCE` 这条路径**尚未端到端验证**。风险点是上游若某处
 读 `layer.w13_weight.shape`/`data_ptr()` 会出问题;A/B 时先确认能跑通,再谈收益。
+
+### 374. 🎯【v0.4·第 8 轮】**找到内存放大的真身:每片都 map 了整块**(引擎自证)
+
+#### 决定性证据(引擎自己的 `XIAOTU_MOE_SHARD_DIAG=1`)
+
+NPS=1 ⇒ `nshard_ = numa_node_count()/world = 2`,输出:
+
+```
+[SHARD-DIAG] region node=0 rc=0 vmasize=4.2GiB addr=0x7ef69a000000 (mbind)
+[SHARD-DIAG] region node=1 rc=0 vmasize=4.2GiB addr=0x7ea472000000 (mbind)
+[SHARD-DIAG] w13 sharding OK NS=2 total=4.2GiB
+[SHARD-DIAG] region node=0 rc=0 vmasize=2.1GiB ...
+[SHARD-DIAG] region node=1 rc=0 vmasize=2.1GiB ...
+[SHARD-DIAG] w2 sharding OK NS=2 total=2.1GiB
+```
+
+**每一片 map 的都是"整块" `total`,不是它自己那 1/NS。** 即每层映射
+`NS × (w13_total + w2_total)`:
+
+| | 每层实际权重 | 每层映射(NS 片 × 整块) | 放大 |
+|---|---|---|---|
+| NPS=4(NS=8) | 6.3 GiB | **50.4 GiB** | **8×** |
+| NPS=1(NS=2) | 6.3 GiB | **12.6 GiB** | **2×** |
+
+代码位置:`moe_v2.hpp::shard_fill_w13/w2` → `shard_region(total, ...)`,
+而 `total = stride * E` 是**整块大小**(w13 = 384×4608×2560 = 4.2 GiB)。
+每片只往里面写 `cbytes = (I/NS)*rowbytes` 的跨度,但**映射是整个 total**。
+
+#### 实测后果(NPS=1 依然要 OOM)
+
+`LOAD=dummy`,只建到 **23/40** 层:
+
+```
+Rss: 1012279220 kB (1012 GB)
+node 0 free: 4521 MB      node 1 free: 866 MB     ← 756 GB 的 node 被打到 <1 GB
+```
+
+⇒ **NPS=1 解决的是"单 node 容量",没有解决"每层映射被放大"这个真 bug。**
+两个问题叠加才是 1330 GB 的来源;只改 BIOS 不够。
+
+#### 附带确认:你提的"释放源张量"路径**当前会 SIGSEGV**(但根因在分片)
+
+`XIAOTU_RELEASE_SOURCE=1` 那次在这次改建的**第一层**就崩了,栈在引擎 `.so` 的
+memcpy 上:
+
+```
+[XTSIG] SIGSEGV at 0x7f3692000000
+_xiaotu_moe_C_avx512_bf16.so ... __memmove_avx_unaligned_erms
+RDX=0x2d0000  ← 2,949,120 = NS=2 时的 cbytes = (2304/2)×2560
+```
+
+⇒ 崩在 `shard_fill_w13` 的 copier。**先修分片映射,再回头验释放路径**
+(释放本身可能没问题,是这个放大把地址空间/节点打爆后才暴露)。
+
+#### 修法(下一步,已明确)
+
+**让每片只映射它真正需要的字节**,把 `shard_fill_w13/w2` 从"每片 map 整块 + 稀疏跨度写"
+改成"每片 map `E × 2 × cbytes` 的紧凑区 + 紧凑索引":
+
+* 现在:`d + e*stride + {rs, (I+rs)}*rowbytes`,映射 `stride*E`
+* 改成:`d + e*(2*cbytes) + {0, cbytes}`,映射 `2*cbytes*E`
+
+读取侧(`gate_up_impl` / `down_impl` 里对 `w13_shard_[n]` / `w2_shard_[n]` 的寻址)同步改。
+**收益**:每层映射 6.3 GiB(恰好等于权重),NS 不再放大 ⇒ 40 层 271 GB 而不是 2160 GB(NPS=4)
+或 504 GB(NPS=1);叠加 `XIAOTU_RELEASE_SOURCE=1` 再省源张量的 271 GB
+⇒ 峰值有望落到 **~500-750 GB**,即"内存略大于权重就该能跑"。
+
+#### 仍未闭环的账(如实标注)
+
+即便按"映射即驻留"算,23 层 × 12.6 GiB ≈ 290 GB,加上 Engram 189 + 非专家 23 + 源张量 271
+= 773 GB,而实测 **1012 GB**,还有 **~240 GB 我没有归因**。所以上面那条"紧凑化后 ~500-750 GB"
+是**预期**,不是已测值;紧凑化改完要重新用 `MEMTRACE` 测一遍才算数。
