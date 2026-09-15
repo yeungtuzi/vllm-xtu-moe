@@ -76,7 +76,7 @@ def report(name, dts, cts):
 
 
 print(f"=== bench label={LABEL} port={PORT} maxtok={MAXTOK} repeat={REPEAT} conc={CONC} ===")
-dt, ct, txt = one(PROMPT, 4)
+dt, ct, txt, pt0 = one(PROMPT, 4)
 print(f"warmup                : {dt:6.2f}s  prompt_tok={pt0:6d}  text={txt[:30]!r}")
 if pt0:
     print(f"  prefill: {pt0 / dt:8.1f} tok/s  ({dt:.2f}s for {pt0} prompt tokens)")
