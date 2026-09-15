@@ -1,15 +1,18 @@
 #!/usr/bin/env python
-"""DeepSeek-V4.1-Flash 单机性能基准(纯 stdlib,不依赖额外包)。
+"""DeepSeek-V4.1-Flash 性能基准(纯 stdlib)。
 
 用法:
-    python bench_v41.py <port> <label> [--conc N] [--maxtok M] [--prompt P]
+    python bench_v41.py <port> <label> [--maxtok M] [--prompt P]
+                        [--repeat R] [--conc C] [--reqs N]
 
-测量:
-  * 单请求延迟(预热 + 计时),拆出 prefill/decode 的粗粒度观察;
-  * N 路并发吞吐(tok/s);
-  * 所有请求 temperature=0,保证可比。
+设计要点(来自 report/tuning/BENCH_REFERENCE.md 的教训):
+  * **必须看方差,不只看均值** —— lk-moe 的数据里"上限没提高但方差被消掉"才是关键信号,
+    所以这里对重复测量给出 P50 / P90 / P99 与 min/max;
+  * 所有请求 temperature=0;
+  * 测吞吐必须用**会持续生成**的 prompt(短 prompt 会 3 个 token 就 EOS)。
 """
 import json
+import statistics
 import sys
 import threading
 import time
@@ -23,11 +26,11 @@ def arg(flag, default):
     return type(default)(sys.argv[sys.argv.index(flag) + 1]) if flag in sys.argv else default
 
 
+MAXTOK = arg("--maxtok", 64)
+PROMPT = arg("--prompt", "Count from 1 to 1000, separated by commas: 1, 2, 3,")
+REPEAT = arg("--repeat", 1)
 CONC = arg("--conc", 1)
-MAXTOK = arg("--maxtok", 32)
-PROMPT = arg("--prompt", "The capital of France is")
 REQS = arg("--reqs", CONC)
-
 URL = f"http://127.0.0.1:{PORT}/v1/completions"
 
 
@@ -37,33 +40,55 @@ def one(prompt, maxtok):
     ).encode()
     req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=1800) as r:
+    with urllib.request.urlopen(req, timeout=3600) as r:
         d = json.loads(r.read())
     dt = time.time() - t0
-    ct = d["usage"]["completion_tokens"]
-    return dt, ct, d["choices"][0]["text"]
+    return dt, d["usage"]["completion_tokens"], d["choices"][0]["text"]
 
 
-print(f"=== bench label={LABEL} port={PORT} conc={CONC} reqs={REQS} maxtok={MAXTOK} ===")
+def pct(xs, p):
+    if not xs:
+        return float("nan")
+    xs = sorted(xs)
+    i = min(len(xs) - 1, int(round((p / 100.0) * (len(xs) - 1))))
+    return xs[i]
 
-# --- 预热(第一次会把 CPU 引擎的页激活)---
+
+def report(name, dts, cts):
+    tps = [c / d for d, c in zip(dts, cts) if d > 0]
+    if not tps:
+        return
+    print(
+        f"{name:22s} n={len(tps):3d}  lat P50={statistics.median(dts):6.2f}s "
+        f"P90={pct(dts, 90):6.2f}s  max={max(dts):6.2f}s | "
+        f"tok/s P50={statistics.median(tps):6.2f} P90={pct(tps, 90):6.2f} "
+        f"min={min(tps):6.2f} max={max(tps):6.2f}"
+    )
+
+
+print(f"=== bench label={LABEL} port={PORT} maxtok={MAXTOK} repeat={REPEAT} conc={CONC} ===")
 dt, ct, txt = one(PROMPT, 4)
-print(f"warmup      : {dt:7.2f}s  {ct:3d} tok   text={txt!r}")
+print(f"warmup                : {dt:6.2f}s  {ct:3d} tok  text={txt[:40]!r}")
 
-# --- 单请求:decode 为主 ---
-for mt in (MAXTOK, MAXTOK * 2):
-    dt, ct, txt = one(PROMPT, mt)
-    print(f"single {mt:4d}tok: {dt:7.2f}s  {ct:3d} tok  {ct / dt:7.2f} tok/s  text={txt[:40]!r}")
+# 串行重复:看抖动(均值之外的稳定性)
+dts, cts = [], []
+for _ in range(REPEAT):
+    d, c, t = one(PROMPT, MAXTOK)
+    dts.append(d)
+    cts.append(c)
+report(f"serial x{REPEAT}", dts, cts)
+if REPEAT == 1:
+    print(f"                       text={t[:60]!r}")
 
-# --- 并发吞吐 ---
+# 并发:每请求各自计时,再算聚合
 if CONC > 1:
     res = []
     lock = threading.Lock()
 
     def worker():
-        dt, ct, _ = one(PROMPT, MAXTOK)
+        d, c, _ = one(PROMPT, MAXTOK)
         with lock:
-            res.append((dt, ct))
+            res.append((d, c))
 
     ts = [threading.Thread(target=worker) for _ in range(REQS)]
     t0 = time.time()
@@ -73,7 +98,9 @@ if CONC > 1:
         t.join()
     wall = time.time() - t0
     tot = sum(c for _, c in res)
+    report(f"conc={CONC}", [d for d, _ in res], [c for _, c in res])
     print(
-        f"conc={CONC:2d}      : wall={wall:7.2f}s  total={tot:4d} tok  "
-        f"aggregate={tot / wall:7.2f} tok/s   per-req avg={sum(d for d, _ in res) / len(res):6.2f}s"
+        f"{'':22s} wall={wall:6.2f}s  total={tot:4d} tok  "
+        f"**aggregate={tot / wall:7.2f} tok/s**  (ideal if perfect scaling = "
+        f"{statistics.median([c / d for d, c in res]) * CONC:7.2f})"
     )
