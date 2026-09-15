@@ -15678,3 +15678,46 @@ launcher 里有的 `XIAOTU_MOE_THREADS` / `_SPIN_IDLE_US` / `_GPU_RESIDENT_LAYER
 `XIAOTU_MOE_GPU_RESIDENT_LAYERS="38,39"` + `XIAOTU_MOE_RESIDENT_BUDGET_GB=1`
 —— 若设置真被读到,插件应因预算不足而**拒绝常驻并告警**(`hybrid_model.py:166` `_resident_ok`)。
 这能一次性回答"这条杠杆到底通不通",而不必依赖噪声里的吞吐差。
+
+### 416. 📌【新目标·第 1 轮】常驻层仍未生效;两个"假信号"的教训;本轮性能结论
+
+#### 416.1 两个被我误用的"信号"(方法学教训)
+
+1. **"没有预算告警"** —— 错。`resident_budget_ok()`(`hybrid_model.py:165-186`)超预算时
+   **静默 `return False`**,根本不打印。用"没有输出"当判据之前,**必须先确认那条输出真的会发**。
+2. **profile/启动段的 `cd-timing`** —— 错。cellAE 启动期的读数是
+   `period=3.30–3.89ms / rest=2.9–3.5`,而**同一个进程在服务态**是
+   `period=0.89 / compute=0.37 / rest=0.52`。**启动段的数字不能当服务性能**。
+
+#### 416.2 常驻层**仍未生效**(服务态对照)
+
+`cellAE`(`LOAD=dummy` + `XIAOTU_MOE_GPU_RESIDENT_LAYERS="38,39"`,
+`RESIDENT_BUDGET_GB=1`)服务态实测:
+
+| 量 | 带常驻配置 | 不带常驻(基线) |
+|---|---|---|
+| `period` / `compute` / `rest` | **0.89 / 0.37 / 0.52 ms** | 0.89 / 0.37 / 0.52 ms(逐位相同) |
+| GPU 占用 | **22.7 GiB** | ~24 GiB(无 +12.7 GiB) |
+| 单流 | 27.85 tok/s | 27.46 tok/s(噪声内) |
+
+⇒ **设置为 2 层常驻没有产生任何可观测差异**;而文件桥已自测能把该值填进 `os.environ`
+且 `gpu_resident_layers()` 在隔离环境下返回 `{38,39}`。
+**未查明**:为何在 EngineCore 的真实路径里没有生效(可能:`extract_layer_index` 得到的
+编号与该集合不匹配;或常驻的建立挂在 GPU-prefill/首轮 forward 的某条未被走到的分支上)。
+
+**交接提示**:下一步应直接在 `hybrid_model.py:688` 那行
+`self._gpu_resident = _li in gpu_resident_layers()` 旁边**临时打印 `_li` 与集合**,
+一次即可定位(比再猜快得多)。
+
+#### 416.3 本轮性能结论(可靠部分)
+
+| 项 | 值 |
+|---|---|
+| 单流(真实权重) | **27.5 tok/s**(起点 13.35 ⇒ **+106%**) |
+| 服务态每层 | `period 0.89 ms` = `compute 0.37(CPU MoE)` + `rest 0.52` |
+| futex 占比 | **42% ⇒ ~0%**(`SPIN_IDLE_US=5000`) |
+| C=8 聚合 | **78 tok/s**(`EAGER=0` + `MAXSEQS=8`) |
+
+**有效手段(均已实测)**:`EAGER=0`(CUDA graph,+80%)、`SPIN_IDLE_US=5000`(消 futex),
+`MAXSEQS=8`(并发)、`THREADS=128`/`NSLICE_SMALL=1`(小增益)、`ASYNC=0`(**必须**)。
+**未走通**:GPU 常驻层(§416.2)、`FAKE_CPU` 定量(§415)。
