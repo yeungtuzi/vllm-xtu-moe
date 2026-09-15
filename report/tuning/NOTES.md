@@ -16619,3 +16619,91 @@ DEDUP 让被选中的专家**彼此相等**,而"相等"恰好使 `subA` 自动�
 剩下的主要来自 `maxA = spanA/32 = 36` 这个上限:热点专家 `want=64` 被截到 36。
 放宽它(如 `spanA/8`)会让每个 job 只占 8 行、但激活重读次数从 36 涨到 144
 (热点专家 2048 token × 5120 × 2B × 144 ≈ 3 GB),需要实测权衡,暂不动。
+
+---
+
+## §449 战略校正(用户 2026-09-15):prefill 应该走 **GPU**,不要再抠 CPU prefill
+
+用户明确指出:**prefill 尽量在 GPU 上完成**;V4-Flash 的旧结论是"输入 >384 就用 GPU 是正收益";
+draft 模型(DSpark)优先保证权重+计算都在 GPU;prefill 优先 GPU 计算但**分层 ping/pong 传输权重**;
+这两件做完显存还有富余,再放常驻 MoE 层。
+
+**我此前的 §439/§447 两个修复其实都在优化 CPU prefill —— 方向错了(虽然修复本身是真的)。**
+按新原则重做定量分析(先测,不再推理):
+
+**实测 H2D 带宽与"每次 prefill 的固定成本"**(pinned → device,cuda:0):
+
+| 量 | 值 |
+|---|---|
+| 每层专家原始字节(V4.1) | **6.724 GiB**(w13 4.22 + w2 2.11 + scale 0.40) |
+| ×40 层 | **268.9 GiB** |
+| 同步 H2D | 20.7 GiB/s |
+| **异步(旁路 stream,即 `prefetch_layer` 的方式)** | **25.0 GiB/s** |
+| ⇒ **每次 prefill 固定成本** | **10.8 s**(完全重叠的最好情况) |
+
+对比 V4-Flash(对照,同脚本实测):每层 ≈3.1 GiB ⇒ 123 GiB ⇒ **5.1 s 固定成本**。
+
+**⇒ "384" 不能直接搬到 V4.1。** 交叉点 = cpu_ms(M) × 40 = 10.8 s:
+按 §448 修复后的 CPU(2048 token = 257 ms/层 ⇒ 10.3 s),V4.1 的交叉点约 **2600 token**。
+(修复前 CPU 在 2048 要 61 s,V4.1 交叉点约 600 —— 所以我把交叉点**推高**了,
+这本身说明 CPU 那两个修复对"短中 prompt"仍有价值,但**长 prompt 必须走 GPU**。)
+
+## §450 对照实验:`gpu_moe_layer` 在 **V4 维度**下是好的
+
+`report/tuning/probes/probe_gpu_prefill_v41.py`(新,维度自动探测):
+
+```
+[gpu-prefill] H=4096 I=2048 E=256 K=6 GK=32 layer=3
+     M    cpu ms   cpu t/s |  gpu+H2D ms   gpu t/s   maxrell | 结论
+   256     23.53   10878.7 |      186.20    1374.9  5.03e-03 | CPU 更快
+=> fixed per-prefill DMA (40 layers) = 5.1 s at 25 GiB/s
+```
+
+* **数值 OK**:GPU 路径与 CPU 引擎相对差 **5.03e-03**,在门限 1.873e-02 之内 ✓
+* 但 `gpu+H2D = 186 ms/层`,而 CPU 在 M=1400 只要 99 ms/层 ⇒ **在我这台机器+当前配置下,
+  连 V4 也是 CPU 更快**(与"V4-Flash >384 用 GPU 划算"的旧结论不一致 —— 旧结论很可能是在
+  CPU 引擎还没调优时测的)。**这条我不下断言,标记为需要用户确认口径**。
+
+## §451 【阻塞点】`gpu_moe_layer` **不支持 V4.1 维度**,连 M=8 都非法访存
+
+同样的探针换 V4.1 权重:
+
+```
+RuntimeError: Triton Error [CUDA]: an illegal memory access was encountered
+  gpu_prefill.py:915  _down_kernel[(E, triton.cdiv(H, BH))]
+```
+
+**M=8 就崩 ⇒ 与 batch 无关,是维度问题**(H=5120/I=2304/E=384 vs V4 的 4096/2048/256)。
+⇒ **V4.1 的 GPU prefill 在修好 Triton 内核的维度假设之前,一步都走不了。**
+
+已排除的怀疑(都查过,看着是通用的):分块循环带掩码、grid 用 `cdiv`、
+`_build_segmentation` 用固定 `E+1` 桶(垃圾桶专家排在最后)、
+且 H/2I/I 对 64 都可整除(5120/4608/2304 ÷64 = 80/72/36 全整除,所以**没有掩码也不会越界**)。
+⇒ **头号嫌疑改为:(a) 段边界(`base+mt*BM+BM` 可能越过 `A`)在段很小时缺掩码;
+(b) `_kmajor_bytes` 的 K-major 重排在 V4.1 形状下的 stride 假设;
+(c) 段为空(384 专家里大多数为空)时的处理。** 下一轮从这里入手。
+
+## §452 修复后的战略次序(按用户指示,替代"抠 CPU prefill")
+
+1. **修 `gpu_moe_layer` 的 V4.1 维度支持** → 长 prompt(>~2600 token)prefill 上 GPU(最多 ~3×);
+2. **DSpark**:draft 权重+计算都放 GPU;
+3. **剩余显存 → 常驻 MoE 层**。对 V4.1 这一条价值特别大:每个常驻层**永久去掉
+   6.72 GiB/层的 DMA**,所以固定成本 ∝ (1 − 常驻比例)。约 40 GB 显存条件下,
+   常驻层是唯一能把那 10.8 s 真正打下来的手段(纯流式只能靠重叠,打不掉)。
+
+## §453 运维:`report/tuning/probes/` 里**不能有与标准库/三方库同名的文件**
+
+探针目录里有我早先留下的 `attr.py`(VMA 内存分析小工具)。Python 跑该目录下的脚本时会把
+**脚本自身目录**放进 `sys.path[0]`,于是它遮蔽了 aiohttp 依赖的 `attr` 包:
+
+```
+File ".../aiohttp/client.py", line 32, in <module>
+    import attr
+File ".../report/tuning/probes/attr.py", line 2, in <module>
+    pid = sys.argv[1]
+IndexError: list index out of range
+```
+
+⇒ 已改名 `attr.py` → `memvma.py` 并清掉 `__pycache__`。
+(同一个坑本项目已经踩过两次:`/tmp/attr.py` 让 cellA 起不来。建议:探针一律带前缀,
+如 `probe_*`。)
