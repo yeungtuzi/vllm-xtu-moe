@@ -31,9 +31,12 @@ MAXTOK = arg("--maxtok", 64)
 # 用重复但可预测的文本,避免 tokenizer 把它压得过短。
 _SYNTH = arg("--synth", 0)
 if _SYNTH:
-    _unit = "The quick brown fox jumps over the lazy dog near the river bank. "
-    _need = max(1, _SYNTH // 10)          # 每 unit 约 11 个 token
-    PROMPT = _unit * _need
+    # ⚠️ **必须用不重复的文本**。早先我用的是 `unit * need`(重复句),vLLM 的
+    # prefix caching 会把它整段命中 ⇒ 测出来的"prefill"是缓存假象
+    # (2048 报 6407 tok/s,而 4096 掉到 128 tok/s,就是那次缓存未命中暴露的)。
+    # 这里给每个位置一个唯一词,保证真的走完整 prefill。
+    _words = [f"w{i}x{i * 7 % 9973}" for i in range(max(1, _SYNTH))]
+    PROMPT = " ".join(_words)
 else:
     PROMPT = arg("--prompt", "Count from 1 to 1000, separated by commas: 1, 2, 3,")
 REPEAT = arg("--repeat", 1)
