@@ -15605,3 +15605,41 @@ period - compute = GPU 工作 + 拷贝 + host-fn 派发延迟,
   (14.4 + 12.66 ≈ 27 ⇒ 仍留 ~6.6 GiB 给 KV)。
   **注意**:以前 util=0.85 会 OOM 是因为 `device_loading_context` 把专家搬上 GPU,
   **那个已被我们的 shim 修掉**,所以现在应该可行。
+
+### 414. 🔧【新目标·第 1 轮】基础设施修复:环境变量"文件桥"(已咬过我们两次)
+
+#### 414.1 问题
+
+实测(vLLM 0.29.1rc1.dev95):**launcher 与 EngineCore 的 environ 不是同一份**。
+launcher 里有的 `XIAOTU_MOE_THREADS` / `_SPIN_IDLE_US` / `_GPU_RESIDENT_LAYERS`,
+在 EngineCore 里**全部缺失**;而 `XIAOTU_MOE_ASYNC` / `_NSLICE_SMALL` / `CD_TIMING` 保留。
+且 EngineCore 的 environ 有 **2711 条**(launcher 76 条)⇒ 它是被**重建**的,
+重建时只保留"它认识的名字"。
+
+**已经咬过两次,且都没有任何日志**:
+* §382:`XIAOTU_RELEASE_SOURCE` 丢失 ⇒ **逐层释放从未执行**(表现为"零释放且无输出");
+* §414:`XIAOTU_MOE_GPU_RESIDENT_LAYERS` 丢失 ⇒ **常驻层实验完全没生效**,数据看起来"无差别"。
+
+#### 414.2 修法(已实现并自测)
+
+* 插件 `__init__.py` 在**任何子模块 import 之前**从 `XIAOTU_ENV_FILE`(默认
+  `/tmp/xiaotu_env`)读 `KEY=VALUE` 补齐 —— **以文件为准(覆盖)**,不是 setdefault。
+  原因:"已经在环境里"的变量反而会被重建丢弃,而**由桥新增**的变量能被保留
+  (实测 `XIAOTU_MOE_RESIDENT_BUDGET_GB` 存活,而 `THREADS/_SPIN/_RESIDENT_LAYERS` 被丢)。
+* `serve_v41.sh` 启动前把本次所有旋钮(含 `EXTRA_ENV` 里的 `KEY=VALUE`)写进该文件。
+* 自测:`env -i` 只给文件、不给环境变量时 `filled=8`、`gpu_resident_layers()={38,39}` ✅
+* 注意:非 `serve_v41.sh` 启动时若文件陈旧会被它覆盖 —— 该脚本每次启动都会重写。
+
+#### 414.3 常驻层实验的**灵敏度不足**(方法学教训)
+
+`cellAC` 配了 `XIAOTU_MOE_GPU_RESIDENT_LAYERS="38,39"`,但:
+* `period` 仍是 **0.89–0.90 ms**(与不带常驻的 0.89 无差别);
+* GPU 占用 **32.7 GiB** 无法区分 —— `util=0.85` 会把 KV 填满到预算,常驻层只是挤掉 KV;
+* 代码里**没有**打印常驻层信息的活跃日志(只有注释与历史告警)⇒ "无日志"不是证据。
+
+**根本原因:2 层 / 43 层 = 4.6%。** 若每层 period 从 0.89 → 0.2 ms,
+平均值只变化 2/43×0.69 ≈ **0.032 ms(3.6%)**,完全落在噪声里。
+
+⇒ **下一枪:用 `XIAOTU_MOE_FAKE_CPU=1` 直接量"纯 GPU 侧每层"**
+(诊断专用:跳过 CPU MoE、输出保持原值,**绝不能用于正确性测试**)。
+它一次就给出"把所有层都放 GPU"的上限,即单发的**理论天花板**。
