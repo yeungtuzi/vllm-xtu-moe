@@ -21,7 +21,12 @@
 #   bash scripts/serve_v41.sh                 # dummy weights (fast bring-up)
 #   LOAD=auto bash scripts/serve_v41.sh       # real weights (~long load)
 #
-# Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV
+# Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS
+#
+# MAXSEQS(默认 1):并发批大小上限。**实测关键**:=1(原值)时 vLLM 同时只调度一个
+#   序列,并发请求被完全串行化 —— 聚合吞吐恒定 ~13 tok/s、与并发无关,而单请求延迟
+#   线性变差(C=8 时 64 token 要 21 s)。见 report/tuning/NOTES.md §400。
+#   默认仍为 1 以保持既有行为不变;做吞吐测试时用 MAXSEQS=8/16 覆盖。
 #
 # License: Apache-2.0
 set -uo pipefail
@@ -107,7 +112,7 @@ nohup env \
   numactl --interleave=all "$PY" -m vllm.entrypoints.openai.api_server \
     --model "$CKPT" --served-model-name dsv41 \
     --load-format "$LOAD" \
-    --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs 1 \
+    --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-1}" \
     --gpu-memory-utilization "$GPU_UTIL" --enforce-eager --trust-remote-code \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --kernel-config '{"enable_jit_warmup": false}' \
