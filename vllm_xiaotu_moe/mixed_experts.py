@@ -107,6 +107,33 @@ _ROUTER_EXTRA_ATTRS = (
 )
 
 
+_RELEASE_MISSES = 0   # 见 _release_source_weights:静默失败的可观测性
+_RELEASE_FILE = "/tmp/xiaotu_release_source"
+
+
+def _release_source_enabled() -> bool:
+    """env 优先,其次看标记文件(两者都没有 = 关闭)。
+
+    ⚠️ **为什么必须有文件开关**:2026-09-15 实测,EngineCore 子进程的 environ 与
+    launcher **不是同一份**(launcher 76 项 / EngineCore 2711 项),
+    `XIAOTU_RELEASE_SOURCE` 在 EngineCore 里**根本不存在** —— 而同一批 `XIAOTU_MOE_*`
+    (THREADS/ASYNC/NSLICE_SMALL/SPIN_IDLE_US)却都在。于是 `os.environ.get(...)` 恒为
+    "0",**开关打开了也永远不释放**,而且不留任何日志。
+
+    插件在 GPU prefill 阈值上早就踩过同一个坑并用文件开关绕过(gpu_prefill.
+    gpu_prefill_min_tokens 读 `XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE`),这里沿用同一手法。
+    开启方式:`echo 1 > /tmp/xiaotu_release_source`。
+    """
+    v = os.environ.get("XIAOTU_RELEASE_SOURCE")
+    if v is not None:
+        return v == "1"
+    try:
+        with open(_RELEASE_FILE) as fh:
+            return fh.read().strip() == "1"
+    except OSError:
+        return False
+
+
 class _XiaotuExpertsMixin:
     """Shared behaviour: build the xiaotu engine from the layer's raw CPU weights.
 
@@ -232,9 +259,26 @@ class _XiaotuExpertsMixin:
         # 引擎构造时已把字节拷进自己的分片区,之后源张量就是死重量 ——
         # 所以在这里**提前构造引擎并释放源存储**,而不是等第一次 forward 懒加载。
         # 开关:XIAOTU_RELEASE_SOURCE=1(默认 0,待 A/B 后再改默认)。
-        if os.environ.get("XIAOTU_RELEASE_SOURCE", "0") == "1":
+        # ⚠️ 模块化(Mode B)路径下主线**不会在装载期调用本钩子**:日志实测
+        # `Model loading took ...`(v41n2.log:52)出现在第一条 `[SHARD-DIAG]`(:57)
+        # **之前**,说明引擎是在 profile run 的第一次 forward 里惰性建的。
+        # 所以真正生效的释放点是 `apply()` 里的 `_maybe_release_source`(NOTES §378)。
+        if _release_source_enabled():
             self._ensure_engine(layer)
-            self._release_source_weights(layer)
+        self._maybe_release_source(layer)
+
+    def _maybe_release_source(self, layer: torch.nn.Module) -> int:
+        """切分一层、释放一层(env 门控、每层幂等)。
+
+        必须同时挂在 `process_weights_after_loading` 与惰性 `apply()` 两处:
+        不同主线版本走哪条路不一样,漏一处就会像 2026-09-15 那样**静默零释放**。
+        """
+        if not _release_source_enabled():
+            return 0
+        if getattr(self, "_src_released", False):
+            return 0
+        self._src_released = True
+        return self._release_source_weights(layer)
 
     def _release_source_weights(self, layer: torch.nn.Module) -> int:
         """释放引擎已分片的**主机源张量**,只保留参数对象本身。
@@ -245,6 +289,7 @@ class _XiaotuExpertsMixin:
         `.shape`/`.data_ptr()`,就会出问题。A/B 时先看能不能跑通再谈收益。
         """
         freed = 0
+        self._released_shapes = getattr(self, "_released_shapes", {})
         names = ["w13_weight", "w2_weight"]
         for attr in getattr(self, "_scale_attrs", ()):
             names.extend(attr if isinstance(attr, (tuple, list)) else (attr,))
@@ -260,6 +305,9 @@ class _XiaotuExpertsMixin:
             if nbytes < (1 << 28):  # 小张量不值得冒险
                 continue
             try:
+                # 模块化链路仍会把已置空的 w1/w2 **透传**进 apply(),而 apply 要从
+                # w2 的 dim 1 取 hidden_size ⇒ 必须在置空前把形状记下来。
+                self._released_shapes[name] = tuple(p.shape)
                 p.data = torch.empty(0, dtype=p.dtype, device=p.device)
             except Exception:  # noqa: BLE001
                 continue
@@ -268,6 +316,28 @@ class _XiaotuExpertsMixin:
             print(
                 f"[vllm-xtu-moe] released {freed / 2**30:.2f} GiB host source "
                 f"expert weights ({getattr(layer, 'layer_name', '?')})",
+                flush=True,
+            )
+        elif _RELEASE_MISSES < 3:
+            # 释放路径**静默失败**过一次(2026-09-15):XIAOTU_RELEASE_SOURCE=1
+            # 明明生效、引擎也建了,日志里却一条 release 都没有。原因是
+            # `if freed:` 把 freed==0 的情况完全吞掉了。这里把"为什么一个字节
+            # 都没释放"直接打出来,否则无从判断。
+            _RELEASE_MISSES += 1
+            seen = []
+            for name in names:
+                p = getattr(layer, name, None)
+                if isinstance(p, torch.Tensor):
+                    seen.append(
+                        f"{name}:{tuple(p.shape)}/{p.dtype}/"
+                        f"{p.numel() * p.element_size() / 2**20:.0f}MiB/{p.device.type}"
+                    )
+                else:
+                    seen.append(f"{name}:{type(p).__name__}")
+            print(
+                f"[vllm-xtu-moe] release found NOTHING to free on "
+                f"{getattr(layer, 'layer_name', '?')} (miss {_RELEASE_MISSES}): "
+                + ", ".join(seen),
                 flush=True,
             )
         return freed
@@ -722,12 +792,28 @@ class _XiaotuExpertsMixin:
                 "XiaotuCPUExperts.apply called before process_weights_after_loading"
             )
         engine = self._ensure_engine(layer)
+        # 惰性建引擎的这一刻,主机源张量已经没有任何消费者了 —— 立即释放。
+        # 这是 V4.1(模块化路径)上唯一真正会执行的释放点,见 NOTES §378。
+        self._maybe_release_source(layer)
         qlen = hidden_states.size(0)
         # Use the tensor the ENGINE was built from: for formats whose checkpoint
         # layout differs (INT4/WNA16), the `w2` argument is the raw packed tensor
         # ([E, I/8, H]) and its dim 1 is NOT the hidden size.
         w2_engine = self._engine_w2 if self._engine_w2 is not None else w2
-        hidden_size = int(w2_engine.shape[1])
+        if w2_engine.numel() == 0:
+            # XIAOTU_RELEASE_SOURCE=1 已把源张量置空,而模块化链路仍把它透传进来。
+            # 用释放时记下的形状,否则 shape[1] 直接越界(会让第二次 forward 挂掉)。
+            hidden_size = int(
+                getattr(self, "_released_shapes", {}).get("w2_weight", (0, 0))[1]
+            )
+            if hidden_size <= 0:
+                raise RuntimeError(
+                    "xiaotu: w2 is empty and no released shape was recorded "
+                    "(XIAOTU_RELEASE_SOURCE released the source without "
+                    "capturing its shape)"
+                )
+        else:
+            hidden_size = int(w2_engine.shape[1])
         out = torch.empty(qlen, hidden_size, dtype=torch.float32,
                           device=hidden_states.device)
         stream = torch.cuda.current_stream()

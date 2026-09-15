@@ -174,17 +174,34 @@ struct WeightTraitsBase {
     // Derived::*_batch_impl; the base default loops per row over the
     // single-instance *_slice_impl, and packed4 overrides with a true M>1 kernel
     // (matmul_packed4_group's 4-token blocked path).
+    // Sharded-read geometry (single-copy NUMA shards; packed4 only). A compact
+    // shard holds only its own slice of every expert block, so the reader has to
+    // be told how the slice is laid out:
+    //   cstride : bytes between consecutive experts INSIDE the shard
+    //             (0 => the dense n2*(hidden/2) layout, i.e. a full block)
+    //   row0    : global row index stored at compact offset 0 of the gate part
+    //   up_off  : byte gap from the gate base to the up base (0 => dense layout,
+    //             i.e. up begins inter*(hidden/2) after gate)
+    // Dense callers (socket replicas / single-copy fallback) pass nothing and get
+    // byte-identical behaviour to before.
     static void gate_up_slice_batched(int me, const uint16_t* xg, const void* w13, const void* w13_g,
                                       const float* w13_gs, float* both_buf, int inter, int hidden,
                                       size_t eid, int groupN, int groupK, int n0, int n1,
-                                      const uint32_t* rowmap = nullptr) {
+                                      const uint32_t* rowmap = nullptr,
+                                      size_t cstride = 0, long row0 = 0, size_t up_off = 0) {
         Derived::gate_up_slice_batch_impl(me, xg, w13, w13_g, w13_gs, both_buf, inter, hidden,
-                                          eid, groupN, groupK, n0, n1, rowmap);
+                                          eid, groupN, groupK, n0, n1, rowmap,
+                                          cstride, row0, up_off);
     }
     static void gate_up_slice_batch_impl(int me, const uint16_t* xg, const void* w13, const void* w13_g,
                                          const float* w13_gs, float* both_buf, int inter, int hidden,
                                          size_t eid, int groupN, int groupK, int n0, int n1,
-                                         const uint32_t* rowmap = nullptr) {
+                                         const uint32_t* rowmap = nullptr,
+                                         size_t cstride = 0, long row0 = 0, size_t up_off = 0) {
+        // Only packed4 implements compact shard addressing; the generic traits
+        // never take the sharded path (kNParallel == false), so the geometry is
+        // unused here (kept in the signature so the shared call site compiles).
+        (void)cstride; (void)row0; (void)up_off;
         for (int mi = 0; mi < me; ++mi)
             Derived::gate_up_slice_impl(xg + (size_t)(rowmap ? rowmap[mi] : (uint32_t)mi) * hidden,
                                         w13, w13_g, w13_gs,
@@ -193,13 +210,16 @@ struct WeightTraitsBase {
     }
     static void down_slice_batched(int me, const uint16_t* actg, const void* w2, const void* w2_g,
                                    const float* w2_gs, float* down_buf, int hidden, int inter,
-                                   size_t eid, int groupN, int groupK, int n0, int n1) {
+                                   size_t eid, int groupN, int groupK, int n0, int n1,
+                                   size_t cstride = 0, long row0 = 0) {
         Derived::down_slice_batch_impl(me, actg, w2, w2_g, w2_gs, down_buf, hidden, inter,
-                                       eid, groupN, groupK, n0, n1);
+                                       eid, groupN, groupK, n0, n1, cstride, row0);
     }
     static void down_slice_batch_impl(int me, const uint16_t* actg, const void* w2, const void* w2_g,
                                       const float* w2_gs, float* down_buf, int hidden, int inter,
-                                      size_t eid, int groupN, int groupK, int n0, int n1) {
+                                      size_t eid, int groupN, int groupK, int n0, int n1,
+                                      size_t cstride = 0, long row0 = 0) {
+        (void)cstride; (void)row0;   // see gate_up_slice_batch_impl
         for (int mi = 0; mi < me; ++mi)
             Derived::down_slice_impl(actg + (size_t)mi * inter, w2, w2_g, w2_gs,
                                      down_buf + (size_t)mi * hidden,
@@ -932,6 +952,11 @@ public:
         // splits (expert, inter-chunk) and reads the worker's socket replica.
         if (nshard_ >= 2) {
             const size_t NS = (size_t)nshard_;
+            // Compact-shard geometry (matches shard_fill_w13): node n stores
+            // [gate cbytes][up cbytes] per expert, with global row0 = n*gu_crows.
+            const size_t gu_crows = (size_t)inter / NS;
+            const size_t gu_rb = (size_t)hidden / 2;
+            const size_t gu_cbytes = gu_crows * gu_rb;
             std::vector<size_t> jc(NS, (size_t)active_.size() * (size_t)subA);
             pfor_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
                 size_t e_idx = job / (size_t)subA;
@@ -959,7 +984,10 @@ public:
                 } else
                 wt::gate_up_slice_batched((int)me, input, w13_shard_[n], w13_g_, w13_gs_,
                                           g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1,
-                                          g.rowmap.data());
+                                          g.rowmap.data(),
+                                          /*cstride=*/2 * gu_cbytes,
+                                          /*row0=*/(long)((size_t)n * gu_crows),
+                                          /*up_off=*/gu_cbytes);
                 // FUSED (lk does 3 barriers, we now do 3): gated-SiLU + f32->bf16
                 // applied inline on this node's chunk for every instance, replacing
                 // the former separate A2/B0 global barriers. Identical numerics.
@@ -1023,6 +1051,11 @@ public:
         // Otherwise flat (expert, h-chunk) over the worker's socket replica.
         if (nshard_ >= 2) {
             const size_t NS = (size_t)nshard_;
+            // Compact-shard geometry (matches shard_fill_w2): node n stores one
+            // cbytes slice per expert, with global row0 = n*d_crows.
+            const size_t d_crows = (size_t)hidden / NS;
+            const size_t d_rb = (size_t)inter / 2;
+            const size_t d_cbytes = d_crows * d_rb;
             std::vector<size_t> jc(NS, (size_t)active_.size() * (size_t)subB);
             pfor_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
                 size_t e_idx = job / (size_t)subB;
@@ -1049,7 +1082,9 @@ public:
                     }
                 } else
                 wt::down_slice_batched((int)me, g.abf16.data(), w2_shard_[n], w2_g_, w2_gs_,
-                                       g.down.data(), hidden, inter, (size_t)eid, groupN, groupK, n0, n1);
+                                       g.down.data(), hidden, inter, (size_t)eid, groupN, groupK, n0, n1,
+                                       /*cstride=*/d_cbytes,
+                                       /*row0=*/(long)((size_t)n * d_crows));
             });
         } else {
             pfor(active_.size() * (size_t)nc_d, [&](size_t ji) {
@@ -1141,14 +1176,14 @@ private:
 
     // Single-copy NUMA sharding (N-parallel path). When nshard_>=2 the two GB-scale
     // blocks are sharded across NUMA nodes: node n owns gate rows [n*I/NS,(n+1)*I/NS)
-    // & down rows [n*H/NS,(n+1)*H/NS). Each node's region uses the FULL-layout stride
-    // (per-expert offset UNCHANGED -> existing kernel path works with rowshift==0),
-    // mmap'd and MPOL_BIND to that node, but only its OWNED rows are faulted in:
-    // unowned rows have no physical backing and are never read, so physical RSS is
-    // ONE full copy across all nodes. Every weight read is from node-local pages
-    // (no cross-node traffic): each layer's weights are read exactly ONCE over the
-    // whole machine (vs 2x with per-socket replication). Scales stay as one full
-    // copy (tiny, indexed by absolute row).
+    // & down rows [n*H/NS,(n+1)*H/NS). Each node maps a COMPACT region holding
+    // EXACTLY its own slice (w13: E*2*cbytes as [gate cbytes][up cbytes] per expert;
+    // w2: E*cbytes), mmap'd and MPOL_BIND to that node. Physical RSS is ONE full copy
+    // across all nodes and the virtual mapping is also 1x the weights (it used to be
+    // NS x the full block). Every weight read is from node-local pages (no cross-node
+    // traffic): each layer's weights are read exactly ONCE over the whole machine (vs
+    // 2x with per-socket replication). Scales stay as one full copy (tiny, indexed
+    // by absolute row); the row->compact-offset mapping is passed as `row0`/`cstride`.
     int nshard_ = 0;
     // 多 rank 同机时本 rank 的 NUMA node 起点(node = rank_node_base_ + shard 下标),
     // 与 numa_pool 的核表切分保持同一套划分。
@@ -1229,11 +1264,11 @@ private:
         }
     }
 
-    // Fill one full-stride, MPOL_BIND-to-node `node` region of `total` bytes with
-    // this node's owned rows copied from `src`. `copier(d,s,per_eid_bytes)` copies
-    // the node's (stride-located) rows into the local region; writing faults the
-    // pages in on `node`, so every backed page is physically local and the total
-    // physical RSS across all nodes equals one full copy.
+    // Fill one MPOL_BIND-to-node `node` region of `total` bytes with this node's
+    // owned slice copied from `src`. `total` is the COMPACT shard size and the
+    // copier emits exactly the node's rows into [0,total); writing faults the pages
+    // in on `node`, so every backed page is physically local and the total physical
+    // RSS across all nodes equals one full copy.
     static void* shard_region(size_t total, int node,
                               const uint8_t* src,
                               const std::function<void(uint8_t*, const uint8_t*, size_t)>& copier) {
@@ -1269,24 +1304,30 @@ private:
 
     // Shard the gate+up block [E][2I][H/2] across nshard_ nodes: node n owns gate
     // rows [n*I/NS,(n+1)*I/NS) and up rows [I+n*I/NS, I+(n+1)*I/NS).
+    //
+    // COMPACT layout: each node maps EXACTLY what it stores — per expert
+    // [gate cbytes][up cbytes], total E*2*cbytes — instead of mmap'ing the whole
+    // E*stride block and writing sparse spans. The reader recovers global rows via
+    // row0 == n*crows (see the packed4 gate_up_slice_batch_impl / rowshift).
     bool shard_fill_w13(const void* src) {
         if (!src || nshard_ < 2) return false;
         const size_t H = cfg_.hidden_size, I = cfg_.intermediate_size, E = cfg_.expert_num;
         const size_t rowbytes = H / 2;
-        const size_t n2 = 2 * I;
-        const size_t stride = n2 * rowbytes;
-        const size_t total = stride * E;
         const int NS = nshard_;
+        const size_t crows = I / NS;               // caller guarantees NS | I
+        const size_t cbytes = crows * rowbytes;
+        const size_t stride = (size_t)2 * I * rowbytes;  // dense source expert block
+        const size_t total = (size_t)2 * cbytes * E;     // compact shard size
         size_t base = shard_owned_.size();
         const uint8_t* s = static_cast<const uint8_t*>(src);
         for (int n = 0; n < NS; ++n) {
-            const size_t rs = (size_t)n * I / NS, re = (size_t)(n + 1) * I / NS;
-            const size_t cbytes = (re - rs) * rowbytes;
+            const size_t rs = (size_t)n * crows;
             void* p = shard_region(total, rank_node_base_ + n, s, [&](uint8_t* d, const uint8_t* srcx, size_t) {
                 for (size_t e = 0; e < E; ++e) {
-                    const size_t eb = e * stride;
-                    std::memcpy(d + eb + rs * rowbytes, srcx + eb + rs * rowbytes, cbytes);         // gate
-                    std::memcpy(d + eb + (I + rs) * rowbytes, srcx + eb + (I + rs) * rowbytes, cbytes); // up
+                    const size_t sb = e * stride;
+                    const size_t db = e * (2 * cbytes);
+                    std::memcpy(d + db,          srcx + sb + rs * rowbytes,       cbytes); // gate
+                    std::memcpy(d + db + cbytes, srcx + sb + (I + rs) * rowbytes, cbytes); // up
                 }
             });
             if (!p) { while (shard_owned_.size() > base) { munmap(shard_owned_.back(), 0); shard_owned_.pop_back(); } return false; }
@@ -1294,36 +1335,37 @@ private:
             shard_owned_.push_back(p);
         }
         if (std::getenv("XIAOTU_MOE_SHARD_DIAG") != nullptr)
-            fprintf(stderr, "[SHARD-DIAG] w13 sharding OK NS=%d total=%.1fGiB\n", NS, (double)total/(1ULL<<30));
+            fprintf(stderr, "[SHARD-DIAG] w13 sharding OK NS=%d shard=%.1fGiB (full would be %.1fGiB)\n",
+                    NS, (double)total/(1ULL<<30), (double)(stride * E)/(1ULL<<30));
         return true;
     }
 
     // Shard the down block [E][H][I/2] across nshard_ nodes: node n owns rows
-    // [n*H/NS,(n+1)*H/NS).
+    // [n*H/NS,(n+1)*H/NS). COMPACT: E*cbytes bytes, one cbytes slice per expert.
     bool shard_fill_w2(const void* src) {
         if (!src || nshard_ < 2) return false;
         const size_t H = cfg_.hidden_size, I = cfg_.intermediate_size, E = cfg_.expert_num;
         const size_t rowbytes = I / 2;
-        const size_t stride = H * rowbytes;
-        const size_t total = stride * E;
         const int NS = nshard_;
+        const size_t crows = H / NS;               // caller guarantees NS | H
+        const size_t cbytes = crows * rowbytes;
+        const size_t stride = H * rowbytes;              // dense source expert block
+        const size_t total = cbytes * E;                 // compact shard size
         size_t base = shard_owned_.size();
         const uint8_t* s = static_cast<const uint8_t*>(src);
         for (int n = 0; n < NS; ++n) {
-            const size_t rs = (size_t)n * H / NS, re = (size_t)(n + 1) * H / NS;
-            const size_t cbytes = (re - rs) * rowbytes;
+            const size_t rs = (size_t)n * crows;
             void* p = shard_region(total, rank_node_base_ + n, s, [&](uint8_t* d, const uint8_t* srcx, size_t) {
-                for (size_t e = 0; e < E; ++e) {
-                    const size_t eb = e * stride;
-                    std::memcpy(d + eb + rs * rowbytes, srcx + eb + rs * rowbytes, cbytes);
-                }
+                for (size_t e = 0; e < E; ++e)
+                    std::memcpy(d + e * cbytes, srcx + e * stride + rs * rowbytes, cbytes);
             });
             if (!p) { while (shard_owned_.size() > base) { munmap(shard_owned_.back(), 0); shard_owned_.pop_back(); } return false; }
             w2_shard_[n] = static_cast<const uint8_t*>(p);
             shard_owned_.push_back(p);
         }
         if (std::getenv("XIAOTU_MOE_SHARD_DIAG") != nullptr)
-            fprintf(stderr, "[SHARD-DIAG] w2 sharding OK NS=%d total=%.1fGiB\n", NS, (double)total/(1ULL<<30));
+            fprintf(stderr, "[SHARD-DIAG] w2 sharding OK NS=%d shard=%.1fGiB (full would be %.1fGiB)\n",
+                    NS, (double)total/(1ULL<<30), (double)(stride * E)/(1ULL<<30));
         return true;
     }
 

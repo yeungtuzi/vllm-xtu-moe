@@ -62,10 +62,50 @@ def _log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 # shim 1 + 4: quant method classes
 # ---------------------------------------------------------------------------
+_PWAL_DIAG = {"n": 0, "src": 0}
+
+
+def _host_mem_mib() -> dict:
+    """Read the disjoint host-memory counters from /proc/self/status."""
+    out: dict = {}
+    try:
+        with open("/proc/self/status") as fh:
+            for ln in fh:
+                key, _, rest = ln.partition(":")
+                if key in ("RssAnon", "RssFile", "RssShmem", "VmRSS"):
+                    out[key] = int(rest.split()[0]) >> 10  # MiB
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def _notify_experts(method, layer) -> None:
     kernel = getattr(method, "moe_kernel", None)
     experts = getattr(kernel, "fused_experts", None)
     fn = getattr(experts, "process_weights_after_loading", None)
+
+    # Observability for the "shard one layer, release one layer" path: without
+    # this, XIAOTU_RELEASE_SOURCE produces no output at all and there is no way
+    # to tell whether the hook ran, which backend class is in use, or whether
+    # the host expert tensors are anonymous or shmem-backed.
+    _PWAL_DIAG["n"] += 1
+    nbytes = 0
+    for nm in ("w13_weight", "w2_weight"):
+        t = getattr(layer, nm, None)
+        if isinstance(t, torch.Tensor):
+            nbytes += t.numel() * t.element_size()
+    _PWAL_DIAG["src"] += nbytes
+    if _PWAL_DIAG["n"] == 1 or _PWAL_DIAG["n"] % 8 == 0:
+        m = _host_mem_mib()
+        print(
+            f"[xtu-diag] pwal#{_PWAL_DIAG['n']} method={type(method).__name__} "
+            f"experts={type(experts).__name__} hook={callable(fn)} "
+            f"layer_src={nbytes / 2**30:.2f}GiB cum_src={_PWAL_DIAG['src'] / 2**30:.1f}GiB "
+            f"RssAnon={m.get('RssAnon', -1)}MiB RssFile={m.get('RssFile', -1)}MiB "
+            f"RssShmem={m.get('RssShmem', -1)}MiB",
+            flush=True,
+        )
+
     if callable(fn):
         fn(layer)
 
@@ -100,9 +140,26 @@ def _patch_quant_method_cls(cls) -> list[str]:
     ):
         @functools.wraps(pwal)
         def process_weights_after_loading(self, layer, *a, **kw):
+            # Split the per-layer memory growth between UPSTREAM's hook
+            # (`_setup_kernel` -> make_mxfp4_moe_kernel -> experts/kernel ctor)
+            # and OUR hook (Mixin.process_weights_after_loading -> _ensure_engine),
+            # so the pinned/shmem growth is attributed to a concrete site.
+            b = _host_mem_mib()
             res = pwal(self, layer, *a, **kw)
+            m = _host_mem_mib()
             if mixed_mode_enabled():
                 _notify_experts(self, layer)
+            a2 = _host_mem_mib()
+            _PWAL_DIAG["split"] = _PWAL_DIAG.get("split", 0) + 1
+            if _PWAL_DIAG["split"] == 1 or _PWAL_DIAG["split"] % 8 == 0:
+                print(
+                    f"[xtu-diag-split] l#{_PWAL_DIAG['split']} "
+                    f"upstream: dShmem={m.get('RssShmem', 0) - b.get('RssShmem', 0):+d}MiB "
+                    f"dAnon={m.get('RssAnon', 0) - b.get('RssAnon', 0):+d}MiB | "
+                    f"our_hook: dShmem={a2.get('RssShmem', 0) - m.get('RssShmem', 0):+d}MiB "
+                    f"dAnon={a2.get('RssAnon', 0) - m.get('RssAnon', 0):+d}MiB",
+                    flush=True,
+                )
             return res
 
         process_weights_after_loading._xtu_shim = True  # type: ignore[attr-defined]

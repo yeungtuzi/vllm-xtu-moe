@@ -1044,12 +1044,21 @@ struct Packed4WeightTraitsBase
     static void gate_up_slice_batch_impl(int me, const uint16_t* xg, const void* w13, const void* w13_g,
                                          const float* w13_gs, float* both_buf, int inter, int hidden,
                                          size_t eid, int groupN, int groupK, int n0, int n1,
-                                         const uint32_t* rowmap = nullptr) {
+                                         const uint32_t* rowmap = nullptr,
+                                         size_t cstride = 0, long row0 = 0, size_t up_off = 0) {
         if (me <= 0) return;
         if (n1 < 0 || n1 > inter) n1 = inter;
         if (n1 <= n0) return;
         const int n2 = 2 * inter;
-        const uint8_t* base = static_cast<const uint8_t*>(w13) + eid * (size_t)n2 * (hidden / 2);
+        // Compact single-copy NUMA shard geometry (see forward_many): each expert
+        // block in the shard is [gate cbytes][up cbytes]; `row0` is the global row
+        // stored at offset 0 and `cstride` the byte distance between experts.
+        // Dense callers pass cstride=0/row0=0/up_off=0 and keep the old layout.
+        const size_t rb = (size_t)hidden / 2;                    // bytes per weight row
+        const size_t S = cstride ? cstride : (size_t)n2 * rb;    // per-expert stride
+        const size_t r0 = (size_t)(row0 < 0 ? 0 : row0);
+        const size_t uoff = up_off ? up_off : (size_t)inter * rb;  // gate -> up gap
+        const uint8_t* gbase = static_cast<const uint8_t*>(w13) + eid * S;
         const int gn = groupN > 0 ? groupN : 1;
         const int gk = groupK > 0 ? groupK : 1;
         const size_t nb = (size_t)(n2 + gn - 1) / gn;
@@ -1068,22 +1077,28 @@ struct Packed4WeightTraitsBase
         const float gs = w13_gs ? w13_gs[eid] : 1.0f;
         // both_buf rows are strided by n2; indices [n0,n1) = gate chunk and
         // [inter+n0, inter+n1) = up chunk, both over ALL me rows at once.
+        // rowshift=r0 maps global row j to shard-local row j-r0 (dense: r0==0).
         float* a32_reuse = nullptr;       // 【轮 85】让 up 复用 gate 已经转好的激活
-        packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, base, LUT, sbase, gs, both_buf,
-                                            me, n2, hidden, groupN, groupK, n0, n1, 0, rowmap,
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, gbase, LUT, sbase, gs, both_buf,
+                                            me, n2, hidden, groupN, groupK, n0, n1, (int)r0, rowmap,
                                             nullptr, &a32_reuse);
-        packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, base, LUT, sbase, gs, both_buf,
-                                            me, n2, hidden, groupN, groupK, inter + n0, inter + n1, 0, rowmap,
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, gbase + uoff, LUT, sbase, gs, both_buf,
+                                            me, n2, hidden, groupN, groupK, inter + n0, inter + n1,
+                                            (int)(r0 + (size_t)inter), rowmap,
                                             a32_reuse, nullptr);
     }
 
     static void down_slice_batch_impl(int me, const uint16_t* actg, const void* w2, const void* w2_g,
                                       const float* w2_gs, float* down_buf, int hidden, int inter,
-                                      size_t eid, int groupN, int groupK, int n0, int n1) {
+                                      size_t eid, int groupN, int groupK, int n0, int n1,
+                                      size_t cstride = 0, long row0 = 0) {
         if (me <= 0) return;
         if (n1 < 0 || n1 > hidden) n1 = hidden;
         if (n1 <= n0) return;
-        const uint8_t* base = static_cast<const uint8_t*>(w2) + eid * (size_t)hidden * (inter / 2);
+        const size_t rb = (size_t)inter / 2;                       // bytes per weight row
+        const size_t S = cstride ? cstride : (size_t)hidden * rb;  // per-expert stride
+        const size_t r0 = (size_t)(row0 < 0 ? 0 : row0);
+        const uint8_t* base = static_cast<const uint8_t*>(w2) + eid * S;
         const int gn = groupN > 0 ? groupN : 1;
         const int gk = groupK > 0 ? groupK : 1;
         const size_t nb = (size_t)(hidden + gn - 1) / gn;
@@ -1101,8 +1116,9 @@ struct Packed4WeightTraitsBase
         }
         const float gs = w2_gs ? w2_gs[eid] : 1.0f;
         // down_buf rows strided by hidden; write slice [n0,n1) for all me rows.
+        // rowshift=r0 maps global row j to shard-local row j-r0 (dense: r0==0).
         packed4::matmul_packed4_group<E8M0, kFastFP4>(actg, base, LUT, sbase, gs, down_buf,
-                                            me, hidden, inter, groupN, groupK, n0, n1);
+                                            me, hidden, inter, groupN, groupK, n0, n1, (int)r0);
     }
 };
 

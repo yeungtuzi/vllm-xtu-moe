@@ -13747,3 +13747,550 @@ RDX=0x2d0000  ← 2,949,120 = NS=2 时的 cbytes = (2304/2)×2560
 崩栈仍指向 `shard_fill_w13` 的 copier(`RDX=0x2d0000` = NS=2 的 cbytes),所以
 **最可能仍是分片映射/真权重张量的交互**;等紧凑化改完、`LOAD=auto`+`RELEASE=0` 验通过后,
 再单独开 RELEASE 做单变量测试。**在此之前不要把 SIGSEGV 记在 RELEASE 头上。**
+
+### 375. 🎯🎯【v0.4·第 9 轮】**§374 的结论被推翻**:放大的是"虚拟地址空间",不是 RSS;真正的 ~775 GiB 是**非匿名**私有脏页
+
+#### 375.1 采样器原始数据(`report/tuning/logs/v41n2.mem`,NPS=1,`LOAD=dummy`,`XIAOTU_RELEASE_SOURCE=1`,pid 58050 = EngineCore)
+
+| 时刻 | node0 free | node1 free | Rss | Anonymous | Private_Dirty − Anonymous |
+|---|---|---|---|---|---|
+| 07:41:22 | 87516 MB | 95126 MB | 871804440 kB | 59472464 kB | **811748780 kB = 774.1 GiB** |
+| 07:42:29 | 18122 MB | 25732 MB | 1012279220 kB | 199640044 kB | **812055988 kB = 774.4 GiB** |
+| 07:43:37 | 4521 MB | 866 MB | 1152244668 kB | 339329632 kB | **812332480 kB = 774.6 GiB** |
+
+* `Private_Dirty − Anonymous` 在三次采样里**恒定 812 GB**(774.1 / 774.4 / 774.6 GiB),而且**第一次采样(引擎还没建完,Rss 831 GB)时就已经全部存在**。
+* 引擎构建**只增长 Anonymous**(56.7 → 190 → 324 GB)。
+* `Pss ≈ Rss`(871804440 vs 871622738 等),说明这 775 GiB **完全是私有的,不是共享**。
+* 该次运行在 **23/40 引擎**处死亡,node0 剩 4.5 GB、node1 剩 0.87 GB。
+
+#### 375.2 结论:两个旧假设都不成立
+
+1. **NS×整块映射不是 RSS 放大器**。子代理单层实测(源数组已预 fault,`smaps_rollup` 取 ΔRss):
+   * fixture(E=16,192 MiB 权重):ΔRss = 206 MiB,ΔVmSize = 394 MiB。
+   * 合成满尺寸(E=384/I=2048/H=4096,4.50 GiB 权重):ΔRss = 4898 MiB(= w13+w2 4608 MiB + scale 288 MiB,误差 2 MiB),ΔVmSize = 9504 MiB。
+   * `AnonHugePages` 增量为 0(THP 为 `[madvise]`,`XIAOTU_MOE_SHARD_HUGEPAGE` 关)。
+   → 整块映射**只膨胀 VmSize + 页表**,**不产生额外常驻页**。`shard_region()` 的紧凑化仍然值得做(正确性:"只 map 自己存的"),但**不要指望它把 RSS 砍半**。
+2. `§374` 里那句"每片 map 整块 ⇒ 内存放大"只解释了**虚拟**放大,解释不了 ~775 GiB。
+
+#### 375.3 新的、唯一的头号问题:那 775 GiB 是什么
+
+`Private_Dirty` 非匿名,只有两种常见来源:
+
+* **file-backed `MAP_PRIVATE` 被写过**(CoW):例如 safetensors `mmap` 后**原地改写**(in-place 量化/转置/缩放)。
+* **hugetlbfs 页**:hugetlb 不计入 `/proc/pid/status` 的 `Anonymous`,却计入 `Private_Dirty`。
+
+必须在**进程活着的时候**逐条走 `/proc/<pid>/smaps`(不是 `smaps_rollup`),按 mapping path 聚合 `Private_Dirty`,把 775 GiB **按路径点名**。这是目前剩下最有价值的一次测量。
+
+#### 375.4 待办(已下发子代理,按优先级)
+
+1. 点名 775 GiB(按 path 聚合 `Private_Dirty`,top 10)。
+2. 报告这些 mapping 的 `Anonymous` / `KernelPageSize` / `VmFlags`,区分 hugetlb 与 file-CoW。
+3. 之后再收尾 `shard_region` 紧凑映射(保持数值门 bit-identical),报告里注明它只降 VmSize。
+4. 报告结束时的 per-node free,判断 mbind 分片 + 这 775 GiB 是否把某个 node 单独压爆。
+5. **不要在 node1 只剩 24 GB 时拉满 40 引擎** —— 会 OOM kill 掉现场。
+
+#### 375.5 仍未隔离的实验格
+
+`LOAD=auto` + `XIAOTU_RELEASE_SOURCE=0`,用来把 §374 附注里那次 SIGSEGV 正确归因(见 §374 附注)。
+
+#### 375.6 算术闭合:~400 GB 根本**不在进程里**
+
+| 项 | 值 | 来源 |
+|---|---|---|
+| 整机 RAM | 1511 GB | `free -g` |
+| 最后一次采样 node0+node1 free | 4521 + 866 MB = **5.4 GB** | `v41n2.mem` |
+| ⇒ 整机已用 | **~1506 GB** | 相减 |
+| 该进程(EngineCore 58050)Rss | **1099 GB** | `v41n2.mem` |
+| ⇒ **不在该进程内**的部分 | **~407 GB** | 相减 |
+
+这就是之前"~240 GB 对不上"的答案:**缺的内存不在 EngineCore 里,而在整机的 page cache / 其它进程里**。空闲态实测 `buff/cache = 375 GB`,而 checkpoint 在盘上 **475.3 GiB(48 个 safetensors)**,量级吻合。
+
+#### 375.7 进程内那 775 GiB 的候选解释
+
+`smaps` 里 `Private_Dirty > 0`、`Anonymous == 0`、`Shared_Dirty == 0` 只有两大类来源:
+
+* **file-backed `MAP_PRIVATE` 被写过(CoW)**:`vllm_xiaotu_moe/mixed_experts.py:609-618` 确实用 `safetensors.safe_open(..., framework="pt")` 打开 checkpoint;`safe_open` 返回的 tensor **直接视图 mmap**,一旦原地改写(反量化/缩放/转置)就把文件页 CoW 成私有脏页。
+* **hugetlbfs**:hugetlb 不计入 `Anonymous`。但 `csrc/` 全树 `grep -i hugetlb` **零命中**,`shard_region` 是 `MAP_PRIVATE|MAP_ANONYMOUS`,故此项基本排除。
+
+注意量级:源侧账本(§374,experts×2 = 542 + Engram 189 + 非专家 ~23 = 754 GB)与 775 GiB **吻合得很好**,说明这 775 GiB 就是**加载期常驻、且从不释放的源张量**。它们是否是 file-backed(CoW)还是被采样口径记成非匿名,需要 `/proc/<pid>/status` 的 `RssAnon` / `RssFile` / `RssShmem` 三件套一次性区分——这是最快的一枪。
+
+#### 375.8 已下发的新优先级
+
+1. **整机口径**采样(`/proc/meminfo` 的 `Cached/Shmem/SReclaimable/AnonPages` + 每 node free),确认那 ~407 GB 是 `Cached` 还是别的进程。
+2. `RssAnon`/`RssFile`/`RssShmem` 三件套 + 按 path 聚合的 top file-backed VMA(把 775 GiB **点名**)。
+3. **直接验证 page cache 假设**:装载前 `echo 3 > /proc/sys/vm/drop_caches`(或读完后对 checkpoint `posix_fadvise(DONTNEED)`),看 node free 是否不再比进程 Rss 多出 ~400 GB。这一步**不改引擎代码**,是当前性价比最高的缓解手段。
+4. `shard_region` 紧凑映射放最后(仍然正确,但不影响 RSS)。
+5. 顺带确认:`LOAD=dummy` 下插件的 `safe_open` 路径是否真的执行。
+
+### 376. 🎯🎯【v0.4·第 10 轮】**那 812 GB 不是 file-CoW,是 shmem/pinned**(本机实测定了口径)
+
+#### 376.1 自证实验(`/tmp/pinprobe.py`,同一台机,`smaps_rollup` + `/proc/self/status`)
+
+| 分配 | RssAnon | RssShmem | `smaps_rollup` Private_Dirty | `smaps_rollup` Anonymous |
+|---|---|---|---|---|
+| baseline | 284448 | 0 | 284944 | 284944 |
+| anon 2 GiB | 2363116 | 0 | 2390728 | 2390728 |
+| **+ pinned 2 GiB** | 2375972 | **2105344** | **4510968** | **2403496** |
+| + `share_memory_()` 2 GiB | 2403236 | **4193836** | **6608128** | **2403504** |
+
+读法:
+
+* **`torch` 的 pinned 内存记在 `RssShmem`,但在 `smaps_rollup` 里落进 `Private_Dirty`,而 `Anonymous` 几乎不涨**(+12 MB)。
+* 所以 `Private_Dirty − Anonymous` 这个差值 = **shmem + file-backed private**,**不是**"文件被 CoW"的独有指纹。我在 §375.7 里把候选收窄成"file-CoW 或 hugetlb"是**错的**。
+* 配套 `/tmp/pinvma.py`:2053 MB 的 pinned 区在 `smaps` 里是 **`rw-s` 的 `/dev/zero (deleted)`**,`Anon=0.00G PD=2.00G`。即 CUDA/torch 的页锁定内存走的是**共享匿名(shmem)**映射。
+
+#### 376.2 hugetlb 已排除,shmem 已确证
+
+* `HugePages_Total: 0`、`Hugetlb: 0 kB`、`AnonHugePages: 0 kB`;/dev/hugepages 挂着但零占用 ⇒ **hugetlb 不可能是那 812 GB**。
+* 固定进程 4 次采样里 `Private_Dirty − Anonymous` 恒为 812 GB(§375.1),与 pinned/shmem 口径完全一致。
+* **shmem 在映射期间不可回收**,这正是内核不回收 page cache 而直接以 `constraint=CONSTRAINT_MEMORY_POLICY` 杀进程的原因(§375.6 的 ~407 GB 缺口里,page cache 那部分是**可回收的**,所以不是主因;真正的地板是这 812 GB)。
+
+#### 376.3 日志给出的确切成分
+
+| 来源 | 大小 | 证据 |
+|---|---|---|
+| Engram 表(pinned host) | **94.42 GiB × 2 = 188.8 GiB** | `v41n2.log:44,46` `engram.py:255` `Engram table offloaded to pinned host memory: 384006168 rows x 256, 94.42 GiB per rank` |
+| 专家源张量 | ~586 GiB(反推) | 812 − 188.8 − 非专家 ≈ 586 |
+| 引擎分片(anon) | 6.33 GiB/层 × 24 = 152 GiB | `[SHARD-DIAG]`;`v41n2.log` 里 `w13 sharding OK` 计数 = **24** |
+
+即:**这 812 GB 的硬地板里,Engram 的 188.8 GiB 是设计使然(`EngramConfig(cpu_offload=True)`,`v41n2.log:23`),剩下 ~586 GiB 是被页锁定/共享匿名化的专家权重。**
+
+#### 376.4 已排除的几条路(省下一轮的重复劳动)
+
+* `create_weights()` 在 `VLLM_EXPERTS_LOAD_DEVICE=cpu` 下只是 `with torch.device("cpu")`(主线 `fused_moe/routed_experts.py:180-184`),得到的是**普通匿名内存**,不是 pinned ⇒ 专家权重不是在这一步被锁页的。
+* 插件里唯一的 `shm_open/ftruncate` 是 `_ep_shm_attach`:`stride = tokens*hidden*4`,TP=1 时 ≈ 42 MB/层 ⇒ 43 层约 1.8 GB,**量级差两个数量级**。
+* 插件里没有磁盘 repack 缓存(`grep tempfile|tofile|np.save|fsync` 只命中 `hybrid_model.py:243` 的 ftruncate)。
+* `_start_pinned_prebuild()`(`gpu_prefill.py:683`)确实会**逐层锁页一整套 K-major 权重**(注释自称 3.19 GiB/层,40+ 层可达 ~130 GiB),但它的调用点 `hybrid_model.py:1161` 在 **GPU 预填充分支**里,且发生在**第一次 forward**;而 §375.1 的三次采样都在引擎构建期、尚无请求 ⇒ **它不是装载期那 812 GB 的成因**,但是**服务期**的第二个大坑(启动后一旦有长 prefill 就会再锁一份)。`XIAOTU_GPU_PREFILL_MIN_TOKENS=0` 可关掉该分支。
+
+#### 376.5 对目标(端到端出数)的直接含义
+
+硬地板 = Engram pinned 188.8 GiB + 专家权重一份 + 引擎分片一份。要装下 40 层,必须让**专家权重只存在一份**且**与引擎分片不叠加**:
+
+1. 让 `XIAOTU_RELEASE_SOURCE=1` 真正生效并**打出可验证的日志**(目前 `v41n2.log` 里**零条** release 相关输出,无法判断它是否执行过 —— 这是必须先补的可观测性)。
+2. 确认那 ~586 GiB 是 pinned 还是普通匿名:若是 pinned,应在 CPU-only 专家路径上**取消页锁定**(它只对 H2D 有意义,CPU 专家不需要)。
+3. 服务期用 `XIAOTU_GPU_PREFILL_MIN_TOKENS=0` 关掉 K-major 锁页预建,避免第二份 ~130 GiB。
+
+### 377. 🎯【v0.4·第 11 轮】**`XIAOTU_RELEASE_SOURCE=1` 是静默失败的**(已定位并补上可观测性)
+
+#### 377.1 链路已完整追通(V4.1 走的是 Mode B,不是 OOT 类)
+
+1. `register_mixed_cpu_backend()`(`mixed_experts.py:961`)把 `cpu_moe.CPUExpertsMxfp4`
+   **直接替换**成 `XiaotuCPUExpertsMxfp4`(`mixed_experts.py:955`)。
+   日志第 5/29 行 `GPU/CPU Mixed: CPU backends -> xiaotu engine (BF16, MXFP4, FP8, INT4; AVX512, no AMX required)`
+   **就是这次替换成功的证据**。
+2. `XiaotuCPUExpertsMxfp4` 继承 `_XiaotuExpertsMixin`(`mixed_experts.py:803`),
+   所以它**带着** `process_weights_after_loading`(`:176`)。
+3. Mode B 的调用点是 `mainline_shims._notify_experts()`(`mainline_shims.py:65`):
+   `kernel.fused_experts.process_weights_after_loading(layer)`,由 shim 4
+   (`_patch_quant_method_cls`,`:95-110`)包住主线量化的同名钩子后调用。
+4. 该 hook 里 `if XIAOTU_RELEASE_SOURCE == "1": self._ensure_engine(layer); self._release_source_weights(layer)`。
+   **`[SHARD-DIAG]` 在装载期就出现了 ⇒ `_ensure_engine` 确实跑了 ⇒ 同一个 `if` 里的
+   `_release_source_weights` 也一定跑了,且环境变量确实是 1。**
+
+#### 377.2 那为什么日志里一条 release 都没有
+
+因为 `_release_source_weights` 的成功打印包在 `if freed:` 里(`mixed_experts.py:267`):
+**`freed == 0` 时它一个字都不打**。所以"释放了 0 字节"和"根本没执行"在日志上**完全无法区分** ——
+这正是上一轮 §376.5 判断"缺少可观测性"的具体形式。
+
+即:**§376 里把 ~586 GiB 归给"从不释放的源张量"是对的,而"释放开关已打开"并不等于"释放生效"。**
+
+#### 377.3 本轮补的可观测性(已通过 `py_compile`)
+
+* `mainline_shims._notify_experts` 新增 `[xtu-diag]` 行(每层记账,首层 + 每 8 层打印一次):
+  `method=` / `experts=` **实际类名**、`hook=<callable>`、`layer_src=<本层源字节>`、
+  `cum_src=<累计>`、以及 `/proc/self/status` 的 **`RssAnon`/`RssFile`/`RssShmem`**。
+  这四者一次就能回答:"Mode B 到底把哪个类当 experts 后端"、"源张量在不在了"、
+  "那 ~586 GiB 是匿名还是 shmem"。
+* `mixed_experts._release_source_weights` 在 `freed == 0` 时打印前 3 次 miss,
+  逐名给出 `shape/dtype/MiB/device` —— 直接暴露是"名字找不到"还是"设备不是 cpu"还是"张量太小"。
+
+判读方式:若释放生效,`cum_src` 继续增长而 `RssShmem+RssAnon` 基本持平;
+若无效,两者同步增长。
+
+#### 377.4 下一步(下一轮执行)
+
+1. 跑一次 `LOAD=dummy`(NPS=1),只看 `[xtu-diag]` 与 release miss 行,即可定性。
+2. 按结果二选一:
+   * 名字/设备不匹配 ⇒ 修 `_release_source_weights` 的取张量逻辑;
+   * 确实释放了但 RSS 不降 ⇒ 说明持有者是 pinned/shmem(§376),要改锁页策略。
+3. 之后才是 `shard_region` 紧凑映射收尾(子代理已在做,`moe_v2.hpp`/`moe_v2_packed4.hpp` 有改动,
+   尚未 rebuild、尚未过数值门)。
+
+### 378. 🎯【v0.4·第 12 轮】**"静默零释放"的根因锁定 + 修好并验证**;顺带独立验证了紧凑分片几何
+
+#### 378.1 根因(日志顺序即证据,不需要再猜)
+
+`v41n2.log` 里的顺序是决定性的:
+
+```
+line 52  07:40:55  Model loading took 11.28 GiB memory and 549.395911 seconds
+line 57            [SHARD-DIAG] region node=0 rc=0 vmasize=...      ← 第一条
+```
+
+**`Model loading took ...` 出现在第一条 `[SHARD-DIAG]` 之前** ⇒ 引擎**不是**在装载期
+(即 `process_weights_after_loading`)建的,而是在**装载完成之后**的 profile run /
+第一次 forward 里**惰性**建的(`mixed_experts.py` 的 `engine = self._ensure_engine(layer)`)。
+
+所以 `XIAOTU_RELEASE_SOURCE=1` 之所以零效果,不是"名字找不到"也不是"设备不是 cpu",
+而是**那个钩子在 V4.1 的模块化路径上根本没被调到**。§377 里补的 `[xtu-diag]` 正好是
+下一轮用来验证这一点的探针。
+
+旁证:`mxfp4.py:1997 Using XiaotuCPUExpertsMxfp4` 出现在 07:35:44(装载中),
+但同期的 `[SHARD-DIAG]` 一条都没有 —— 说明"选了我们的后端"与"调了我们的装载钩子"是两件事。
+
+#### 378.2 修复
+
+新增幂等助手 `_maybe_release_source()`(env 门控 + 每层只放一次),**同时挂两处**:
+
+* `process_weights_after_loading`(OOT / 旧主线路径);
+* `apply()` 里紧接 `_ensure_engine(layer)` 之后(**V4.1 上唯一真正会执行的那一处**)。
+
+漏一处的后果就是这次这样"看着配了开关、其实一个字节没放"。
+
+#### 378.3 同时修掉一个会让**第二次 forward 挂掉**的隐患
+
+`apply()` 里 `hidden_size` 是从 `w2.shape[1]` 取的,而模块化链路会把 `w1/w2`
+**透传**进 `apply()`;一旦把源张量置成 0 元素,`shape[1]` 就**越界**。
+(已核对:`apply()` 内部 `w1` 完全没用,`w2` 只用于这一行。)
+
+修法:置空前把形状记进 `self._released_shapes[name]`;取 hidden_size 时若张量已空,
+回落到记录的形状,并且取不到就**显式报错**而不是静默算错。
+
+#### 378.4 已验证(假 layer 冒烟,不是推断)
+
+```
+env=0 -> 0 (nothing freed), w13 完好
+[vllm-xtu-moe] released 6.59 GiB host source expert weights (model.layers.3.mlp.experts)
+env=1 -> freed 6.59 GiB;  w13 numel=0  w2 numel=0
+recorded w2 shape: (384, 5120, 1152)
+idempotent 2nd call -> 0
+hidden_size from recorded shape: 5120   (== H)
+RELEASE LOGIC OK
+```
+
+即每层真正放出 **6.59 GiB**(w13 4.22 + w2 2.11 + scales 0.26)。40 层量级 ~264 GiB。
+
+#### 378.5 独立验证:子代理的紧凑分片 C++ 改动**几何自洽**(仅静态,数值门待 rebuild 后跑)
+
+* 写方 `shard_fill_w13`(`moe_v2.hpp:1312`):`cbytes=crows*rowbytes`,
+  `total=2*cbytes*E`,每专家写 `[gate cbytes][up cbytes]`,源偏移 `e*stride + rs*rowbytes`
+  与 `e*stride + (I+rs)*rowbytes`;`shard_fill_w2` 同理 `total=cbytes*E`。
+* 读方 `packed4::gate_up_slice_batch_impl`:收到 `cstride=2*gu_cbytes`、`row0=n*gu_crows`、`up_off=gu_cbytes`,
+  `S = cstride ?: n2*rb`、`gbase = W + eid*S`、up 基址 `gbase+uoff`、rowshift `r0+inter`。**逐项与写方对得上。**
+* 关键语义核对:`matmul_packed4_group` **只把 rowshift 用在权重读**上
+  (`W + (j - rowshift)*(K/2)`,见 `moe_v2_packed4.hpp:233-234,314,472,496,...`),
+  而 scale 用**全局输出行** `scale_at(j, ...)`(`:727,767,834,861,886`)。
+  ⇒ **scale 保持完整不分片是设计使然**,读方传未偏移的 `sbase` 是**对的**,
+  这与上一轮我担心的"scale 行错位"相反 —— 这里没有问题。
+* 向后兼容:dense 调用者(`cstride=0,row0=0,up_off=0`)化简为原来的
+  `base + j*(K/2)` 与 `eid*n2*(hidden/2)`,**字节级不变** ⇒ V4 不受影响。
+* 顺带发现(既有代码,非本次引入):`shard_fill_*` 失败时 `munmap(ptr, 0)` 的 length 为 0,
+  实际不会解映射(EINVAL),是个潜在泄漏点,记为待办。
+
+### 379. 🎯🎯【v0.4·第 13 轮】**把 812 GB 按 VMA 点名了**:293.7 GiB `/dev/zero (deleted)`(pinned)+ 249 GiB anon
+
+#### 379.1 实测(直接读正在装载的 EngineCore 的 `/proc/<pid>/smaps` 聚合)
+
+`VLLM::EngineCore` pid 62239(`LOAD=dummy`,TP=1,装载中,`Rss≈544 GiB`):
+
+```
+/proc/62239/status: VmSize=589966 MiB  VmRSS=556959 MiB
+                    RssAnon=255756 MiB  RssFile=444 MiB  RssShmem=300759 MiB
+```
+
+按 VMA 名聚合 `Rss`:
+
+| 聚合 Rss | `Anonymous` | 映射数 | VMA 名 |
+|---|---|---|---|
+| **301387 MiB (294.3 GiB)** | **0 MiB** | 21 | **`/dev/zero (deleted)`** |
+| **255143 MiB (249.2 GiB)** | 255143 MiB | 252 | `[rw-p anon]` |
+| 583 MiB | 583 MiB | 1 | `[heap]` |
+| 其余 | — | — | 驱动/torch/triton 的 .so,均 < 70 MiB |
+
+**结论(不再是推断):**
+
+1. **`RssShmem` 与 `RssAnon` 是disjoint的**,`/dev/zero (deleted)` 那 294 GiB **全部记在 `RssShmem`,`Anonymous` 恰好为 0**。
+   这与 §376.1 的探针**完全一致**(pinned 内存 → `smaps_rollup` 的 `Private_Dirty`、`Anonymous=0`)
+   ⇒ §375/§376 里那个"`Private_Dirty − Anonymous`"的神秘块,**就是这 294 GiB pinned**。
+2. `n=21` 个 `/dev/zero (deleted)` 映射,平均 14.3 GiB/个。Engram 两张表占 188.8 GiB(§376.3),
+   余下 ~105 GiB 仍待细分(下一个待办)。
+3. 249 GiB `[rw-p anon]` 就是模型的主机专家张量(`torch.device("cpu")`,`--load-format dummy` 下也是全量分配)。
+
+#### 379.2 为什么这解释了 OOM 而不是"page cache 可回收就行"
+
+pinned 内存**不可回收、不可换出**(本机 `Swap: 0`),而 `MPOL_BIND` 的分配只能在自己 node 上回收
+⇒ 内核直接以 `constraint=CONSTRAINT_MEMORY_POLICY` 杀掉 EngineCore。§375.6 里那个 ~407 GB
+"不在进程内"的部分是**可回收的 page cache**,所以它**不是**主因;**主因是这 294 GiB 的硬地板。**
+
+#### 379.3 安全结论:释放源张量**不会**让引擎悬空(本轮静态验证)
+
+`moe_v2.hpp` 里对 `w13_/w2_/w13_g_/w2_g_/w13_gs_/w2_gs_` 的**全部赋值**(:454-499)只有三种:
+
+* `memcpy` 进 `buf_*`(引擎自有 `make_unique` 缓冲);
+* 指向 `w13_shard_/_w2_shard_`(`shard_region` 的 mmap 副本);
+* 指向 `*_s_`(`sock_fill` 的 `numa_socket_alloc` + `memcpy` 副本)。
+
+**没有任何一条是把 Python 源张量的指针直接存下来**。所以 `_release_source_weights` 把
+`w13_weight/w2_weight/w13_weight_scale/w2_weight_scale` 置空是**安全的**;
+§374 附注里那次 SIGSEGV **不是**悬空 scale 指针导致的。
+
+#### 379.4 顺带发现(既有代码,非本轮引入)
+
+`munmap(ptr, 0)` 的 length 写成 0(== EINVAL,实际不解映射)出现在**两处**:
+`shard_fill_w13/w2` 的失败回滚(`moe_v2.hpp:1333,1362`)和 `sock_fill`(`:1391`)。
+三处同一个写法 ⇒ 一个待修的泄漏点(失败路径才触发,平时不显形)。
+
+#### 379.5 本轮状态
+
+子代理的验证跑 `xtm1`(07:57:15 起,GPU1,`LOAD=dummy`)仍在装载。
+注意 `mainline_shims.py` mtime 07:56:23 **早于**该跑启动 ⇒ 这次跑**带上**了 `[xtu-diag]` 探针;
+但 `mixed_experts.py` mtime 08:00:43 **晚于**启动 ⇒ **没带上** §378 的释放修复。
+所以这次跑的两个用途:(a) 若 `[xtu-diag]` 始终不出现,即**实证** §378.1 的"钩子没被调到";
+(b) 紧凑映射的数值门。
+释放修复的端到端验证要等下一次跑。
+
+#### 379.6 逐条点名(稍晚一次采样,进程已长大)
+
+`/dev/zero (deleted)` 共 **35 条,合计 340.5 GiB**:
+
+| 大小 | 条数 | 小计 |
+|---|---|---|
+| 131072 MiB (128 GiB) | 2 | 256.0 GiB |
+| 8192 MiB | 6 | 48.0 GiB |
+| 4096 MiB | 8 | 32.0 GiB |
+| 512 MiB | 6 | 3.0 GiB |
+| 256 MiB | 6 | 1.5 GiB |
+| 其余小映射 | 7 | <0.02 GiB |
+
+**非 `/dev/zero` 的 >1 GiB 映射有 33 条,每条恰好 6885 MiB(6.72 GiB)** —— 这正是
+**每层专家源张量**的大小(w13 4.22 + w2 2.11 + scales 0.39 = 6.72 GiB),`33 × 6.72 = 221.8 GiB`。
+按 40 层外推 ≈ **268.8 GiB**,与代码注释里的"V4.1 就是 271 GB"**完全吻合**。
+
+⇒ **两条结论:**
+
+1. **源张量是匿名(`[rw-p anon]`)的**,不是 pinned ⇒ §378 的 `_release_source_weights`
+   (`p.device.type == "cpu"` + `p.data = torch.empty(0)`)**确实能放掉它们**,最多 ~269 GiB。这
+   正好是让 40/40 引擎装得下的关键量(§377.5 的 ~586 GiB 里,这一份是大头)。
+2. 那 340.5 GiB pinned 里,Engram 明确占 188.8 GiB;余下 **~152 GiB** 尚未细分
+   (形态是 8 GiB/4 GiB/512 MiB/256 MiB 的块,像是**逐层的 pinned 暂存区**,不是 Engram)。
+   这是下一个待办,但它**不影响**本轮结论 —— 它不可回收,只能在别处省。
+
+### 380. 🎯【v0.4·第 13 轮·补】**`process_weights_after_loading` 确实被调到;而它每层把权重"搬进 pinned"**
+
+#### 380.1 更正 §378.1(我的推断被实测推翻)
+
+子代理的 `TAG=xtm1`(`RELEASE_SOURCE=0`,GPT1)跑里打出了:
+
+```
+[xtu-diag] pwal#1 method=Mxfp4MoEMethod experts=XiaotuCPUExpertsMxfp4 hook=True \
+           layer_src=6.33GiB cum_src=6.3GiB  RssAnon=269526MiB RssFile=444MiB RssShmem=270354MiB
+[xtu-diag] pwal#8 method=Mxfp4MoEMethod experts=XiaotuCPUExpertsMxfp4 hook=True \
+           layer_src=6.33GiB cum_src=50.6GiB RssAnon=221330MiB RssFile=444MiB RssShmem=361746MiB
+```
+
+⇒ **`_notify_experts`(即主线量化的 `process_weights_after_loading` shim)在 V4.1 上确实会被调用**,
+`experts` 就是我们替换进去的 `XiaotuCPUExpertsMxfp4`,`hook=True`。
+
+**所以 §378.1 那句"钩子根本没被调到"是错的。** 我当时的依据是"第一条 `[SHARD-DIAG]` 出现在
+`Model loading took` 之后",但 `process_weights_after_loading` 本来就发生在 `load_weights` 返回
+(即那行日志)之后 —— 这两件事并不矛盾。真正能区分的是 `env`:`_ensure_engine` 在
+`process_weights_after_loading` 里是**被 env 门控**的,所以在 `RELEASE_SOURCE=0` 的 xtm1 里
+`[xtu-diag]` 打了而 SHARD-DIAG 一条都没有(count=0),完全自洽。
+
+⇒ v41n2 那次 SHARD-DIAG 到底来自"装载钩子(env=1)"还是"profile run 里的惰性 apply()",
+**仍然是未定的**,要用下面这次 A/B 来定。§378 的修复本身(两处都挂)不受影响,反而更稳。
+
+#### 380.2 新发现:`process_weights_after_loading` 每层把权重搬进 pinned(这是 shmem 的来源)
+
+两条 diag 对比:
+
+| 层 | cum_src | RssAnon | RssShmem |
+|---|---|---|---|
+| #1 | 6.3 GiB | 269526 MiB | 270354 MiB |
+| #8 | 50.6 GiB | **221330 MiB (−47.1 GiB)** | **361746 MiB (+89.3 GiB)** |
+
+**RssAnon 降了 47 GiB,同时 RssShmem 涨了 89 GiB** —— 这正是"把匿名张量拷进
+`pin_memory()`(→ `/dev/zero (deleted)` 共享匿名)然后释放匿名原件"的指纹,
+与 §376.1 的探针、§379 的 VMA 点名完全一致。
+
+规模:7 层换来 +89 GiB ⇒ **约 +12.7 GiB/层**;外推 40 层 ≈ **+508 GiB pinned**。
+这就是 §379.6 里"Engram 之外还有 ~152 GiB pinned 未细分"的来源,而且是**会长大的那一份**。
+加上 Engram 188.8 GiB ⇒ 专家路径最终会有 **~700 GiB 不可回收内存**,再叠加引擎分片
+(≈253 GiB 匿名)就必然 OOM。
+
+#### 380.3 对修复的意义
+
+好消息:**pinned 存储同样会被 `p.data = torch.empty(0)` 放掉**(pinned 在 torch 里仍是 `device='cpu'`
+⇒ 通过 §378 的 `p.device.type != "cpu"` 检查)。所以"切分一层、释放一层"**正好**能压住这条曲线:
+每层引擎一建完就把它那 6.33 GiB(或 pinned 后的 12.7 GiB)还回去,峰值不再随层数线性上涨。
+
+#### 380.4 子代理本轮的另一项成果(已验证,可直接采信)
+
+* 紧凑分片修复**数值门 bit-identical**:`OK=7 BAD=1`,`me=1 max_rel=1.873e-02`(与改前一致)。
+* 真实 DS-V4 尺寸下每引擎 **ΔVmSize 13365 → 6885 MiB**(13.05 → 6.72 GiB,**正好 NS×→1×**),
+  **ΔRss 不变(6887 MiB)** —— 与 §375.2 的预判一致:省的是虚拟地址空间/页表,不是常驻。
+* `SHARD-DIAG` 现在打印 `w13 shard=2.1GiB (full would be 4.2GiB)` / `w2 shard=1.1GiB (full would be 2.1GiB)`。
+* 更正我在 §375.1 的一个取样偏差:`P_D − Anon` **不是恒定的**,完整序列是
+  128→185→264→282→391→498→608→714→774→774→775 GiB,是**随装载爬升**的;
+  我引用的三次恰好都在平台期,所以看起来"恒定"。**结论方向不变**(它就是 RssShmem),
+  但"引擎构建前就已存在"这个说法应当撤回。
+* `P_D − Anon ≡ RssShmem` 的内核机制已给出:`smaps_rollup` 的 `Anonymous` 只计 `MM_ANONPAGES`,
+  而 shmem 属 `MM_SHMEMPAGES`;mapcount==1 的 shmem 页计入 `Private_Dirty` 而非 `Shared_Dirty`
+  (故 `Shared_Dirty` 恒为 0)。
+* `~407 GB 不在进程内` = checkpoint 的**可回收** page cache(`Cached − Shmem ≈ 359 GiB`),
+  **不是** OOM 主因;主因仍是不可回收的 RssShmem。
+* `drop_caches` 需要 root,本会话拿不到;已用 `Cached−Shmem` 分解替代。
+
+### 381. 【v0.4·第 14 轮】每层 pinned 增长定量;若干条嫌疑被排除;拆因探针已就位
+
+#### 381.1 三点序列(xtm1,`RELEASE_SOURCE=0`,每 8 层一条 `[xtu-diag]`)
+
+| 层 | cum_src | RssAnon | RssShmem |
+|---|---|---|---|
+| #1 | 6.3 GiB | 269526 MiB | 270354 MiB |
+| #8 | 50.6 GiB | 221330 MiB | 361746 MiB |
+| #16 | 101.2 GiB | 166250 MiB | 466194 MiB |
+
+* `RssAnon` **单调下降 −6885 MiB/层**(15 层共 −470 MiB×15),**恰好等于每层源张量 6.72 GiB**
+  ⇒ 每处理一层,前一层那份匿名源就被换掉。
+* `RssShmem` **单调上升 +13056 MiB/层 = 12.75 GiB/层**(≈ 源张量的 **2×**)。
+* 每层净增 ≈ **+6 GiB**;40 层外推 pinned ≈ **510 GiB**,叠加 Engram 188.8 GiB
+  ⇒ 专家路径终态约 **700 GiB 不可回收**,再加引擎分片(≈253 GiB 匿名)与 page cache,**必然 OOM**。
+  这与 §375.1 里"平台期 775 GiB"的观测自洽。
+
+#### 381.2 一个必须记下的**否定**结论:`Shmem` 不随进程退出而残留(不是跨轮泄漏)
+
+xtm1 被 SIGKILL 后,`/proc/meminfo` 的 `Shmem` 一度仍有 **532 GiB**,而
+`/dev/shm` 为空、无 SysV 段、无任何进程 `RssShmem`、也无 deleted-fd 持有者 —— 一度像是泄漏。
+连续采样后真相是**内核拆页滞后**:
+
+```
+08:05:37 Shmem=237GiB   08:05:41 189   08:05:45 141
+08:05:49  93            08:05:53  45   08:05:57   0     (僵尸被回收)
+```
+
+即约 **10 GiB/s** 线性释放,~25 s 归零。**不是泄漏**,后续不要据此误判。
+
+#### 381.3 本轮排除掉的嫌疑(避免下轮重复)
+
+* `modular_kernel.py:116` 的 `pin_memory=PIN_MEMORY` 只是 `expert_num_tokens` 元数据
+  (num_experts 个 int32 ≈ 1.5 KB),**不是** 13 GiB/层的来源。
+* **shim 5**(`convert_weight_to_mxfp4_moe_kernel_format`,`mainline_shims.py:296`)对 CPU 后端
+  **直接返回原始张量**,不做重打包、不锁页。
+* **prepack shim**(`prepare_mxfp4_moe_layer_for_cpu`,`:252`)是**透传**,连上游实现都不调用
+  (`return tuple(bound.arguments[p] ...)`,从不调 `_orig`)。
+* 我们的 `process_weights_after_loading`(`mixed_experts.py:179`)里唯一的张量变换是
+  `t.to(self._scale_dtype).contiguous()`,而 MXFP4 的 `_scale_dtype` 未设(为 None)⇒ 该分支跳过。
+* `/dev/shm` 空、无 SysV 大段、无 deleted-fd ⇒ 不是 tmpfs 文件泄漏。
+
+⇒ 剩下最可能的落点是**上游 `_setup_kernel` → `make_mxfp4_moe_kernel` → `experts_cls(...)` /
+`mk.FusedMoEKernel(...)` 里按层分配的 pinned 暂存**(每个 kernel 一份)。
+
+#### 381.4 已就位的拆因探针(下一跑直接给答案)
+
+在 `mainline_shims._patch_quant_method_cls` 的包装里,把每个量化方法的
+`process_weights_after_loading` 拆成"上游钩子"和"我们的钩子"两段,各自采样
+`/proc/self/status` 的 `RssShmem/RssAnon` 前后差,每 8 层打印一次:
+
+```
+[xtu-diag-split] l#N upstream: dShmem=+XMiB dAnon=-YMiB | our_hook: dShmem=+AMiB dAnon=-BMiB
+```
+
+若 `upstream` 那半就是 +12.75 GiB,则落点确认为 `_setup_kernel`;**若在 `our_hook` 那半**,
+则落点在我们的 `_ensure_engine`(但 xtm1 是 `RELEASE_SOURCE=0`,`_ensure_engine` 根本没跑,
+而 shmem 照样涨 ⇒ **基本可以预判是 upstream 那半**)。已 `py_compile` + 冒烟通过。
+
+### 382. 🎯🎯【v0.4·第 15 轮】**找到"开关打开了却零释放"的真正原因:环境变量到不了 EngineCore**
+
+#### 382.1 实测:launcher 有,EngineCore 没有
+
+同一时刻逐项对比 `/proc/<pid>/environ`(cellB,`TAG=cellB`):
+
+| 变量 | launcher(94573) | **EngineCore(94790)** |
+|---|---|---|
+| `HF_HUB_OFFLINE` | 1 | 1 |
+| `VLLM_EXPERTS_LOAD_DEVICE` | 1 | 1 |
+| `XIAOTU_MOE_THREADS` | 1 | 1 |
+| `XIAOTU_MOE_ASYNC` / `NSLICE_SMALL` / `SPIN_IDLE_US` | 1 | 1 |
+| `OMP_NUM_THREADS` / `MEMTRACE` / `GPUS` | 1 | 1 |
+| **`XIAOTU_RELEASE_SOURCE`** | **1** | **0(整个 environ 里 "RELEASE" 出现 0 次)** |
+| `MEMTRACE_INTERVAL` / `TAG` / `PORT` | 1 | 0 |
+
+而 EngineCore 的 environ 条目数是 **2711**,launcher 只有 **76** ⇒ EngineCore 是被一个
+**重建过的环境**启动的,不是简单继承。所以 `os.environ.get("XIAOTU_RELEASE_SOURCE", "0")`
+在 EngineCore 里**恒为 "0"** —— **开关打开了也永远不释放,且不留任何日志。**
+
+这就是 §377/§378 一直在追的"静默零释放"的**真正第一因**:不是"释放了 0 字节",
+而是**释放分支根本没被进入**。§378.1 我最初那个"钩子没被调到"的直觉方向是对的,
+但当时给的理由(日志行序)是错的 —— 现在换成了直接读 environ 的硬证据。
+
+已确认身份无误:`cellB.log` 里 vLLM 自己打印 `EngineCore pid=94790`、`APIServer pid=94573`。
+
+#### 382.2 修法:文件开关(插件早已用过的同一手法)
+
+新增 `mixed_experts._release_source_enabled()`:**env 优先,其次读标记文件**
+`/tmp/xiaotu_release_source`(内容 `1` 即开)。两处调用点
+(`process_weights_after_loading` 与 `_maybe_release_source`)都改用它。
+这与 `gpu_prefill.gpu_prefill_min_tokens` 读 `XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE`
+是同一个套路 —— 插件当年就是为"运行时切换阈值"踩过同样的坑。
+
+开启方式:`echo 1 > /tmp/xiaotu_release_source`。
+
+已冒烟验证优先级:
+
+```
+no env, no file  -> False      no env, file=1 -> True
+no env, file=0   -> False      env=0, file=1 -> False   (env 优先)
+env=1            -> True
+```
+
+#### 382.3 自我事故记录(重要,避免重演)
+
+* **我的 `/tmp/attr.py` 弄挂了子代理的 cellA**:`serve_v41.sh` 会 `cd /tmp` 再启动,
+  于是 aiohttp 的 `import attr` 命中了我的探针文件,报
+  `FileNotFoundError: '/proc/--model/status'`。已把全部探针脚本移到
+  `report/tuning/probes/`,`import attr` 已复原。
+* **`pkill -f "serve_v41.sh"` 又把我自己的 shell 打死了**(handoff §4.5 记过的老坑):
+  我那条命令行里就含 "serve_v41.sh"。教训:只用 pid 文件或
+  `ps -eo pid,comm | awk '$2=="VLLM::EngineCor"'` 匹配,绝不用含自身模式串的 `pkill -f`。
+
+#### 382.4 本轮实际部署
+
+* cellB 已停(它没带文件开关,`RELEASE_SOURCE` 到不了 EngineCore ⇒ 等价于对照组,价值低)。
+* 机器已干净:`Shmem=0`、`MemFree=1123 GiB`、三张卡 0 MiB。
+* 已 `echo 1 > /tmp/xiaotu_release_source`,并以 `TAG=cellC PORT=8097 GPUS=0` 重新起跑
+  (**这次才真正带上释放修复**),EngineCore pid=95872,启动无 traceback。
+  判据:`release` 行是否出现、`[xtu-diag-split]` 的 `our_hook: dShmem` 是否为负、
+  以及 `RssShmem+RssAnon` 的斜率是否从 +6.03 GiB/层 明显走平。
+
+### 383. 【v0.4·第 16 轮】cellC 确认带上修复;三条嫌疑排除
+
+#### 383.1 cellC 是有效实验(时序已核)
+
+* `mixed_experts.py`(含文件开关)mtime **08:12:12**;`cellC` 启动 **08:14:07**;
+  EngineCore pid=95872 起于 **08:14:31**;对应 `__pycache__/mixed_experts.pyc` mtime 08:12:12。
+  ⇒ **cellC 确实加载了 `_release_source_enabled()`**,这次实验有效。
+* 装载进度(观察点):`engram=1`(两张表已到 1 张)、`Shmem=211 GiB`、EngineCore RSS ≈ 307 GB、
+  `xtu-diag=0 / released=0`(还没到 MoE 层)。这是一次纯粹的"等待",不是卡住。
+
+#### 383.2 本轮排除的三条嫌疑
+
+* **`XIAOTU_MOE_EP_SHARD_STORAGE`**:`hybrid_model.py:565` 用它决定"每 rank 只分配
+  `n_routed_experts/TP` 个专家" —— 是**专家数分片**,与共享内存无关;TP=1 时是 no-op。**不是** pin 源。
+* **hisparse(层级稀疏索引器)宿主 KV 池**:`v1/hisparse/layout.py:76-78` 明确要求
+  `HiSparseConnector` 提供 `host_pool_gib`,否则 `raise ValueError("HiSparse requires ...")`;
+  `vllm/config/kv_transfer.py:41-47` 说明它来自 `--kv-transfer-config`。
+  **我们的启动从不传 `--kv-transfer-config`,日志里也没有任何 hisparse 行** ⇒ hisparse 未启用,**不是** pin 源。
+  (记录它的意义:`runtime.py:181 allocate_pinned_host_pool` 与 `:347 SharedOffloadRegion`
+  正是"大块 pinned/shmem 宿主池"的现成先例,将来真要 pin 大对象时值得照抄。)
+* **`CpuMegaExpertsParams`(插件自己的 CPU 专家参数)**:`hybrid_model.py:429-449` 全是
+  `torch.zeros(..., device="cpu", dtype=torch.uint8)` ⇒ **匿名**,不 pin。
+  这正好对上 §381.1 里 `RssAnon` 每层 −6.72 GiB 的那一份。
+
+#### 383.3 仍未定位
+
+`RssShmem` 每层 +12.75 GiB 的**具体分配点**仍未点名。上游 `vllm/` 全库
+`pin_memory=True` 的站点已逐个看过(输出侧、spec-decode、multimodal、lora),
+没有一个是 per-layer GB 级的。下一步靠 cellC 的 `[xtu-diag-split]`
+(`upstream:` vs `our_hook:`)来二分 —— 这也是本轮把它加进去的目的。
