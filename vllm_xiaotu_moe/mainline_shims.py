@@ -79,6 +79,16 @@ def _host_mem_mib() -> dict:
     return out
 
 
+def _mem_diag_on() -> bool:
+    """内存诊断探针是否开启(默认否)。
+
+    这些探针会给**每个模型的每一层**加一次 `/proc/self/status` 读取与若干行打印。
+    V4/V4.1 的默认路径必须零额外开销,所以按 env 门控,只有
+    `XIAOTU_MEM_DIAG=1` 时才打开(排查内存时用)。
+    """
+    return os.environ.get("XIAOTU_MEM_DIAG") == "1"
+
+
 def _release_on() -> bool:
     """释放开关是否打开(与 mixed_experts._release_source_enabled 同一判据)。
 
@@ -110,7 +120,7 @@ def _notify_experts(method, layer) -> None:
         if isinstance(t, torch.Tensor):
             nbytes += t.numel() * t.element_size()
     _PWAL_DIAG["src"] += nbytes
-    if _PWAL_DIAG["n"] == 1 or _PWAL_DIAG["n"] % 8 == 0:
+    if _mem_diag_on() and (_PWAL_DIAG["n"] == 1 or _PWAL_DIAG["n"] % 8 == 0):
         m = _host_mem_mib()
         print(
             f"[xtu-diag] pwal#{_PWAL_DIAG['n']} method={type(method).__name__} "
@@ -159,7 +169,7 @@ def _patch_quant_method_cls(cls) -> list[str]:
             # (`_setup_kernel` -> make_mxfp4_moe_kernel -> experts/kernel ctor)
             # and OUR hook (Mixin.process_weights_after_loading -> _ensure_engine),
             # so the pinned/shmem growth is attributed to a concrete site.
-            b = _host_mem_mib()
+            b = _host_mem_mib() if _mem_diag_on() else {}
             # 记录 upstream 钩子**前后**的权重指针。若指针变了(或被释放),就证明
             # "pwal 换掉了/搬走了原始存储",这正好解释 cellC 为什么在 pwal 返回后
             # 立刻建引擎会 SIGSEGV,而惰性路径(看到的是稳定后的张量)却没事。
@@ -177,7 +187,7 @@ def _patch_quant_method_cls(cls) -> list[str]:
                     _nm: getattr(layer, _nm) for _nm in _pre
                 }
             res = pwal(self, layer, *a, **kw)
-            m = _host_mem_mib()
+            m = _host_mem_mib() if _mem_diag_on() else {}
             if _pre and _PWAL_DIAG.get("n", 0) <= 2:
                 for _nm, (_p0, _s0, _o0) in _pre.items():
                     _t = getattr(layer, _nm, None)
@@ -195,9 +205,11 @@ def _patch_quant_method_cls(cls) -> list[str]:
                               flush=True)
             if mixed_mode_enabled():
                 _notify_experts(self, layer)
-            a2 = _host_mem_mib()
+            a2 = _host_mem_mib() if _mem_diag_on() else {}
             _PWAL_DIAG["split"] = _PWAL_DIAG.get("split", 0) + 1
-            if _PWAL_DIAG["split"] == 1 or _PWAL_DIAG["split"] % 8 == 0:
+            if _mem_diag_on() and (
+                _PWAL_DIAG["split"] == 1 or _PWAL_DIAG["split"] % 8 == 0
+            ):
                 print(
                     f"[xtu-diag-split] l#{_PWAL_DIAG['split']} "
                     f"upstream: dShmem={m.get('RssShmem', 0) - b.get('RssShmem', 0):+d}MiB "
