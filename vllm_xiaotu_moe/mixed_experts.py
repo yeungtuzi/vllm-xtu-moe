@@ -383,7 +383,15 @@ class _XiaotuExpertsMixin:
                 # 模块化链路仍会把已置空的 w1/w2 **透传**进 apply(),而 apply 要从
                 # w2 的 dim 1 取 hidden_size ⇒ 必须在置空前把形状记下来。
                 self._released_shapes[name] = tuple(p.shape)
-                p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+                # ⚠️ **不能**用 `torch.empty(0)`:那是 **0 维**张量,而模块化链路
+                # (`modular_kernel.moe_problem_size`)会断言
+                # `len(w1.shape) == 3 and len(w2.shape) == 3` —— 0 维会直接
+                # AssertionError 打挂 EngineCore(cellI 实测)。
+                # 用全零 stride 的 `empty_strided`:保留真实 shape/ndim,
+                # 但底层 storage 只有 **1 个元素**,内存照样放掉。
+                p.data = torch.empty_strided(
+                    tuple(p.shape), (0,) * p.dim(), dtype=p.dtype, device=p.device
+                )
             except Exception:  # noqa: BLE001
                 continue
             freed += nbytes
