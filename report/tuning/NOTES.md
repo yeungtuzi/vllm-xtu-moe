@@ -15953,3 +15953,58 @@ for (size_t it = job.ab; it < job.ae; ++it) {          // 该专家下的每个 
   因此**"关掉 NUMA 分片 + 打开分组"** 是一条**能立刻试**的组合(代价:失去分片的 NUMA 局部性);
 * 用 `XIAOTU_MOE_GROUP_FACTOR`(行 607)可以把阈值调到"强制分组 / 强制逐 token",
   正好可以在**同一份权重上做 A/B** —— 这是验证"分组到底值多少"的最低成本手段。
+
+### 422. 🔬【新目标·第 4 轮】实现并**验证闸门生效**;但 A/B 未能取到数(NOSHARD 跑静默死亡)
+
+#### 422.1 已完成:opt-in 闸门 + 编译通过
+
+在 `moe_v2.hpp` 的 `if constexpr (wt::kNParallel)` 分支里加了一个**分片感知的闸门**:
+
+```cpp
+const size_t _nass_gate = (size_t)M * (size_t)k;
+if ((nshard_ >= 2) || (_nass_gate <= _grp_min)) {   // 分片模式 or 小批量 ⇒ 原 N-slice
+    forward_many_nsliced(...); return;
+}
+// 仅 nshard_ < 2(即 XIAOTU_MOE_NOSHARD=1)且大批量时,落到下面的 Expert grouping
+```
+
+* `_grp_min` = `XIAOTU_MOE_GROUP_MIN_NASS`(默认 512);
+* `XIAOTU_MOE_GROUP_DIAG=1` 打印一次判定;
+* **默认(分片)路径逐字不变** —— 因为 `nshard_ >= 2` 时仍然原样 `return`。
+* 编译参数:`PYBIND11_INC=$(python -c "import torch,os;print(os.path.dirname(torch.__file__)+'/include')")`
+  (**pybind11 随后端的 torch 提供**,不是独立包 —— 这一条值得记下来,否则 `build_engine_variants.sh` 会报
+  `pybind11 include dir not found`)。5 个变体编译通过。
+
+#### 422.2 **已验证闸门生效**(实测日志)
+
+`cellAS`(`XIAOTU_MOE_NOSHARD=1` + `XIAOTU_MOE_GROUP_DIAG=1`):
+
+```
+[group] packed4 large-batch -> grouping M=2048 k=6 NASS=12288 nshard=0
+```
+
+⇒ packed4 的大批量**第一次真正落到"按专家分组"路径**(此前对 MXFP4 永远不可达,§421)。
+RSS 1147 GB(2 份 socket 副本,符合 `NOSHARD` 的预期代价)。
+
+#### 422.3 但**没有取到数值**:该跑静默死亡
+
+* EngineCore **没有任何 ERROR 行**就被回收(`APIServer` 只报 "Engine core initialization failed");
+* 时间是"rel=40 之后、profile/服务阶段" —— 也就是**分组路径刚开始被大规模执行**的时候;
+* 两个候选原因(未区分):(a) RSS 1147 GB + 2 份副本 ⇒ **OOM 被杀**;
+  (b) 分组路径对 packed4 **从未被执行过**,可能存在越界/布局错误导致硬崩溃。
+* `[group]` 行**确实打了多条**(说明分组路径被进入并运行了一段时间),但不能排除是"跑了一会儿才崩"。
+
+**⇒ 结论:闸门与编译都已完成并验证;但"分组路径在 packed4 上是否正确、能带来多少 prefill 收益"
+这两个问题**仍然未答**。下一步需要一个**更可控**的跑法:降低 `XIAOTU_MOE_GROUP_MIN_NASS`
+之前先用小 `MAXLEN`/小 prompt 让分组路径只处理很小的一批,配合 `XIAOTU_MOE_GROUP_DIAG`
+与数值门,先证正确性,再谈收益。
+
+#### 422.4 本轮的小结
+
+| 项 | 状态 |
+|---|---|
+| 慢 prefill 的确切机制(精确到行) | ✅ §421.1 |
+| 更正"分组=批 GEMM"的误判(实为 L3 局部性,~7×) | ✅ §421.2 |
+| 硬障碍:分片下 `w13_` 只是 shard0,布局不匹配 | ✅ §421.3 |
+| opt-in 闸门 + 编译通过 + **验证生效** | ✅ §422.1/422.2 |
+| 分组路径在 packed4 上的**正确性**与 **prefill 收益** | ❌ **未验证**(静默死亡) |
