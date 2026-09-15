@@ -308,6 +308,30 @@ def _install_upstream_seg_shims() -> list[str]:
     return applied
 
 
+def _install_build_kernel_probe() -> list[str]:
+    """探 `Mxfp4MoEMethod._build_moe_kernel`(类属性,安全),定位剩余的匿名内存。"""
+    if not _mem_diag_on():
+        return []
+    try:
+        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+    except Exception:  # noqa: BLE001
+        return []
+    orig = Mxfp4MoEMethod.__dict__.get("_build_moe_kernel")
+    if orig is None or getattr(orig, "_xtu_shim", False):
+        return []
+
+    @functools.wraps(orig)
+    def _build_moe_kernel(self, layer):
+        b = _host_mem_mib()
+        res = orig(self, layer)
+        _seg_sample("_build_moe_kernel", b)
+        return res
+
+    _build_moe_kernel._xtu_shim = True  # type: ignore[attr-defined]
+    Mxfp4MoEMethod._build_moe_kernel = _build_moe_kernel
+    return ["Mxfp4MoEMethod._build_moe_kernel"]
+
+
 def _install_engram_last_shim() -> list[str]:
     """构造期只放 meta 占位,把 188.8 GiB pinned 表推迟到专家阶段之后(IRON_RULES R11)。
 
@@ -660,6 +684,10 @@ def _install_mxfp4_cpu_convert_shim() -> list[str]:
             # CPU 后端 = OOT 引擎,直接吃 checkpoint 原始布局,不做任何重打包。
             _mb = _host_mem_mib() if _mem_diag_on() else {}
             if mixed_mode_enabled() and getattr(mxfp4_backend, "name", "") == "CPU":
+                if _mem_diag_on():
+                    _m = _host_mem_mib()
+                    print(f"[xtu-seg] convert_weight(cpu passthrough): dAnon="
+                          f"{_m.get('RssAnon',0)-_mb.get('RssAnon',0):+d}MiB", flush=True)
                 return (w13_weight, w2_weight, w13_weight_scale,
                         w2_weight_scale, w13_bias, w2_bias)
             return _orig(
@@ -793,6 +821,7 @@ def apply_mainline_shims() -> list[str]:
         _install_device_loading_shim,
         _install_engram_last_shim,
         _install_upstream_seg_shims,
+        _install_build_kernel_probe,
         _install_engram_materialize_shim,
         _install_oracle_shims,
         _install_prepack_shims,
