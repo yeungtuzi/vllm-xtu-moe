@@ -79,6 +79,21 @@ def _host_mem_mib() -> dict:
     return out
 
 
+def _release_on() -> bool:
+    """释放开关是否打开(与 mixed_experts._release_source_enabled 同一判据)。
+
+    ⚠️ 这里必须门控:下面的"钩子前快照"会**持有**权重张量的引用。若对所有模型
+    (含 V4)都抓,就会把它们本可释放的存储多留一份 —— 那正是
+    "适配新模型不能破坏已有模型"的红线。
+    """
+    try:
+        from vllm_xiaotu_moe.mixed_experts import _release_source_enabled
+
+        return _release_source_enabled()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _notify_experts(method, layer) -> None:
     kernel = getattr(method, "moe_kernel", None)
     experts = getattr(kernel, "fused_experts", None)
@@ -149,7 +164,7 @@ def _patch_quant_method_cls(cls) -> list[str]:
             # "pwal 换掉了/搬走了原始存储",这正好解释 cellC 为什么在 pwal 返回后
             # 立刻建引擎会 SIGSEGV,而惰性路径(看到的是稳定后的张量)却没事。
             _pre = {}
-            for _nm in ("w13_weight", "w2_weight"):
+            for _nm in (("w13_weight", "w2_weight") if _release_on() else ()):
                 _t = getattr(layer, _nm, None)
                 if isinstance(_t, torch.Tensor):
                     _pre[_nm] = (_t.data_ptr(), tuple(_t.shape), _t.storage_offset())
