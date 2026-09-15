@@ -16707,3 +16707,50 @@ IndexError: list index out of range
 ⇒ 已改名 `attr.py` → `memvma.py` 并清掉 `__pycache__`。
 (同一个坑本项目已经踩过两次:`/tmp/attr.py` 让 cellA 起不来。建议:探针一律带前缀,
 如 `probe_*`。)
+
+## §454 权重构成实测(直接统计 48 个 safetensors 的 header,不靠估算)
+
+用户质疑:V4 权重 160 G 时 GPU prefill 要传 69 G,为什么 V4.1 权重 500 G 就要传 269 GB?
+"其中一百多 GB 不是 engram 吗,那个也要传吗?"
+
+**答案:engram **不**需要传。我的 269 GiB 里**本来就不含 engram**。但用户的质疑点破了我一个真实的口径错误。**
+
+| 分类 | V4-Flash | V4.1-Flash |
+|---|---|---|
+| routed_experts | **146.62 GiB**(94.3%) | **275.67 GiB**(58.0%) |
+| engram | **无** | **189.13 GiB**(39.8%,只有 12 个张量) |
+| attention/embed/norm/other | 7.61 GiB | 8.88 GiB |
+| ffn dense + gate | 1.19 GiB | 1.57 GiB |
+| **合计** | **155.42 GiB** | **475.24 GiB** |
+| 每层 routed experts | 3.188 GiB × 43 层 | **6.724 GiB × 40 层** |
+
+**结论**
+
+1. **engram(189.13 GiB)是查表用的,不进 GPU prefill 的 DMA 预算。**
+   它是 pinned 主机内存,每个 token 只 **gather 几行**(ngram embedding),
+   从不整表搬运。用户这个直觉是对的。所以 V4.1 每次 prefill 要传的是
+   **275.67 GiB 的 routed experts**(我此前说 268.9 GiB —— 我只数了 w13/w2/scale,
+   漏了每专家的 gate/bias 类张量,应以 **275.67 GiB** 为准)。
+2. **真正的口径错误在 V4 那 69 GiB 上。** 实测 V4-Flash 的 routed experts 是
+   **146.62 GiB**(不是 69)。`docs/GPU_PREFILL_MAINLINE.md` §2.2 的 "69 GiB"
+   很可能是一个 **TP=2 每 rank** 的数(146.62/2 = 73.3 ≈ 69),
+   而我拿它当 TP=1 的数去和 V4.1 的 TP=1 数字(269)比 ⇒ **把 1.88× 的差距说成了 3.9×**。
+3. 修正后的同类对比:
+
+   | | routed experts(TP=1) | 固定 DMA @25 GiB/s |
+   |---|---|---|
+   | V4-Flash | 146.62 GiB | **5.9 s** |
+   | V4.1-Flash | 275.67 GiB | **11.0 s** |
+
+   即 V4.1 的固定成本是 V4 的 **1.88×**(不是 3.9×);TP=3 时每 rank 91.9 GiB ⇒ **3.7 s**。
+4. 因此交叉点(V4.1,TP=1,修复后 CPU 2048 token = 10.3 s)≈ **2100 token**,
+   而不是我 §449 按错误口径写的 2600(方向不变,量级不变,但口径必须写对)。
+   **注意:CPU 路径也随 TP 除以 N,所以交叉点的 token 数近似与 TP 无关;
+   TP 只是把两边的绝对时间一起缩小。**
+
+**仍未解决的差异(需要用户确认口径)**:用户给的 V4-Flash 结论是 ">384 token 用 GPU 就划算",
+而我今天在这台机器 + 当前 CPU 引擎下测出的交叉点是 **~2000-2400 token**(V4-Flash 也是
+~2240:V4 CPU 125.64 ms/层 × 43 = 5.4 s vs 固定 5.9 s)。差 5-6 倍。可能的解释:
+(a) 结论是在 CPU 引擎还没调优(线程数少/未开大页/未修 §439/§447 的路径)时测的;
+(b) "划算"衡量的是端到端 TTFT,还含 attention 侧差异;(c) 不同机器/TP。
+**在没搞清口径之前,我不把 384 当既定前提硬套到 V4.1。**
