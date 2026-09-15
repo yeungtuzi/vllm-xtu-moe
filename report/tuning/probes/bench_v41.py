@@ -84,7 +84,7 @@ if pt0:
 # 串行重复:看抖动(均值之外的稳定性)
 dts, cts = [], []
 for _ in range(REPEAT):
-    d, c, t = one(PROMPT, MAXTOK)
+    d, c, t, _pt = one(PROMPT, MAXTOK)
     dts.append(d)
     cts.append(c)
 report(f"serial x{REPEAT}", dts, cts)
@@ -97,7 +97,7 @@ if CONC > 1:
     lock = threading.Lock()
 
     def worker():
-        d, c, _ = one(PROMPT, MAXTOK)
+        d, c, _, _pt = one(PROMPT, MAXTOK)
         with lock:
             res.append((d, c))
 
