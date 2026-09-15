@@ -1055,6 +1055,9 @@ class _XiaotuExpertsMixin:
             # 常驻层:整层 MoE 在 GPU 上算(权重已在 GPU 且已转 K-major,无 H2D)。
             from vllm_xiaotu_moe.gpu_prefill import gpu_moe_layer
 
+            # ⚠️ 必须先建槽位:`_resident_I` 是在 `_ensure_resident` 里设置的,
+            # 而 kwargs 从左到右求值 —— 写成 slot=... 在同一行会在 I= 之后被求值 ⇒ AttributeError。
+            _slot = self._ensure_resident(layer)
             out = gpu_moe_layer(
                 h_bf16, ids_i32, wts_f32,
                 self._engine_w13 if self._engine_w13 is not None else layer.w13_weight,
@@ -1063,7 +1066,7 @@ class _XiaotuExpertsMixin:
                 None,
                 H=hidden_size, I=self._resident_I,
                 K=int(self.moe_config.experts_per_token),
-                device=h_bf16.device, slot=self._ensure_resident(layer),
+                device=h_bf16.device, slot=_slot,
             )
         else:
             engine.cpu_decode(
