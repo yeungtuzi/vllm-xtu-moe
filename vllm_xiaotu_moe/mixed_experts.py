@@ -636,35 +636,31 @@ class _XiaotuExpertsMixin:
         """
         if getattr(self, "_resident_slot", None) is not None:
             return self._resident_slot
-        from vllm_xiaotu_moe.gpu_prefill import PrefetchSlot, _kmajor_bytes
+        # ⚠️ 逐字照抄 V4 的 `_build_resident_slot`(hybrid_model.py:1086):
+        #   * K-major 在**主机**上做(`_pinned_kmajor`,顺带锁页),再阻塞 H2D;
+        #     我先前写成"先 .to(cuda) 再在设备上转",会走到另一条内核路径 ⇒ 曾触发
+        #     `Triton Error [CUDA]: an illegal memory access`(cellAI);
+        #   * 设备缓冲用 `slot.alloc(src, dev)` 按 src 的形状/dtype 分配;
+        #   * `slot.busy = None`(不是空 Event)。
+        from vllm_xiaotu_moe.gpu_prefill import PrefetchSlot, _pinned_kmajor
 
-        self._prepare_weights(layer)
-        w13 = self._engine_w13 if self._engine_w13 is not None else layer.w13_weight
-        w2 = self._engine_w2 if self._engine_w2 is not None else layer.w2_weight
-        s13, s2 = self._scales
-        if s13 is None:
-            s13 = self._find_scale(layer, (self._scale_attrs[0],))
-        if s2 is None:
-            s2 = self._find_scale(layer, (self._scale_attrs[1],))
         dev = torch.device("cuda", torch.cuda.current_device())
-        bufs = (
-            _kmajor_bytes(w13.to(dev, non_blocking=True)),
-            _kmajor_bytes(s13.to(dev, non_blocking=True)),
-            _kmajor_bytes(w2.to(dev, non_blocking=True)),
-            _kmajor_bytes(s2.to(dev, non_blocking=True)),
+        src = (
+            _pinned_kmajor(w13), _pinned_kmajor(s13),
+            _pinned_kmajor(w2), _pinned_kmajor(s2),
         )
-        torch.cuda.synchronize()
         slot = PrefetchSlot()
-        slot.bufs = bufs
+        slot.alloc(src, dev)
+        for buf, s_ in zip(slot.bufs, src):
+            buf.copy_(s_, non_blocking=False)
         slot.ready = torch.cuda.Event()
         slot.ready.record()
-        slot.busy = torch.cuda.Event()
-        slot.busy.record()
-        slot.t0 = slot.t1 = None
+        slot.busy = None
         self._resident_slot = slot
-        self._resident_keep = (w13, w2, s13, s2)     # 保活,别让它们被回收
-        self._resident_I = int(w13.shape[1]) // 2      # intermediate_size
-        nbytes = sum(t.numel() * t.element_size() for t in bufs)
+        self._slot_device = dev
+        self._resident_keep = src          # 保活(主机 pinned 源)
+        self._resident_I = int(w13.shape[1]) // 2
+        nbytes = sum(b.numel() * b.element_size() for b in slot.bufs)
         print(
             f"[vllm-xtu-moe] GPU-resident(V4.1) {getattr(layer, 'layer_name', '?')}: "
             f"{nbytes / 2**30:.2f} GiB on {dev}",
