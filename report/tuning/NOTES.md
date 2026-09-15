@@ -15643,3 +15643,38 @@ launcher 里有的 `XIAOTU_MOE_THREADS` / `_SPIN_IDLE_US` / `_GPU_RESIDENT_LAYER
 ⇒ **下一枪:用 `XIAOTU_MOE_FAKE_CPU=1` 直接量"纯 GPU 侧每层"**
 (诊断专用:跳过 CPU MoE、输出保持原值,**绝不能用于正确性测试**)。
 它一次就给出"把所有层都放 GPU"的上限,即单发的**理论天花板**。
+
+### 415. ⚠️【新目标·第 1 轮】`XIAOTU_MOE_FAKE_CPU=1` 的数字**自相矛盾,不可用作上限**
+
+`cellAD`(`FAKE_CPU=1` + `CD_TIMING=1`,其余与基线相同)实测:
+
+```
+[cd-timing] qlen=1 period=3.20ms compute=0.00ms rest=3.20ms (compute 0%, rest 100%)
+[cd-timing] qlen=1 period=3.85ms compute=0.00ms rest=3.84ms
+[cd-timing] qlen=2 period=43.33ms ... / period=13.69ms ...
+```
+
+* **跳过 CPU MoE 之后,每层 `period` 反而从 0.89 ms 升到 3.20 ms(慢 3.6×)**;
+* 这在物理上说不通(少做一件事不该更慢)⇒ **该开关在当前编排下给出的不是"纯 GPU 侧成本"**,
+  可能原因:跳过计算后 host-fn 回调/流同步的节奏被改变,`period`(回调到回调)不再代表 GPU 层耗时。
+* **结论:不要把 FAKE_CPU 的数字当作"全层常驻"的理论上限。** 该开关标注为诊断专用,
+  现在进一步标注为"**在本编排下不可用于定量**"。
+
+#### 415.1 目前**可靠**的单发画像(真实权重,`SPIN=5000`,`EAGER=0`)
+
+| 量 | 值 | 说明 |
+|---|---|---|
+| `period` | **0.89 ms/层** → 38 ms/token → **27.5 tok/s** | 完整路径 |
+| `compute`(CPU MoE) | **0.37 ms/层**(41%) | 含引擎内的 barrier |
+| `rest` | **0.52 ms/层**(59%) | = GPU 工作 + 拷贝 + host-fn 派发 |
+| `rest` 的批次无关分量 | **≈0.4 ms/层** | 由 qlen=1(0.52)vs qlen=8(0.88)反推 |
+
+⇒ 单发的主要损耗是 `rest` 里那个**每层约 0.4 ms 的批次无关分量**(43 层 ≈ 17 ms/token)。
+它的性质(拷贝?派发?GPU 同步?)**尚未确定**,FAKE_CPU 没能回答。
+
+#### 415.2 下一步:先证明"常驻层"这条路**是否可达**(灵敏判据)
+
+2 层/43 层的实验灵敏度不足(§414.3)。改用**预算拒绝**作为灵敏信号:
+`XIAOTU_MOE_GPU_RESIDENT_LAYERS="38,39"` + `XIAOTU_MOE_RESIDENT_BUDGET_GB=1`
+—— 若设置真被读到,插件应因预算不足而**拒绝常驻并告警**(`hybrid_model.py:166` `_resident_ok`)。
+这能一次性回答"这条杠杆到底通不通",而不必依赖噪声里的吞吐差。
