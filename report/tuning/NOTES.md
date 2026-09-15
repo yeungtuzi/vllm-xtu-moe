@@ -15177,3 +15177,41 @@ if constexpr (wt::kNSliceSmallM) {
 
 **下一跑(已起)**:`SPIN_IDLE_US=300` + `NSLICE_SMALL=1` + `THREADS=128` + `MAXSEQS=1`
 + `ASYNC=0`,判据是**单流 tok/s 是否出现数量级改善**(预期从 13 向带宽上限 47~94 靠)。
+
+### 404. 🔬【v0.4·第 37 轮·续】四个旋钮累计只 +7%;剖析受阻,改用自带计时钩子
+
+#### 404.1 `SPIN_IDLE_US=300` 的收益也很小
+
+| 配置(单流,真实权重) | tok/s | 相对基线 |
+|---|---|---|
+| `NSLICE=0, SPIN=0, THR=60`(基线) | 13.35 | — |
+| `NSLICE=1, SPIN=0, THR=128` | 13.81 | +3.4% |
+| **`NSLICE=1, SPIN=300, THR=128`** | **14.31** | **+7.2%** |
+
+⇒ **四个旋钮(ASYNC/THREADS/NSLICE/SPIN)累计只有 +7%**,都不是主因。
+`THREADS=128` 已确认生效(进程 **178** 线程)。另注意:`SPIN=300` 的**首次请求(warmup)
+用了 59.5 s**(平时 0.9 s),说明首轮有额外的自旋/预热行为,值得以后再查。
+
+#### 404.2 环境限制:无法用常规剖析器(重要,免得重复尝试)
+
+| 工具 | 状态 |
+|---|---|
+| `perf` | ❌ 内核 **5.15.0-191 无匹配 perf 包**(`perf not found for kernel ...`),且 `perf_event_paranoid=4` |
+| `gdb -p` | ❌ `ptrace_scope=1` + 非 root ⇒ `Could not attach to process` |
+| `strace -p` | ❌ 同一 ptrace 限制 |
+| `py-spy` | ❌ 未安装 |
+
+⇒ **不要在这台机器上指望 perf/gdb 附加剖析**。替代路径:**用引擎自带的计时钩子**。
+
+#### 404.3 可用的自带钩子(下一步就用它们)
+
+| 开关 | 位置 | 作用 |
+|---|---|---|
+| **`XIAOTU_CD_TIMING`** / `_EVERY` | `python_binding/binding.cpp:291,836` | **per-layer 分段计时**(与 host-func 同口径) |
+| `XIAOTU_MOE_PROFILE` | `moe_v2.hpp:1208` | 引擎侧 profiling |
+| `XIAOTU_MOE_DIAG_BARRIER` | `moe_v2.hpp:979,1203` | barrier 诊断(直接验证"同步开销"假设) |
+| `XIAOTU_MOE_POOL_TRACE` / `XIAOTU_CD_TRACE` | csrc | 线程池/解码追踪 |
+
+**下一跑(已起)**:在"当前最优配置"(`ASYNC=0/THREADS=128/NSLICE=1/SPIN=300/MAXSEQS=1`)上
+叠加 `XIAOTU_CD_TIMING=1` 与 `XIAOTU_MOE_PROFILE=1`,发一个 64-token 请求,
+直接读出**每层各段耗时**,把 1.9 ms/层拆开。
