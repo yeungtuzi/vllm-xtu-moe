@@ -150,8 +150,14 @@ def _gate_up_kernel_split(
     if end <= base:
         return
     n = pid_n * BN + tl.arange(0, BN)
-    w_off = pid_e * W13_E
-    s_off = pid_e * S13_E
+    # int64: the expert base offset is pid_e * stride(0), and for V4.1 the
+    # K-major w13/w2 tensors exceed 2^31 bytes (4.53 GB / 2.26 GB), so
+    # `pid_e * W13_E` OVERFLOWS int32. For w2 that wraps negative and faults
+    # (illegal memory access); for w13 it wraps POSITIVE (383*11796480 =
+    # 4,518,051,840 -> 223,084,544), so it silently reads the WRONG expert.
+    # Triton types a Python int arg by its value, so the cast must be here.
+    w_off = pid_e.to(tl.int64) * W13_E
+    s_off = pid_e.to(tl.int64) * S13_E
     mt = 0
     while mt * BM < (end - base):
         g_rows = base + mt * BM + tl.arange(0, BM)
@@ -212,8 +218,14 @@ def _gate_up_kernel(
     if end <= base:
         return
     n = pid_n * BN + tl.arange(0, BN)
-    w_off = pid_e * W13_E
-    s_off = pid_e * S13_E
+    # int64: the expert base offset is pid_e * stride(0), and for V4.1 the
+    # K-major w13/w2 tensors exceed 2^31 bytes (4.53 GB / 2.26 GB), so
+    # `pid_e * W13_E` OVERFLOWS int32. For w2 that wraps negative and faults
+    # (illegal memory access); for w13 it wraps POSITIVE (383*11796480 =
+    # 4,518,051,840 -> 223,084,544), so it silently reads the WRONG expert.
+    # Triton types a Python int arg by its value, so the cast must be here.
+    w_off = pid_e.to(tl.int64) * W13_E
+    s_off = pid_e.to(tl.int64) * S13_E
     mt = 0
     while mt * BM < (end - base):
         g_rows = base + mt * BM + tl.arange(0, BM)
@@ -271,8 +283,10 @@ def _down_kernel(
     if end <= base:
         return
     h = pid_h * BH + tl.arange(0, BH)
-    w_off = pid_e * W2_E
-    s_off = pid_e * S2_E
+    # int64: see _gate_up_kernel -- V4.1's w2 is 2.26 GB, so pid_e * W2_E
+    # overflows int32 and faults at high expert ids.
+    w_off = pid_e.to(tl.int64) * W2_E
+    s_off = pid_e.to(tl.int64) * S2_E
     mt = 0
     while mt * BM < (end - base):
         g_rows = base + mt * BM + tl.arange(0, BM)
@@ -342,8 +356,10 @@ def _down_kernel_split(
     if end <= base:
         return
     h = pid_h * BH + tl.arange(0, BH)
-    w_off = pid_e * W2_E
-    s_off = pid_e * S2_E
+    # int64: see _gate_up_kernel -- V4.1's w2 is 2.26 GB, so pid_e * W2_E
+    # overflows int32 and faults at high expert ids.
+    w_off = pid_e.to(tl.int64) * W2_E
+    s_off = pid_e.to(tl.int64) * S2_E
     mt = 0
     while mt * BM < (end - base):
         g_rows = base + mt * BM + tl.arange(0, BM)
