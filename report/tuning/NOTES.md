@@ -15760,3 +15760,59 @@ mixed_experts.py:690           cfg.use_gpu_prefill = False
 
 **验收**:① 不设常驻时行为/数值与现在一致;② 设 2–3 个 decode 侧层后
 `[cd-timing]` 的 `period` 与 `rest` 应出现**超出噪声**的下降;③ 输出仍正确。
+
+### 418. ✅🔬【新目标·第 2 轮】V4.1 的 GPU 常驻层**已实现并验证生效**;但实测**不提高单发上限**
+
+#### 418.1 实现完成并**证明生效**
+
+`XIAOTU_MOE_GPU_RESIDENT_LAYERS="38,39"` 现在在 V4.1 模块化路径上真正生效:
+
+```
+[vllm-xtu-moe] resident layer keeps host sources: ...layers.38.ffn.experts   (装载期豁免释放)
+[vllm-xtu-moe] resident src probe: w13 shape=(384,4608,2560)
+                stride=(11796480,2560,1) storage=4529848320 contiguous=True
+[vllm-xtu-moe] GPU-resident(V4.1) ...layers.38.ffn.experts: 6.72 GiB on cuda:0
+[vllm-xtu-moe] GPU-resident(V4.1) ...layers.39.ffn.experts: 6.72 GiB on cuda:0
+Application startup complete.
+GPU 占用 22.7 → 33.7 GiB(正好多出 2 × 6.72 GiB)
+```
+
+一路上修掉 5 个真实缺陷(都是我引入或路径缺失的):
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| 1 | V4.1 路径**根本没有**常驻层实现(§417) | 新增 `_is_resident_layer` / `_ensure_resident` + `apply()` 分支 |
+| 2 | kwargs 从左到右求值,`I=self._resident_I` 先于 `slot=...` ⇒ AttributeError | 先建槽位再调用 |
+| 3 | 设备侧做 K-major 触发 `Triton illegal memory access` | 逐字照抄 V4:`_pinned_kmajor` 主机侧转置 + `slot.alloc` + 阻塞 H2D + `busy=None` |
+| 4 | 整段替换误删 `w13/s13/w2/s2` 解析 ⇒ NameError | 补回并加"宿主张量 + storage 足够"校验 |
+| 5 | **装载期 eager 路径把常驻层的源释放成 1 字节空壳**(探针实测) | 释放路径豁免常驻层 |
+
+#### 418.2 但实测**单发上限没有提高**(与 lk-moe 一致)
+
+服务态、真实请求后读取(排除启动段):
+
+| 指标 | 无常驻 | 有常驻(38,39) |
+|---|---|---|
+| `period` / 层 | **0.89 ms** | **0.97–0.98 ms(+9%)** |
+| `compute`(CPU MoE) | 0.37 | 0.36–0.38(略降,符合 2/43) |
+| **`rest`** | **0.52 ms** | **0.60–0.61 ms(+17%)** |
+| 单流 | **27.46 tok/s** | **26.96 tok/s** |
+
+⇒ **把层放 GPU 反而略微变慢**。合理原因:常驻层改用 `gpu_moe_layer`,而 batch=1 时
+GPU 侧那套分组 GEMM 效率低;同时它对 GPU/SM 资源的占用还抬高了其余层的 `rest`。
+
+**这与用户转述的 lk-moe 结论吻合**:"放后 3 层 … **居然变平稳、上限不提高**"。
+即**常驻层的作用是削方差,不是提高单发上限**。
+
+#### 418.3 那么单发的余量在哪里?(本轮最可靠的结论)
+
+* `rest`(0.52 ms/层 ≈ 22 ms/token)**不能靠把层搬上 GPU 消除** —— 已用 2 层常驻实测证伪;
+* `compute`(CPU MoE)0.37 ms/层 ≈ 16 ms/token ⇒ 仅它就对应 **~63 tok/s 的上限**;
+  实测等效带宽 = 101 MiB ÷ 0.37 ms ≈ **273 GB/s**;
+  而带宽账给的上限是 200 GB/s→47 tok/s、400 GB/s→94 tok/s(见 §402.2)
+  ⇒ **CPU 引擎这一侧仍有 ~2× 的空间**,应在那里找余量(而不是 GPU 侧)。
+* 可用手段:`THREADS` 继续上调(现 128,机器有 384 线程)、NUMA 分片利用率、
+  `NSLICE_SMALL` 路径的 N 维切分质量。**这些是下一阶段的调优方向。**
+
+**默认值不变**:`XIAOTU_MOE_GPU_RESIDENT_LAYERS` 默认空 ⇒ 不设时行为与之前**逐字相同**
+(满足"不破坏已有模型"的红线)。
