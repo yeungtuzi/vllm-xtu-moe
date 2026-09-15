@@ -111,6 +111,23 @@ export CUDA_VISIBLE_DEVICES="$GPUS"
 #   THREADS      未设时插件按 n_ccd×5 自动调优,这里钉成 60。
 # 一律写成 "${VAR:-<现值>}":**默认行为逐字不变**,但允许从外部覆盖做 A/B。
 # 调参时配合 report/tuning/NOTES.md §389。
+# ---- 环境变量文件桥 ----------------------------------------------------------
+# 实测:vLLM spawn EngineCore 时会**静默丢弃**部分 XIAOTU_* (THREADS/SPIN_IDLE_US/
+# GPU_RESIDENT_LAYERS/RELEASE_SOURCE 都丢过),于是"设了开关却没生效、且无日志"。
+# 插件在 __init__.py 里会从该文件补齐缺失项(真实环境优先)。见 NOTES §414。
+XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
+{
+  echo "XIAOTU_MOE_THREADS=${XIAOTU_MOE_THREADS:-60}"
+  echo "XIAOTU_MOE_NSLICE_SMALL=${XIAOTU_MOE_NSLICE_SMALL:-0}"
+  echo "XIAOTU_MOE_ASYNC=${XIAOTU_MOE_ASYNC:-0}"
+  echo "XIAOTU_MOE_SPIN_IDLE_US=${XIAOTU_MOE_SPIN_IDLE_US:-5000}"
+  echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-}"
+  echo "XIAOTU_MOE_RESIDENT_BUDGET_GB=${XIAOTU_MOE_RESIDENT_BUDGET_GB:-0}"
+  echo "XIAOTU_RELEASE_SOURCE=${XIAOTU_RELEASE_SOURCE:-1}"
+  for kv in $EXTRA_ENV; do case "$kv" in *=*) echo "$kv";; esac; done
+} > "$XTU_ENV_FILE"
+export XIAOTU_ENV_FILE
+
 nohup env \
   HF_HUB_OFFLINE=1 \
   VLLM_ENGINE_READY_TIMEOUT_S=7200 \
