@@ -15435,3 +15435,51 @@ TypeError: make_mxfp4_moe_kernel() takes from 4 to 5 positional arguments but 8 
   ⇒ **已移除该包装**,只保留 `_setup_kernel` 这一级(28 个 shim,运行正常)。
 * **教训**:探针本身也必须用一次**真实启动**来验证,只做 import 级检查不够;
   并且优先用"类属性替换"这类不会踩"按名导入"坑的方式。
+
+### 410. 🔬【新目标·第 1 轮】9.18 GiB/层的**细分失败**:方法学缺陷(整进程 RssAnon 被并发线程污染)
+
+#### 410.1 探针结果(逐级排除)
+
+```
+[xtu-seg] convert_weight(cpu passthrough): dAnon=+0MiB        ← 转换器不是
+[xtu-seg] experts.__init__:                dAnon=+0MiB        ← 我们的构造函数不是
+[xtu-seg] _build_moe_kernel:               未打印(≤64MiB)     ← 建 kernel 也不是
+[xtu-seg] l#N _setup_kernel:               dAnon=+13770MiB    ← 但它就是 +13.77 GiB
+```
+
+代码层面也逐条否掉了:
+
+* `replace_parameter`(`layer_utils.py:22-41`)在 CPU 直通时走 **fast path**
+  (`type/dtype/storage 大小全同`)→ `update_tensor_inplace`;
+* `update_tensor_inplace`(`:8-17`)在 `dst.data_ptr() == src.data_ptr()` 时**不拷贝**;
+* `shim5` 让 `convert_weight_...` 对 CPU 原样返回;
+* `experts.__init__` 实测 +0。
+
+**⇒ 各部分之和 ≈0,却测出整体 +13.77 GiB —— 这说明我的测法有缺陷,而不是代码有魔法。**
+
+#### 410.2 方法学缺陷(必须记下,避免后人重复)
+
+`/proc/self/status` 的 `RssAnon` 是**整个进程**的口径。而 EngineCore 有 **178 个线程**,
+在 `_setup_kernel` 执行期间**别的线程仍在分配**(权重加载器、Engram 构建、pinned 预建等)。
+⇒ **窄作用域的前后差值会把无关线程的分配算进来**,不能作为该作用域的归属。
+
+之前 `[xtu-diag-split]` 给出的 "upstream +9.18 GiB / our_hook +0" 同样受此影响,
+只是作用域更宽(整层钩子),污染相对小一些,但**也不是干净的归因**。
+
+#### 410.3 仍然可靠的事实(不依赖窄作用域)
+
+| 项 | 值 | 来源 |
+|---|---|---|
+| 进程 RSS(真实权重,运行中) | **863 GiB** | `/proc/<pid>/status` |
+| 引擎分片(40 × 6.33) | **253 GiB** | SHARD-DIAG / 设计 |
+| Engram pinned | **189 GiB** | `engram.py:255` 日志 |
+| 非专家(GPU 侧 + 主机侧) | ~25 GiB | 日志 |
+| **未归因** | **≈396 GiB** | 相减 |
+
+**下一步的正确量法**(不再用整进程差值):
+1. 用 `torch.profiler.profile(profile_memory=True)`(带分配栈)跑一次装载;
+2. 或用 `PYTORCH_CUDA_ALLOC_CONF`/CPU 分配器统计按**分配者**归因;
+3. 或直接看 `/proc/<pid>/smaps` 的 VMA 归属(但匿名堆难以区分分配者)。
+
+**当前决定**:这条线**暂时挂起**(它不是用户当前最关心的),先把精力放到用户点名的
+**性能**上——`perf` 已安装可用,可做 CPU 热点归因。
