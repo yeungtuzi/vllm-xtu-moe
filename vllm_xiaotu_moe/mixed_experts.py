@@ -263,9 +263,78 @@ class _XiaotuExpertsMixin:
         # `Model loading took ...`(v41n2.log:52)出现在第一条 `[SHARD-DIAG]`(:57)
         # **之前**,说明引擎是在 profile run 的第一次 forward 里惰性建的。
         # 所以真正生效的释放点是 `apply()` 里的 `_maybe_release_source`(NOTES §378)。
-        if _release_source_enabled():
-            self._ensure_engine(layer)
+        # 【2026-09-15 cellC】但**也不能无条件在这里提前建**:那样会 SIGSEGV,见
+        # `_eager_build_ok` 的文档。先验证,不满足就退回惰性路径并打印原因。
+        if _release_source_enabled() and self._xiaotu_engine is None:
+            ok, why = self._eager_build_ok(layer)
+            if ok:
+                self._ensure_engine(layer)
+            else:
+                print(
+                    f"[vllm-xtu-moe] deferring engine build to first forward "
+                    f"({getattr(layer, 'layer_name', '?')}): {why}",
+                    flush=True,
+                )
         self._maybe_release_source(layer)
+
+    @staticmethod
+    def _stage_src(layer: torch.nn.Module, nm: str):
+        """取用于建引擎的源张量:优先 shim 在 upstream 钩子**之前**保活的那份。
+
+        原因见 `_eager_build_ok` 与 NOTES §385:pwal 返回后 `layer.w13_weight`
+        可能指向一块临时/已释放的存储,直接读会 SIGSEGV。
+        """
+        snap = getattr(layer, "_xiaotu_pre_pwal_src", None) or {}
+        t = snap.get(nm)
+        return t if isinstance(t, torch.Tensor) else getattr(layer, nm, None)
+
+    def _eager_build_ok(self, layer: torch.nn.Module) -> tuple[bool, str]:
+        """能否在 `process_weights_after_loading` 里**安全**地提前建引擎。
+
+        2026-09-15 cellC 实测:这里直接 `_ensure_engine` 会 **SIGSEGV**,崩在 C++
+        引擎构造函数里的 `shard_fill_w13` memcpy —— 寄存器 `RSI`(源指针)与故障地址
+        **完全相等**(0x7ecc84000000,页对齐),`RDX = 0x2d0000 = 2949120 = cbytes`,
+        即第一次 gate 拷贝就读到不可读内存 ⇒ 那一刻 `layer.w13_weight` 给不出可读的主机指针。
+
+        这也顺带解释了历史上"释放了 0 字节且完全静默":`_release_source_weights` 的
+        `p.device.type != "cpu"` 会直接 `continue` —— **两者是同一个原因**。
+
+        所以先验证再建;不满足就退回惰性路径(在 `apply()` 里建,那里已验证可用)并打印原因。
+        宁可晚一点释放,也不要 segfault。
+        """
+        for nm in ("w13_weight", "w2_weight"):
+            p = self._stage_src(layer, nm)
+            if not isinstance(p, torch.Tensor):
+                return False, f"{nm} is {type(p).__name__}"
+            if p.device.type != "cpu":
+                return False, f"{nm} on device={p.device.type}"
+            if p.numel() == 0:
+                return False, f"{nm} is empty"
+            if not p.is_contiguous():
+                return False, f"{nm} not contiguous"
+            # 子代理指出:cellC 那种坏张量恰好能通过上面所有检查。补两项 ——
+            # (a) 非零 storage_offset 会让"从 data_ptr 起读满 E*stride"越出视图;
+            # (b) 长度必须够引擎按定长步长读满,否则就是读到别人的内存。
+            if p.storage_offset() != 0:
+                return False, f"{nm} storage_offset={p.storage_offset()}"
+        w13 = self._stage_src(layer, "w13_weight")
+        w2 = self._stage_src(layer, "w2_weight")
+        if isinstance(w13, torch.Tensor) and isinstance(w2, torch.Tensor):
+            if w13.dim() != 3 or w2.dim() != 3:
+                return False, f"rank: w13 {w13.dim()}D w2 {w2.dim()}D (want 3D)"
+            e = int(self.moe_config.num_experts)
+            # H/I 必须**从 w13 推导**,再拿去验 w2;若反过来用 w2 的形状推导就是自证。
+            h = int(w13.shape[2]) * 2
+            i = int(w13.shape[1]) // 2
+            need13 = e * 2 * i * (h // 2)
+            need2 = e * h * (i // 2)
+            if int(w13.shape[0]) != e or int(w2.shape[0]) != e:
+                return False, (f"expert dim: w13 {int(w13.shape[0])} w2 "
+                               f"{int(w2.shape[0])} vs E={e}")
+            if int(w13.numel()) < need13 or int(w2.numel()) < need2:
+                return False, (f"short source: w13 {int(w13.numel())}<{need13} or "
+                               f"w2 {int(w2.numel())}<{need2} (E={e} H={h} I={i})")
+        return True, ""
 
     def _maybe_release_source(self, layer: torch.nn.Module) -> int:
         """切分一层、释放一层(env 门控、每层幂等)。
@@ -449,6 +518,31 @@ class _XiaotuExpertsMixin:
         instead of silently computing garbage.
         """
 
+    def _assert_host_source(self, ex_w13, ex_w2) -> None:
+        """引擎只接受**连续、非空、在主机上**的源张量。
+
+        这些指针会被直接交给 C++ 引擎,引擎在里面按 `[E][2I][H/2]` 的定长步长
+        `memcpy`。一旦拿到设备指针/空张量/非连续视图,C++ 侧只会在
+        `shard_fill_w13` 里读到不可读地址然后 **SIGSEGV**(2026-09-15 cellC 实测),
+        没有 Python 栈可看。所以在这里先拦下来,给出可读的错误。
+        """
+        for nm, t in (("w13", ex_w13), ("w2", ex_w2)):
+            if t is None:
+                raise RuntimeError(f"xiaotu {self._engine_attr}: {nm} is None")
+            bad = (
+                t.device.type != "cpu"
+                or t.numel() == 0
+                or not t.is_contiguous()
+            )
+            if bad:
+                raise RuntimeError(
+                    f"xiaotu {self._engine_attr}: refusing to build the engine "
+                    f"from a non-host source ({nm}: device={t.device.type} "
+                    f"numel={t.numel()} contiguous={t.is_contiguous()} "
+                    f"shape={tuple(t.shape)}); handing this to the C++ engine "
+                    f"would segfault in shard_fill_*."
+                )
+
     def _prepare_weights(self, layer) -> None:
         """Resolve the tensors/grouping the engine consumes.
 
@@ -475,9 +569,12 @@ class _XiaotuExpertsMixin:
         import xiaotu_moe
 
         self._prepare_weights(layer)
-        ex_w13 = self._engine_w13 if self._engine_w13 is not None else layer.w13_weight
-        ex_w2 = self._engine_w2 if self._engine_w2 is not None else layer.w2_weight
+        ex_w13 = (self._engine_w13 if self._engine_w13 is not None
+                  else self._stage_src(layer, "w13_weight"))
+        ex_w2 = (self._engine_w2 if self._engine_w2 is not None
+                 else self._stage_src(layer, "w2_weight"))
         self._validate_weights(layer, ex_w13, ex_w2)
+        self._assert_host_source(ex_w13, ex_w2)
         if self._expect_dtype is not None and ex_w13.dtype != self._expect_dtype:
             raise NotImplementedError(
                 f"xiaotu {self._engine_attr} backend expects "

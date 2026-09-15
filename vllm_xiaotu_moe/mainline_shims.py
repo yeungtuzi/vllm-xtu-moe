@@ -145,8 +145,39 @@ def _patch_quant_method_cls(cls) -> list[str]:
             # and OUR hook (Mixin.process_weights_after_loading -> _ensure_engine),
             # so the pinned/shmem growth is attributed to a concrete site.
             b = _host_mem_mib()
+            # 记录 upstream 钩子**前后**的权重指针。若指针变了(或被释放),就证明
+            # "pwal 换掉了/搬走了原始存储",这正好解释 cellC 为什么在 pwal 返回后
+            # 立刻建引擎会 SIGSEGV,而惰性路径(看到的是稳定后的张量)却没事。
+            _pre = {}
+            for _nm in ("w13_weight", "w2_weight"):
+                _t = getattr(layer, _nm, None)
+                if isinstance(_t, torch.Tensor):
+                    _pre[_nm] = (_t.data_ptr(), tuple(_t.shape), _t.storage_offset())
+            if _pre:
+                # 【保活】若 upstream 在 pwal 里换掉/搬走/释放了原始存储,那么 pwal
+                # 返回后 `layer.w13_weight` 可能指向一块临时内存(cellC 的 SIGSEGV
+                # 正是如此)。把**钩子前**的张量引用存下来:既让源保持可读,
+                # 也给 `_ensure_engine` 一个安全的构建来源。
+                layer._xiaotu_pre_pwal_src = {
+                    _nm: getattr(layer, _nm) for _nm in _pre
+                }
             res = pwal(self, layer, *a, **kw)
             m = _host_mem_mib()
+            if _pre and _PWAL_DIAG.get("n", 0) <= 2:
+                for _nm, (_p0, _s0, _o0) in _pre.items():
+                    _t = getattr(layer, _nm, None)
+                    if not isinstance(_t, torch.Tensor):
+                        print(f"[xtu-diag-ptr] {_nm}: {_p0:#x} {_s0} off={_o0} "
+                              f"-> GONE ({type(_t).__name__})", flush=True)
+                        continue
+                    _p1, _s1, _o1 = _t.data_ptr(), tuple(_t.shape), _t.storage_offset()
+                    if (_p0, _s0, _o0) != (_p1, _s1, _o1):
+                        print(f"[xtu-diag-ptr] {_nm}: {_p0:#x} {_s0} off={_o0} "
+                              f"-> {_p1:#x} {_s1} off={_o1}  ** REPLACED by pwal **",
+                              flush=True)
+                    else:
+                        print(f"[xtu-diag-ptr] {_nm}: unchanged {_p1:#x} {_s1} off={_o1}",
+                              flush=True)
             if mixed_mode_enabled():
                 _notify_experts(self, layer)
             a2 = _host_mem_mib()

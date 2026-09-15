@@ -14294,3 +14294,83 @@ env=1            -> True
 `pin_memory=True` 的站点已逐个看过(输出侧、spec-decode、multimodal、lora),
 没有一个是 per-layer GB 级的。下一步靠 cellC 的 `[xtu-diag-split]`
 (`upstream:` vs `our_hook:`)来二分 —— 这也是本轮把它加进去的目的。
+
+### 384. 【v0.4·第 17 轮】已提交 f7cc2bf;两条待办
+
+#### 384.1 已提交:`f7cc2bf`
+
+把**已验证**的紧凑映射与诊断/开关一起提交(详见 commit message)。要点:
+紧凑映射已过数值门且 dense 路径字节不变;释放相关代码全部在开关之后,
+**默认关闭**,所以默认行为不变。诚实标注:释放路径的端到端效果**仍待 cellC**。
+
+#### 384.2 待办 A(必须等 cellC 跑完才能改):`serve_v41.sh` 的 `cd /tmp` 是隐患
+
+脚本第 80 行 `cd /tmp` 之后启动服务 ⇒ **任何留在 `/tmp` 的 `*.py` 都会遮蔽同名模块**
+(aiohttp 的 `import attr` 就被我的 `/tmp/attr.py` 打中,cellA 直接崩)。
+应改成一个专用空目录(如 `$OUTDIR/run`),不要用 `/tmp`。
+**现在不能改**:cellC 正在跑这个脚本,而 bash 是**边读边执行**脚本的,
+运行中修改脚本可能让解释器从错误偏移继续读、执行到垃圾 —— 必须等 cellC 结束。
+
+#### 384.3 待办 B:同类的 `munmap(ptr, 0)`
+
+`moe_v2.hpp` 的 `shard_fill_w13/w2` 回滚路径与 `sock_fill` 共三处把 `munmap` 的
+length 写成 0(== EINVAL,实际不解映射)。只在失败路径触发,平时不显形,但要修。
+
+#### 384.4 cellC 观察点(截至本轮)
+
+`engram=2`(两张表都已 offload)、RSS 427 GB、et≈202 s;`loaddone=0 / diag=0 / released=0 / split=0`。
+上次同配置的 `Model loading took` 在 549 s ⇒ 还需约 6 分钟进到 MoE 层。
+
+### 385. 🎯🎯【v0.4·第 19 轮】cellC 崩了 —— **定位到"提前建引擎"这条路径**,并已加护栏
+
+#### 385.1 崩溃证据(cellC,EngineCore 95872,08:18:48)
+
+```
+[XTSIG] SIGSEGV at faulting address 0x7ecc84000000
+  RIP = libc __memcpy_avx512_unaligned_erms
+  RDX = 0x2d0000 = 2,949,120 = (I/NS)*rowbytes = 1152*2560   -> 分片拷贝
+  RSI = 故障地址 = 0x7ecc84000000            -> **源**指针
+  RDI = 0x7f543d7c9000(目的,页对齐,可写)
+  shard_fill_w13 的 lambda <- shard_region <- MOE_V2<MXFP4Tag>::MOE_V2 <- pybind
+```
+
+* 崩溃发生在**第一层**、`Using XiaotuCPUExpertsMxfp4` 之后;`xtu-diag / xtu-diag-split /
+  released / SHARD-DIAG` **一条都没有**(全为 0)。
+* **紧凑映射被洗清**:故障在**源**侧(`si_addr == RSI`),而紧凑化只改了**目的**偏移
+  (`d + e*2cbytes + {0,cbytes}`);源偏移与改前逐字节相同
+  (`srcx + e*stride + {rs,I+rs}*rowbytes`,长度同为 cbytes)。子代理核过最大源偏移
+  = 4,528,650,240 = `stride*E`(E=384/I=2304/H=5120),正好贴边不越界。
+
+#### 385.2 真正的判别变量:**什么时候建引擎**
+
+| 运行 | RELEASE | 引擎在哪建 | 结果 |
+|---|---|---|---|
+| v41n2 | 0 | 惰性,`apply()` 第一次 forward | ✅ 建成,SHARD-DIAG 正常,到 23 层 |
+| v41n1 | 1 (LOAD=auto) | `process_weights_after_loading` 里 | ❌ **同一个 SIGSEGV**(§374 附注里那次"未隔离"的崩溃) |
+| cellC | 1 (文件开关) | 同上 | ❌ 同签名、同 RDX |
+
+⇒ **在 `pwal` 返回的那一刻,`layer.w13_weight/w2_weight` 的 `data_ptr()` 无法安全读满
+`[E][2I][H/2]`**,尽管它看起来完全正常(device=cpu、numel>0、contiguous)。
+这是一条**从未成功过**的路径,不是本轮引入的回归。
+
+#### 385.3 本轮加的护栏(`mixed_experts.py`)
+
+1. `_eager_build_ok(layer)`:提前建之前先验证 w13/w2 是 tensor、在 cpu、非空、连续;
+   不满足就**退回惰性路径并打印原因**(`deferring engine build to first forward ...`)。
+2. `_assert_host_source(ex_w13, ex_w2)`:在 `_ensure_engine` 里、把指针交给 C++ **之前**
+   再拦一道,把"给 C++ 一个非法源"从 SIGSEGV 变成可读的 `RuntimeError`。
+
+已冒烟验证:good→(True,''),meta/empty/non-contiguous/missing 各自给出正确原因,
+`_assert_host_source` 对非连续张量抛错、对正常张量放行。
+
+#### 385.4 已知不足(子代理指出,重要)
+
+`_assert_host_source` 目前**不检查** `storage_offset()==0`,也**不检查** numel 是否
+≥ 期望的 `E*2*I*(H/2)` / `E*H*(I/2)`。而 cellC 的那种坏张量恰好能通过现有检查
+(device=cpu、numel>0、contiguous)⇒ **护栏可能拦不住它**。
+下一步要么补上这两项,要么直接**禁用提前建**、只走已验证可用的惰性路径。
+
+#### 385.5 关于 +12.75 GiB/层 pinned 的 A/B
+
+**暂时做不了**:cellB 与 cellC 都没能走到"引擎已存在"的那一刻,
+`[xtu-diag-split]` 的 `our_hook:` 半段因此从未被采样。要先让"在 pwal 时刻建引擎"不再 fault。
