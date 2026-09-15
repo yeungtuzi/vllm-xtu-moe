@@ -14623,3 +14623,40 @@ DEVICE-LOADING SHIM OK
 2. 若装载期能建引擎,`SHARD-DIAG` 与 `released` 应首次同时出现 ⇒ 内存 A/B 才真正可做。
 3. 再跑 V4 回归(数值门 `1.873e-02` + 确定性),确认这个新 shim 没有破坏 V4
    (它对未标记参数是逐字等价的,理论上无影响,但要有实测)。
+
+### 391. 🎉🎉🎉【v0.4·第 30 轮】**shim 修复端到端见效**:pinned 增长归零、释放首次真正生效、GPU OOM 消失
+
+同一条件对比(`LOAD=dummy`,`GPU_UTIL=0.60`,NPS=1):
+
+| 指标 | cellH(**无** shim) | **cellI(有 shim)** |
+|---|---|---|
+| GPU OOM | ❌ `p.data.to(target_device)` 抛 OOM | ✅ **`OOM=0`** |
+| `XTSIG` | 0 | 0 |
+| `deferring`(护栏推迟) | 8 | **0**(权重终于在 CPU 上,护栏放行) |
+| `released N GiB` | 0 | ✅ **8 次,每次 6.59 GiB**(= w13 4.22 + w2 2.11 + scales 0.26) |
+| `release found NOTHING` | 3 | **0** |
+| GPU0 占用 | 36.0 GiB(然后 OOM) | **13.2 GiB** |
+
+#### 391.1 最关键的一条:`RssShmem` **不再每层 +12.75 GiB**
+
+`[xtu-diag]` 曲线(每 8 层一条):
+
+| | 层 #1 | 层 #8 | 变化 |
+|---|---|---|---|
+| `RssShmem` | 270354 MiB | **270368 MiB** | **+14 MiB(基本持平)** |
+| `RssAnon` | 289907 MiB | 384407 MiB | +94.5 GiB |
+
+对比 cellE/xtm1(修复前):`RssShmem` 每层 **+12.75 GiB**、`RssAnon` 每层 −6.72 GiB。
+⇒ **那 ~340 GiB 的 pinned 地板(§379 的 `/dev/zero (deleted)`)被彻底去掉**,
+这正是"专家经 GPU 中转 + `pin_memory` 搬回"造成的,根因一旦切断,增长即归零。
+
+`RssAnon` 的增长(+13.5 GiB/层)现在是**引擎自己的分片副本**(预期内,本来就该是这一份),
+而源张量在同一层里被 `released` 放掉 —— 这就是"切分一层、释放一层"终于**真正跑起来**了。
+
+#### 391.2 仍未完成的观察
+
+* `[xtu-diag]` 现在报 `layer_src=0.00GiB / cum_src=0.0GiB`,而同一层的 `released` 却是 6.59 GiB
+  ⇒ 说明探针取张量的**时刻/对象**与释放路径不一致。**不影响上面的结论**(释放路径自己算出的字节数是硬的),
+  但探针要修,否则以后会误判。
+* 装载尚未结束(`loaddone=0`,RSS 657 GB,MemFree 458 GB,仍在进行)。**未验证**:能否走到 40/40 引擎
+  与 `Application startup complete`,以及真实请求能否出数。
