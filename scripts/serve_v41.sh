@@ -92,6 +92,7 @@ nohup env \
     --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs 1 \
     --gpu-memory-utilization "$GPU_UTIL" --enforce-eager --trust-remote-code \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
+    --kernel-config '{"enable_jit_warmup": false}' \
     --port "$PORT" > "$LOG" 2>&1 &
 echo $! > "$OUTDIR/$TAG.pid"
 echo "[v41] pid=$(cat "$OUTDIR/$TAG.pid")"
