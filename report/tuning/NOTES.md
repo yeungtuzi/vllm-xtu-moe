@@ -14706,3 +14706,56 @@ w2 : shape=(384,5120,1152) ndim=3 storage=1B
 2. 是否出现 `Application startup complete`;
 3. 若起来了 —— 发一个真实请求,确认**端到端出数**(这才算目标的第一步达成);
 4. 之后才是内存/性能 A/B(`ASYNC` 等,见 §389)。
+
+### 393. 【v0.4·第 31 轮】cellJ:装载 40/40 通过、KV cache 也分配了,但**卡死在第一次 forward 之前**
+
+#### 393.1 cellJ 成绩单(又前进了两大步)
+
+```
+XTSIG=0  defer=0  rel=40  loaddone=1  OOM=0  assert=0
+Model loading took 11.28 GiB memory and 647.1 seconds
+Available KV cache memory: 9.31 GiB
+GPU KV cache size: 315,007 tokens  (最大并发 307.62 @1024 tokens)
+[indexer.py:804] DSA indexer decode path: use_flattening=False supports_varlen=False
+```
+
+* ✅ **`empty_strided` 修复生效**:`moe_problem_size` 的 `len(w.shape)==3` 断言**不再触发**(`assert=0`),
+  而这正是 cellI 挂掉的地方。
+* ✅ **KV cache 也成功分配**(cellI 连这一步都没到)。
+* ❌ 随后**冻结**:日志停在 `indexer.py:804`(09:57:16),之后 6 分半钟**一行都没有**。
+
+#### 393.2 冻结时的现场(诊断要点)
+
+| 观测 | 值 |
+|---|---|
+| 主线程状态 | **`D`(uninterruptible sleep)**,`wchan = rwsem_down_write_slowpath` |
+| 线程分布 | **1 个 D + 103 个 S**(不是全局死锁的样子) |
+| CPU 进展 | utime 仅 **+7 ticks / 8 s**(≈0.07 s/8 s)⇒ **不是算力瓶颈** |
+| GPU | **利用率 0%**,占用 24 GiB ⇒ GPU 没在干活 |
+| 内存压力 | `PSI memory some avg10=0.00`、MemFree 38 GiB ⇒ **不是内存回收卡住** |
+| 进程内存 | RssAnon **812 GiB** + RssShmem 265 GiB = RSS **1076 GB**,104 线程 |
+
+`rwsem_down_write_slowpath` 是**写者等待读改写信号量**,典型是 `mmap_lock`(或文件系统 rwsem):
+主线程想拿写锁(做 mmap/munmap/fork 之类),而某个持读锁的线程没有放。
+
+#### 393.3 可疑点排序(下一轮按序验证)
+
+1. **`XIAOTU_MOE_ASYNC=0`**(我们脚本里钉的值;引擎**默认是 1**)。
+   冻结点正好在"KV cache 就绪、即将进入第一次 forward(profile run)"之前,
+   而 `=0` 会走 `cudaLaunchHostFunc` 握手路径。该路径在**启动期**可能从未被验证过。
+   ⇒ 用 `XIAOTU_MOE_ASYNC=1` 试(顺便也验证 §389 的性能改动)。
+2. **释放造成的地址空间/分配器状态**:`rel=40` 放掉 264 GiB,但 RSS 仍有 1076 GB
+   (预期约 467 GB)⇒ 约 600 GB 可能是**已释放但未归还 OS** 的分配器内存(glibc arena)。
+   大量 munmap/trim 会在 mmap_lock 上排队。⇒ 可在释放后调用 `malloc_trim(0)`。
+3. **引擎 104 线程池**(`XIAOTU_MOE_THREADS=60` ⇒ 104 线程)在启动期与主线程争锁。
+   ⇒ 用 `XIAOTU_MOE_THREADS=8` 做对照。
+
+更细的诊断(需 root 或额外工具):`/proc/<tid>/stack`、`py-spy dump --pid`、
+`cat /proc/<tid>/syscall`。
+
+#### 393.4 本轮结论(诚实边界)
+
+* **已达成**:V4.1 在 NPS=1 下**能装载完 40 层**、**能释放全部源张量**、**能分配 KV cache**、
+  全程无 GPU OOM、无 SIGSEGV、无形状断言。
+* **未达成**:走不到 `Application startup complete`,因此**还没有端到端出数**;
+  新的唯一阻塞点是这个 `rwsem` 冻结。
