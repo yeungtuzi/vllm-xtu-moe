@@ -1075,7 +1075,9 @@ class _XiaotuExpertsMixin:
         # 若是长 prefill 就走 GPU、不建引擎;而紧接着的解码步(qlen < 阈值)会把引擎
         # 建起来 —— 那一刻若把源权重释放掉,下一次长 prefill 就没得流式读了。
         # 所以只要这个模块启用了 GPU prefill,就**永不释放**源权重。
-        engine = None if (_resident or _gpu_pf) else self._ensure_engine(layer)
+        # 引擎**始终**要建(非常驻层):GPU 流式路径读的就是引擎自有的紧凑分片
+        # (NOTES §459),而且解码步无论如何都需要它。
+        engine = None if _resident else self._ensure_engine(layer)
         if not _resident and not _gp_on:
             # 惰性建引擎的这一刻,主机源张量已经没有任何消费者了 —— 立即释放。
             # 这是 V4.1(模块化路径)上唯一真正会执行的释放点,见 NOTES §378。
@@ -1145,51 +1147,79 @@ class _XiaotuExpertsMixin:
             )
         elif _gpu_pf:
             # ---- 长 prefill:本层专家在 GPU 上算(逐层流式权重) ----------------
-            # slot=None ⇒ 同步 H2D + 设备侧 K-major 转置。`_pinned` 是**就地**
-            # cudaHostRegister(不复制),转置在设备上做 ⇒ 不产生累积的 pinned 驻留,
-            # 代价是 H2D 不能与计算重叠(~400 ms/层 vs 重叠后的 ~270)。
-            from vllm_xiaotu_moe.gpu_prefill import gpu_moe_layer
-
-            self._prepare_weights(layer)
-            w13h = getattr(self, "_engine_w13", None)
-            if w13h is None:
-                w13h = layer.w13_weight
-            w2h = getattr(self, "_engine_w2", None)
-            if w2h is None:
-                w2h = layer.w2_weight
-            s13h, s2h = self._scales
-            if s13h is None:
-                s13h = self._find_scale(layer, (self._scale_attrs[0],))
-            if s2h is None:
-                s2h = self._find_scale(layer, (self._scale_attrs[1],))
-            for _nm, _t in (("w13", w13h), ("w2", w2h), ("s13", s13h), ("s2", s2h)):
-                if not isinstance(_t, torch.Tensor):
-                    raise RuntimeError(
-                        f"xiaotu gpu-prefill needs a host tensor for {_nm}; got "
-                        f"{type(_t).__name__}"
-                    )
-                # 同常驻层:必须确认源 storage 没被 XIAOTU_RELEASE_SOURCE 换成
-                # 1 字节空壳,否则会拿垃圾数据算(这里会**静默算错**,比崩更糟)。
-                _need = _t.numel() * _t.element_size()
-                _have = _t.untyped_storage().nbytes()
-                if _have < _need:
-                    raise RuntimeError(
-                        f"xiaotu gpu-prefill {_nm} has a released/undersized storage "
-                        f"(need {_need} bytes, storage {_have} bytes, "
-                        f"shape={tuple(_t.shape)}); XIAOTU_RELEASE_SOURCE must be 0 "
-                        "when VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS is enabled"
-                    )
-            out = gpu_moe_layer(
-                h_bf16, ids_i32, wts_f32, w13h, s13h, w2h, s2h,
-                H=hidden_size, I=int(w13h.shape[1]) // 2,
-                K=int(self.moe_config.experts_per_token),
-                device=h_bf16.device, slot=None,
+            # 权重来源优先用**引擎自有的紧凑分片**(NOTES §459):这些分片合起来正好
+            # 是一份完整拷贝,所以 GPU 流式在 XIAOTU_RELEASE_SOURCE=1 下也能工作,
+            # 主机专家内存 522 -> 253 GiB(实测保留源张量会让 EngineCore 在加载完成前
+            # 就到 1073 GB、每 node 只剩 ~3 GB)。分片不存在(如 NOSHARD)时才退回源张量。
+            from vllm_xiaotu_moe.gpu_prefill import (
+                PrefetchSlot,
+                gpu_moe_layer,
+                kmajor_from_engine_shards,
             )
+
+            # 需要的只有形状:E/H/I。源张量可能已被释放,所以优先用释放时记下的形状。
+            _shp = getattr(self, "_released_shapes", {}).get("w2_weight")
+            if _shp is None:
+                _w2live = getattr(self, "_engine_w2", None)
+                if _w2live is None:
+                    _w2live = layer.w2_weight
+                _shp = tuple(_w2live.shape)
+            _E, _I = int(_shp[0]), 2 * int(_shp[2])
+            _dev = h_bf16.device
+            _km = kmajor_from_engine_shards(
+                engine, _dev, hidden_size, _I, _E, int(self._group_k)
+            )
+            if _km is not None:
+                _slot = PrefetchSlot()
+                _slot.bufs = _km
+                _slot.ready = torch.cuda.Event()
+                _slot.ready.record(torch.cuda.current_stream(_dev))
+                out = gpu_moe_layer(
+                    h_bf16, ids_i32, wts_f32, _km[0], _km[1], _km[2], _km[3],
+                    H=hidden_size, I=_I,
+                    K=int(self.moe_config.experts_per_token),
+                    device=_dev, slot=_slot,
+                )
+            else:
+                # 退回源张量(需要源没被释放——`_gp_on` 已保证这一点)。
+                self._prepare_weights(layer)
+                w13h = getattr(self, "_engine_w13", None)
+                if w13h is None:
+                    w13h = layer.w13_weight
+                w2h = getattr(self, "_engine_w2", None)
+                if w2h is None:
+                    w2h = layer.w2_weight
+                s13h, s2h = self._scales
+                if s13h is None:
+                    s13h = self._find_scale(layer, (self._scale_attrs[0],))
+                if s2h is None:
+                    s2h = self._find_scale(layer, (self._scale_attrs[1],))
+                for _nm, _t in (("w13", w13h), ("w2", w2h), ("s13", s13h), ("s2", s2h)):
+                    if not isinstance(_t, torch.Tensor):
+                        raise RuntimeError(
+                            f"xiaotu gpu-prefill needs a host tensor for {_nm}; got "
+                            f"{type(_t).__name__}"
+                        )
+                    _need = _t.numel() * _t.element_size()
+                    _have = _t.untyped_storage().nbytes()
+                    if _have < _need:
+                        raise RuntimeError(
+                            f"xiaotu gpu-prefill {_nm} has a released/undersized storage "
+                            f"(need {_need} bytes, storage {_have} bytes, "
+                            f"shape={tuple(_t.shape)})"
+                        )
+                out = gpu_moe_layer(
+                    h_bf16, ids_i32, wts_f32, w13h, s13h, w2h, s2h,
+                    H=hidden_size, I=int(w13h.shape[1]) // 2,
+                    K=int(self.moe_config.experts_per_token),
+                    device=_dev, slot=None,
+                )
             if not getattr(self, "_gpu_pf_dbg", False):
                 self._gpu_pf_dbg = True
                 print(
-                    f"[vllm-xtu-moe] GPU prefill ACTIVE: first layer={qlen} tokens "
-                    f">= threshold {_gp_min} -> layer MoE on GPU (streaming fp4)",
+                    f"[vllm-xtu-moe] GPU prefill ACTIVE: first {qlen} tokens >= "
+                    f"threshold {_gp_min}; weights from "
+                    f"{'engine shards' if _km is not None else 'checkpoint source'}",
                     flush=True,
                 )
         else:

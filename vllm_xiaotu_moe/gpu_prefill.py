@@ -696,6 +696,80 @@ def _pinned_kmajor(t: torch.Tensor) -> torch.Tensor:
     return _ensure_pinned(key, ent)
 
 
+def _dma_hostbuf(engine, which: int, node: int, nbytes: int, device) -> torch.Tensor:
+    """DMA one of the ENGINE's own host buffers to a fresh device tensor."""
+    if nbytes <= 0:
+        raise RuntimeError(f"gpu-prefill: engine buffer which={which} node={node} is empty")
+    t = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    stream = torch.cuda.current_stream(device).cuda_stream
+    got = engine.copy_hostbuf_to_device(int(which), int(node), t.data_ptr(), stream)
+    if int(got) != int(nbytes):
+        raise RuntimeError(
+            f"gpu-prefill: shard DMA failed (which={which} node={node}: "
+            f"copied {got}/{nbytes} bytes)"
+        )
+    return t
+
+
+def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
+                              n_experts: int, group_k: int):
+    """K-major device weights built from the engine's OWN host buffers.
+
+    WHY (report/tuning/NOTES.md §459): the GPU prefill path used to stream the
+    checkpoint source tensors, which forced ``XIAOTU_RELEASE_SOURCE=0`` and cost an
+    extra ~269 GiB of host memory (measured: EngineCore hit 1073 GB RSS before
+    finishing the load, with ~3 GB free per NUMA node). But the engine already owns
+    a complete copy of the expert weights -- as per-NUMA-node *compact* shards that
+    together are exactly one dense copy, laid out per expert as
+    ``[gate cbytes][up cbytes]`` with node n holding gate rows
+    ``[n*crows,(n+1)*crows)`` and up rows ``[I+n*crows, I+(n+1)*crows)``
+    (see ``shard_fill_w13``/``shard_fill_w2``) -- plus its own copy of the scales.
+
+    So we DMA those and reassemble the canonical layout on the DEVICE. The
+    reassembly is just ``view``+``cat``: node n's gate block IS the contiguous row
+    range ``[n*crows,(n+1)*crows)`` of the canonical ``[E, I, H/2]`` gate matrix,
+    so concatenating the nodes along dim 1 reproduces it exactly.
+
+    Returns ``(w13_t, s13_t, w2_t, s2_t)`` already K-major (ready for a
+    ``PrefetchSlot``), or ``None`` when the engine has no shards (e.g. NOSHARD) --
+    the caller then falls back to the source tensors.
+    """
+    geo = engine.shard_geometry()
+    ns = int(geo["ns"])
+    if ns < 2 or not geo["w13_node_bytes"] or not geo["w2_node_bytes"]:
+        return None
+    H, I, E = int(hidden), int(inter), int(n_experts)
+    rb13 = H // 2
+    rb2 = I // 2
+
+    gate_parts, up_parts = [], []
+    for n in range(ns):
+        buf = _dma_hostbuf(engine, 0, n, int(geo["w13_node_bytes"]), device)
+        # per expert: [gate cbytes][up cbytes]
+        blk = buf.view(E, 2, int(geo["w13_cbytes"]))
+        crows = int(geo["w13_crows"])
+        gate_parts.append(blk[:, 0, :].reshape(E, crows, rb13))
+        up_parts.append(blk[:, 1, :].reshape(E, crows, rb13))
+    w13_raw = torch.cat(
+        [torch.cat(gate_parts, dim=1), torch.cat(up_parts, dim=1)], dim=1
+    )                                                     # [E, 2I, H/2]
+
+    w2_parts = []
+    for n in range(ns):
+        buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
+        w2_parts.append(buf.view(E, int(geo["w2_crows"]), rb2))
+    w2_raw = torch.cat(w2_parts, dim=1)                    # [E, H, I/2]
+
+    gk = int(group_k) if int(group_k) > 0 else 1
+    s13_raw = _dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device) \
+        .view(E, 2 * I, H // gk)
+    s2_raw = _dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device) \
+        .view(E, H, I // gk)
+
+    return (_kmajor_bytes(w13_raw), _kmajor_bytes(s13_raw),
+            _kmajor_bytes(w2_raw), _kmajor_bytes(s2_raw))
+
+
 def prebuild_pinned_kmajor(tensors: list, workers: int = 6) -> None:
     """两阶段预建 K-major 缓存(见 report/tuning/TRIED_AND_REVERTED.md R4)。
 
