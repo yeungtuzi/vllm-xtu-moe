@@ -15215,3 +15215,40 @@ if constexpr (wt::kNSliceSmallM) {
 **下一跑(已起)**:在"当前最优配置"(`ASYNC=0/THREADS=128/NSLICE=1/SPIN=300/MAXSEQS=1`)上
 叠加 `XIAOTU_CD_TIMING=1` 与 `XIAOTU_MOE_PROFILE=1`,发一个 64-token 请求,
 直接读出**每层各段耗时**,把 1.9 ms/层拆开。
+
+### 405. 🎯🎯🎯【v0.4·第 37 轮·续】**决定性拆解:瓶颈不在 CPU 引擎,而是"rest"占 69%**
+
+带 `XIAOTU_CD_TIMING=1` + `XIAOTU_MOE_PROFILE=1` 跑真实权重(cellT,
+`ASYNC=0/THREADS=128/NSLICE=1/SPIN=300/MAXSEQS=1`),实测(稳定多行一致):
+
+```
+[cd-timing] layers=43 qlen=1 k=6 period=1.84ms compute=0.56ms(engine=0.56 ep=0.00)
+                                      rest=1.27ms   (compute 31%, rest 69%)
+[NS-PROF] bucket=M<=2 calls=5 na=6.0 | per-call(us): setup=32 A=347 B=164 C=15 ovh=0 TOTAL=558
+```
+
+| 项 | 每层 | 占 43 层 |
+|---|---|---|
+| **period(整层)** | **1.84 ms** | **79 ms/token** ⇒ 与实测 13 tok/s 完全吻合 |
+| **compute(我们的 CPU MoE 引擎)** | **0.56 ms** | **24 ms/token(≈41 tok/s 的水平)** |
+| ├ setup / A / B / C | 32 / 347 / 164 / 15 µs | — |
+| ├ ep(专家并行通信) | 0.00 ms | — |
+| **rest(其余:GPU 侧 + 层间同步)** | **1.27 ms** | **55 ms/token(真正的瓶颈)** |
+
+#### 405.1 结论(推翻"引擎慢"的默认假设)
+
+* **我们的 CPU 专家引擎并不慢**:每层 0.56 ms,单独看等效 ≈41 tok/s;
+* **真正吃掉 69% 的是 "rest"** —— GPU 侧的注意力/其余算子,以及每层的 CPU↔GPU 交接;
+* 43 层 × 1.27 ms = 55 ms/token 的"rest"是我们与带宽上限之间那道 13→47+ tok/s 的墙;
+* 这解释了为什么**调 CPU 侧旋钮(THREADS/NSLICE/SPIN)累计只有 +7%**:它们只影响那 31%。
+
+#### 405.2 头号嫌疑:`--enforce-eager`(关闭 CUDA graph)
+
+`serve_v41.sh` 里写死 `--enforce-eager`。在 **batch=1 解码**下 GPU 算子极小,
+kernel 启动开销(~数微秒到数十微秒)会被 **43 层 × 每层多个算子**放大;
+而 `--enforce-eager` 正是**禁止 CUDA graph 捕获**、让每个算子都单独启动的开关。
+1.27 ms/层 与这个量级相符。
+
+⇒ **下一跑:去掉 `--enforce-eager`(用 CUDA graph)**。
+注意插件历史记录(TRIED_AND_REVERTED R4)提到"捕获期间调用 cudaHostRegister 会作废捕获",
+所以若报错/挂起,要回退并记录 —— 不能盲目认定它一定可用。
