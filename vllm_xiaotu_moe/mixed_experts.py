@@ -288,6 +288,15 @@ class _XiaotuExpertsMixin:
         # 所以真正生效的释放点是 `apply()` 里的 `_maybe_release_source`(NOTES §378)。
         # 【2026-09-15 cellC】但**也不能无条件在这里提前建**:那样会 SIGSEGV,见
         # `_eager_build_ok` 的文档。先验证,不满足就退回惰性路径并打印原因。
+        if self._is_resident_layer(layer):
+            # 常驻层:不建 CPU 引擎、不释放源(见 _maybe_release_source 的注释)。
+            print(
+                f"[vllm-xtu-moe] resident layer keeps host sources: "
+                f"{getattr(layer, 'layer_name', '?')}",
+                flush=True,
+            )
+            self._src_released = True
+            return
         if _release_source_enabled() and self._xiaotu_engine is None:
             ok, why = self._eager_build_ok(layer)
             if ok:
@@ -373,6 +382,12 @@ class _XiaotuExpertsMixin:
         if not _release_source_enabled():
             return 0
         if getattr(self, "_src_released", False):
+            return 0
+        # ⚠️ **常驻层绝不能释放**:它的权重还要被一次性搬到 GPU 常驻(NOTES §418)。
+        # 实测踩过:装载期的 eager 路径不知道常驻层的存在,把 layers.38/39 的源张量
+        # 换成了 1 字节 `empty_strided` 空壳 ⇒ 常驻槽位拿到垃圾/直接报错。
+        if self._is_resident_layer(layer):
+            self._src_released = True          # 标记已处理,避免反复判
             return 0
         self._src_released = True
         return self._release_source_weights(layer)
