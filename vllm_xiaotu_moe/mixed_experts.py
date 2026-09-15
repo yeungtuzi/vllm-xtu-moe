@@ -121,6 +121,7 @@ def _host_mib() -> dict:
     return out
 
 
+_LAYER_IDX_RE = __import__("re").compile(r"layers\.(\d+)\.")
 _RELEASE_MISSES = 0   # 见 _release_source_weights:静默失败的可观测性
 _RELEASE_FILE = "/tmp/xiaotu_release_source"
 
@@ -607,6 +608,70 @@ class _XiaotuExpertsMixin:
                 return t
         return None
 
+    # ---- GPU 常驻层(V4.1 模块化路径;NOTES §417)---------------------------
+    def _is_resident_layer(self, layer: torch.nn.Module) -> bool:
+        """本层是否在 `XIAOTU_MOE_GPU_RESIDENT_LAYERS` 里。
+
+        ⚠️ 这条功能原先只存在于 `hybrid_model.py`(DeepSeek-**V4** 的 OOT 路径),
+        V4.1 走的模块化路径**根本没有实现** —— 这正是 §414/§416 两轮排查的收敛点。
+        默认空集合 ⇒ 恒为 False ⇒ 非常驻路径逐字不变。
+        """
+        try:
+            from vllm_xiaotu_moe.hybrid_model import gpu_resident_layers
+
+            spec = gpu_resident_layers()
+            if not spec:
+                return False
+            m = _LAYER_IDX_RE.search(getattr(layer, "layer_name", "") or "")
+            return bool(m) and int(m.group(1)) in spec
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _ensure_resident(self, layer: torch.nn.Module):
+        """把本层权重**一次性**搬到 GPU 并转成 K-major,做成常驻槽位。
+
+        复用 `gpu_prefill.gpu_moe_layer` 的 `slot=` 接口(它已处理 CUDA graph 捕获:
+        常驻槽位的 ready 事件在**捕获外** record,图内不 wait_event)。常驻之后这些层
+        **不再走 CPU 引擎**,因此贡献 0 往返、0 DRAM 权重流量。
+        """
+        if getattr(self, "_resident_slot", None) is not None:
+            return self._resident_slot
+        from vllm_xiaotu_moe.gpu_prefill import PrefetchSlot, _kmajor_bytes
+
+        self._prepare_weights(layer)
+        w13 = self._engine_w13 if self._engine_w13 is not None else layer.w13_weight
+        w2 = self._engine_w2 if self._engine_w2 is not None else layer.w2_weight
+        s13, s2 = self._scales
+        if s13 is None:
+            s13 = self._find_scale(layer, (self._scale_attrs[0],))
+        if s2 is None:
+            s2 = self._find_scale(layer, (self._scale_attrs[1],))
+        dev = torch.device("cuda", torch.cuda.current_device())
+        bufs = (
+            _kmajor_bytes(w13.to(dev, non_blocking=True)),
+            _kmajor_bytes(s13.to(dev, non_blocking=True)),
+            _kmajor_bytes(w2.to(dev, non_blocking=True)),
+            _kmajor_bytes(s2.to(dev, non_blocking=True)),
+        )
+        torch.cuda.synchronize()
+        slot = PrefetchSlot()
+        slot.bufs = bufs
+        slot.ready = torch.cuda.Event()
+        slot.ready.record()
+        slot.busy = torch.cuda.Event()
+        slot.busy.record()
+        slot.t0 = slot.t1 = None
+        self._resident_slot = slot
+        self._resident_keep = (w13, w2, s13, s2)     # 保活,别让它们被回收
+        self._resident_I = int(w13.shape[1]) // 2      # intermediate_size
+        nbytes = sum(t.numel() * t.element_size() for t in bufs)
+        print(
+            f"[vllm-xtu-moe] GPU-resident(V4.1) {getattr(layer, 'layer_name', '?')}: "
+            f"{nbytes / 2**30:.2f} GiB on {dev}",
+            flush=True,
+        )
+        return slot
+
     def _ensure_engine(self, layer: torch.nn.Module):
         if self._xiaotu_engine is not None:
             return self._xiaotu_engine
@@ -932,10 +997,13 @@ class _XiaotuExpertsMixin:
             raise RuntimeError(
                 "XiaotuCPUExperts.apply called before process_weights_after_loading"
             )
-        engine = self._ensure_engine(layer)
-        # 惰性建引擎的这一刻,主机源张量已经没有任何消费者了 —— 立即释放。
-        # 这是 V4.1(模块化路径)上唯一真正会执行的释放点,见 NOTES §378。
-        self._maybe_release_source(layer)
+        # GPU 常驻层:不建 CPU 引擎、也不释放源张量(它还要被常驻槽位用)。
+        _resident = self._is_resident_layer(layer)
+        engine = None if _resident else self._ensure_engine(layer)
+        if not _resident:
+            # 惰性建引擎的这一刻,主机源张量已经没有任何消费者了 —— 立即释放。
+            # 这是 V4.1(模块化路径)上唯一真正会执行的释放点,见 NOTES §378。
+            self._maybe_release_source(layer)
         qlen = hidden_states.size(0)
         # Use the tensor the ENGINE was built from: for formats whose checkpoint
         # layout differs (INT4/WNA16), the `w2` argument is the raw packed tensor
@@ -983,11 +1051,26 @@ class _XiaotuExpertsMixin:
         _is_first = ".0." in getattr(layer, "layer_name", "")
         if _sync == "1" or (_sync == "pre") or (_sync == "first" and _is_first):
             torch.cuda.synchronize()
-        engine.cpu_decode(
-            stream.cuda_stream, qlen, self.moe_config.experts_per_token,
-            h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
-            out.data_ptr(),
-        )
+        if _resident:
+            # 常驻层:整层 MoE 在 GPU 上算(权重已在 GPU 且已转 K-major,无 H2D)。
+            from vllm_xiaotu_moe.gpu_prefill import gpu_moe_layer
+
+            out = gpu_moe_layer(
+                h_bf16, ids_i32, wts_f32,
+                self._engine_w13 if self._engine_w13 is not None else layer.w13_weight,
+                None,
+                self._engine_w2 if self._engine_w2 is not None else layer.w2_weight,
+                None,
+                H=hidden_size, I=self._resident_I,
+                K=int(self.moe_config.experts_per_token),
+                device=h_bf16.device, slot=self._ensure_resident(layer),
+            )
+        else:
+            engine.cpu_decode(
+                stream.cuda_stream, qlen, self.moe_config.experts_per_token,
+                h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
+                out.data_ptr(),
+            )
         if _sync == "post":
             torch.cuda.synchronize()
         if _HID_LAYER and _HID_LAYER in getattr(layer, "layer_name", ""):
