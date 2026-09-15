@@ -27,7 +27,15 @@ def _xtu_load_env_file() -> int:
                     continue
                 k, v = line.split("=", 1)
                 k = k.strip()
-                if k and k not in _os.environ:      # 真实环境优先
+                if k:
+                    # ⚠️ **以文件为准(覆盖)**,不是 setdefault。
+                    # 原因:EngineCore 的 environ 是被**重建**的(实测 2711 条 vs launcher 76 条),
+                    # 重建时**只保留它认识的名字** —— 于是"已经在环境里"的变量反而会被丢掉,
+                    # 而"由本桥新增"的变量能被保留(实测 XIAOTU_MOE_RESIDENT_BUDGET_GB 存活,
+                    # 而 XIAOTU_MOE_THREADS/_SPIN_IDLE_US/_GPU_RESIDENT_LAYERS 全被丢)。
+                    # 文件由 serve_v41.sh 用同一份环境写成,所以覆盖不会引入不一致。
+                    # 注意:非 serve_v41.sh 启动时若 /tmp/xiaotu_env 是陈旧的,会被它覆盖 ——
+                    # 所以该脚本每次启动都会重写此文件。
                     _os.environ[k] = v.strip()
                     n += 1
     except OSError:
