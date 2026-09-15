@@ -686,7 +686,21 @@ class CpuXiaotuMoE(nn.Module):
                     )
             else:
                 self._gpu_resident = _li in gpu_resident_layers()
-        except Exception:
+                # 【诊断】一次性看清"常驻层为什么没生效":打印解析到的层号、prefix
+                # 与集合。XIAOTU_RESIDENT_DIAG=1 才开(避免刷屏)。
+                if os.environ.get("XIAOTU_RESIDENT_DIAG") == "1":
+                    _G = globals().setdefault("_RESIDENT_DIAG_N", [0])
+                    if _G[0] < 6 or self._gpu_resident:
+                        print(
+                            f"[xtu-resident] idx={_li} prefix={prefix} "
+                            f"set={sorted(gpu_resident_layers())} "
+                            f"resident={self._gpu_resident}",
+                            flush=True,
+                        )
+                    _G[0] += 1
+        except Exception as _e:
+            if os.environ.get("XIAOTU_RESIDENT_DIAG") == "1":
+                print(f"[xtu-resident] EXCEPTION {type(_e).__name__}: {_e}", flush=True)
             self._gpu_resident = False
         self._resident_slot = None
         # ---- expert parallelism state (see ep_enabled()) ----
