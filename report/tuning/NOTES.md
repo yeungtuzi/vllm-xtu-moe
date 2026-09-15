@@ -15086,3 +15086,62 @@ N-slice 小批量路径正是为小 batch 设计的;等 `max_num_seqs` 提上去
   2. 本机真实权重单流 ≈**13 tok/s** vs lk-moe ≈**50 tok/s** —— 差距要拆解
      (GPU/引擎/内存带宽/是否放显存),这是性能主线的下一个大目标;
   3. 那两条假设可以作为本机的候选实验方向,但**受内存带宽限制"这一条在本机条件不同,不可照搬**。
+
+### 402. 🎯🎯🎯【v0.4·第 37 轮·续】**我们远未到带宽上限 ⇒ 13 tok/s 是"开销受限",不是正常水平**
+
+#### 402.1 用户给出的关键校准
+
+lk-moe 那台机器 **CPU 与内存带宽明显弱于本机**(**单路** EPYC 9334、**插 20 条内存**易造成
+通道不平衡而降低内存性能),但 **GPU 强很多**。用户判断:
+**"我们的 prefill 可能不如它,但 decode 应该强不少"**。
+⇒ 本机 13 tok/s vs 它 ~50 tok/s **不是可接受的差距**,而是异常偏低。
+
+#### 402.2 带宽账(算出来的下界)
+
+DeepSeek-V4.1 mxfp4,每权重 0.5 byte,E=384,H=5120,I=2304,topk=6,40 层:
+
+```
+每专家 w13 = 11.2 MiB, w2 = 5.6 MiB  ⇒ 16.9 MiB
+每层 per-token(6 专家) = 101.2 MiB
+全模型 per-token       = 3.96 GiB
+若带宽 200 GB/s ⇒ 上限 47 tok/s
+若带宽 400 GB/s ⇒ 上限 94 tok/s
+若带宽 600 GB/s ⇒ 上限 141 tok/s
+```
+
+实测 **13 tok/s ⇒ 实际只用到 ~55 GB/s**。双路 EPYC 9654 + 1.5 TiB 的可用带宽远高于此,
+**⇒ 瓶颈是"每层开销/同步/线程唤醒",不是权重带宽。**
+
+#### 402.3 提高 `max_num_seqs` 反而更差
+
+`MAXSEQS=8`(cellQ,`ASYNC=0`/`THREADS=128`/`NSLICE_SMALL=0`):
+
+| | 聚合 tok/s | 单请求延迟 |
+|---|---|---|
+| `MAXSEQS=1`,C=8 | 13.30 | 21.31 s |
+| **`MAXSEQS=8`,C=8** | **8.86** | **57.77 s** |
+
+⇒ **批量不仅没带来吞吐收益,还更差**。单流(decode 用不上 batching)也仍是 12.67 tok/s。
+
+#### 402.4 头号嫌疑:`XIAOTU_MOE_NSLICE_SMALL=0`
+
+引擎里:
+
+```cpp
+if constexpr (wt::kNSliceSmallM) {
+    static const bool nslice_small = [] {           // 默认 true
+        const char* e = std::getenv("XIAOTU_MOE_NSLICE_SMALL");
+        return !(e && std::atoi(e) == 0);           // =0 forces the legacy path
+    }();
+    if (nslice_small && NASS <= 4 * (size_t)pool_.nthreads())
+        forward_many_nsliced(...);
+}
+```
+
+* 单流 decode 时 `NASS = batch × topk = 1 × 6 = 6`,极小;
+* **N-slice 路径正是为"专家侧并行度不足的小批量"设计的**(沿 N 维切分给多线程);
+* 而 `serve_v41.sh` 钉了 `NSLICE_SMALL=0`,**强制走 legacy 路径** —— 这极可能就是我们
+  单流 decode 只有 13 tok/s、且批量更差的原因。
+
+**下一跑(已起)**:`NSLICE_SMALL=1` + `MAXSEQS=8` + `THREADS=128` + `ASYNC=0`,
+同时测单流与并发,以判定它能否同时改善两者。
