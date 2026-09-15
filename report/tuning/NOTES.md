@@ -14425,3 +14425,98 @@ EngineCore pid=99152,`134 GB`,`XTSIG=0 / defer=0 / pwal=0 / ptr=0`,仍在装载�
 (1) 让"装载期建引擎"不再 fault(cellE 正在验证 `c8a1b51` 的保活快照);
 (2) 真实权重加载;
 (3) DSpark 从未验证。
+
+### 388. 【v0.4·第 26 轮】转向兼容与性能:把新增开销**全部**关到开关后面
+
+用户指示:内存取证先告一段落,优先推进 V4.1 的**兼容与性能**。本轮据此做兼容审计。
+
+#### 388.1 审计方法
+
+`git diff --stat fea5c82..HEAD -- vllm_xiaotu_moe/`(fea5c82 = 我动手前的最后一次提交)
+⇒ `mainline_shims.py +103`、`mixed_experts.py +201/-6`。逐条判定"是否对**非释放路径**有影响":
+
+| 改动 | 是否门控 | 对 V4 的影响 |
+|---|---|---|
+| `_release_source_enabled()` / `_RELEASE_MISSES` / `_RELEASE_FILE` | 纯函数/模块级常量 | 无 |
+| `_stage_src()` | ✅ 已改为**只在开关打开时**用快照 | 与改动前**逐字一致** |
+| `_eager_build_ok()` | ✅ 仅在 `_release_source_enabled()` 时调用 | 无 |
+| `apply()` 里新增的 `_maybe_release_source(layer)` | ✅ 开关关时立即 `return 0` | 一次函数调用,可忽略 |
+| `hidden_size` 回落分支 | ✅ 仅在 `w2.numel()==0` 时触发(开关关时不可能) | 无 |
+| `[xtu-diag]` / `[xtu-diag-split]` 采样与打印 | ✅ **本轮改为 `XIAOTU_MEM_DIAG=1` 才开** | 默认不读 `/proc`、不打印 |
+| `[xtu-diag-ptr]` 快照 | ✅ 上一轮已按 `_release_on()` 门控 | 默认不持有任何权重引用 |
+| **`_assert_host_source(ex_w13, ex_w2)`** | ❌ **唯一未门控的行为改动** | 见下 |
+
+#### 388.2 唯一未门控的改动及其安全性论证
+
+`_assert_host_source` 在 `_ensure_engine` 里**无条件**执行,只在三种情况下 raise:
+`device.type != "cpu"`、`numel() == 0`、`not is_contiguous()`。
+
+* V4 的 CPU 专家权重是 **cpu + 连续 + 非空** ⇒ **一定通过**,行为与改动前一致。
+* 若某天真出现不满足的情况,旧代码会在 C++ 里以 **SIGSEGV** 结束(§385 已实测);
+  新代码给出一条可读的 `RuntimeError`。⇒ 这是**把崩溃换成报错**,不是行为回归。
+
+⇒ **结论:除这一处"把 segfault 变成报错"的加固外,V4 的代码路径可证明未受影响。**
+下一步应跑一次 V4 回归(数值门 `1.873e-02` + 确定性 11/11)把这句话变成实测证据。
+
+#### 388.3 验证(本轮已做)
+
+* `_mem_diag_on()` 默认 `False`(零开销),`XIAOTU_MEM_DIAG=1` 时为 `True`。
+* diag 关闭时:`_notify_experts` 仍正确转发钩子(实测 2/2 次),且**不产生快照**
+  (`hasattr(layer,'_xiaotu_pre_pwal_src') == False`)⇒ V4 不会被多留一份权重。
+* 释放开关为 0 时 `_stage_src` 返回 `layer.<nm>` 本身(与旧行为一致)。
+
+#### 388.4 cellF
+
+带 `UnboundLocalError` 修复起跑,`XTSIG=0`。它走的是:装载期安全推迟 →
+`apply()` 里惰性建引擎 → 每建完一层立即释放该层源张量。
+
+### 389. 🔥【v0.4·第 27 轮】性能:`serve_v41.sh` 是**为"跑通"配的,不是为性能配的** —— 三处硬编码把最大收益关掉了
+
+用户要求推进兼容与性能。审计 `scripts/serve_v41.sh:89-92` 与引擎默认值的差异,发现:
+
+| `serve_v41.sh` 钉住的值 | 引擎/插件**默认** | 后果 |
+|---|---|---|
+| `XIAOTU_MOE_ASYNC=0` | **默认开启**(`binding.cpp:68`) | 关掉了**本项目最大的单点收益** |
+| `XIAOTU_MOE_SPIN_IDLE_US=0` | 300(`hybrid_model.py:849` setdefault) | 关掉了自旋等待 |
+| `XIAOTU_MOE_NSLICE_SMALL=0` | **默认开启**(`moe_v2.hpp:547`) | `=0` **强制走 legacy 路径**(注释原文 "=0 forces the legacy path"),小批量 N-slice 加速失效 |
+| `XIAOTU_MOE_THREADS=60` | 未设时自动取 `n_ccd × 5`,上限=核数(`hybrid_model.py:858-878`) | 覆盖了自动调优,且 60 明显偏低 |
+
+#### 389.1 为什么这一条最值钱(用项目自己的实测数字)
+
+`binding.cpp:68-72` 的注释写得很清楚,ASYNC 的收益是:
+
+* **每 token 6.53 → 1.80 ms(3.6×)**
+* **C=4 聚合 71.8 → 107.3 t/s(1.49×)**
+* 且已验证「与 host-func **逐位相同**」、「服务级 greedy 文本 **5/5 相同**」、「长跑无 hang」
+* 关闭后自动回落 `cudaLaunchHostFunc`,**功能等价、更慢**
+
+⇒ 也就是说:**功能与数值都验证过的 3.6× 收益,在 V4.1 的启动脚本里被关掉了。**
+
+线程数的项目实测(`hybrid_model.py:855-861`,NPS=4 条件下):192 线程 8.25-9.98 tok/s、
+176→11.44、160→11.66、144→12.57、**128→12.66** ⇒ 最优在 128 附近,而脚本给的是 **60**。
+(注意:那组数字是 **NPS=4/8 node** 下测的;**NPS=1 的最优点需重测**,不能直接照搬。)
+
+#### 389.2 第二个问题:它们**无法从外部覆盖**
+
+```sh
+XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-60}"   # 可覆盖
+XIAOTU_MOE_NSLICE_SMALL=0                        # 硬编码,不可覆盖
+XIAOTU_MOE_ASYNC=0                               # 硬编码,不可覆盖
+XIAOTU_MOE_SPIN_IDLE_US=0                        # 硬编码,不可覆盖
+```
+
+⇒ **即使我们知道 ASYNC 值 3.6×,也没法通过环境变量做 A/B** —— 脚本会把它们按死。
+应改成 `${XIAOTU_MOE_ASYNC:-0}` 这种形式:**默认值不变**(仍是 0,行为零变化),
+但允许外部覆盖来做 A/B。
+
+**现在不能改**:cellF 正在执行这个脚本,bash 是边读边执行,运行中改脚本会让解释器
+从错误偏移继续读。必须等它结束。
+
+#### 389.3 交付计划(等 cellF 结束后执行)
+
+1. `serve_v41.sh`:四处改 `${VAR:-<现值>}`,默认行为**逐字不变**;
+2. 用同一份权重做 A/B:`ASYNC=0/1`、`SPIN_IDLE_US=0/300`、`NSLICE_SMALL=0/1`、
+   `THREADS=60/96/128/160`,记录 tok/s 与每 token 延迟;
+3. 因为 ASYNC 已声明"数值逐位相同",A/B 应以**性能**为主、数值门做回归确认;
+4. **V4 回归**(数值门 `1.873e-02` + 确定性)也要在同一窗口做掉,确保 §388 的
+   "V4 未受影响"从论证变成实测。

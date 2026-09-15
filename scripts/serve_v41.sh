@@ -77,8 +77,20 @@ if [ "${MEMTRACE:-0}" = "1" ]; then
   echo "[v41] memtrace -> $MEMLOG"
 fi
 
-cd /tmp
+# 【不要 cd /tmp】任何留在 /tmp 的 `*.py` 都会遮蔽同名模块 —— 2026-09-15 一个
+# 遗留的 /tmp/attr.py 就命中了 aiohttp 的 `import attr`,让整个 cellA 起不来
+# (`FileNotFoundError: '/proc/--model/status'`)。改用专用的空目录。
+RUN_CWD="$OUTDIR/run"; mkdir -p "$RUN_CWD"; cd "$RUN_CWD"
 export CUDA_VISIBLE_DEVICES="$GPUS"
+# 【性能提示】下面四项是**为"先跑通"钉的保守值**,并不是引擎默认:
+#   ASYNC        引擎默认开启,注释自带实测收益:每 token 6.53→1.80 ms(3.6×)、
+#                C=4 聚合 71.8→107.3 t/s,且已验证"与 host-func 逐位相同"、
+#                "greedy 文本 5/5 相同" ⇒ 关掉它等于白丢一个已验证的大收益;
+#   SPIN_IDLE_US 插件默认 300(hybrid_model.py setdefault),这里钉成 0;
+#   NSLICE_SMALL 引擎默认开启;=0 会**强制走 legacy 路径**;
+#   THREADS      未设时插件按 n_ccd×5 自动调优,这里钉成 60。
+# 一律写成 "${VAR:-<现值>}":**默认行为逐字不变**,但允许从外部覆盖做 A/B。
+# 调参时配合 report/tuning/NOTES.md §389。
 nohup env \
   HF_HUB_OFFLINE=1 \
   VLLM_ENGINE_READY_TIMEOUT_S=7200 \
@@ -87,9 +99,9 @@ nohup env \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
   XIAOTU_RELEASE_SOURCE="${XIAOTU_RELEASE_SOURCE:-1}" \
   XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-60}" \
-  XIAOTU_MOE_NSLICE_SMALL=0 \
-  XIAOTU_MOE_ASYNC=0 \
-  XIAOTU_MOE_SPIN_IDLE_US=0 \
+  XIAOTU_MOE_NSLICE_SMALL="${XIAOTU_MOE_NSLICE_SMALL:-0}" \
+  XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
+  XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-0}" \
   OMP_NUM_THREADS=1 \
   $EXTRA_ENV \
   numactl --interleave=all "$PY" -m vllm.entrypoints.openai.api_server \
