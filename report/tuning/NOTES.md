@@ -13470,3 +13470,64 @@ FLASHMLA_SPARSE_DSV41 backend`)。探针被 25 min 超时在 **forward 之前**�
 **V4.1 在本机"跑起来"= 只需要补 SM80 的稀疏 MLA 注意力**,其余(专家/Engram/KV/元数据/
 索引器)主线已具备且已验证可用。已开工:先做 **prefill** 的
 `flash_mla_sparse_fwd` 等价物(SM90 路径保持逐字节不变,仅 Ampere/Ada 走新路径)。
+
+### 370. 【v0.4·第 2 轮】V4.1 全部 SM80 阻塞点已打通;**新的唯一阻塞是 NUMA 单节点 OOM**(不是总量)
+
+#### (a) 本轮修好的东西(全部在 `vllm/models/deepseek_v41/` 内,不影响其它模型)
+
+| 提交 | 内容 |
+|---|---|
+| `49bc21d307` | V4.1 自己的 `common/ops/{cache_utils,fused_compress_quant_cache,indexer_k_store}.py` 里 3 处 Triton `fp8e4nv`(A100 无此类型)+ cuTeDSL 快路径门闸 |
+| `7d81ed02c6` | **prefill** 注意力:`flash_mla_sparse_fwd`(SM80 上是抛错桩)→ 复用 V4 的 portable Triton 稀疏 MLA |
+| `6abeddc5d2` | **decode** 注意力:`flash_mla_with_kvcache` → 新写 SWA-only / compressed(c1a,c2a)两条 Triton 路径,MTP + 非 MTP 都覆盖 |
+| 插件 `a9193d4` | **`_XiaotuExpertsMixin.apply()` 接受上游新的 modular 签名**(`output=`/`topk_weights=`/`topk_ids=`/`workspace*`)。这是 **mode B** 的潜在 bug:V4 走 mode A(OOT override)所以从没暴露,V4.1 架构不同只能走 mode B |
+
+数值验证(A100 GPU 2,与 float32 torch 参考对比,多次重复):
+prefill 最差 `max_abs=3.70e-3`,`max_rel=3.35e-2`;decode 7 个用例最差 `max_abs=3.69e-3`。
+e4m3 字节编码 helper 与 torch `float8_e4m3fn` **逐位一致**(100 万值 0 不匹配)。
+
+**兼容性原则(用户本轮明确提出)**:`git diff 34e36f8075 HEAD --name-only` 的全部改动都落在
+`vllm/models/deepseek_v41/` 这一个包里(没有任何共享文件被改)。V4/Qwen/GLM/Mixtral 都不 import 它,
+所以**结构上不可能**影响既有模型的兼容性与性能;V4 的数值门禁(`1.873e-02`)与引擎确定性(11/11)
+本轮复跑也逐位不变。
+
+#### (b) 唯一剩下的阻塞:NUMA **单节点** OOM(内核证据)
+
+```
+Out of memory: Killed process 1681819 (VLLM::EngineCor)
+  anon-rss: 576 GB    shmem-rss: 814 GB
+  oom-kill: constraint=CONSTRAINT_MEMORY_POLICY, nodemask=0
+```
+
+* 机器**空载时 1427 GB free**(已确认不是被别人占用),8 个 NUMA node **每个只有 193 GB**。
+* 崩溃时进程共 ~1390 GB ⇒ 若均匀铺开约 174 GB/node,**本该放得下**;
+  实际是 **node 0 先被填满**(`nodemask=0`)。
+* 触发点是 `do_anonymous_page`(用户态匿名页首次触碰),不是总量不足 —— 与 handoff §5.4 记录的
+  "**粒度 × 未绑定**,不是总量"是同一类问题。
+* **可疑的 814 GB shmem 尚未定位**:这不是我们引擎的 EP 缓冲(`auto_ep_setup` 在
+  `num_processes<=1` 时直接 return;而且引擎权重分片是 `MAP_PRIVATE|MAP_ANONYMOUS`,算 anon),
+  也不是 `/dev/shm`(tmpfs 只有 756 GB 且当时仅用 60 MB)。
+  ⇒ 已在 `scripts/serve_v41.sh` 加 `MEMTRACE=1`(逐 node free + 最胖进程的
+  Rss/Pss/Shared_Clean/Shared_Dirty/Private_Dirty),下一轮直接量出来。
+
+#### (c) 好消息:专家/Engram 这条链**完全打通**
+
+服务起来时引擎自己打印:
+
+```
+xiaotu MOE_MXFP4 engine: E=384 H=5120 I=2304 topk=6 group=1x32
+  scales=yes routing=sqrtsoftplus/bias swiglu=clamp@10.0
+```
+
+⇒ 我们的引擎**正确识别并接管了 V4.1 的专家格式**(fp4 e2m1 + ue8m0 groupK=32)、
+**路由**(sqrtsoftplus + noaux_tc bias)与**激活**(clamped SwiGLU @10.0);
+Engram 两张表各 94.42 GiB 也按主线原生 `cpu_offload` 落到了 pinned host。
+39/40 层的引擎都构造成功了(第 40 层时被 OOM 杀掉)。
+
+#### (d) 下一轮的顺序
+
+1. `MEMTRACE=1` 跑一次,定位 814 GB shmem 的来源;
+2. 按结果二选一:(a) 把该分配显式 `mbind`/interleave 到多 node;
+   (b) 消除重复(最可能是"源张量 + 引擎分片副本"2×,见 IRON_RULES R9);
+3. 再跑端到端(prefill-only 的 `max_tokens=1` 可以先验通,因为 `profile_run` 是
+   `skip_attn=True`、必须真实请求才会走注意力)。
