@@ -225,6 +225,52 @@ class _XiaotuExpertsMixin:
                 resolved.append(t)
             self._scales = tuple(resolved)
         self._router = None
+        # ---- 切分一层、释放一层(内存;默认关闭,未 A/B)------------------------
+        # vLLM 会把**每层**的主机专家张量留到运行结束,而我们的引擎又持有一份
+        # per-NUMA 分片副本 ⇒ 专家权重 **2×**(IRON_RULES R9);
+        # 对 V4.1-Flash 就是 271 GB 白白占用。
+        # 引擎构造时已把字节拷进自己的分片区,之后源张量就是死重量 ——
+        # 所以在这里**提前构造引擎并释放源存储**,而不是等第一次 forward 懒加载。
+        # 开关:XIAOTU_RELEASE_SOURCE=1(默认 0,待 A/B 后再改默认)。
+        if os.environ.get("XIAOTU_RELEASE_SOURCE", "0") == "1":
+            self._ensure_engine(layer)
+            self._release_source_weights(layer)
+
+    def _release_source_weights(self, layer: torch.nn.Module) -> int:
+        """释放引擎已分片的**主机源张量**,只保留参数对象本身。
+
+        ⚠️ 这是**未经端到端验证**的优化(2026-09-15 加入,默认关闭)。
+        参数对象会变成 0 元素张量:模块化链路只把 w1/w2 **透传**给我们的
+        `apply()`,而 `apply()` 用的是引擎、**从不读它们** —— 但如果上游某处读了
+        `.shape`/`.data_ptr()`,就会出问题。A/B 时先看能不能跑通再谈收益。
+        """
+        freed = 0
+        names = ["w13_weight", "w2_weight"]
+        for attr in getattr(self, "_scale_attrs", ()):
+            names.extend(attr if isinstance(attr, (tuple, list)) else (attr,))
+        seen = set()
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            p = getattr(layer, name, None)
+            if not isinstance(p, torch.Tensor) or p.device.type != "cpu":
+                continue
+            nbytes = p.numel() * p.element_size()
+            if nbytes < (1 << 28):  # 小张量不值得冒险
+                continue
+            try:
+                p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+            except Exception:  # noqa: BLE001
+                continue
+            freed += nbytes
+        if freed:
+            print(
+                f"[vllm-xtu-moe] released {freed / 2**30:.2f} GiB host source "
+                f"expert weights ({getattr(layer, 'layer_name', '?')})",
+                flush=True,
+            )
+        return freed
 
     # ---- routing -------------------------------------------------------
     def _get_router(self):

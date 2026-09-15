@@ -13608,3 +13608,55 @@ Sep 15 01:40:32  Out of memory: Killed process 1687794 (VLLM::EngineCor)
 
 > 方法论提醒:`MEMTRACE=1` 的逐 node 采样已经证明**各 node 均匀增长**,
 > 所以"再加 numactl 参数"这条路已经走到头;下一步必须**减少总量**。
+
+### 373. 【v0.4·第 7 轮】(a) NPS=1 已生效;(b) 重启后**内核没有 NVIDIA 模块**;(c) 实现"切分一层/释放一层"
+
+#### (a) NPS=1 ✅(用户改 BIOS 后重启)
+
+```
+available: 2 nodes (0-1)     node0: 773782 MB (free 767463)   node1: 773988 MB (free 771159)
+node distances: 0-1 = 32 (跨 socket)
+```
+⇒ 每 node **~756 GB**,远超进程需要的 ~166 GB/node(NPS=4 时是 193 GB 上限)。
+且引擎的 `nshard_ = numa_node_count()/world` **自动 8 → 2**,所以每层"shard 映射整层大小 × NS"
+的放大也随之降 4×。
+
+#### (b) 🔴 **阻塞:重启进的是 `5.15.0-191` 内核,而它没有 nvidia.ko**
+
+```
+$ modprobe nvidia
+modprobe: FATAL: Module nvidia not found in directory /lib/modules/5.15.0-191-generic
+$ lsmod | grep nvidia      -> (空)
+$ ls /dev/nvidia*          -> 不存在
+```
+* 只有 **`5.15.0-179`** 和 **`5.15.0-186`** 的模块树里有 nvidia.ko(各 10 个模块);
+  `-191` 是 0 个。GRUB 默认 `GRUB_DEFAULT=0` ⇒ 指向 -191。
+* 系统**没装 dkms**(`/usr/sbin/dkms` 不存在),所以换内核不会自动重建模块;
+  `nvidia-driver-580` / `nvidia-kernel-source-580` 都在,且 `linux-headers-5.15.0-191-generic`
+  **已安装** ⇒ 两条路都可走(都需要 root,本会话无 sudo):
+  1. **最快**:重启进 `5.15.0-186`(`GRUB_DEFAULT="1>2"` + `update-grub`,或在 GRUB 里选
+     Advanced options → 5.15.0-186)。NPS=1 是 BIOS 设置,重启后仍然有效。
+  2. 或 `apt install dkms nvidia-dkms-580 && dkms autoinstall`(为 -191 现场编译)。
+
+#### (c) ✅ 实现"加载一层 → 按 NUMA 切分一层 → 释放一层"
+
+**做法**(`vllm_xiaotu_moe/mixed_experts.py`,开关 `XIAOTU_RELEASE_SOURCE=1`,
+`serve_v41.sh` 已默认打开):
+* 原来引擎是**第一次 forward 时懒加载**;现在在 `process_weights_after_loading` 里就
+  `_ensure_engine(layer)` —— 也就是"切分这一层";
+* 紧接着 `_release_source_weights(layer)`:把该层主机源专家张量(`w13_weight`/`w2_weight`
+  及大 scale)替换成 0 元素张量,释放其 storage ⇒ "释放这一层"。
+  参数对象仍在、模块化链路只是把 w1/w2 **透传**给我们的 `apply()`,而 `apply()` 用引擎、
+  **从不读它们**。
+
+**为什么这是当前能拿到的最好形态**:vLLM **没有内置的逐层加载器**
+(只有 `--enable-layerwise-nvtx-tracing`,是观测不是加载),所以"40 层源张量同时驻留"
+在 `load_weights` 阶段无法避免;但**引擎阶段可以做到源与分片之和恒定 ≈ 1× 权重**,
+而不是 2×。
+
+**预期收益(未实测,GPU 回来后验)**:保底 **−271 GB**(源专家张量);
+叠加 NSHARD 8→2 对分片映射放大的削减,峰值有望从 **1330 GB** 掉到 **~600-700 GB**,
+即真正回到"内存略大于权重就该能跑"。
+
+⚠️ **诚实标注**:`XIAOTU_RELEASE_SOURCE` 这条路径**尚未端到端验证**。风险点是上游若某处
+读 `layer.w13_weight.shape`/`data_ptr()` 会出问题;A/B 时先确认能跑通,再谈收益。

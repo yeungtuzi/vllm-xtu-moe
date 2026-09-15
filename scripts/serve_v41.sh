@@ -8,6 +8,11 @@
 #   * Engram tables (188.8 GiB) -> pinned host memory (engram_config.cpu_offload,
 #                                  on by default)
 #   * everything else (~23 GiB)  -> GPU
+#
+# XIAOTU_RELEASE_SOURCE=1 (default here) implements 切分一层/释放一层: once a
+# layer's engine owns its NUMA-sharded copy, the vLLM-side host source tensor is
+# dropped, so the expert bytes are not held twice (IRON_RULES R9). Tune with
+# XIAOTU_RELEASE_SOURCE=0 to A/B it.
 # The one thing that does NOT work out of the box on A100 is attention: V4.1
 # ships only FlashMLA (SM90+) and FlashInfer (SM100/SM120) paths. This script is
 # the end-to-end acceptance test for the SM80 fallback.
@@ -80,6 +85,7 @@ nohup env \
   VLLM_HANDSHAKE_TIMEOUT_MINS=120 \
   VLLM_USE_FLASHINFER_SAMPLER=0 \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
+  XIAOTU_RELEASE_SOURCE="${XIAOTU_RELEASE_SOURCE:-1}" \
   XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-60}" \
   XIAOTU_MOE_NSLICE_SMALL=0 \
   XIAOTU_MOE_ASYNC=0 \
