@@ -15892,3 +15892,64 @@ lk-moe 的图给的是 1.08~2.07 **k** tok/s(输入 8.2k~501.8k)。我们冷启�
 缓存命中是 2.2~2.4 k tok/s。**他们的测量方法(是否用同一段文本、是否开 prefix caching)
 我们不知道**,所以**不能断言我们差 20 倍**;能确定的是:**我们的冷 prefill 是 59 tok/s,
 而且它随 token 数线性增长(权重按 token 重复读)** —— 这一条本身就是必须修的。
+
+### 421. 🎯🎯🎯【新目标·第 4 轮】**长 prefill 慢的确切机制 + 一个我需要更正的推断**
+
+#### 421.1 机制(精确到行):MXFP4 永远走不到"按专家分组"的路径
+
+```cpp
+// xiaotu_moe/csrc/moe/moe_v2.hpp:528-537
+if constexpr (wt::kNParallel) {
+    forward_many_nsliced(M, k, expert_ids, weights, input, output, 0, wlimit_override());
+    return;                       // ← 无条件 return
+}
+// ---------- 行 558+ 的 "--- Expert grouping ---" 永远不可达 ----------
+```
+
+* packed4(MXFP4)的 `wt::kNParallel` 为 **true** ⇒ **decode 与 prefill 一律走 `forward_many_nsliced`**;
+* 该路径**按 (token, expert) 对**把每个 GEMV 的 N 维摊到线程池 ⇒
+  prefill 时 `NASS = M×k = 2417×6 = 14502` 个对,**每个对各自读一遍专家块**;
+* 反推流量:`14502 × 16.9 MiB × 40 层 ≈ 9.8 TB`;**与 §420.2 从 60.5 s 实测反推的 9.6 TB 吻合**;
+* 这同时解释了 **`XIAOTU_MOE_NSLICE_SMALL` 对 MXFP4 只值 +3.4%** ——
+  它控制的分支在 `kNParallel` 的 `return` **之后**,对 packed4 是**死代码**。
+
+#### 421.2 更正:分组路径**不是批 GEMM**,省的是 L3
+
+我原以为"行 558+ 是现成的按专家批 GEMM,只要把闸门打开"。读完后必须更正:
+
+```cpp
+for (size_t it = job.ab; it < job.ae; ++it) {          // 该专家下的每个 assignment
+    wt::gate_up(xt, w13_, ..., inter, hidden, job.eid, groupN, groupK);   // 仍是单 token GEMV
+}
+```
+
+它**仍然逐个 assignment 调 GEMV**,收益来自"同一专家的块在该子批内保持 L3 热"
+(源码注释自称典型 **~7×**),**不是**把多 token 合成一次权重读取。
+
+#### 421.3 更硬的障碍:分组路径**在 NUMA 分片下不可用**
+
+* 分组路径读的是成员 `w13_` / `w2_`;
+* 而 `nshard_ >= 2` 时 `w13_ = w13_shard_[0]`(`moe_v2.hpp:459`)——
+  **只有 node0 的紧凑分片**,且是 `[gate cbytes][up cbytes]` 布局;
+* 分组路径调 `wt::gate_up(...)` 用的是**密集布局 + 整块索引**,与该分片**不兼容**;
+* ⇒ NDParallel 路径用的是 `w13_for(s)` / `w13_shard_[n]` 这套"分片感知"的 reader,
+  分组路径用的是 `w13_` 这套"整块"reader —— **两者不能混用**。
+
+**⇒ 结论:要真正修好 prefill,需要把"按专家分组"改成
+"分片感知的、按专家做批 GEMM"**,即:
+1. 让分组路径像 N-slice 一样用 `w13_shard_[n]` / `w13g_for(s)` 与紧凑几何
+   (可复用 §378 那套 `cstride/row0/up_off` 参数);
+2. 并把内层的 `wt::gate_up`(单 token GEMV)换成 packed4 已有的 **M>1 批内核**
+   (`matmul_packed4_group` 的 4-token 阻塞路径),让同一专家的多个 token 共享权重读取。
+
+**这是一项实打实的 C++ 工程**(不是打开一个开关),收益上限大(prefill 数十倍、
+并同时改善 §408 的并发不扩展),但**不能在剩余轮次里赶工**——
+它需要:改 reader 几何 → 接批内核 → 逐层数值门(`OK=7 BAD=1, max_rel=1.873e-02`)→
+长 prefill 与 decode 双回归。
+
+#### 421.4 当前可立即验证的替代方案(留给下一轮评估)
+
+* 分组路径在 **`nshard_ < 2`** 时 `w13_` 是**整块**(走 `sock_fill` 或 `buf_w13_`),
+  因此**"关掉 NUMA 分片 + 打开分组"** 是一条**能立刻试**的组合(代价:失去分片的 NUMA 局部性);
+* 用 `XIAOTU_MOE_GROUP_FACTOR`(行 607)可以把阈值调到"强制分组 / 强制逐 token",
+  正好可以在**同一份权重上做 A/B** —— 这是验证"分组到底值多少"的最低成本手段。
