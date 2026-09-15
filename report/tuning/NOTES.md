@@ -13531,3 +13531,45 @@ Engram 两张表各 94.42 GiB 也按主线原生 `cpu_offload` 落到了 pinned 
    (b) 消除重复(最可能是"源张量 + 引擎分片副本"2×,见 IRON_RULES R9);
 3. 再跑端到端(prefill-only 的 `max_tokens=1` 可以先验通,因为 `profile_run` 是
    `skip_attn=True`、必须真实请求才会走注意力)。
+
+### 371. ✅【v0.4·第 3 轮】**DeepSeek-V4.1-Flash 在 A100 上端到端跑通**(dummy 权重)
+
+#### 结果
+
+```
+engines=40/40   errors=0   ready=1
+Application startup complete.
+POST /v1/chat/completions -> 200, completion_tokens=8, finish_reason=length
+```
+
+整条链路真的跑起来了:**40 层全部构造成功、0 错误、真实请求完成 prefill + 8 步 decode**。
+
+> ⚠️ **注意方法论**:`profile_run` 用的是 `_dummy_run(..., skip_attn=True)`,**加载成功不代表注意力能用**。
+> 必须发真实请求才算验收 —— 我们就是靠这一步才发现 Engram kernel 的 `fp8e4nv`。
+
+#### 本轮修掉的两个"最后一公里"
+
+| 提交 | 内容 |
+|---|---|
+| `a66b6ae` | `serve_v41.sh` 补 `--kernel-config '{"enable_jit_warmup": false}'`(V4 脚本一直有,V4.1 漏了) |
+| `6b5ef34f7b` | **`_engram_lookup_kernel` 的 `fp8e4nv`**:它把 fp8 Engram 表按 `float8_e4m3fn` 取,在 Ampere 上编译失败。**而且它在运行时路径上**(`forward → engram.prepare_emb → lookup`),所以关 JIT warmup 并不能绕过。修法:Ampere/Ada 传 `weight.view(torch.uint8)` + `_e4m3_uint8_to_f32` 解码,用新 constexpr `E4M3_UINT8` 选择;**SM90+ 路径逐字节不变** |
+
+#### NUMA OOM 的结论(第 2 轮那个阻塞)
+
+`--max-model-len 2048 → 1024` 后**不再 OOM**:40 层引擎全部构造完成,最紧的 node 7 仍余 ~34 GB。
+根因是 **per-node headroom**(8×193 GB,node 1/3 天生少 ~40 GB),而不是总量 ——
+`MEMTRACE` 实测各 node **均匀增长**(每 node 同步 -63.5 GB),证明 `numactl --interleave=all` 是生效的。
+`Private_Dirty` 远大于 `Anonymous` 的那部分(约 290 GB)是 **CUDA pinned host 内存**
+(Engram `torch.empty(..., pin_memory=True)` + UVA),它在 smaps 里记成 file-backed 而非 anon。
+
+#### 已验证 / **未**验证边界(务必如实看)
+
+**已验证**
+* SM80 注意力 prefill + decode 的内核级数值对拍(vs fp32 torch 参考,worst `max_abs` 3.7e-3);
+* 端到端结构:加载 → 专家引擎(40 层)→ Engram 主机卸载 → 真实请求 → 8 token 输出,**0 错误**;
+* 兼容性:V4.1 的全部改动都在 `vllm/models/deepseek_v41/` 内;V4 门禁 `1.873e-02`、确定性 11/11 复跑不变。
+
+**未验证**
+* 🔴 **真实权重下的输出正确性** —— 本轮是 `--load-format dummy`,输出必然是乱码;
+* 🔴 decode 的**多步**正确性(只跑了 8 步)、长上下文、并发;
+* 🔴 TP=2 路径;DSpark 投机解码;视觉塔。
