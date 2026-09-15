@@ -662,8 +662,8 @@ class _XiaotuExpertsMixin:
         # 解析本层实际要用的权重/尺度(与 _ensure_engine 同源;INT4 等格式的
         # 重排由 _prepare_weights 负责)。
         self._prepare_weights(layer)
-        w13 = self._engine_w13 if self._engine_w13 is not None else layer.w13_weight
-        w2 = self._engine_w2 if self._engine_w2 is not None else layer.w2_weight
+        w13 = getattr(self, "_engine_w13", None) if getattr(self, "_engine_w13", None) is not None else layer.w13_weight
+        w2 = getattr(self, "_engine_w2", None) if getattr(self, "_engine_w2", None) is not None else layer.w2_weight
         s13, s2 = self._scales
         if s13 is None:
             s13 = self._find_scale(layer, (self._scale_attrs[0],))
@@ -727,9 +727,9 @@ class _XiaotuExpertsMixin:
         import xiaotu_moe
 
         self._prepare_weights(layer)
-        ex_w13 = (self._engine_w13 if self._engine_w13 is not None
+        ex_w13 = (getattr(self, "_engine_w13", None) if getattr(self, "_engine_w13", None) is not None
                   else self._stage_src(layer, "w13_weight"))
-        ex_w2 = (self._engine_w2 if self._engine_w2 is not None
+        ex_w2 = (getattr(self, "_engine_w2", None) if getattr(self, "_engine_w2", None) is not None
                  else self._stage_src(layer, "w2_weight"))
         self._validate_weights(layer, ex_w13, ex_w2)
         self._assert_host_source(ex_w13, ex_w2)
@@ -1057,7 +1057,7 @@ class _XiaotuExpertsMixin:
         # Use the tensor the ENGINE was built from: for formats whose checkpoint
         # layout differs (INT4/WNA16), the `w2` argument is the raw packed tensor
         # ([E, I/8, H]) and its dim 1 is NOT the hidden size.
-        w2_engine = self._engine_w2 if self._engine_w2 is not None else w2
+        w2_engine = getattr(self, "_engine_w2", None) if getattr(self, "_engine_w2", None) is not None else w2
         if w2_engine.numel() == 0:
             # XIAOTU_RELEASE_SOURCE=1 已把源张量置空,而模块化链路仍把它透传进来。
             # 用释放时记下的形状,否则 shape[1] 直接越界(会让第二次 forward 挂掉)。
@@ -1109,9 +1109,9 @@ class _XiaotuExpertsMixin:
             _slot = self._ensure_resident(layer)
             out = gpu_moe_layer(
                 h_bf16, ids_i32, wts_f32,
-                self._engine_w13 if self._engine_w13 is not None else layer.w13_weight,
+                getattr(self, "_engine_w13", None) if getattr(self, "_engine_w13", None) is not None else layer.w13_weight,
                 None,
-                self._engine_w2 if self._engine_w2 is not None else layer.w2_weight,
+                getattr(self, "_engine_w2", None) if getattr(self, "_engine_w2", None) is not None else layer.w2_weight,
                 None,
                 H=hidden_size, I=self._resident_I,
                 K=int(self.moe_config.experts_per_token),
