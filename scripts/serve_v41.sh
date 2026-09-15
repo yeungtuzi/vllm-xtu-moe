@@ -23,6 +23,12 @@
 #
 # Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS
 #
+# EAGER(默认 1):是否加 --enforce-eager(即**禁止 CUDA graph**)。
+#   实测(NOTES §405)每层 1.84 ms 里我们的 CPU MoE 只占 0.56 ms(31%),
+#   69% 是 "rest"(GPU 侧算子 + 层间交接)。batch=1 时 GPU 算子极小,
+#   kernel 启动开销被 43 层放大 ⇒ 关掉 eager(启用 CUDA graph)是头号候选优化。
+#   默认仍为 1 以保持既有行为;测试用 EAGER=0。
+#
 # MAXSEQS(默认 1):并发批大小上限。**实测关键**:=1(原值)时 vLLM 同时只调度一个
 #   序列,并发请求被完全串行化 —— 聚合吞吐恒定 ~13 tok/s、与并发无关,而单请求延迟
 #   线性变差(C=8 时 64 token 要 21 s)。见 report/tuning/NOTES.md §400。
@@ -113,7 +119,7 @@ nohup env \
     --model "$CKPT" --served-model-name dsv41 \
     --load-format "$LOAD" \
     --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-1}" \
-    --gpu-memory-utilization "$GPU_UTIL" --enforce-eager --trust-remote-code \
+    --gpu-memory-utilization "$GPU_UTIL" $( [ "${EAGER:-1}" = "1" ] && echo --enforce-eager ) --trust-remote-code \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --kernel-config '{"enable_jit_warmup": false}' \
     --port "$PORT" > "$LOG" 2>&1 &
