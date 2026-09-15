@@ -30,6 +30,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import importlib
 import inspect
@@ -87,6 +88,72 @@ def _mem_diag_on() -> bool:
     `XIAOTU_MEM_DIAG=1` 时才打开(排查内存时用)。
     """
     return os.environ.get("XIAOTU_MEM_DIAG") == "1"
+
+
+_XTU_CPU_EXPERT_ATTR = "_xiaotu_cpu_expert"
+
+
+def _install_device_loading_shim() -> list[str]:
+    """让 `device_loading_context` **跳过**被标记的 CPU 专家参数。
+
+    主线 `model_loader/utils.py:176-208` 会把这个模块里**所有 CPU 参数搬到
+    `target_device`(GPU)**,跑完 `process_weights_after_loading` 再搬回 CPU 并
+    **锁页**。对"专家常驻 CPU"的混合模式这是三重伤害(见 NOTES §390):
+
+      * GPU 上要瞬时放下一整层专家(V4.1 = 6.33 GiB/层)⇒ **GPU OOM**
+        (实测 `p.data = p.data.to(target_device)` 抛 OutOfMemoryError);
+      * 搬回来走 `pin_memory=True` ⇒ 专家权重整体变成**不可回收**的 pinned;
+      * 钩子时刻 `p.device` 是 cuda ⇒ 我们的 CPU 引擎拿到 **GPU 指针**去 memcpy ⇒ SIGSEGV。
+
+    这里用一份等价实现替换它,只多一句"被标记则跳过"。未标记的参数行为**逐字不变**。
+    """
+    try:
+        from vllm.model_executor.model_loader import utils as _u
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip device_loading_context shim: {type(exc).__name__}: {exc}")
+        return []
+    orig = getattr(_u, "device_loading_context", None)
+    if orig is None or getattr(orig, "_xtu_shim", False):
+        return []
+
+    @contextlib.contextmanager
+    def device_loading_context(module, target_device):
+        if not mixed_mode_enabled() or target_device.type == "cpu":
+            with orig(module, target_device) as m:
+                yield m
+            return
+        from vllm import envs as _envs
+        from vllm.utils.torch_utils import is_pin_memory_available
+
+        moved: set[str] = set()
+        for name, p in module.named_parameters():
+            if getattr(p, _XTU_CPU_EXPERT_ATTR, False):
+                continue                      # ← 我们的 CPU 专家:留在 CPU
+            if p.device.type == "cpu":
+                moved.add(name)
+                p.data = p.data.to(target_device)
+        try:
+            yield module
+        finally:
+            use_pin_memory = (
+                is_pin_memory_available()
+                and not _envs.VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY
+            )
+            for name, p in module.named_parameters():
+                if name in moved:
+                    p.data = torch.empty_like(
+                        p.data, device="cpu", pin_memory=use_pin_memory
+                    ).copy_(p.data)
+
+    device_loading_context._xtu_shim = True  # type: ignore[attr-defined]
+    _u.device_loading_context = device_loading_context
+    # 也要替换 loader 侧按名字导入的绑定
+    for mod_name in ("vllm.model_executor.model_loader.utils",):
+        try:
+            importlib.import_module(mod_name)
+        except Exception:  # noqa: BLE001
+            pass
+    return ["device_loading_context"]
 
 
 def _release_on() -> bool:
@@ -150,7 +217,18 @@ def _patch_quant_method_cls(cls) -> list[str]:
         def create_weights(self, layer, *a, **kw):
             if mixed_mode_enabled():
                 with torch.device("cpu"):
-                    return cw(self, layer, *a, **kw)
+                    res = cw(self, layer, *a, **kw)
+                # 给"因混合模式而被建在 CPU 上"的大参数打标记,供
+                # `_install_device_loading_shim` 把它们排除在"搬上 GPU"之外。
+                # 只标记大张量(≥64 MiB):专家权重是 GB 级,router/bias 之类是小的,
+                # 不标记以免影响它们正常的 device 处理。
+                for _, p in layer.named_parameters(recurse=True):
+                    try:
+                        if p.numel() * p.element_size() >= (64 << 20):
+                            setattr(p, _XTU_CPU_EXPERT_ATTR, True)
+                    except Exception:  # noqa: BLE001
+                        pass
+                return res
             return cw(self, layer, *a, **kw)
 
         create_weights._xtu_shim = True  # type: ignore[attr-defined]
@@ -516,6 +594,7 @@ def apply_mainline_shims() -> list[str]:
     applied: list[str] = []
     for step in (
         _install_quant_method_shims,
+        _install_device_loading_shim,
         _install_oracle_shims,
         _install_prepack_shims,
         _install_mxfp4_cpu_convert_shim,

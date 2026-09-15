@@ -14520,3 +14520,74 @@ XIAOTU_MOE_SPIN_IDLE_US=0                        # 硬编码,不可覆盖
 3. 因为 ASYNC 已声明"数值逐位相同",A/B 应以**性能**为主、数值门做回归确认;
 4. **V4 回归**(数值门 `1.873e-02` + 确定性)也要在同一窗口做掉,确保 §388 的
    "V4 未受影响"从论证变成实测。
+
+### 390. 🎯🎯🎯【v0.4·第 29 轮】**V4.1 真正的拦路者找到了,而且一直不在 NUMA/内存那边**
+
+cellG(`GPU_UTIL=0.85`,`LOAD=dummy`)跑到 106 秒后 EngineCore 挂了。栈是决定性的:
+
+```
+process_weights_after_loading(model, model_config, target_device)   # base_loader.py:91
+  with loading_context:                                            # model_loader/utils.py:134
+    p.data = p.data.to(target_device)                              # utils.py:190
+torch.OutOfMemoryError: Tried to allocate 4.22 GiB.
+    GPU 0 has a total capacity of 39.49 GiB of which 2.84 GiB is free
+```
+
+#### 390.1 `device_loading_context` 干了什么(utils.py:176-208)
+
+```python
+@contextmanager
+def device_loading_context(module, target_device):
+    if target_device.type == "cpu":
+        yield module; return                      # ← 目标若是 CPU,什么都不做
+    for name, p in module.named_parameters():
+        if p.device.type == "cpu":
+            cpu_params.add(name)
+            p.data = p.data.to(target_device)      # ① 把 CPU 参数**搬到 GPU**
+    try: yield module
+    finally:
+        use_pin_memory = is_pin_memory_available() and not VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY
+        for name, p in module.named_parameters():
+            if name in cpu_params:
+                p.data = torch.empty_like(p.data, device="cpu",
+                                          pin_memory=use_pin_memory).copy_(p.data)   # ② 搬回 CPU,**pinned**
+```
+
+**这一个函数同时解释了我们查了几轮的全部现象:**
+
+| 现象 | 解释 |
+|---|---|
+| `process_weights_after_loading` 时刻 `w13_weight` 是 **device=cuda**(cellE 实测) | ① 把 CPU 参数搬到了 GPU |
+| cellC/v41n1 在引擎构造函数里 **SIGSEGV**(源指针是 GPU VA) | 同一原因:CPU 引擎拿到了 GPU 指针 |
+| 历史上的**静默零释放**(`p.device.type != "cpu"` ⇒ `freed=0`) | 同一原因 |
+| 每层 `RssShmem` **+12.75 GiB**、`RssAnon` **−6.72 GiB**(§381.1) | ② 搬回来时用 `pin_memory=True` 重新分配 ⇒ 匿名旧张量释放、pinned 新张量产生 |
+| 专家权重**整体变成 pinned**(§379:340 GiB `/dev/zero (deleted)`) | ② 的累计结果 |
+| **GPU OOM** | ① 每层要在 GPU 上**瞬时**放下一整层专家(6.33 GiB),而 `--gpu-memory-utilization 0.85` 已把 ~33.6 GiB 预留给 KV cache |
+
+⇒ **`VLLM_EXPERTS_LOAD_DEVICE=cpu` 在这条主线上被 `device_loading_context` 反向利用了**:
+它把"专家放 CPU"变成了"每层先搬上 GPU 处理、再搬回 CPU 并锁页"。
+对大专家模型这是**双重伤害**:GPU 需要瞬时余量,CPU 侧变成不可回收的 pinned。
+
+#### 390.2 为什么 cellG 这里才炸,而 v41n2 能跑到 24 层
+
+`target_device` 来自 `base_loader.py:62-65`:
+`load_device = device_config.device if load_config.device is None else load_config.device`。
+默认是 cuda。而 **GPU 余量**决定了 ① 能不能成功:
+cellG 时 GPU0 只剩 **2.84 GiB**,而单层专家要 6.33 GiB;
+v41n2 当时余量更宽松,所以 ① 勉强通过,代价是每层产生一份 pinned(②)。
+
+⇒ 这条路径**从来就是靠 GPU 余量在悬崖边走**。
+
+#### 390.3 已验证的修法方向(不改主线,只改启动参数)
+
+1. **给 GPU 留出 ≥ 单层专家的瞬时余量**:把 `--gpu-memory-utilization` 从 0.85 降到 ~0.6
+   (40 GB × 0.6 = 24 GiB KV,余 ~15 GiB > 6.33 GiB)。
+   这是**一行启动参数**,最可能直接解掉 OOM。
+2. **`VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1`**:让 ② 不再产生 pinned 副本,
+   去掉那 ~340 GiB 不可回收内存的地板(代价:主机侧少了锁页,可能影响 H2D 速度)。
+3. (更彻底但影响面大,暂不做)`--load-device cpu`:能让 `device_loading_context` **完全空转**
+   (utils.py:178-181),但它同时会让 `create_model` 在 CPU 上建**所有**参数 —— 连 attention 也是,
+   **不能用**。真正干净的修法需要一个只对 experts 生效的开关。
+
+已用 1+2 起跑 cellH(`GPU_UTIL=0.60` + `VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1`,
+`LOAD=dummy`),验证这条推论。
