@@ -15303,3 +15303,58 @@ kernel 启动开销(~数微秒到数十微秒)会被 **43 层 × 每层多个算
 (启动完整、输出正确、无 capture 报错)。若日后遇到 CUDA graph 捕获问题
 (插件历史 TRIED_AND_REVERTED R4 提过捕获期 `cudaHostRegister` 会作废捕获),
 用 `EAGER=1` 回退即可。
+
+### 407. 【v0.4·第 37 轮·续】澄清三个问题 + `EAGER=0 + MAXSEQS=8` 结果 + 剖析环境该怎么装
+
+#### 407.1 "24 ms/token ≈ 41 tok/s" 是**单流** —— 表述已更正
+
+`[cd-timing] layers=43 **qlen=1** k=6 period=... compute=...` 里的 **`qlen=1`** 就是
+"本步只解 1 个 token" ⇒ 该行**全程是单流**。
+
+* `compute=0.56 ms/层`(EAGER=1 时)× 43 层 = **24 ms/token ⇒ 1/0.024 ≈ 41 tok/s**;
+* 这是**单流下、若只算 CPU 引擎**的理论上限,**不是聚合**;
+* `EAGER=0` 之后 `compute=0.43 ms/层` ⇒ 单流 CPU-引擎上限升到 **≈54 tok/s**;
+* 为了不再混淆,以后一律写明:`compute` 是**单流每层 CPU MoE 耗时**,
+  "tok/s 上限"= `1/(43 × compute)` 是**单流理论上限**。
+
+#### 407.2 为什么 `EAGER=0` 会提升性能(**分清实测与推断**)
+
+* **实测**:每层 `rest` 1.27 → **0.52 ms**(−0.75 ms/层);43 层 × 0.75 ms ≈ 32 ms/token,
+  正好等于观测到的 79 → 41 ms/token(13.35 → 25.71 tok/s)。**"eager 代价很大"这件事是被测出来的。**
+* **推断(机制,未直接隔离)**:`--enforce-eager` 禁止 CUDA graph ⇒ batch=1 时每个 GPU 算子
+  单独 launch,而单 token 的算子极小 ⇒ **GPU 处于"启动开销受限"而非"算力受限"**;
+  CUDA graph 把整段算子捕获成一次 replay,基本消掉逐算子 launch 开销。
+  这个解释与量级相符,但**我们没能直接看到 kernel 时间线**(perf 不可用、GPU 侧要 Nsight),
+  所以严格说:机制是**解释**,不是**已隔离的结论**。
+* 次要观测:CPU `compute` 也从 0.56 → 0.43 ms。合理原因是**交接/同步次数减少**
+  (每次 graph replay 一次同步,而不是每个算子一次),CPU 侧等待减少。
+
+#### 407.3 `EAGER=0 + MAXSEQS=8` 的实测(cellV)
+
+| 场景 | 聚合 tok/s | 单请求延迟 |
+|---|---|---|
+| 单流 ×2 | 24.94 | 2.57 s |
+| C=4 | **4.68**(异常,需复测) | 54.76 s |
+| **C=8** | **62.32** | 8.21 s |
+
+* **批处理确实有大幅收益**:C=8 聚合 62.32 tok/s ≈ 单流的 **2.4×**;
+* 该配置下 `qlen=8`:`period=2.09 ms, compute=1.19 ms(57%), rest=0.88 ms(43%)`
+  ⇒ 8 个 token 用 43×2.09=90 ms ⇒ 11.2 ms/token ⇒ 理论 89 tok/s,与实测 62 同量级;
+* **C=4 那一格 4.68 tok/s 明显异常**(延迟 54.76 s 且四个请求同时结束),
+  与 C=8 的 62.32 矛盾 ⇒ **需复测**,暂不下结论。
+
+#### 407.4 剖析环境需要装/改什么(回答用户提问)
+
+| 目标 | 需要做什么 | 说明 |
+|---|---|---|
+| **`perf` 能用** | `sudo apt install linux-tools-$(uname -r) linux-tools-common` | 现有 `/usr/bin/perf` 是个**转发脚本**,报 `perf not found for kernel 5.15.0-191` 是因为**缺对应内核版本的 linux-tools 包**(内核刚升级到 -191)。必须与 `uname -r` 完全匹配 |
+| 允许非特权 perf | `sudo sysctl -w kernel.perf_event_paranoid=1`(持久化写 `/etc/sysctl.d/99-perf.conf`) | 现在 `=4` 会挡住非特权 perf;`1` 够做 CPU 采样,`-1` 更宽松 |
+| `gdb`/`strace`/`py-spy` 能附加 | `sudo sysctl -w kernel.yama.ptrace_scope=0`(持久化 `/etc/sysctl.d/99-ptrace.conf`) | 现在 `=1` 只允许跟踪自己的子进程 ⇒ `Could not attach` |
+| **看 GPU 侧(当前真正的瓶颈)** | 装 **Nsight Systems**:`nsys`(NVIDIA 源或 CUDA Toolkit 自带) | `rest` 是 **GPU 侧**开销,`perf`(CPU 采样)**看不到它**。要看 kernel 时间线与空隙,需要 `nsys profile` |
+| Python 层 | `/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/pip install py-spy` | 只看 Python 栈,看不到 C++/CUDA 热点;同样受 ptrace 限制 |
+
+**优先级建议**:
+1. **`nsys`** —— 因为当前瓶颈已确认在 GPU 侧(`rest` 0.52 ms/层),这最值得装;
+2. `perf` + `perf_event_paranoid=1` —— 用于看 CPU 引擎内部热点(但引擎自带的
+   `NS-PROF` 已把 `compute` 拆成 setup/A/B/C,边际价值较小);
+3. `ptrace_scope=0` —— 只为 gdb/strace 采样,属"顺带",且是安全取舍(同 uid 进程可互相附加)。
