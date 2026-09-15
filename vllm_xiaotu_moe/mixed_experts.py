@@ -107,6 +107,20 @@ _ROUTER_EXTRA_ATTRS = (
 )
 
 
+def _host_mib() -> dict:
+    """读 /proc/self/status 的互斥计数(只用 XIAOTU_MEM_DIAG=1 时)。"""
+    out: dict = {}
+    try:
+        with open("/proc/self/status") as fh:
+            for ln in fh:
+                k, _, rest = ln.partition(":")
+                if k in ("RssAnon", "RssShmem", "RssFile"):
+                    out[k] = int(rest.split()[0]) >> 10
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 _RELEASE_MISSES = 0   # 见 _release_source_weights:静默失败的可观测性
 _RELEASE_FILE = "/tmp/xiaotu_release_source"
 
@@ -157,7 +171,15 @@ class _XiaotuExpertsMixin:
     _scale_dtype = None
 
     def __init__(self, moe_config, quant_config):
+        _dbg = os.environ.get("XIAOTU_MEM_DIAG") == "1"
+        if _dbg:
+            _b = _host_mib()
         super().__init__(moe_config, quant_config)
+        if _dbg:
+            _m = _host_mib()
+            print(f"[xtu-seg] experts.__init__: dAnon="
+                  f"{_m.get('RssAnon',0)-_b.get('RssAnon',0):+d}MiB "
+                  f"dShmem={_m.get('RssShmem',0)-_b.get('RssShmem',0):+d}MiB", flush=True)
         self._xiaotu_engine = None
         self._layer_ref: torch.nn.Module | None = None
         self._router = None

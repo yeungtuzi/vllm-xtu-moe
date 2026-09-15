@@ -15390,3 +15390,48 @@ C=4 之后进入收益递减(C=8 只比 C=4 多 16%)。
 
 下一跑加**更细的分段探针**:在 `_setup_kernel` / `make_mxfp4_moe_kernel` / `experts_cls(...)`
 三处各采样一次,把这 9.18 GiB 落到具体一行。
+
+### 409. 🔬【新目标·第 1 轮】`_setup_kernel` 每层 +**13.77 GiB** 匿名;并记录一次我自己的探针事故
+
+#### 409.1 细分探针的结果
+
+```
+[xtu-seg] l#0 _setup_kernel: dAnon=+13770MiB dShmem=+0MiB
+[xtu-seg] l#1 _setup_kernel: dAnon=+13769MiB dShmem=+2MiB      ← 之后每层都稳定 +13769MiB
+[xtu-diag-split] l#1 upstream: dShmem=+0MiB dAnon=+9181MiB | our_hook: dShmem=+0MiB dAnon=-2160MiB
+[xtu-diag-split] l#8 upstream: dShmem=+2MiB dAnon=+9180MiB | our_hook: dShmem=+0MiB dAnon=+0MiB
+```
+
+* **`_setup_kernel` 内部每层净增 13.77 GiB 匿名内存**;
+* 而整个 `pwal`(包含它)每层只净增 **9.18 GiB** ⇒ **其中约 4.6 GiB 在 pwal 返回前被释放**;
+* `13.77 GiB ≈ 2 × 6.72 GiB(单层 w13+w2+scales)` ⇒ **强烈提示出现了"第二份权重副本"**。
+
+`_setup_kernel` 尾部(quantization/mxfp4.py:726-769)的动作顺序:
+
+```python
+w13, w2, w13_scale, w2_scale, ... = convert_weight_to_mxfp4_moe_kernel_format(...)
+replace_parameter(layer, "w13_weight", w13)          # ← 换参数
+...
+self._build_moe_kernel(layer)                        # → make_mxfp4_moe_kernel()
+```
+
+shim5 已让 `convert_weight_...` 对 CPU 后端**原样返回**,所以副本不来自它;
+下一个嫌疑是 `_build_moe_kernel` → `make_mxfp4_moe_kernel` → `experts_cls(moe_config, quant_config)`
+即**我们自己的 `XiaotuCPUExpertsMxfp4.__init__`**(它继承主线的 `CPUExpertsMxfp4` /
+`FusedMoEExpertsModular`)。
+⇒ 已加一级更细的探针:`_XiaotuExpertsMixin.__init__` 里在 `super().__init__` 前后采样,
+下一跑即可判定这 13.77 GiB 是否出自 experts 构造函数。
+
+#### 409.2 ⚠️ 我的一次探针事故(记录以免重演)
+
+我原本还包装了 `make_mxfp4_moe_kernel`,结果引擎初始化直接失败:
+
+```
+TypeError: make_mxfp4_moe_kernel() takes from 4 to 5 positional arguments but 8 were given
+```
+
+* 绑定的正确性检查**全部通过**(oracle/quantization 两处都是独立对象、签名正确、都带 `_xtu_shim`);
+* **机制未查明**。它是"锦上添花"的二级细分,不值得为一个未查明的失败冒破坏可跑通路径的风险
+  ⇒ **已移除该包装**,只保留 `_setup_kernel` 这一级(28 个 shim,运行正常)。
+* **教训**:探针本身也必须用一次**真实启动**来验证,只做 import 级检查不够;
+  并且优先用"类属性替换"这类不会踩"按名导入"坑的方式。

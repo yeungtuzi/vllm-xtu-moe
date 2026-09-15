@@ -658,6 +658,7 @@ def _install_mxfp4_cpu_convert_shim() -> list[str]:
                     w13_weight_scale, w2_weight_scale, w13_bias=None,
                     w2_bias=None, *a, _orig=orig, **kw):
             # CPU 后端 = OOT 引擎,直接吃 checkpoint 原始布局,不做任何重打包。
+            _mb = _host_mem_mib() if _mem_diag_on() else {}
             if mixed_mode_enabled() and getattr(mxfp4_backend, "name", "") == "CPU":
                 return (w13_weight, w2_weight, w13_weight_scale,
                         w2_weight_scale, w13_bias, w2_bias)
