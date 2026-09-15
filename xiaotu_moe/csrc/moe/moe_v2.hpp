@@ -531,9 +531,31 @@ public:
             // 而 `small_batch_workers()` 在 DS-V4 维度上恒等于 nt_ ⇒ 传了也等于没限制,
             // 只会踩到 limited 等待路径的边界竞态。真正要限制 worker 子集需要
             // 先把 numa_pool 的 limited 路径修好(见 report/tuning/NOTES.md §33)。
-            forward_many_nsliced(M, k, expert_ids, weights, input, output, 0,
-                                 wlimit_override());
-            return;
+            //
+            // 【第 421 轮】此前这里对 packed4 **无条件**走 N-slice 并 return,导致下面
+            // "--- Expert grouping ---" 对 MXFP4 **永远不可达**:prefill 时
+            // NASS = M*k 极大(2417 token ⇒ 14502),每个 (token,专家) 对各自读一遍
+            // 专家块 ⇒ 流量 ~9.8 TB、冷 prefill 只有 ~59 tok/s(NOTES §420/§421)。
+            //
+            // 分组路径读的是成员 `w13_`;而 `nshard_ >= 2` 时 `w13_ = w13_shard_[0]`
+            // **只是 node0 的紧凑分片**,布局与索引都不匹配 ⇒ 分片模式下**绝不能**放开。
+            // 仅当 `XIAOTU_MOE_NOSHARD=1`(socket 副本 / 整块 reader)且批量足够大时,
+            // 才允许落到分组路径。**默认(分片)路径行为逐字不变。**
+            const size_t _nass_gate = (size_t)M * (size_t)k;
+            static const size_t _grp_min = [] {
+                const char* e = std::getenv("XIAOTU_MOE_GROUP_MIN_NASS");
+                long v = e ? std::atol(e) : 512L;
+                return (size_t)(v > 0 ? v : 512L);
+            }();
+            if ((nshard_ >= 2) || (_nass_gate <= _grp_min)) {
+                forward_many_nsliced(M, k, expert_ids, weights, input, output, 0,
+                                     wlimit_override());
+                return;
+            }
+            if (std::getenv("XIAOTU_MOE_GROUP_DIAG") != nullptr)
+                fprintf(stderr, "[group] packed4 large-batch -> grouping "
+                                "M=%d k=%d NASS=%zu nshard=%d\n",
+                        M, k, _nass_gate, nshard_);
         }
         // Small-batch N-slicing (decode): with few assignments the grouped and
         // per-token paths both leave most workers idle. Route them through the
