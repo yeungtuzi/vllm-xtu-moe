@@ -236,7 +236,25 @@ def _install_engram_materialize_shim() -> list[str]:
 
     process_weights_after_loading._xtu_shim = True  # type: ignore[attr-defined]
     _u.process_weights_after_loading = process_weights_after_loading
-    return ["process_weights_after_loading(+engram materialize)"]
+    # ⚠️ **必须同时替换按名字导入它的模块**。`base_loader.py:13-15` 用的是
+    # `from ...utils import process_weights_after_loading`,它持有的是**另一份绑定**;
+    # 只改 `utils` 上的属性,调用点仍然走旧函数 —— cellL 里
+    # `materialized=0` 就是这么来的(Engram 表再也不会被物化)。
+    # 与 shim 5(mxfp4 的两处绑定)是同一类坑。
+    rebound = []
+    for mod_name in (
+        "vllm.model_executor.model_loader.base_loader",
+        "vllm.model_executor.model_loader",
+        "vllm.model_executor.model_loader.tensorizer_loader",
+    ):
+        try:
+            m = importlib.import_module(mod_name)
+        except Exception:  # noqa: BLE001
+            continue
+        if getattr(m, "process_weights_after_loading", None) is not None:
+            setattr(m, "process_weights_after_loading", process_weights_after_loading)
+            rebound.append(mod_name.rsplit(".", 1)[-1])
+    return [f"process_weights_after_loading(+engram materialize; rebound={rebound})"]
 
 
 def _install_engram_last_shim() -> list[str]:
