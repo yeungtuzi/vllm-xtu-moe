@@ -16897,3 +16897,69 @@ Mode B(`mixed_experts.py`)已接上阈值门控的流式路径(`elif _gpu_pf` �
 若用户显式开启而源已被释放,会**显式报错**(而不是静默算错)。
 遗留:该分支目前用 `slot=None`(同步 H2D,无预取重叠,~400 ms/层),
 以及 `docs/GPU_PREFILL.md` 里 V4 的"137 GiB / 5.9 s"与新测的 V4.1 数字需要分模型写清。
+
+---
+
+## §460 GPU prefill 改为流式**引擎自有分片**(§459 的实现 + 验证)
+
+### C++ 侧(`moe_v2.hpp` / `binding.cpp`)
+`MOE_V2` 现在记录自己的缓冲尺寸(`g_w13_shard_bytes_ / g_w2_shard_bytes_ /
+g_w13g_bytes_ / g_w2g_bytes_ / crows / cbytes),并暴露:
+* `shard_geometry()` → dict(ns, per-node bytes, scale bytes, crows, cbytes);
+* `copy_hostbuf_to_device(which, node, dst, stream)` → `cudaMemcpyAsync` H2D,
+  `which`: 0=w13 分片、1=w2 分片、2=w13 scale、3=w2 scale。
+(binding **不链接 torch**,所以只传裸指针,和它已有的 host-func 路径同一风格。)
+
+### Python 侧(`gpu_prefill.kmajor_from_engine_shards`)
+关键认识:**每 node 的 gate 块就是规范 `[E, I, H/2]` 里连续的行区间**
+(`shard_fill_w13`: node n 存 gate 行 `[n·crows,(n+1)·crows)`,每专家块
+`[gate cbytes][up cbytes]`),所以重建只是 `view` + `cat`:
+
+```
+blk    = dma(which=0, n).view(E, 2, cbytes)
+gate_n = blk[:,0,:].reshape(E, crows, H/2)     # 规范 gate 的第 n 段
+up_n   = blk[:,1,:].reshape(E, crows, H/2)     # 规范 up  的第 n 段
+w13    = cat([cat(gate_n, dim=1), cat(up_n, dim=1)], dim=1)   # [E,2I,H/2]
+```
+scale 是引擎自己复制的**单份**(未分片),直接 DMA 后 view 成
+`[E,2I,H/gk]` / `[E,H,I/gk]`。最后 `_kmajor_bytes` 得到 K-major,塞进
+`PrefetchSlot.bufs` 交给 `gpu_moe_layer`(走 slot 分支,不再重复转置)。
+
+### 验证 1:逐字节等价(单元,`probe_shard_kmajor_equiv.py`)
+真权重 layer 3:
+
+```
+w13  ref(384,2560,4608) got(384,2560,4608) bit_equal=True n_diff=0
+s13  ref(384, 160,4608) got(384, 160,4608) bit_equal=True n_diff=0
+w2   ref(384,1152,5120) got(384,1152,5120) bit_equal=True n_diff=0
+s2   ref(384,  72,5120) got(384,  72,5120) bit_equal=True n_diff=0
+```
+
+⇒ 用分片重建出的权重**和流式源张量逐字节相同**。
+
+### 验证 2:宿主内存真的降下来了
+带 `XIAOTU_RELEASE_SOURCE=0`(旧方案):**EngineCore 1073 GB 时还没加载完**
+(`node0 free 3.5 GB / node1 free 2.1 GB`,已 kill)。
+用分片方案 + 正常 `RELEASE_SOURCE=1` 加载中:**728.7 GB**,`node0/1 free 142/155 GB`。
+⇒ **主机专家内存 522 → 253 GiB**,§459 的目标达成。
+
+### 新发现:启用 GPU prefill 需要**预留显存**
+第一次跑失败在 KV cache 定容:
+
+```
+[vllm-xtu-moe] GPU prefill ACTIVE: first 2048 tokens >= threshold 2048; weights from engine shards
+INFO ... Graph capturing finished in 8 secs, took -2.09 GiB
+INFO ... Available KV cache memory: -1.57 GiB
+ValueError: No available memory for the cache blocks.
+```
+
+原因:vLLM 的 **profile run** 也会走到 `_gpu_pf`(它用 2048 token 的 dummy batch),
+于是那 ~14 GiB 的逐层 staging 缓冲被算进峰值显存 ⇒ KV 预算变成负数。
+**逐层 staging 的显存占用 ≈ 1-2 倍的"单层专家权重大小"**
+(V4.1 TP=1 单层 6.72 GiB;当前实现因为 raw + K-major 两份,峰值约 13-14 GiB)。
+
+⇒ **启用该功能的必要条件:把 `--gpu-memory-utilization` 调低以腾出这份预留**
+(本例 KV 需求很小:MLA fp8_ds_mla 下 8192 token ≈ 190 MB,所以腾出十几 GiB 几乎无损)。
+**要写进文档**(用户自己按卡的显存/PCIe 决定)。
+**可优化点(下一步)**:直接按分片块填 K-major 目标张量,省掉 `raw` 中间体
+(峰值 ~14 → ~9.5 GiB)。
