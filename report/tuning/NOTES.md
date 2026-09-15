@@ -13573,3 +13573,38 @@ POST /v1/chat/completions -> 200, completion_tokens=8, finish_reason=length
 * 🔴 **真实权重下的输出正确性** —— 本轮是 `--load-format dummy`,输出必然是乱码;
 * 🔴 decode 的**多步**正确性(只跑了 8 步)、长上下文、并发;
 * 🔴 TP=2 路径;DSpark 投机解码;视觉塔。
+
+### 372. 【v0.4·第 4 轮】真实权重运行**再次撞 NUMA OOM**;结构性目标已达成,正确性验证待下一轮
+
+#### 实测
+
+`LOAD=auto`(真实权重,475 GB)跑到 **31/40 层引擎**时被 OOM 杀掉(无 Traceback):
+
+```
+Sep 15 01:40:32  Out of memory: Killed process 1687794 (VLLM::EngineCor)
+                 anon-rss: 452 GB   shmem-rss: 812 GB   (≈ 1264 GB)
+```
+
+* 与第 2 轮**同一机制**:`CONSTRAINT_MEMORY_POLICY` 单 node 打满,不是总量 ——
+  进程结束后机器仍有 **1231 GB free**。
+* dummy 权重那次(`MAXLEN=1024`)能跑完 40 层(RSS 峰值 1328 GB);
+  真实权重这次在 1264 GB 就被杀 ⇒ **差别在当时的 per-node headroom**,不在总量。
+* 8×193 GB 的节点里,node 1/3 天生比其它少 ~40 GB(其它进程/页缓存),而进程需要 **~165-175 GB/node**。
+  ⇒ **余量只有 ±10 GB,是否 OOM 取决于运气。**
+
+#### 结论
+
+* ✅ **结构性目标已达成**:dummy 权重下 40/40 引擎 + 真实请求 + 8 token,**0 错误**(§371)。
+* 🔴 **真实权重的"可用出数"仍被内存卡住** —— 这是**资源问题,不是代码问题**。
+
+#### 下一轮的三条路(按性价比排序)
+
+1. **消除引擎的权重副本(能省 ~269 GB,最根本)**:`shard_region` 把权重拷进 per-NUMA 分片区,
+   而 vLLM 的源张量仍然驻留 ⇒ 专家权重 **2×**(IRON_RULES R9 早已记录)。
+   若能 mbind 源张量原地分片、或构造后释放源,进程峰值从 ~1.26 TB 降到 ~1.0 TB,余量立刻充足。
+2. **等机器更空时重跑**:同一份代码在不同时刻的 per-node headroom 下结果不同,先 `free -g` 确认 ≥1.45 TB。
+3. **降低需求**:更小的 `--max-model-len`(KV 对 V4.1 本就极小,收益有限);
+   或临时减少 Engram 的 pin(不可行 —— 单卡显存放不下 189 GB)。
+
+> 方法论提醒:`MEMTRACE=1` 的逐 node 采样已经证明**各 node 均匀增长**,
+> 所以"再加 numactl 参数"这条路已经走到头;下一步必须**减少总量**。
