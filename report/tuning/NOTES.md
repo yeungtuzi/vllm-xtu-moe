@@ -14866,3 +14866,47 @@ cellM(`XIAOTU_ENGRAM_LAST=1`)第 40 层:
 476 s 时 `rel=40 / materialized=0 / loaddone=0`,仍在装载段(与 cellL 同相位);
 `OOM=0 / assert=0 / ERROR=0`。**待确认**:物化是否真的被调用、能否走到
 `Application startup complete`。
+
+### 396. 🎉🎉🎉【v0.4·第 36 轮】**DeepSeek-V4.1-Flash 在 NPS=1 下首次端到端出数(API 返回 token)**
+
+#### 396.1 里程碑证据(cellM,`XIAOTU_ENGRAM_LAST=1`,`LOAD=dummy`,TP=1,GPU0)
+
+```
+[xtu-engram-last] materialized 2 Engram table(s) AFTER the expert phase (IRON_RULES R11)
+released 6.59 GiB × 40 layers                      ← 40/40 全部"切分一层、释放一层"
+GPU KV cache size: 315,007 tokens
+Application startup complete.
+```
+
+真实 HTTP 请求(`POST /v1/completions`,端口 8107):
+
+```json
+{"id":"cmpl-b88e93fed3e91edd","object":"text_completion","model":"dsv41",
+ "choices":[{"index":0,"text":"каза isказа isказа isказа ...","finish_reason":"length"}],
+ "usage":{"prompt_tokens":5,"completion_tokens":16,"total_tokens":21}}
+```
+
+耗时 **5.7 s / 16 token**;`/v1/models` 亦正常响应。
+
+**⚠️ 必须如实标注的边界**:文本是**乱码**,因为权重是 **`--load-format dummy`**(随机/占位)。
+这**证明的是整条链路贯通**:装载 → 逐层切片 → 释放 → Engram 后置物化 → KV cache 分配
+→ 前向 → decode → 反 tokenize → HTTP 返回。**不代表数值正确性,更不代表真实权重可跑。**
+
+#### 396.2 内存:1116 GB → **863 GB**(省 ~250 GB)
+
+* Engram 后置贡献:R11 生效,专家阶段 `RssShmem` 从 270354 MiB 降到 18 MiB(§395.1);
+* 仍偏高(账面 ≈ 467 GiB + Engram 189 = 656 GiB):**§395.3 的上游 9.18 GiB/层匿名增长
+  (40 层 ≈ 367 GiB)是下一个主攻点**。
+
+#### 396.3 与目标的对照
+
+| 目标项 | 状态 |
+|---|---|
+| 最小可用端到端出数(优先单卡) | ✅ **达成**(TP=1 / 单卡 / NPS=1 / dummy 权重) |
+| CED/CSA2 跨层 KV、层级稀疏索引器、mHC、FP4 专家 | ✅ 已随本次运行贯通(0 错误) |
+| Engram 主机内存 | ✅ 后置(R11),专家阶段不再占用 |
+| **真实权重** | ❌ 未验证(从未装载成功) |
+| **DSpark** | ⚪ 未启用(运行里 `speculative_config=None`) |
+| 数值正确性 | ❌ 未验证(dummy 权重,输出必然乱码) |
+
+⇒ 目标**第一阶段达成**;距"真正跑起来(真实权重)"仍差最后一段。
