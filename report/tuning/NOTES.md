@@ -14660,3 +14660,49 @@ DEVICE-LOADING SHIM OK
   但探针要修,否则以后会误判。
 * 装载尚未结束(`loaddone=0`,RSS 657 GB,MemFree 458 GB,仍在进行)。**未验证**:能否走到 40/40 引擎
   与 `Application startup complete`,以及真实请求能否出数。
+
+### 392. 🚀【v0.4·第 30 轮·续】装载**首次全程成功**(40/40 释放) + 新阻塞点及其修复
+
+#### 392.1 cellI 的成绩单(shim 修复之后)
+
+```
+XTSIG=0  defer=0  rel=40  loaddone=1  OOM=0
+Model loading took 11.28 GiB memory and 647.1 seconds
+释放总量 = 40 × 6.59 GiB = 264 GiB
+结束后:Shmem=0  MemFree=1122 GiB     ← 内存全部还回来了
+```
+
+**这是本项目第一次做到**:装载跑完、40 层全部"切分一层、释放一层"、
+没有 GPU OOM、没有 pinned 地板、结束时内存归零。
+
+#### 392.2 新的阻塞点(已定位并已修)
+
+装载之后、`determine_available_memory` 的 profile run 里挂掉:
+
+```
+modular_kernel.py:1317 _fused_experts
+  → fused_experts.moe_problem_size(...)
+modular_kernel.py:809  moe_problem_size
+  assert len(w1.shape) == 3 and len(w2.shape) == 3      → AssertionError
+```
+
+**这是我自己的释放造成的**:`torch.empty(0)` 是 **0 维**张量,而模块化链路会把
+`w1/w2` 透传进 `apply()` 并读它们的 shape ⇒ 释放把 ndim 从 3 变成了 0。
+
+**修法**:改用**全零 stride 的 `empty_strided`** —— 保留真实 shape/ndim,
+底层 storage 只有 1 个元素。实测:
+
+```
+freed 6.33 GiB (storage 4.22+2.11 GiB before)
+w13: shape=(384,4608,2560) ndim=3 storage=1B
+w2 : shape=(384,5120,1152) ndim=3 storage=1B
+```
+
+附带好处:`numel()` 不再为 0,`apply()` 里那个 `hidden_size` 回落分支不再被触发。
+
+#### 392.3 下一跑(cellJ)的判据
+
+1. 是否越过 `moe_problem_size` 的断言;
+2. 是否出现 `Application startup complete`;
+3. 若起来了 —— 发一个真实请求,确认**端到端出数**(这才算目标的第一步达成);
+4. 之后才是内存/性能 A/B(`ASYNC` 等,见 §389)。
