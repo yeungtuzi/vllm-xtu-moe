@@ -35,7 +35,12 @@ if _SYNTH:
     # prefix caching 会把它整段命中 ⇒ 测出来的"prefill"是缓存假象
     # (2048 报 6407 tok/s,而 4096 掉到 128 tok/s,就是那次缓存未命中暴露的)。
     # 这里给每个位置一个唯一词,保证真的走完整 prefill。
-    _words = [f"w{i}x{i * 7 % 9973}" for i in range(max(1, _SYNTH))]
+    _seed = arg("--synth-seed", 1)
+    # 内容必须**同时依赖长度与种子**,否则不同长度之间共享前缀(会被 prefix caching 命中)。
+    _words = [
+        f"q{_seed}z{i}r{(i * 7919 + _seed * 104729 + _SYNTH) % 999983}"
+        for i in range(max(1, _SYNTH))
+    ]
     PROMPT = " ".join(_words)
 else:
     PROMPT = arg("--prompt", "Count from 1 to 1000, separated by commas: 1, 2, 3,")

@@ -23,6 +23,10 @@
 #
 # Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS
 #
+# PREFIX_CACHE(默认 1 = 保持 vLLM 默认开启):设为 0 会加 --no-enable-prefix-caching。
+#   **测量长上下文 prefill 时必须设 0** —— 否则不同 prompt 共享前缀会被整段命中,
+#   量出"prefill 几千甚至上万 tok/s"的假象(NOTES §420 连续两次踩到)。
+#
 # 【性能默认已调】SPIN_IDLE_US 默认 5000(原 0):实测把 perf 里 ~42% 的 futex
 #   (lll_lock_wait/wake)降到 ~0%,compute 0.43->0.37 ms/层,单流 25.7->27.5 tok/s。
 #   见 NOTES §412。可用 SPIN 环境变量覆盖。
@@ -145,7 +149,8 @@ nohup env \
     --model "$CKPT" --served-model-name dsv41 \
     --load-format "$LOAD" \
     --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-1}" \
-    --gpu-memory-utilization "$GPU_UTIL" $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager ) --trust-remote-code \
+    --gpu-memory-utilization "$GPU_UTIL" $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager ) \
+    $( [ "${PREFIX_CACHE:-1}" = "1" ] || echo --no-enable-prefix-caching ) --trust-remote-code \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --kernel-config '{"enable_jit_warmup": false}' \
     --port "$PORT" > "$LOG" 2>&1 &
