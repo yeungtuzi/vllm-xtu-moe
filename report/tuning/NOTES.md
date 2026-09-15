@@ -14910,3 +14910,52 @@ Application startup complete.
 | 数值正确性 | ❌ 未验证(dummy 权重,输出必然乱码) |
 
 ⇒ 目标**第一阶段达成**;距"真正跑起来(真实权重)"仍差最后一段。
+
+### 397. 🏆🏆🏆【v0.4·第 37 轮】**目标达成:DeepSeek-V4.1-Flash 真实权重(475 GiB)在单张 A100-40GB + NPS=1 上跑通,输出正确**
+
+#### 397.1 决定性证据(cellN,`LOAD=auto` **真实权重**,TP=1,GPU0,端口 8108)
+
+```
+rel=40  loaddone=1  startup=1  OOM=0  assert=0  XTSIG=0  ERROR=0
+Application startup complete.
+RSS = 862 GiB      MemFree = 193 GiB
+```
+
+**真实请求的返回(这是关键——不是乱码,是正确答案):**
+
+| prompt | 输出 | 说明 |
+|---|---|---|
+| `The capital of France is` | **` Paris.`** | `finish_reason: stop`,3 token,**事实正确** |
+| `1 + 1 =` | **` 2，2 + 2 = 4，4 + 3 =`** | **算术正确** |
+
+第二次请求 **0.439 s** 返回。
+
+⇒ **748B / 475 GiB 真实权重**,在 **1× A100-40GB(单卡)** + 1.5 TiB 主机上、
+NPS=1、CPU 专家引擎、SM80 移植路径下,**端到端出正确的数**。
+
+#### 397.2 这一轮之前失败过的地方,以及各自是怎么被解决的
+
+| 曾经的阻塞点 | 解决 |
+|---|---|
+| GPU OOM(`p.data.to(target_device)` 每层搬一整层专家上 GPU) | **`device_loading_context` shim**:给 CPU 专家打 `_xiaotu_cpu_expert` 标记并跳过搬运(§390) |
+| 引擎构造 SIGSEGV(CPU 引擎拿到 GPU 指针) | 同上;并加 `_eager_build_ok` / `_assert_host_source` 护栏(§385) |
+| 释放后 `moe_problem_size` 形状断言 | `empty_strided` 保留 3 维形状(§392) |
+| 启动期 `rwsem` 冻结 | 改用引擎默认的 `XIAOTU_MOE_ASYNC=1`(§393) |
+| Engram 188.8 GiB pinned 占着专家阶段 | **Engram 后置**(IRON_RULES R11),专家阶段 `RssShmem` 270354 MiB → 18 MiB(§395) |
+| 物化钩子永不触发 | 重绑 `base_loader` 的按名导入(§395.2) |
+
+#### 397.3 内存账(真实权重)
+
+* RSS **862 GiB**;MemFree 193 GiB;
+* 相对本轮开始时的 1064~1116 GB,靠 Engram 后置等改动降了下来;
+* **仍未点名**:上游每层 +9.18 GiB 匿名(40 层 ≈ 367 GiB,§395.3)——这是进一步瘦身的主攻点。
+
+#### 397.4 明确的未验证边界(必须随结论一起带走)
+
+1. **DSpark 从未启用**:运行里 `speculative_config=None`,所以"投机解码可用"**未验证**;
+2. **TP=2 未验证**(本次是 TP=1 单卡);
+3. **性能未做系统对比**:只测了单请求延迟(3 token 0.44 s / 16 token 0.44 s 量级),
+   未做吞吐、并发、长上下文;
+4. **`XIAOTU_ENGRAM_LAST=1` 与真实权重不兼容**:该开关目前只做 dummy 填充,
+   真实权重场景必须保持关闭(本次正是关闭的),否则会得到未初始化的表;
+5. 数值正确性只做了**两个 prompt 的定性核对**(事实题 + 算术题),**不是** benchmark 级验证。
