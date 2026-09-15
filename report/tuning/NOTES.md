@@ -14591,3 +14591,35 @@ v41n2 当时余量更宽松,所以 ① 勉强通过,代价是每层产生一份 
 
 已用 1+2 起跑 cellH(`GPU_UTIL=0.60` + `VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1`,
 `LOAD=dummy`),验证这条推论。
+
+#### 390.4 本轮已实现并单测通过的修法(shim 层,不改主线)
+
+`device_loading_context` 是根因,而 `target_device` 来自 `load_config.device`,
+若设成 cpu 会让 `create_model` 把**所有**参数(含 attention)建在 CPU —— 不能用。
+所以改成在我们自己的 shim 层做**定向**修复:
+
+1. `create_weights` shim 给混合模式下建在 CPU 的**大**参数(≥64 MiB)打标记
+   `_xiaotu_cpu_expert`(只标大张量,避免影响 router/bias 等小参数的正常处理);
+2. 新增 `_install_device_loading_shim()`:以等价实现替换 `device_loading_context`,
+   只在两个循环里各多一句 `if getattr(p, _xiaotu_cpu_expert, False): continue`;
+3. 已注册进 shim 列表(现 **27** 个,列表里可见 `device_loading_context`)。
+
+**真 GPU 单测**(`CUDA_VISIBLE_DEVICES=0`):
+```
+inside : expert = cpu (must be cpu)   other = cuda (must be cuda)
+after  : expert = cpu                 other = cpu
+DEVICE-LOADING SHIM OK
+```
+⇒ 被标记的专家**留在 CPU**,未标记参数**仍被搬上 GPU 并在退出时还原** ⇒ 原语义保留。
+
+预期:专家不再经 GPU 中转 ⇒ (a) 无 GPU OOM;(b) 无 pinned 地板;
+(c) 钩子时刻 `p.device` 是 cpu ⇒ CPU 引擎不会再拿到 GPU 指针。
+
+#### 390.5 交接:下一步要做的验证(优先级从高到低)
+
+1. **端到端跑一次 cellI**(`LOAD=dummy`,`GPU_UTIL=0.60`):看是否还有
+   `p.data = p.data.to(target_device)` 的 OOM、`[xtu-diag]` 里 `RssShmem` 是否不再每层 +12.75 GiB、
+   以及引擎能否在装载期就地建成(`deferring` 是否消失)。
+2. 若装载期能建引擎,`SHARD-DIAG` 与 `released` 应首次同时出现 ⇒ 内存 A/B 才真正可做。
+3. 再跑 V4 回归(数值门 `1.873e-02` + 确定性),确认这个新 shim 没有破坏 V4
+   (它对未标记参数是逐字等价的,理论上无影响,但要有实测)。
