@@ -14815,3 +14815,54 @@ lay.w13_weight storage bytes: 1         # 但底层 storage 已换成 1 字节 �
    meta/占位,在 post-load 钩子里 materialize。
 2. **逐层 load/slice/release**:在 vLLM 里识别 `_xiaotu_cpu_expert` 标记的参数,
    按层完成 加载→切片→释放,避免"一次性全量"。**作为单独 PR 提交。**
+
+### 395. 🎯【v0.4·第 36 轮】Engram 后置**效果确认**;拆因探针首次给出硬数字:**上游每层自己吃 9.18 GiB 匿名内存**
+
+#### 395.1 Engram 后置的内存效果(实测,cellL)
+
+同位置对比 `[xtu-diag]` 的 `RssShmem`:
+
+| | cellE(改前) | **cellL(Engram 后置)** |
+|---|---|---|
+| pwal#1 | **270354 MiB** | **18 MiB** |
+| pwal#8 | 361746 MiB | 32 MiB |
+| pwal#16 | 466194 MiB | 48 MiB |
+| pwal#40 | — | **96 MiB** |
+
+⇒ 那 **188.8 GiB 不可回收的 pinned 表已彻底不在专家阶段**;40 层全程 `RssShmem` 只涨到 96 MiB。
+**IRON_RULES R11 的效果被实测确认。**
+
+#### 395.2 抓到一个会让它彻底失效的坑(已修)
+
+cellL 里 `materialized=0` —— 物化钩子从未执行。原因:
+`base_loader.py:13-15` 用的是
+`from vllm.model_executor.model_loader.utils import process_weights_after_loading`
+⇒ 持有**另一份绑定**,只改 `utils` 模块属性对调用点无效(**与 shim 5 的 mxfp4 两处绑定同类**)。
+已改为在 `base_loader` / `model_loader` / `tensorizer_loader` 上逐一重绑;单测确认两处
+现在指向同一被包装对象。
+**后果必须记住**:不修则 Engram 表**永不物化**,而内存曲线看起来完全正常 —— 极易误判为成功。
+
+#### 395.3 🎯 新硬数字:`[xtu-diag-split]` 首次跑通
+
+cellM(`XIAOTU_ENGRAM_LAST=1`)第 40 层:
+
+```
+[xtu-diag-split] l#40 upstream: dShmem=+2MiB   dAnon=+9180MiB
+                        our_hook: dShmem=+0MiB  dAnon=+0MiB
+```
+
+* **上游 `process_weights_after_loading` 自己每层新增 ~9.18 GiB 匿名内存**
+  ⇒ 40 层 ≈ **367 GiB**。这是 §394.3 里"~600 GiB 缺口"的一大块,而且**与我们插件的
+  释放/切片无关**(`our_hook` 那半是 +0)。
+* 9.18 GiB / 层 与单层权重 6.33 GiB 不成简单比例(×1.45),**具体是谁尚未点名**。
+  合理解释里最该先查的两条:(a) 上游在 CPU 后端路径上又建了一份副本;
+  (b) `FusedMoEExpertsModular.__init__` 按 `max_num_tokens` 分配的 workspace
+  (但 1024 token × 4608 × 2B 只有 ~9.4 MB,量级不符)。
+* **下一步量法**:在 `_setup_kernel` 前后分别采样,并在
+  `make_mxfp4_moe_kernel` 内部分段打点,把 9.18 GiB 落到具体一行。
+
+#### 395.4 cellM 状态
+
+476 s 时 `rel=40 / materialized=0 / loaddone=0`,仍在装载段(与 cellL 同相位);
+`OOM=0 / assert=0 / ERROR=0`。**待确认**:物化是否真的被调用、能否走到
+`Application startup complete`。
