@@ -86,10 +86,14 @@ if pt0:
 
 # 串行重复:看抖动(均值之外的稳定性)
 dts, cts = [], []
-for _ in range(REPEAT):
+for _i in range(REPEAT):
     d, c, t, _pt = one(PROMPT, MAXTOK)
     dts.append(d)
     cts.append(c)
+    # 逐请求打印:第一次常包含 **CUDA graph 捕获/预热** 的一次性成本,
+    # 只看 P50 会把稳态掩盖掉(见 NOTES §420)。prefill 吞吐按 prompt_tokens/耗时算。
+    _pf = f" prefill={_pt / d:8.1f} tok/s" if _pt else ""
+    print(f"  req#{_i + 1}: lat={d:7.2f}s tok={c:4d}{_pf}")
 report(f"serial x{REPEAT}", dts, cts)
 if REPEAT == 1:
     print(f"                       text={t[:60]!r}")
