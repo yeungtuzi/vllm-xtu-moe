@@ -644,6 +644,28 @@ class _XiaotuExpertsMixin:
         #   * `slot.busy = None`(不是空 Event)。
         from vllm_xiaotu_moe.gpu_prefill import PrefetchSlot, _pinned_kmajor
 
+        # 解析本层实际要用的权重/尺度(与 _ensure_engine 同源;INT4 等格式的
+        # 重排由 _prepare_weights 负责)。
+        self._prepare_weights(layer)
+        w13 = self._engine_w13 if self._engine_w13 is not None else layer.w13_weight
+        w2 = self._engine_w2 if self._engine_w2 is not None else layer.w2_weight
+        s13, s2 = self._scales
+        if s13 is None:
+            s13 = self._find_scale(layer, (self._scale_attrs[0],))
+        if s2 is None:
+            s2 = self._find_scale(layer, (self._scale_attrs[1],))
+        for _nm, _t in (("w13", w13), ("w2", w2), ("s13", s13), ("s2", s2)):
+            if (
+                not isinstance(_t, torch.Tensor)
+                or _t.device.type != "cpu"
+                or not _t.is_contiguous()
+            ):
+                raise RuntimeError(
+                    f"xiaotu resident layer needs contiguous host {_nm}; got "
+                    f"{type(_t).__name__} device="
+                    f"{getattr(_t, 'device', None)}"
+                )
+
         dev = torch.device("cuda", torch.cuda.current_device())
         src = (
             _pinned_kmajor(w13), _pinned_kmajor(s13),
