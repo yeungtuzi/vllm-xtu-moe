@@ -14374,3 +14374,54 @@ length 写成 0(== EINVAL,实际不解映射)。只在失败路径触发,平时�
 
 **暂时做不了**:cellB 与 cellC 都没能走到"引擎已存在"的那一刻,
 `[xtu-diag-split]` 的 `our_hook:` 半段因此从未被采样。要先让"在 pwal 时刻建引擎"不再 fault。
+
+### 386. 【v0.4·第 22 轮】Engram 主机内存定性:188.8 GiB pinned,**硬地板、无旋钮**
+
+目标里列的第 5 项("Engram 主机内存")现在可以结案:
+
+* **来源确认**:`vllm/models/deepseek_v41/nvidia/engram.py:283-295` 明确用
+  `torch.empty(..., pin_memory=True)` 分配主机表 —— 这正是 §376/§379 里
+  `RssShmem = /dev/zero (deleted)` 的那一类,**pin 是设计使然**,不是 bug。
+* **大小确定**:两张表各 `384016682 rows x 256`,`94.42 GiB/rank` ⇒ **188.8 GiB**。
+  数值来自模型 config(`engram_num_embeddings`、`engram_n_heads=8`、`engram_head_dim=256`),
+  **不是可调参数**。
+* **没有可用的缩放旋钮**:`EngramConfig.cpu_offload` 只是 bool;
+  `dp_shared_memory=True` 能让多个 DP rank **共享一张**表(走 `/dev/shm`,`prefix=vllm_engram_`),
+  但我们在 TP=1/DP=1 下只有一个 rank,**共享不带来任何节省**。
+
+⇒ **结论:188.8 GiB 是不可回收、不可换出(本机无 swap)的硬地板。**
+可用于"专家源 + 引擎分片 + 非专家权重"的预算约为
+`1511 − 189(Engram) − ~25(非专家) ≈ 1297 GiB`,再扣掉可回收的 page cache。
+这也是为什么必须把"专家权重只留一份"做出来 —— 否则 269(源) + 253(分片) 叠加必爆。
+
+#### 386.1 cellE 现场
+
+EngineCore pid=99152,`134 GB`,`XTSIG=0 / defer=0 / pwal=0 / ptr=0`,仍在装载。
+它带的是 `c8a1b51`(保活快照 + 加固护栏 + `[xtu-diag-ptr]`),约 8 分钟后经过第一层 MoE。
+
+### 387. 【v0.4·第 23 轮】目标七项阻塞点的**已验证 / 未验证边界**汇总
+
+目标原文列了 7 项(CED/CSA2 跨层 KV、层级稀疏索引器、mHC、Engram 主机内存、FP4 专家、DSpark),
+这里给出一张可直接交接的状态表。**"已验证"只认有实测证据的**。
+
+| # | 阻塞点 | 状态 | 证据 / 边界 |
+|---|---|---|---|
+| 1 | **CED/CSA2 跨层 KV** | ✅ 已验证(能跑通) | `vllm/models/deepseek_v41/attention.py:263-291`:靠 `kv_source_layer_ids` / `index_source_layers` 选层,缺了会**直接 raise**(`:277-279`)⇒ 它是**必需**机制、随模型必然启用(config 里有 `text_config.kv_source_layer_ids`)。§371 的 dummy 端到端跑(40/40 引擎 + 真实请求 + 出 8 token、0 错误)**已经走过这条路径**;数值层面由 SM80 attention 与 fp32 torch 参考对齐覆盖(prefill 最差 `max_abs=3.70e-3`)。**未验证**:真实权重下的跨层 KV 数值。 |
+| 2 | **层级稀疏索引器** | ✅ 已验证(能跑通) | 日志 `Using FP8 indexer cache for Lightning Indexer`;SM80 侧的 `indexer_k_store.py` / `fused_compress_quant_cache.py` / `cache_utils.py` 已把 Triton `tl.float8e4nv` 换掉并加了 cuTeDSL 门控。**注**:我曾怀疑 `v1/hisparse` 的宿主 KV 池吃内存,已排除——它需要 `--kv-transfer-config` 里的 `HiSparseConnector.host_pool_gib`,我们不传,日志无 hisparse 行(§383)。 |
+| 3 | **mHC** | ✅ 已验证(修好且放行) | `kernels/mhc/tilelang.py`:`mhc_pre_broadcast_tilelang` 改为按 `is_deep_gemm_supported()` 门控,否则走 `_torch_hc_prenorm_gemm`。修前是 `deepgemm-src/.../hyperconnection.hpp:59 Unsupported architecture`。 |
+| 4 | **Engram 主机内存** | ✅ 已定性 / ⛔ 不可优化 | 188.8 GiB **pinned**(`engram.py:283-295` 显式 `pin_memory=True`),尺寸由模型 config 决定,**无可调旋钮**;`dp_shared_memory` 在 DP=1 下无收益。**这是硬地板**(§386)。 |
+| 5 | **FP4 专家** | ✅ 已验证(数值门通过) | 紧凑分片 `f7cc2bf` 数值门 **bit-identical**(`OK=7 BAD=1, max_rel=1.873e-02`);SM80 走 AVX-512 VNNI/BF16 引擎,不需 AMX。 |
+| 6 | **DSpark** | ⚪ 未启用(故未验证) | 日志里 `speculative_config=None` ⇒ 我们的运行根本没开投机解码。**边界**:这不是"已验证可用",只是"没被触发";`hybrid_model.py` 里那份 draft 实例的 shm 命名修法(§236/§238)是历史工作,与本轮运行无关。 |
+| 7 | **端到端出数** | ⚠️ 部分达成 | **dummy 权重下已达成**(§371:40/40 引擎 + 真实请求 + 8 token,0 错误),但那是 **NPS=4**;NPS=1 下被"专家权重 2×"卡住(§375-§385)。**真实权重下尚未成功**。 |
+
+#### 387.1 因此,"目标是否达成"的诚实结论
+
+* **最小可用的端到端出数**:在 dummy 权重、NPS=4 下**已经达成**(有实测)。
+* **在 NPS=1(当前 BIOS)下**:**未达成** —— 卡在内存,根因链已完整
+  (专家权重同时存在"源 269 GiB + 引擎分片 253 GiB"两份;Engram 188.8 GiB 不可动)。
+* **真实权重**:从未成功加载完(§372 在 31/40 层撞 OOM)。
+
+⇒ 目标**不能标记完成**,应保持 active,交接点为:
+(1) 让"装载期建引擎"不再 fault(cellE 正在验证 `c8a1b51` 的保活快照);
+(2) 真实权重加载;
+(3) DSpark 从未验证。

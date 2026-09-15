@@ -284,9 +284,14 @@ class _XiaotuExpertsMixin:
         原因见 `_eager_build_ok` 与 NOTES §385:pwal 返回后 `layer.w13_weight`
         可能指向一块临时/已释放的存储,直接读会 SIGSEGV。
         """
-        snap = getattr(layer, "_xiaotu_pre_pwal_src", None) or {}
-        t = snap.get(nm)
-        return t if isinstance(t, torch.Tensor) else getattr(layer, nm, None)
+        # ⚠️ 只在**释放开关打开时**才优先用快照。否则会改变其它模型(V4 等)建引擎
+        # 所依据的张量 —— 那正是"适配新模型不能破坏已有模型"的红线。
+        if _release_source_enabled():
+            snap = getattr(layer, "_xiaotu_pre_pwal_src", None) or {}
+            t = snap.get(nm)
+            if isinstance(t, torch.Tensor):
+                return t
+        return getattr(layer, nm, None)
 
     def _eager_build_ok(self, layer: torch.nn.Module) -> tuple[bool, str]:
         """能否在 `process_weights_after_loading` 里**安全**地提前建引擎。
@@ -357,6 +362,7 @@ class _XiaotuExpertsMixin:
         `apply()`,而 `apply()` 用的是引擎、**从不读它们** —— 但如果上游某处读了
         `.shape`/`.data_ptr()`,就会出问题。A/B 时先看能不能跑通再谈收益。
         """
+        global _RELEASE_MISSES
         freed = 0
         self._released_shapes = getattr(self, "_released_shapes", {})
         names = ["w13_weight", "w2_weight"]
