@@ -156,6 +156,131 @@ def _install_device_loading_shim() -> list[str]:
     return ["device_loading_context"]
 
 
+_ENGRAM_LAST_PENDING: list = []
+
+
+def _engram_last_on() -> bool:
+    """是否启用"Engram 最后加载"(IRON_RULES R11)。**默认关闭**。"""
+    return os.environ.get("XIAOTU_ENGRAM_LAST") == "1"
+
+
+def _materialize_engram_tables() -> int:
+    """把延后的 Engram pinned 大表真正建出来(专家阶段全部结束之后调用)。
+
+    ⚠️ 范围与边界:目前只实现 **dummy 填充**(与 `--load-format dummy` 语义一致,
+    即 `dummy_weight_value` = 1.0 / 127)。真实权重需要"物化后补跑一次 Engram 加载",
+    尚未实现 —— 那种情况下**显式报错**,绝不静默给出未初始化的表。
+    """
+    n = 0
+    for m in list(_ENGRAM_LAST_PENDING):
+        try:
+            w = torch.empty(
+                m.part_num_embeddings, m.dim,
+                dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True,
+            )
+            s = torch.empty(
+                m.part_num_embeddings, m.dim // m.block_size,
+                dtype=torch.uint8, device="cpu", pin_memory=True,
+            )
+            w.fill_(1.0)      # 与主线 set_weight_attrs(dummy_weight_value=1.0) 一致
+            s.fill_(127)      # ue8m0 的 1.0 = 指数 127
+            # ⚠️ 不能写 `m.weight.data = w`:占位是 **meta** 张量,而 `nn.Parameter`
+            # 的 `.data=` 要求两侧 tensor type 相容(meta vs cpu 会抛
+            # "incompatible tensor type")。所以**换掉整个 Parameter**,
+            # 并把主线 `set_weight_attrs` 写在 `__dict__` 里的属性(如
+            # `dummy_weight_value` / `weight_loader`)原样带过去。
+            for attr, t in (("weight", w), ("weight_scale_inv", s)):
+                old = getattr(m, attr)
+                if isinstance(old, torch.nn.Parameter):
+                    new = torch.nn.Parameter(t, requires_grad=old.requires_grad)
+                    new.__dict__.update(getattr(old, "__dict__", {}))
+                    setattr(m, attr, new)
+                else:
+                    setattr(m, attr, t)
+            n += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"[xtu-engram-last] materialize FAILED: {type(exc).__name__}: {exc}",
+                  flush=True)
+    _ENGRAM_LAST_PENDING.clear()
+    if n:
+        print(f"[xtu-engram-last] materialized {n} Engram table(s) AFTER the expert "
+              f"phase (IRON_RULES R11)", flush=True)
+    return n
+
+
+def _install_engram_materialize_shim() -> list[str]:
+    """把 Engram 表的**物化**挂到"专家阶段全部结束之后"。
+
+    上游现成的模型级 post-load 钩子就在 `model_loader/utils.py` 的
+    `process_weights_after_loading()` 末尾(`utils.py:167` 那句
+    `model.process_weights_after_loading()` 之后)。我们在函数返回前物化,
+    此时所有专家层都已完成 `process_weights_after_loading` + 释放。
+    """
+    if not _engram_last_on():
+        return []
+    try:
+        from vllm.model_executor.model_loader import utils as _u
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip engram materialize shim: {type(exc).__name__}: {exc}")
+        return []
+    orig = getattr(_u, "process_weights_after_loading", None)
+    if orig is None or getattr(orig, "_xtu_shim", False):
+        return []
+
+    @functools.wraps(orig)
+    def process_weights_after_loading(model, model_config, target_device, *a, **kw):
+        res = orig(model, model_config, target_device, *a, **kw)
+        if _ENGRAM_LAST_PENDING:
+            _materialize_engram_tables()
+        return res
+
+    process_weights_after_loading._xtu_shim = True  # type: ignore[attr-defined]
+    _u.process_weights_after_loading = process_weights_after_loading
+    return ["process_weights_after_loading(+engram materialize)"]
+
+
+def _install_engram_last_shim() -> list[str]:
+    """构造期只放 meta 占位,把 188.8 GiB pinned 表推迟到专家阶段之后(IRON_RULES R11)。
+
+    分配点:`engram.py:266-296 ParallelEngramEmbedding._allocate_weights()` 的两个
+    `torch.empty(..., pin_memory=True)`。它在**模块构造期**就执行,比 `load_weights`
+    还早,于是内存最紧的专家阶段白扛 188.8 GiB 不可回收内存(cellK 实测,NOTES §394)。
+
+    **默认关闭**(`XIAOTU_ENGRAM_LAST=1` 才开),保证其它模型行为逐字不变。
+    """
+    if not _engram_last_on():
+        return []
+    try:
+        from vllm.models.deepseek_v41.nvidia import engram as _e
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip engram-last shim: {type(exc).__name__}: {exc}")
+        return []
+    cls = getattr(_e, "ParallelEngramEmbedding", None)
+    if cls is None:
+        return []
+    orig = cls.__dict__.get("_allocate_weights")
+    if orig is None or getattr(orig, "_xtu_shim", False):
+        return []
+
+    def _allocate_weights(self):
+        # 只对"cpu_offload 但非 dp_shared_memory"这条会分配 188.8 GiB 的路径生效;
+        # 其它路径(含 DP 共享)逐字走原实现。
+        if (not _engram_last_on()) or (not getattr(self, "cpu_offload", False)) \
+                or getattr(self, "dp_shared_memory", False):
+            return orig(self)
+        _ENGRAM_LAST_PENDING.append(self)
+        return (
+            torch.empty(self.part_num_embeddings, self.dim,
+                        dtype=torch.float8_e4m3fn, device="meta"),
+            torch.empty(self.part_num_embeddings, self.dim // self.block_size,
+                        dtype=torch.uint8, device="meta"),
+        )
+
+    _allocate_weights._xtu_shim = True  # type: ignore[attr-defined]
+    cls._allocate_weights = _allocate_weights
+    return ["ParallelEngramEmbedding._allocate_weights"]
+
+
 def _release_on() -> bool:
     """释放开关是否打开(与 mixed_experts._release_source_enabled 同一判据)。
 
@@ -595,6 +720,8 @@ def apply_mainline_shims() -> list[str]:
     for step in (
         _install_quant_method_shims,
         _install_device_loading_shim,
+        _install_engram_last_shim,
+        _install_engram_materialize_shim,
         _install_oracle_shims,
         _install_prepack_shims,
         _install_mxfp4_cpu_convert_shim,
