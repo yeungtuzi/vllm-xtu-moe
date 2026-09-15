@@ -27,7 +27,15 @@ def arg(flag, default):
 
 
 MAXTOK = arg("--maxtok", 64)
-PROMPT = arg("--prompt", "Count from 1 to 1000, separated by commas: 1, 2, 3,")
+# --synth N:生成 N 个 token 量级的长 prompt(用于长上下文 prefill 计时)。
+# 用重复但可预测的文本,避免 tokenizer 把它压得过短。
+_SYNTH = arg("--synth", 0)
+if _SYNTH:
+    _unit = "The quick brown fox jumps over the lazy dog near the river bank. "
+    _need = max(1, _SYNTH // 10)          # 每 unit 约 11 个 token
+    PROMPT = _unit * _need
+else:
+    PROMPT = arg("--prompt", "Count from 1 to 1000, separated by commas: 1, 2, 3,")
 REPEAT = arg("--repeat", 1)
 CONC = arg("--conc", 1)
 REQS = arg("--reqs", CONC)
@@ -43,7 +51,8 @@ def one(prompt, maxtok):
     with urllib.request.urlopen(req, timeout=3600) as r:
         d = json.loads(r.read())
     dt = time.time() - t0
-    return dt, d["usage"]["completion_tokens"], d["choices"][0]["text"]
+    return (dt, d["usage"]["completion_tokens"], d["choices"][0]["text"],
+            d["usage"].get("prompt_tokens", 0))
 
 
 def pct(xs, p):
@@ -68,7 +77,9 @@ def report(name, dts, cts):
 
 print(f"=== bench label={LABEL} port={PORT} maxtok={MAXTOK} repeat={REPEAT} conc={CONC} ===")
 dt, ct, txt = one(PROMPT, 4)
-print(f"warmup                : {dt:6.2f}s  {ct:3d} tok  text={txt[:40]!r}")
+print(f"warmup                : {dt:6.2f}s  prompt_tok={pt0:6d}  text={txt[:30]!r}")
+if pt0:
+    print(f"  prefill: {pt0 / dt:8.1f} tok/s  ({dt:.2f}s for {pt0} prompt tokens)")
 
 # 串行重复:看抖动(均值之外的稳定性)
 dts, cts = [], []
