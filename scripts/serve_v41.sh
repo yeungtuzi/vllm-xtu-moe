@@ -23,7 +23,12 @@
 #
 # Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS
 #
-# EAGER(默认 1):是否加 --enforce-eager(即**禁止 CUDA graph**)。
+# EAGER(默认 **0** = 启用 CUDA graph):是否加 --enforce-eager。
+#   **实测 +80%**:单流 14.31 -> 25.71 tok/s;每层 period 1.84 -> 0.95 ms,
+#   其中 rest(GPU 侧算子)1.27 -> 0.52 ms —— 关掉 eager 省下的正是 batch=1 时
+#   被 43 层放大的 kernel 启动开销。已在真实权重下验证启动完整、输出正确。
+#   若遇到 CUDA graph 捕获问题(插件历史 TRIED_AND_REVERTED R4 提到
+#   捕获期 cudaHostRegister 会作废捕获),用 EAGER=1 回退。见 NOTES §406。
 #   实测(NOTES §405)每层 1.84 ms 里我们的 CPU MoE 只占 0.56 ms(31%),
 #   69% 是 "rest"(GPU 侧算子 + 层间交接)。batch=1 时 GPU 算子极小,
 #   kernel 启动开销被 43 层放大 ⇒ 关掉 eager(启用 CUDA graph)是头号候选优化。
@@ -119,7 +124,7 @@ nohup env \
     --model "$CKPT" --served-model-name dsv41 \
     --load-format "$LOAD" \
     --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-1}" \
-    --gpu-memory-utilization "$GPU_UTIL" $( [ "${EAGER:-1}" = "1" ] && echo --enforce-eager ) --trust-remote-code \
+    --gpu-memory-utilization "$GPU_UTIL" $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager ) --trust-remote-code \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --kernel-config '{"enable_jit_warmup": false}' \
     --port "$PORT" > "$LOG" 2>&1 &
