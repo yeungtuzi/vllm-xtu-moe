@@ -14959,3 +14959,25 @@ NPS=1、CPU 专家引擎、SM80 移植路径下,**端到端出正确的数**。
 4. **`XIAOTU_ENGRAM_LAST=1` 与真实权重不兼容**:该开关目前只做 dummy 填充,
    真实权重场景必须保持关闭(本次正是关闭的),否则会得到未初始化的表;
 5. 数值正确性只做了**两个 prompt 的定性核对**(事实题 + 算术题),**不是** benchmark 级验证。
+
+### 398. 📊【v0.4·第 37 轮·续】真实权重性能**基线**(cellN,`ASYNC=0`)
+
+条件:真实权重(475 GiB)、TP=1、单卡 A100-40GB、NPS=1、`LOAD=auto`、`maxlen=1024`、
+`gpu-util=0.60`、`temperature=0`。cellN 的引擎旋钮(实测 environ):
+
+```
+XIAOTU_MOE_ASYNC=0   XIAOTU_MOE_SPIN_IDLE_US=0   XIAOTU_MOE_NSLICE_SMALL=0
+XIAOTU_MOE_THREADS=60   XIAOTU_RELEASE_SOURCE=1
+```
+
+| 场景 | 耗时 | token | 吞吐 |
+|---|---|---|---|
+| 单请求 `max_tokens=64` | 5.35 s | 64 | **11.97 tok/s** |
+| 单请求 `max_tokens=128` | 10.68 s | 128 | **11.99 tok/s** |
+
+* 线性:64→128 token 耗时 5.35→10.68 s ⇒ **decode 稳态 ≈ 12 tok/s**,prefill 占比很小;
+* 输出**连贯且正确**(`..., 100. The sum of the first 100 natu...`)—— 真实权重质量正常;
+* 短 prompt 会 3 个 token 就 EOS,所以测吞吐必须用会持续生成的 prompt(计数/列举类)。
+
+**这组数字是后续所有调优的对照基准。** 下一步按 §389:
+`ASYNC=1`(引擎默认,注释称每 token 6.53→1.80 ms) → 再扫 `THREADS`。
