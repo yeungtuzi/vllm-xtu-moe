@@ -112,16 +112,27 @@ export CUDA_VISIBLE_DEVICES="$GPUS"
 #                "greedy 文本 5/5 相同" ⇒ 关掉它等于白丢一个已验证的大收益;
 #   SPIN_IDLE_US 插件默认 300(hybrid_model.py setdefault),这里钉成 0;
 #   NSLICE_SMALL 引擎默认开启;=0 会**强制走 legacy 路径**;
-#   THREADS      未设时插件按 n_ccd×5 自动调优,这里钉成 60。
+#   THREADS      未设时插件按 n_ccd×5 自动调优(本机 24 CCD ⇒ 120),这里钉成 **192**
+#                (实测数据见下面 XIAOTU_MOE_THREADS 那一段;旧值 60 是错的)。
 # 一律写成 "${VAR:-<现值>}":**默认行为逐字不变**,但允许从外部覆盖做 A/B。
 # 调参时配合 report/tuning/NOTES.md §389。
 # ---- 环境变量文件桥 ----------------------------------------------------------
 # 实测:vLLM spawn EngineCore 时会**静默丢弃**部分 XIAOTU_* (THREADS/SPIN_IDLE_US/
 # GPU_RESIDENT_LAYERS/RELEASE_SOURCE 都丢过),于是"设了开关却没生效、且无日志"。
 # 插件在 __init__.py 里会从该文件补齐缺失项(真实环境优先)。见 NOTES §414。
+# XIAOTU_MOE_THREADS(默认 **192** = 本机全部物理核;原来是 60):
+#   **实测线程数是 prefill 的头号旋钮**(NOTES §424,真权重单层微基准,B=1400):
+#     60  -> 386.8 ms/层(B=2048)   ← 旧默认,两头都亏
+#     120 -> 219.2                  ← 引擎自身默认(为"解码带宽"调的,解码最优)
+#     192 -> 170.9   ⇒ 比 60 快 **2.26×**,比 120 快 1.28×
+#     384 -> 176.0   但**解码**从 0.45 掉到 8.88 ms(**17×**,SMT 在作业少时纯抢 L3/功耗)
+#   解码在 192 下**没有退化**(真权重服务实测:串行 27.53/27.78 tok/s,
+#   与历史最佳 27.5-28.5 一致;C=8 聚合 85.31→**92.34** tok/s,历史最好)。
+#   ⇒ 60 既不是引擎默认也不是任何一档的最优,是当初"先跑通"钉下的保守值,故改 192。
+#   引擎自身的默认(120)**没有动** —— 那是别的模型的解码最优点(NOTES §424)。
 XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
 {
-  echo "XIAOTU_MOE_THREADS=${XIAOTU_MOE_THREADS:-60}"
+  echo "XIAOTU_MOE_THREADS=${XIAOTU_MOE_THREADS:-192}"
   echo "XIAOTU_MOE_NSLICE_SMALL=${XIAOTU_MOE_NSLICE_SMALL:-0}"
   echo "XIAOTU_MOE_ASYNC=${XIAOTU_MOE_ASYNC:-0}"
   echo "XIAOTU_MOE_SPIN_IDLE_US=${XIAOTU_MOE_SPIN_IDLE_US:-5000}"
@@ -139,7 +150,7 @@ nohup env \
   VLLM_USE_FLASHINFER_SAMPLER=0 \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
   XIAOTU_RELEASE_SOURCE="${XIAOTU_RELEASE_SOURCE:-1}" \
-  XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-60}" \
+  XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-192}" \
   XIAOTU_MOE_NSLICE_SMALL="${XIAOTU_MOE_NSLICE_SMALL:-0}" \
   XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
   XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-5000}" \
