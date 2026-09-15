@@ -16022,3 +16022,87 @@ RSS 1147 GB(2 份 socket 副本,符合 `NOSHARD` 的预期代价)。
 (用 `w13_shard_[n]` + §378 那套 `cstride/row0/up_off` 紧凑几何,而不是 `w13_`),
 这样既**不增加内存**,又能在**默认分片模式**下生效 —— 那才是真正的修法(§421.3)。
 当前这个 opt-in 闸门仍然有价值:它证明"分组路径可达且能跑完 40 层",为下一步铺路。
+
+---
+
+## §423 bench_cpu_engine.py 对 V4.1 完全失效(已修)
+
+`scripts/bench_cpu_engine.py` 是**唯一**能脱离 vLLM/GPU 单独测 CPU 引擎的
+微基准(`engine.cpu_prefill` = `forward_many`,无任何 GPU 拷贝),但它的维度是
+**写死的 V4/V3 值**:
+
+```python
+H, I, GK, E, K = 4096, 2048, 32, 256, 6      # ← 错
+N_LAYERS = 43                                 # ← 错
+```
+
+V4.1-Flash 的真实维度(config.json → `text_config`,并由 safetensors 头核对):
+
+| 字段 | 值 |
+|---|---|
+| `hidden_size` | **5120** |
+| `moe_intermediate_size` | **2304** |
+| `n_routed_experts` | **384** |
+| `num_experts_per_tok` | **6** |
+| `num_hidden_layers` | **40** |
+| `engram_layer_ids` | `[1, 14]` |
+| `dspark_target_layer_ids` | `[37, 38, 39]` |
+| 专家张量 | `w1/w3.weight [2304, 2560] I8`(K/2=2560 → H=5120)、`w2.weight [5120, 1152]`;`*.scale [.., 160/72] F8_E8M0` → groupK=32,groupN=1 |
+
+后果:第一次填张量就 `ValueError: could not broadcast input array from shape
+(2304,2560) into shape (2048,2048)` ⇒ **V4.1 根本没法微基准**,所有 CPU 侧
+调参都只能在完整服务里做(而完整服务要加载 475 GiB)。
+
+**修法**:改为从 `config.json` 自动探测,并保留 `HID/I/E/K/GK/NLAYERS` 环境变量
+覆盖 ⇒ V3/V4 的既有用法**逐字不变**,V4.1 直接可用。banner 里打印实际维度。
+
+## §424 线程数是 prefill 的头号杀手(实测,真权重,单层)
+
+`XIAOTU_MOE_THREADS` 的既有默认是 **120**,理由是**解码**带宽实验("每 CCD 4-5 核
+才跑满 DDR5,再加核只增竞争",numa_pool.hpp:822-826);而 `serve_v41.sh:124`
+更进一步把它钉成 **60**。prefill 是**计算**受限(NASS≈14502),不是带宽受限 ——
+所以这个"解码调出来的"线程数在 prefill 上代价极大。
+
+`bench_cpu_engine.py`(layer 3,真权重,`nshard_=2`,`_avx512_bf16` 变体,
+`B`=token 数,`NASS=B*6`):
+
+| THREADS | B=1 ms/层 | B=64 | B=512 | B=2048 | B=2048 TFLOP/s |
+|---|---|---|---|---|---|
+| **60** | 0.81 | 20.76 | 105.42 | **386.80** | 2.25 |
+| 120(**引擎默认**) | **0.45** | 16.16 | 61.31 | 219.22 | 3.97 |
+| **192**(=全部物理核) | 0.51 | 13.95 | **53.66** | **170.88** | **5.09** |
+| 384(=开 SMT) | **8.88** | 12.36 | 54.38 | 175.97 | 4.94 |
+
+结论:
+
+1. **`THREADS=60` 两头都亏**:解码 0.81 vs 120 的 0.45(**1.8×**)、
+   prefill 386.8 vs 192 的 **170.9 ms(2.26×)**。它既不是引擎默认也不是最优,
+   是当初"先跑通"钉下的保守值 ⇒ 应改。
+2. **解码最优 ≈ 120**(0.45 ms),与 numa_pool.hpp 的 120 上限**同向**
+   —— 那条带宽论证对解码是对的,不要动它的默认。
+3. **prefill 最优 = 192**(=物理核数),比 120 再快 **1.28×**,比 60 快 **2.26×**。
+4. **绝不要开 SMT(384)**:解码 8.88 ms,比 120 差 **17×**(prefill 无差别)
+   ⇒ SMT 线程在"作业数远小于线程数"时纯属互相抢 L3/功耗。
+5. ⇒ 线程数应按 **NASS 自适应**(小 NASS 用 ~120、大 NASS 用 192),
+   或至少把服务默认从 60 提到 192 并在服务里 A/B 解码是否退化。
+
+## §425 【重要修正】CPU MoE 只占 prefill 的一小部分
+
+用 §424 的数字外推冷 prefill(2417 token,40 层):
+
+| THREADS | 40 层 CPU MoE(B=2048) | 折算 2417 token | 占实测 60.5 s |
+|---|---|---|---|
+| 60 | 15.47 s | ≈18.3 s | ~30% |
+| 120 | 8.77 s | ≈10.4 s | ~17% |
+| 192 | 6.84 s | ≈8.1 s | ~13% |
+
+**即使把 CPU MoE 优化到 0,冷 prefill 也只能从 60.5 s 降到 ~42 s。**
+所以此前"prefill 慢是因为 CPU 引擎对每个 (token,专家) 对重读专家块、~9.8 TB 流量"
+的判断**不是当前的主导原因**:
+
+* packed4 **确实**有 M>1 的真批内核(`XiaotuCPUExpertsMxfp4::gate_up_slice_batch_impl`
+  → `packed4::matmul_packed4_group`,权重行解码一次喂 `me` 行,
+  `moe_v2_packed4.hpp:1044/1081`),不是"每对重读一遍";
+* 真正的大头(**~70%**)在别处:**GPU 侧 attention/indexer/hc(sinkhorn)/层间交接**。
+  ⇒ prefill 优化必须先用 `XIAOTU_CD_TIMING=1` 拿到 prefill 期间的
+  `period` vs `compute` 拆分,再决定动哪里(见 §426)。
