@@ -180,6 +180,16 @@ def main():
         flop = B * K * (2.0 * I * H + H * I) * 2 / 1e12
         print(f"{B:6d} {dt*1e3:10.2f} {dt*1e3*N_LAYERS:9.1f} "
               f"{B/(dt*N_LAYERS):8.1f} {flop/dt:8.2f}", flush=True)
+        # CHECK=1: fingerprint the engine's output so two BUILDS can be compared
+        # for numerical equivalence (the M-chunking fix in §437 must not change
+        # results). Deterministic because `rng` is seeded and the call sequence is
+        # fixed; `out` is freshly zeroed above, so this is a pure function of the
+        # inputs + build. Force me>819 with DEDUP=6 to exercise the new path.
+        if os.environ.get("CHECK") == "1":
+            o = np.asarray(out, dtype=np.float64)
+            print(f"[check] B={B} dedup={dedup} sum={o.sum():.10e} "
+                  f"abssum={np.abs(o).sum():.10e} max={np.abs(o).max():.10e} "
+                  f"n_nonfinite={int((~np.isfinite(o)).sum())}", flush=True)
     return 0
 
 

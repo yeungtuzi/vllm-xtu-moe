@@ -1037,6 +1037,40 @@ struct Packed4WeightTraitsBase
     }
 
     // ---- Batched N-sliced variants (kNParallel). ----------------------------
+    // `matmul_packed4_group`'s FAST_FP4 kernel is gated on `M*K <= 4<<20`
+    // (moe_v2_packed4.hpp:254). At gate/up K == hidden (5120), so that silently
+    // caps `me` at 819: any expert with MORE tokens than that drops to the generic
+    // fallback. Measured as a 2.11x cliff (840 -> 368 ms/layer vs 763 -> 174
+    // ms/layer, NOTES §437) -- i.e. exactly the prefill case, where a single
+    // expert legitimately owns thousands of tokens.
+    //
+    // Fix: chunk the M dimension so any `me` keeps the fast kernel. Each row's dot
+    // product is accumulated independently, so chunking changes no arithmetic --
+    // results are identical. And because the chunk is exactly the old guard value,
+    // `me <= 819` (the entire previously-working domain) still issues ONE call with
+    // mc == me, i.e. it is byte-for-byte the old behaviour. The chunk also caps the
+    // per-thread `a32_storage` at the same 16 MB it was capped at before, which is
+    // why the guard cannot simply be raised.
+    static constexpr size_t kFastMKElems = (size_t)4 << 20;
+    // Default chunk 64: measured optimum over 16..819 (NOTES §439). It keeps the
+    // per-thread fp32 activation buffer at 64*K*4 bytes (1.31 MB at K=5120, i.e.
+    // about one Zen4 L2) while still decoding each weight row once per chunk. At
+    // me=1400 it is 142.6 ms/layer vs 184.6 at chunk=819 and 434.2 on the old slow
+    // path. Values 16..819 give BIT-IDENTICAL results, so this is purely a cache
+    // choice. Capped by the guard so the fast kernel is always the one selected.
+    static size_t fast_m_chunk(int K) {
+        static const long ov = [] {
+            const char* e = std::getenv("XIAOTU_MOE_FAST_CHUNK");
+            return e ? std::atol(e) : 0L;
+        }();
+        const size_t guard = kFastMKElems / (size_t)(K > 0 ? K : 1);
+        if (ov > 0) {
+            const size_t v = (size_t)ov;
+            return (guard && v > guard) ? guard : v;
+        }
+        const size_t want = 64;
+        return (guard && want > guard) ? guard : (guard ? want : 1);
+    }
     // Same as the single-instance *_slice_impl but with `me` token-rows of the
     // SAME expert run in one GEMM call, so the packed kernel (matmul_packed4_group
     // FAST path) decodes each weight row once and shares it across me rows and
@@ -1078,14 +1112,26 @@ struct Packed4WeightTraitsBase
         // both_buf rows are strided by n2; indices [n0,n1) = gate chunk and
         // [inter+n0, inter+n1) = up chunk, both over ALL me rows at once.
         // rowshift=r0 maps global row j to shard-local row j-r0 (dense: r0==0).
-        float* a32_reuse = nullptr;       // 【轮 85】让 up 复用 gate 已经转好的激活
-        packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, gbase, LUT, sbase, gs, both_buf,
-                                            me, n2, hidden, groupN, groupK, n0, n1, (int)r0, rowmap,
-                                            nullptr, &a32_reuse);
-        packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, gbase + uoff, LUT, sbase, gs, both_buf,
-                                            me, n2, hidden, groupN, groupK, inter + n0, inter + n1,
-                                            (int)(r0 + (size_t)inter), rowmap,
-                                            a32_reuse, nullptr);
+        // Chunked over M so the FAST_FP4 kernel is reachable for any `me`
+        // (me <= 819 -> exactly one iteration, i.e. bit-identical to before).
+        const size_t mch = fast_m_chunk(hidden);
+        for (size_t m0 = 0; m0 < (size_t)me; m0 += mch) {
+            const int mc = (int)std::min<size_t>(mch, (size_t)me - m0);
+            // The kernel reads the activation row as A + rowmap[i]*K, so a chunk
+            // must advance either A itself (no gather) or rowmap (gather) -- never
+            // both, or the row index is applied twice.
+            const uint16_t* ac = rowmap ? xg : (xg + m0 * (size_t)hidden);
+            const uint32_t* rm = rowmap ? (rowmap + m0) : nullptr;
+            float* bc = both_buf + m0 * (size_t)n2;
+            float* a32_reuse = nullptr;   // 【轮 85】up 复用 gate 转好的激活(每个 chunk 内)
+            packed4::matmul_packed4_group<E8M0, kFastFP4>(ac, gbase, LUT, sbase, gs, bc,
+                                                mc, n2, hidden, groupN, groupK, n0, n1, (int)r0, rm,
+                                                nullptr, &a32_reuse);
+            packed4::matmul_packed4_group<E8M0, kFastFP4>(ac, gbase + uoff, LUT, sbase, gs, bc,
+                                                mc, n2, hidden, groupN, groupK, inter + n0, inter + n1,
+                                                (int)(r0 + (size_t)inter), rm,
+                                                a32_reuse, nullptr);
+        }
     }
 
     static void down_slice_batch_impl(int me, const uint16_t* actg, const void* w2, const void* w2_g,
@@ -1117,8 +1163,15 @@ struct Packed4WeightTraitsBase
         const float gs = w2_gs ? w2_gs[eid] : 1.0f;
         // down_buf rows strided by hidden; write slice [n0,n1) for all me rows.
         // rowshift=r0 maps global row j to shard-local row j-r0 (dense: r0==0).
-        packed4::matmul_packed4_group<E8M0, kFastFP4>(actg, base, LUT, sbase, gs, down_buf,
-                                            me, hidden, inter, groupN, groupK, n0, n1, (int)r0);
+        // Chunked over M for the same reason as gate_up_slice_batch_impl (§437);
+        // down has no rowmap, so the activation base advances with the chunk.
+        const size_t mch = fast_m_chunk(inter);
+        for (size_t m0 = 0; m0 < (size_t)me; m0 += mch) {
+            const int mc = (int)std::min<size_t>(mch, (size_t)me - m0);
+            packed4::matmul_packed4_group<E8M0, kFastFP4>(actg + m0 * (size_t)inter, base, LUT,
+                                                sbase, gs, down_buf + m0 * (size_t)hidden,
+                                                mc, hidden, inter, groupN, groupK, n0, n1, (int)r0);
+        }
     }
 };
 

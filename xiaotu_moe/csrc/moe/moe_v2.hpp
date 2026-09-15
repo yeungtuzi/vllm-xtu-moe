@@ -966,6 +966,34 @@ public:
         }
         const size_t a2_total = exp_off_[na];
 
+        // XIAOTU_MOE_ME_DIAG=1: report the per-forward routing shape. WHY (NOTES
+        // §438): the service's real-weight prefill measured 1535 ms/layer at
+        // qlen=2048 -- 8.6x the isolated microbench -- and the leading explanation
+        // is that routing concentrates enough that a single expert owns more than
+        // hidden-based FAST_FP4 limit (4<<20)/hidden = 819 tokens, dropping it to
+        // the slow kernel (§437). That is a claim about REAL routing, so it has to
+        // be measured, not inferred.
+        {
+            static const bool me_diag = std::getenv("XIAOTU_MOE_ME_DIAG") != nullptr;
+            if (me_diag) {
+                const size_t thr = (size_t)((size_t)4 << 20) / (size_t)(hidden > 0 ? hidden : 1);
+                size_t mx = 0, over = 0, sum = 0;
+                for (size_t e_idx = 0; e_idx < active_.size(); ++e_idx) {
+                    const size_t m = exp_[active_[e_idx]].ai_list.size();
+                    if (m > mx) mx = m;
+                    if (m > thr) ++over;
+                    sum += m;
+                }
+                fprintf(stderr,
+                        "[me-diag] M=%d k=%d NASS=%zu active=%zu max_me=%zu "
+                        "n_over_thr=%zu thr=%zu mean_me=%.1f nshard=%d\n",
+                        M, k, NASS, active_.size(), mx, over, thr,
+                        active_.empty() ? 0.0 : (double)sum / (double)active_.size(),
+                        nshard_);
+                fflush(stderr);
+            }
+        }
+
         using clk = std::chrono::steady_clock;
         auto pA0 = clk::now();
         // Phase A: batched gate+up slices. Sharded: each NUMA node computes the
