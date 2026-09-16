@@ -537,6 +537,24 @@ def _patch_quant_method_cls(cls) -> list[str]:
         @functools.wraps(cw)
         def create_weights(self, layer, *a, **kw):
             if mixed_mode_enabled():
+                # 【LvLLM(guqiong96/Lvllm)fork 适配,2026-09-16】该 fork 的
+                # `mxfp4.Mxfp4MoEMethod.create_weights`(以及同族 fp8/int4)用
+                #     device = cuda if current_platform.is_cuda_alike() else "cpu"
+                #     if isinstance(layer, RoutedExperts) and not layer.is_gpu_resident_layer:
+                #         device = "cpu"
+                # 来选张量建在哪 —— **显式 device=**,所以下面那个
+                # `with torch.device("cpu")` 对它无效。而它的
+                # `is_lk_moe_gpu_resident_layer()` 在 `LVLLM_MOE_NUMA_ENABLED=0` 时
+                # **恒返回 True**(`if not is_lk_moe_feature_enabled(): return True`)
+                # ⇒ 我们的混合模式下(必须关掉 lk_moe)专家权重会被**建到 GPU 上**,
+                # 43 层 × 1.59 GiB/rank ⇒ `torch.OutOfMemoryError`(实测 §500)。
+                # 这里把它压成 False,让 fork 自己选 CPU。**只在属性存在时改**,
+                # 主线(mainline)没有这个属性 ⇒ 行为逐字不变。
+                try:
+                    if hasattr(layer, "is_gpu_resident_layer"):
+                        layer.is_gpu_resident_layer = False
+                except Exception:  # noqa: BLE001
+                    pass
                 with torch.device("cpu"):
                     res = cw(self, layer, *a, **kw)
                 # 给"因混合模式而被建在 CPU 上"的大参数打标记,供

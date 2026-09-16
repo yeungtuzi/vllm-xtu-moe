@@ -56,9 +56,54 @@
 
 ---
 
-## 3. arm B 为什么起不来:两个**各自独立**的阻塞,都有证据
+## 3. arm B 为什么起不来:一条**逐步逼近**的链,每一步都有证据
 
-### 3.1 Mode A(OOT 覆盖模型类)+ 参考的 `VLLM_COMPILE` + `MBT=4096` ⇒ **GPU 侧死锁**
+### 3.0 第一步(已修):专家权重被建在 **GPU** 上 ⇒ CUDA OOM
+```
+File ".../vllm_xiaotu_moe/mainline_shims.py", line 541, in create_weights
+File ".../vllm/model_executor/layers/quantization/mxfp4.py", line ..., in <lambda>
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1024.00 MiB.
+GPU 0 has a total capacity of 39.49 GiB of which 651.50 MiB is free.
+```
+**根因(lvllm-2.5 的 `mxfp4.Mxfp4MoEMethod.create_weights`,逐字)**:
+```python
+device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
+new_tensor = torch.zeros
+if isinstance(layer, RoutedExperts) and not layer.is_gpu_resident_layer:
+    device = "cpu"          # ← 唯一能让专家权重留在 CPU 的分支
+    new_tensor = torch.empty
+...
+new_tensor(..., device=device)      # ← 显式 device= ⇒ 我们 `with torch.device("cpu")` 无效
+```
+而 `is_lk_moe_gpu_resident_layer()` 在 `LVLLM_MOE_NUMA_ENABLED=0` 时**恒返回 True**
+(`vllm/envs.py:2551: if not is_lk_moe_feature_enabled(): return True`)。
+我们的混合模式**必须**关掉 lk_moe ⇒ 条件永远不成立 ⇒ 1 GiB 的专家张量往 CUDA 上建
+(43 层 × 1.59 GiB/rank 根本放不下,`gpu_util` 降到 0.80 也没用)。
+
+**已修**(`mainline_shims._patch_quant_method_cls.create_weights`):在调用原实现前
+`layer.is_gpu_resident_layer = False`(**只在属性存在时改** ⇒ 主线没有该属性,行为逐字不变)。
+修完**OOM 消失**,直接推进到 3.1 —— 这一步是可验证的。
+
+### 3.1 第二步(**未修**,是真正的移植点):CPU MoE 执行被**硬绑在 lk_moe** 上
+```
+File ".../vllm/model_executor/layers/fused_moe/runner/moe_runner.py", line 664, in _apply_quant_method
+File ".../vllm/model_executor/layers/fused_moe/routed_experts.py", line 1841, in _cpu_prefill
+    self.lk_moe.cpu_prefill(...)
+AttributeError: 'NoneType' object has no attribute 'cpu_prefill'
+```
+lvllm-2.5 的 `RoutedExperts._cpu_prefill`(`routed_experts.py:1831-1841`)直接调
+`self.lk_moe.cpu_prefill(...)`;`lk_moe` 关闭时它是 `None`。
+**这里没有"换后端类"的缝** —— 与主线不同(主线把 CPU 专家做成
+`FusedMoEExpertsModular` 后端类,我们的 `register_mixed_cpu_backend()` 换掉那 4 个类就接管了)。
+⇒ 想在 lvllm 里跑我们的引擎,**必须**加一个适配层,二选一:
+* (a) 让插件 patch `RoutedExperts._cpu_prefill`(以及对应的 GPU-prefill 分支)去调我们的引擎;
+* (b) 给 `self.lk_moe` 绑一个**鸭子类型的替身**:暴露 lk_moe 的 `cpu_prefill`/`cpu_decode`/`gpu_prefill`
+  签名。
+  **好消息**:(b) 的成本比看起来小 —— 我们**已经有** `xiaotu_moe/gpu_prefill_bridge.py`
+  给引擎类包装了 lk_moe 签名的 `gpu_prefill(x_ptr, out_ptr, ids_ptr, wts_ptr, qlen, k, stream)`
+  (当初就是为 lk 编排写的)。缺的只是 `cpu_prefill` / `cpu_decode` 这两个同风格的入口。
+
+### 3.2 Mode A(OOT 覆盖模型类)+ 参考的 `VLLM_COMPILE` + `MBT=4096` ⇒ **GPU 侧死锁**
 * 现象:86 个引擎全部建好,随后卡在 profile run;日志最后一行
   `08:14 … DSA indexer decode path`(之后只剩 `shm_broadcast` 的 60s 告警)。
 * 现场证据(不是猜):
@@ -68,26 +113,11 @@
   ⇒ 定性:**GPU 侧等不到对端**(TP=2 集合通信/图捕获层面的死锁),不是 CPU 引擎在算。
 * 最可能的原因:Mode A 此前只在主线的 `CompilationMode.NONE` 下验证过,
   **`VLLM_COMPILE` 这条路径从未验证**(我们的 `serve_mainline.sh` 用的就是 `NONE`)。
-
-### 3.2 Mode B(主线 `RoutedExperts` + 我们的 CPU 后端)+ `gpu_util=0.90` ⇒ **CUDA OOM**
-```
-File ".../vllm_xiaotu_moe/mainline_shims.py", line 541, in create_weights
-File ".../vllm/model_executor/layers/quantization/mxfp4.py", line ..., in <lambda>
-torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1024.00 MiB.
-GPU 0 has a total capacity of 39.49 GiB of which 651.50 MiB is free.
-```
-* 定性:**专家权重被建在 GPU 上**。我们"专家权重留在 CPU"的那条 shim
-  (`device_loading_context`,`mainline_shims` 第 9 条,已 applied)覆盖的是**主线**的
-  `create_weights` 路径;lvllm-2.5 的 `mxfp4.create_weights` 是**另一份实现**,
-  没被覆盖到 ⇒ 1 GiB 的专家张量直接往 CUDA 上建。
-* 叠加因素:`gpu_util=0.90` 已经把 ~35.5 GiB 预留下来,只剩 651 MiB 可分配。
-  但**即使把 gpu_util 降到 0.80 也不解决问题**:每层专家只要还在 GPU 上,43 层就要 ~68 GiB/rank。
+  **应当先修成"检测到该组合就显式拒绝启动",而不是死锁** —— 死锁是最坏的失败形态。
 
 ### 3.3 结论(关于"同配置 A/B")
-**在 lvllm-2.5 上跑通我们的引擎,需要一次真正的移植,而不是调参**:
-1. Mode A 要适配 `VLLM_COMPILE`(图捕获/编译下的自定义 MoE 层契约);
-2. Mode B 要把"专家权重在 CPU"的 device context 覆盖到 lvllm-2.5 的
-   `mxfp4.create_weights`(以及同族 `fp8/int4` 的对应实现)。
+**在 lvllm-2.5 上跑通我们的引擎需要一次真正的移植**(3.1 的适配层;3.2 的编译模式支持),
+**不是调参**。3.0 是这条路上第一个已修掉的障碍。
 在此之前,**同配置性能对比无法给出**;把 B′ 的数字当"同配置结果"是不诚实的。
 
 ---

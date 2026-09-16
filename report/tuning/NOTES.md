@@ -18383,3 +18383,20 @@ File ".../vllm/engine/arg_utils.py", line 3009                          load_gen
   下一步第一个动作就是**对齐这个 kwarg** 再比;
 * 我们引擎自身已有的正确性证据不变:数值门禁 `OK=7 BAD=1`(1.873e-02,逐位一致)、
   逐位确定性 11/11、服务端 greedy 4/5 逐字节同。
+
+### §500 附:arm B 的阻塞链**逐步逼近**到一行硬绑定(3.0 已修,3.1 是真正的移植点)
+1. **已修**:lvllm-2.5 的 `mxfp4.create_weights` **显式** `device=`,而它选 CPU 的唯一条件是
+   `not layer.is_gpu_resident_layer`;`is_lk_moe_gpu_resident_layer()` 在
+   `LVLLM_MOE_NUMA_ENABLED=0` 时**恒返回 True** ⇒ 我们被迫关掉 lk_moe 时专家权重全建到 GPU 上。
+   修法(`mainline_shims._patch_quant_method_cls.create_weights`):调用原实现前
+   `layer.is_gpu_resident_layer = False`(**只在属性存在时改** ⇒ 主线无此属性、行为逐字不变)。
+   **修完 OOM 消失**,直接暴露下一步。
+2. **真正的移植点(未修)**:`routed_experts.py:1841 _cpu_prefill → self.lk_moe.cpu_prefill(...)`,
+   而 `lk_moe` 关闭时是 `None` ⇒ `AttributeError: 'NoneType' object has no attribute 'cpu_prefill'`。
+   lvllm 把 **CPU MoE 的执行硬绑在 lk_moe 上**,没有"换后端类"的缝(主线有:我们把
+   `CPUExpertsMxfp4` 等 4 个类换掉就接管了)。适配二选一:(a) patch `RoutedExperts._cpu_prefill`;
+   (b) 给 `self.lk_moe` 绑一个鸭子类型替身。**(b) 成本不高**:我们的
+   `xiaotu_moe/gpu_prefill_bridge.py` 早就给引擎包了 lk_moe 签名的 `gpu_prefill(...)`,
+   缺的只是同风格的 `cpu_prefill`/`cpu_decode`。
+3. Mode A + `VLLM_COMPILE` + `MBT=4096` 的 **GPU 侧死锁**(worker CPU=0、主线程卡在 libcuda、
+   GPU util 0%、显存只有权重、**无** `WATCHDOG` 行)仍未修;至少要改成"显式拒绝启动"。
