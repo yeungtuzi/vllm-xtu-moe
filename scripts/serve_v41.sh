@@ -129,7 +129,7 @@ export CUDA_VISIBLE_DEVICES="$GPUS"
 # 实测:vLLM spawn EngineCore 时会**静默丢弃**部分 XIAOTU_* (THREADS/SPIN_IDLE_US/
 # GPU_RESIDENT_LAYERS/RELEASE_SOURCE 都丢过),于是"设了开关却没生效、且无日志"。
 # 插件在 __init__.py 里会从该文件补齐缺失项(真实环境优先)。见 NOTES §414。
-# XIAOTU_MOE_THREADS(默认 **176** = 物理核 192 留 16 个余量;原来是 60,中途曾是 192):
+# XIAOTU_MOE_THREADS(默认 **184** = 物理核 192 留 8 个余量(实测拐点);原来是 60,中途曾是 192):
 #   【为什么留余量】SMT 关掉后,192 = **占满全部物理核**。单 token 解码的 B=1 延迟在
 #   192 下是**双峰**的(静默机器上连测:0.58 / 3.81 / 11.17 ms),而 176/184 稳定 ~0.5 ms
 #   —— 只要有一个 worker 被抢占(OS/vLLM/CUDA 线程),barrier 就要等它,而没有任何余核可去。
@@ -147,7 +147,7 @@ export CUDA_VISIBLE_DEVICES="$GPUS"
 #   引擎自身的默认(120)**没有动** —— 那是别的模型的解码最优点(NOTES §424)。
 XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
 {
-  echo "XIAOTU_MOE_THREADS=${XIAOTU_MOE_THREADS:-176}"
+  echo "XIAOTU_MOE_THREADS=${XIAOTU_MOE_THREADS:-184}"
   echo "XIAOTU_MOE_NSLICE_SMALL=${XIAOTU_MOE_NSLICE_SMALL:-0}"
   echo "XIAOTU_MOE_ASYNC=${XIAOTU_MOE_ASYNC:-0}"
   echo "XIAOTU_MOE_SPIN_IDLE_US=${XIAOTU_MOE_SPIN_IDLE_US:-5000}"
@@ -165,7 +165,7 @@ nohup env \
   VLLM_USE_FLASHINFER_SAMPLER=0 \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
   XIAOTU_RELEASE_SOURCE="${XIAOTU_RELEASE_SOURCE:-1}" \
-  XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-176}" \
+  XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-184}" \
   XIAOTU_MOE_NSLICE_SMALL="${XIAOTU_MOE_NSLICE_SMALL:-0}" \
   XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
   XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-5000}" \

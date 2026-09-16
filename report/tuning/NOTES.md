@@ -17187,3 +17187,75 @@ SMT 关后用 192 线程 B=2048 = 180.8-185.8 ms(比 SMT 开的 174.13 慢 ~5%),
 ### 结论:`serve_v41.sh` 默认 `XIAOTU_MOE_THREADS` 192 -> **176**
 物理核 192 留 16 个余量:prefill 只付 ~4-5%,换来解码延迟不再双峰。
 (SMT 开着的机器上 192 仍然安全;要更保守可用 184——实测与 176 同级。)
+
+## §468 【重大发现·已核对官方报告】V4.1 的 prefill **本该只需要编码器那一半**
+
+用户问:V4.1 的 prefill 是不是只需要搬运前 20 层?**是。** 官方报告
+`DeepSeek_V41_Tech_Report.pdf`(就在 checkpoint 目录里)原文:
+
+> "**Decoder SWA Bounded Replay** bounds the decoder forward pass to n_win tokens,
+> **nearly halving total prefill computation**. Under CED, decoder global KV is
+> projected from the final encoder hidden states. **The only obstacle to ending
+> prefill at the encoder is decoder SWA KV**, which is generated from each decoder
+> layer's own hidden states... reconstructing it requires running the L2 decoder
+> layers over the last n_win prompt tokens."
+
+以及架构图说明:
+> "The 40-layer network is divided into a causal encoder and a decoder, **each with
+> 20 layers**. All feed-forward layers use standard DeepSeekMoE."
+
+⇒ **prefill 本该在 encoder 结束(第 20 层)**;decoder 那 20 层只对 prompt 的
+**最后 `n_win` 个 token** 跑一遍(为了重建 decode 前几步要用的 decoder SWA KV,
+且不进 prefix cache)。这就是报告里 "prefill 8B / decode 16B 参数每 token" 的来源。
+
+**所以用户的两个推论都成立:**
+* **GPU prefill** 只需搬 encoder 那 20 层 (+ 末尾 n_win 的一小段)
+  ⇒ 每层 6.72 GiB 的 DMA 总量 **≈ 腰斩**(275.67 → ~138 GiB);
+* **CPU prefill 同样只需要前一半** ⇒ CPU 侧 MoE 计算量也近乎腰斩。
+
+**而当前 vLLM 实现并没有利用它** —— 两个独立证据:
+1. 代码:`model.py:706-726` 对**全部 40 层**循环,`hidden_states` 是全量 token;
+   `grep is_prefill|skip_moe|prefill_only` 零命中(§455);
+2. 实测:`[me-diag]` 显示 qlen=2048 时 **40 层**都拿到全量 token;
+   本次 `MBT=8192` 的运行里 40 层都看到 **6999** token。
+
+⇒ **当前 prefill 在两个后端上都做了约 2× 的多余工作。这是最大的 prefill 杠杆**,
+而且是**模型层**的改动(要在层循环里对 decoder 段做 bounded replay),不是引擎插件能做的。
+影响:GPU 固定 DMA 10.8 → ~5.4 s,交叉点 ~2100 → ~1100 token;CPU prefill 时间近乎减半。
+
+## §469 线程数拐点 = **184**(按用户规则:不要占满,留余量)
+
+静默机器上细扫(192 物理核;准则"每 worker 至少留 2 核、不要占满"):
+
+| THREADS | B=1 ms | B=2048 ms | B=4096 ms | B=4096 t/s |
+|---|---|---|---|---|
+| 168 | 0.46 | 282.86 | 401.56 | 255.0 |
+| 176 | 0.52 | 184.61 | 386.45 | 265.0 |
+| 180 | 0.57 | 189.35 | 350.57 | 292.1 |
+| **184** | **0.46** | 185.82 | **339.87** | **301.3** |
+| 188 | **2.51** ⚠️ | 185.45 | 343.90 | 297.8 |
+| 190 | **10.04** ⚠️ | 177.12 | 332.79 | 307.7 |
+
+**B=1 在 ≤184 稳定(0.46-0.57),188 起崩(2.51 → 10.04)**;prefill 一直缓升到 190。
+⇒ **184 = 拐点**:解码尾延迟不抖,prefill 只比 190 差 2%(339.87 vs 332.79)。
+`serve_v41.sh` 默认 **184**(留 8 核)。**永不用满**这条与 lk-moe 的
+"每 worker 留 2 核" 一致。
+
+## §470 GPU prefill 仍然慢,且**离线/在服务相差 3×**(未解释,MIN_TOKENS 保持 0)
+
+静默机器(loadavg 1.9)上带改进后的组装重跑(MBT=8192,阈值 4096,util=0.70):
+
+| | 结果 |
+|---|---|
+| **第一个 forward** | **40/40 层都走了 GPU("weights from engine shards")**,却用了 **78.28 s(1950 ms/层)** |
+| 第二个 forward | 39 层被预检 DISABLED(空闲不足)⇒ 回落 CPU,62.31 s |
+| 纯 CPU 基线 | 36.22 s |
+| **离线同一条路径单层实测** | 组装 550-604 + 内核 123 ≈ **~680 ms/层** |
+
+**在服务里 ~1950 ms/层 vs 离线 ~680 ms/层 —— 差 ~3×,原因未定位。**
+候选(未验证,不要当结论):服务里显存紧张导致 caching allocator 每层退回
+`cudaMalloc/cudaFree`(GB 级,同步);或组装与 vLLM/引擎线程争抢;
+或 K-major 每层新建 6.8 GB 造成碎片。
+
+⇒ **结论不变:GPU prefill 在 TP=1 上目前不是收益,`MIN_TOKENS` 必须保持 0。**
+下一步应先解释这 3×,再谈 overlap/文档默认值。
