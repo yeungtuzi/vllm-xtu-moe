@@ -115,6 +115,11 @@ inline void silu_gate_clamped(const float* gate, const float* up, float* out,
 template <typename Derived>
 struct WeightTraitsBase {
     static constexpr bool kE8M0 = false;  // default: raw fp32 scales; overridden by packed4
+    // NVFP4 除了 per-block scale 还有 per-expert 的 **global(tensor) scale**。
+    // 丢了它动态范围会塌(MLX/Metal 就是直接拒绝该参数,损失 ~137x 量程)。
+    // 我们的内核在 fp32 里应用它,但 `w13_gs/w2_gs` 为 null 时**默认 1.0f**
+    // ⇒ 接线漏传会**静默**丢量程。用这个标志让构造函数不能保持沉默。
+    static constexpr bool kNeedsGlobalScale = false;
     // Storage bytes for the full [E] weight tensors. Each Derived provides
     // *_impl which accounts for its own element width and packing.
     static constexpr size_t w13_bytes(size_t E, size_t n2, size_t H) {
@@ -402,6 +407,26 @@ public:
         const size_t w2_bytes = WeightTraits::w2_bytes(E, H, I);
         const size_t w13g_bytes = (size_t)E * ((n2 + gn - 1) / gn) * ((H + gk - 1) / gk) * (e8m0 ? 1u : sizeof(float));
         const size_t w2g_bytes = (size_t)E * ((H + gn - 1) / gn) * ((I + gk - 1) / gk) * (e8m0 ? 1u : sizeof(float));
+        // 供 GPU 流式路径查询(见 NOTES §459):引擎自有的这些主机缓冲合起来
+        // 就是**一份**完整的专家权重,所以 GPU 路径可以直接 DMA 它们,
+        // 不必为了流式而强留 checkpoint 源张量(那要多 269 GiB)。
+        g_w13_dense_bytes_ = w13_bytes;
+        g_w2_dense_bytes_ = w2_bytes;
+        g_w13g_bytes_ = w13g_bytes;
+        g_w2g_bytes_ = w2g_bytes;
+        g_group_k_ = gk;
+        if constexpr (WeightTraits::kNeedsGlobalScale) {
+            if (!w13_gs || !w2_gs) {
+                fprintf(stderr,
+                        "[xtu-moe] WARNING: this backend needs a per-expert GLOBAL "
+                        "(tensor) scale (NVFP4) but %s%s%s were not supplied; the "
+                        "engine will use 1.0f, which SILENTLY collapses the dynamic "
+                        "range (the MLX/Metal NVFP4 failure mode). Pass the tensor "
+                        "scales (w13_gs/w2_gs).\n",
+                        w13_gs ? "" : "w13_gs ", w2_gs ? "" : "w2_gs ",
+                        (w13_gs && w2_gs) ? "" : "-> missing");
+            }
+        }
         // SINGLE-COPY NUMA SHARDING (new default for the N-parallel packed4 path).
         // The MoE re-reads the ~GB-scale weight blocks every decode step. Two
         // competing designs place those reads physically local to each core:
@@ -1281,6 +1306,17 @@ private:
     std::vector<const uint8_t*> w13_shard_;
     std::vector<const uint8_t*> w2_shard_;
 
+    // ---- 引擎自有主机缓冲的尺寸/几何(GPU 流式路径用,NOTES §459)------------
+    // 每 node 的紧凑分片合起来是**一份**完整专家权重;scale 是引擎自己复制的一份
+    // (未分片)。把这些尺寸记下来,GPU 侧就能直接 DMA 引擎的缓冲,而不必保留
+    // checkpoint 源张量(那要多 269 GiB,本机放不下)。
+    size_t g_w13_shard_bytes_ = 0, g_w2_shard_bytes_ = 0;
+    size_t g_w13_dense_bytes_ = 0, g_w2_dense_bytes_ = 0;
+    size_t g_w13g_bytes_ = 0, g_w2g_bytes_ = 0;
+    size_t g_w13_crows_ = 0, g_w13_cbytes_ = 0;
+    size_t g_w2_crows_ = 0, g_w2_cbytes_ = 0;
+    int g_group_k_ = 1;
+
     // Lightweight per-phase timing (env-gated print). Accumulates wall time of
     // the 5 phases across calls; prints a breakdown every prof_every_ calls.
     bool prof_ = false;
@@ -1398,6 +1434,30 @@ private:
     // [gate cbytes][up cbytes], total E*2*cbytes — instead of mmap'ing the whole
     // E*stride block and writing sparse spans. The reader recovers global rows via
     // row0 == n*crows (see the packed4 gate_up_slice_batch_impl / rowshift).
+public:
+    // ---- GPU 流式路径的公共访问器(见 report/tuning/NOTES.md §459)---------
+    // 这些缓冲是引擎**自有**的(不依赖 checkpoint 源张量),所以 GPU prefill 可以在
+    // XIAOTU_RELEASE_SOURCE=1 下工作 —— 主机专家内存从 522 GiB 降到 253 GiB。
+    int shard_ns() const { return nshard_; }
+    size_t shard_w13_node_bytes() const { return g_w13_shard_bytes_; }
+    size_t shard_w2_node_bytes() const { return g_w2_shard_bytes_; }
+    size_t scale_w13_bytes() const { return g_w13g_bytes_; }
+    size_t scale_w2_bytes() const { return g_w2g_bytes_; }
+    size_t shard_w13_crows() const { return g_w13_crows_; }
+    size_t shard_w13_cbytes() const { return g_w13_cbytes_; }
+    size_t shard_w2_crows() const { return g_w2_crows_; }
+    size_t shard_w2_cbytes() const { return g_w2_cbytes_; }
+    // which: 0 = w13 (per-node shard), 1 = w2 (per-node shard),
+    //        2 = w13 scales (single copy), 3 = w2 scales (single copy)
+    const void* host_wbuf(int which, int node) const {
+        if (which == 0) return (node >= 0 && node < (int)w13_shard_.size()) ? w13_shard_[node] : nullptr;
+        if (which == 1) return (node >= 0 && node < (int)w2_shard_.size()) ? w2_shard_[node] : nullptr;
+        if (which == 2) return w13_g_;
+        if (which == 3) return w2_g_;
+        return nullptr;
+    }
+
+private:
     bool shard_fill_w13(const void* src) {
         if (!src || nshard_ < 2) return false;
         const size_t H = cfg_.hidden_size, I = cfg_.intermediate_size, E = cfg_.expert_num;
@@ -1407,6 +1467,9 @@ private:
         const size_t cbytes = crows * rowbytes;
         const size_t stride = (size_t)2 * I * rowbytes;  // dense source expert block
         const size_t total = (size_t)2 * cbytes * E;     // compact shard size
+        g_w13_shard_bytes_ = total;
+        g_w13_crows_ = crows;
+        g_w13_cbytes_ = cbytes;
         size_t base = shard_owned_.size();
         const uint8_t* s = static_cast<const uint8_t*>(src);
         for (int n = 0; n < NS; ++n) {
@@ -1440,6 +1503,9 @@ private:
         const size_t cbytes = crows * rowbytes;
         const size_t stride = H * rowbytes;              // dense source expert block
         const size_t total = cbytes * E;                 // compact shard size
+        g_w2_shard_bytes_ = total;
+        g_w2_crows_ = crows;
+        g_w2_cbytes_ = cbytes;
         size_t base = shard_owned_.size();
         const uint8_t* s = static_cast<const uint8_t*>(src);
         for (int n = 0; n < NS; ++n) {

@@ -900,10 +900,12 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
 // classes (pybind11 keys registered classes by C++ typeid).
 struct MXFP4Tag;  // forward decl so the base can detect the fast FP4 path
 template <const float (&LUT)[16], typename Tag = void, bool E8M0 = false,
-          bool FastFP4 = true>
+          bool FastFP4 = true, bool NeedsGS = false>
 struct Packed4WeightTraitsBase
-    : WeightTraitsBase<Packed4WeightTraitsBase<LUT, Tag, E8M0, FastFP4>> {
+    : WeightTraitsBase<Packed4WeightTraitsBase<LUT, Tag, E8M0, FastFP4, NeedsGS>> {
     static constexpr bool kE8M0 = E8M0;   // scale stored as 1-byte e8m0 vs fp32
+    // NVFP4 需要 per-expert global(tensor) scale;MXFP4/WNA16 不需要。
+    static constexpr bool kNeedsGlobalScale = NeedsGS;
     // FAST path only for the FP4 E2M1 LUT (MXFP4/NVFP4), where dequant reduces to
     // mag[nib&7]*sign and avoids the slow gather. WNA16's INT4_CENTER8 table does
     // not decompose that way and keeps the general gather path -- it MUST pass
@@ -1189,7 +1191,8 @@ using WNA16WeightTraits =
 // NVFP4: FP4 E2M1 weights (same nibble layout as MXFP4), fp32 per-group scales
 // PLUS a per-expert global scale. groupK is 32 when fed by vLLM.
 struct NVFP4Tag {};
-using NVFP4WeightTraits = Packed4WeightTraitsBase<packed4::E2M1, NVFP4Tag>;
+using NVFP4WeightTraits =
+    Packed4WeightTraitsBase<packed4::E2M1, NVFP4Tag, false, true, /*NeedsGS=*/true>;
 
 }  // namespace xiaotu_moe
 

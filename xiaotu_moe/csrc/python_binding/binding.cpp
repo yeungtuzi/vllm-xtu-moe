@@ -903,6 +903,48 @@ static void bind_moe_class(py::module& m, const char* name) {
         }, py::arg("stream"), py::arg("qlen"), py::arg("top_k"),
            py::arg("hidden"), py::arg("expert_ids"), py::arg("weights"),
            py::arg("out_gpu"))
+        // ---- GPU 流式 prefill:让 Python 能 DMA 引擎自有的主机缓冲 -------------
+        // 动机(NOTES §459):GPU prefill 原先要求保留 checkpoint 源张量才能逐层
+        // 流式权重,代价是 +269 GiB 主机内存,本机放不下。而引擎的每 node 紧凑分片
+        // **合起来正好是一份完整拷贝**,scale 也是引擎自己复制的一份 —— 直接 DMA
+        // 这些缓冲即可,于是 XIAOTU_RELEASE_SOURCE 可以保持 1。
+        .def("shard_geometry", [](MOE& self) {
+            py::dict d;
+            d["ns"] = self.shard_ns();
+            d["w13_node_bytes"] = self.shard_w13_node_bytes();
+            d["w2_node_bytes"] = self.shard_w2_node_bytes();
+            d["w13_scale_bytes"] = self.scale_w13_bytes();
+            d["w2_scale_bytes"] = self.scale_w2_bytes();
+            d["w13_crows"] = self.shard_w13_crows();
+            d["w13_cbytes"] = self.shard_w13_cbytes();
+            d["w2_crows"] = self.shard_w2_crows();
+            d["w2_cbytes"] = self.shard_w2_cbytes();
+            return d;
+        })
+        // which: 0 = w13 shard(node), 1 = w2 shard(node), 2 = w13 scales, 3 = w2 scales
+        .def("copy_hostbuf_to_device",
+             [](MOE& self, int which, int node, uintptr_t dst, uintptr_t stream) -> size_t {
+            const void* src = self.host_wbuf(which, node);
+            if (!src) return 0;
+            size_t n = 0;
+            switch (which) {
+                case 0: n = self.shard_w13_node_bytes(); break;
+                case 1: n = self.shard_w2_node_bytes(); break;
+                case 2: n = self.scale_w13_bytes(); break;
+                case 3: n = self.scale_w2_bytes(); break;
+                default: return 0;
+            }
+            if (!n) return 0;
+            cudaError_t rc = cudaMemcpyAsync(
+                reinterpret_cast<void*>(dst), src, n,
+                cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream));
+            if (rc != cudaSuccess) {
+                fprintf(stderr, "[shard-dma] cudaMemcpyAsync failed: %s (which=%d node=%d n=%zu)\n",
+                        cudaGetErrorString(rc), which, node, n);
+                return 0;
+            }
+            return n;
+        }, py::arg("which"), py::arg("node"), py::arg("dst"), py::arg("stream"))
         .def("cpu_prefill", [](MOE& self,
                               int qlen, int top_k,
                               py::object expert_ids, py::object weights,
