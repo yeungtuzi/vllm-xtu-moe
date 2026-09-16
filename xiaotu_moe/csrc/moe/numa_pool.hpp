@@ -498,6 +498,8 @@ public:
             sharded_call_ = 0;   // this is a flat call: task_ is valid, so reset
                                  // any stale sharded marker so late workers anchor flat.
             remaining_.store(n);      // outstanding work items in this call
+            // 【R113】flat 无损账按下标每代重置(与 remaining_ 同一发布窗口内)
+            issued_f_.store(0); exec_f_.store(0); dec_only_f_.store(0); dropped_f_.store(0);
             // diagnostic processed-bitset for this call (only when debug/trace on)
             if (diag_active()) proc_vec_.assign(n, 0);
             current_gen_.store(gen, std::memory_order_release);       // 偶数:就绪
@@ -598,6 +600,11 @@ public:
                     (unsigned long long)gen, n_, start_, start_+n_, counter_.load(),
                     remaining_.load(), (unsigned long long)current_gen_.load(),
                     dropped_.load());
+                // 【R113】flat 无损账:unclassified 必须为 0;若不为 0,缺口就是"领票没归类"的那张
+                fprintf(stderr, "  [flat-ledger] issued=%ld exec=%ld dec_only=%ld dropped=%ld  "
+                        "**unclassified=%ld**  (issued 应 == exec+dec_only+dropped)\n",
+                        issued_f_.load(), exec_f_.load(), dec_only_f_.load(), dropped_f_.load(),
+                        issued_f_.load() - exec_f_.load() - dec_only_f_.load() - dropped_f_.load());
                 if (diag_active()) {
                     size_t miss=0; std::string s;
                     for (size_t z=0;z<n_;++z) if(!proc_vec_[z]){ s+=std::to_string(start_+z)+" "; ++miss;}
@@ -1236,13 +1243,15 @@ private:
             }
             for (;;) {
                 size_t t = counter_.fetch_add(1, std::memory_order_relaxed);
+                issued_f_.fetch_add(1, std::memory_order_relaxed);   // 【R113】领票即记账
                 size_t i = t - start;
                 uint64_t g = current_gen_.load(std::memory_order_acquire);
                 if (g == gen) {
                     // Snapshot is authoritative: caller has not started the next
                     // call (publish-first), so start_/n_/task_ unchanged.
-                    if (i >= n) break;   // true future-gap -> safe lock-free drop
+                    if (i >= n) { dropped_f_.fetch_add(1, std::memory_order_relaxed); break; }   // future-gap
                     if (lf_) lf_(lc_, i);
+                    exec_f_.fetch_add(1, std::memory_order_relaxed);
                     if (diag_active()) proc_vec_[i] = 1;
                     // 【第 126 轮修】原为 `if (current_gen_ != gen) continue;` —— 世代前进就
                     // **跳过递减**,而票已经从 counter_ 领走 ⇒ flat 调用方永远等不到 0
@@ -1285,6 +1294,7 @@ private:
                         // 就会**丢掉一次递减** ⇒ 本代 remaining_ 永不归零。
                         // 必须先把本代的那一次递减补上,再回去重新 arm。
                         // (这是 §183b 记录的第二处同型缺陷。)
+                        dec_only_f_.fetch_add(1, std::memory_order_relaxed);   // 【R113】只减不执行
                         if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                             std::lock_guard<std::mutex> gl(done_mtx_);
                             done_cv_.notify_all();
@@ -1299,9 +1309,11 @@ private:
                     i = t - start;
                     if (i >= n) {               // genuinely beyond live range -> re-arm
                         dropped_.fetch_add(1, std::memory_order_relaxed);
+                        dropped_f_.fetch_add(1, std::memory_order_relaxed);
                         break;
                     }
                     if (lf_) lf_(lc_, i);
+                    exec_f_.fetch_add(1, std::memory_order_relaxed);
                     if (diag_active()) proc_vec_[i] = 1;
                     // Lock-protected notify (same reasoning as the fast path): hold
                     // done_mtx_ so the completion notify can't be missed by the
@@ -1427,6 +1439,17 @@ private:
     // 【第 123 轮纯诊断】不动任何控制流,只计数,用来区分"丢票"与"递减被世代守卫跳过"。
     // 崩溃签名是 exec==total 而 rem==1/2,而每个 exec 后都紧跟一个带守卫的递减
     // ⇒ 必然有一处 break 丢弃了已领票据,或有一处守卫把递减跳过了。谁非零即定位。
+    // 【R113 第一步·flat 无损账】分片路径有 issued_/inrange_/inrange2_/abandoned_(§200/§201),
+    // **flat 路径一直没有** —— 所以两次"丢票挂死"(@§497/§501)只能靠 `counter-end==nt_` 反推。
+    // 这三个计数把 flat 路径也变成"领票即记账",不变式:
+    //     issued_f == exec_f + dec_only_f + dropped_f   (unclassified 必须恒为 0)
+    // 一旦看门狗触发,dump 里立刻能读出"是哪一类票消失的":
+    //   * unclassified != 0        ⇒ 有路径领了票却没归类(代码漏记账)
+    //   * dropped_f 比预期多        ⇒ 被判越界丢弃的票里含**本代应有的票**(就是那个 bug)
+    alignas(64) std::atomic<long> issued_f_{0};      // 领票次数(counter_.fetch_add(1))
+    alignas(64) std::atomic<long> exec_f_{0};        // 执行了 job 且递减了
+    alignas(64) std::atomic<long> dec_only_f_{0};    // 只递减没执行(跨到 sharded 调用的那张)
+    alignas(64) std::atomic<long> dropped_f_{0};     // 既没执行也没递减(越界丢弃)
     alignas(64) std::atomic<long> abandoned_{0};                    // diag: 已领票后在 break 处被丢弃
     // 【第 122 轮·修埋点】`skipped_dec_` 已失效:第 121 轮删世代守卫时把它的自增一并删了,
     // 于是它结构上恒为 0、再无信息量。换成真正的不变式检查 `underflow_`:递减前桶值已是 0
