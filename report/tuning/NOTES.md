@@ -18400,3 +18400,10 @@ File ".../vllm/engine/arg_utils.py", line 3009                          load_gen
    缺的只是同风格的 `cpu_prefill`/`cpu_decode`。
 3. Mode A + `VLLM_COMPILE` + `MBT=4096` 的 **GPU 侧死锁**(worker CPU=0、主线程卡在 libcuda、
    GPU util 0%、显存只有权重、**无** `WATCHDOG` 行)仍未修;至少要改成"显式拒绝启动"。
+
+### §498 补:阈值按实测重新标定 1.05 → **1.15**
+静默机器上重复 3 次:`DEDUP=12 = 0.95 ms/层`,`DEDUP=23 = 1.07 / 1.08 / 1.09`(另有一次 1.71
+是**我并发跑 .pth 自检**造成的假值 —— 这正是"门禁必须空机跑"的又一例证)。
+故 2-node 阈值取 **1.15**(对最慢的 DEDUP=23 留 ~6% 余量)。数值门禁在这之后仍是
+`OK=7 BAD=1`(逐位一致)⇒ §500 那处 shim 改动对引擎内核**零影响**(它只在
+`hasattr(layer,'is_gpu_resident_layer')` 时生效,主线没有该属性)。
