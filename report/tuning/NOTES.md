@@ -18030,3 +18030,37 @@ ERROR [multiproc_executor.py:314] Worker proc VllmWorker-0 died unexpectedly (ex
 2. 若确认 OOM:查 `determine_available_memory` 期间的峰值来自哪里(V4 的 43 层引擎 138 GB +
    源 + 非专家;我这两轮改的标记只多留 ~0.4 GB 量级,**理论上不该致命**);
 3. **仍然没有 V4 基线** —— "是否回归"这个问题依旧悬着,不要下结论。
+
+## §495 【排除 OOM】V4 的死**不是内存不足**(峰值 277.9 GB,每 node 尚余 134.5 GB)
+
+把 `serve_v41.sh` 的 MEMTRACE 段移植到 `serve_mainline.sh`(commit 已提交)后复跑 V4,终于拿到数据:
+
+| 量 | 值 |
+|---|---|
+| mem 采样次数 | 9 ✓(这次手段生效了) |
+| **最胖进程峰值 RSS** | **277.9 GB** |
+| **单 node 最低空闲** | **134.5 GB**(即约 269 GB 余量) |
+
+⇒ **没有任何节点接近耗尽。V4 的死是"崩溃"而不是 OOM。**
+**这直接推翻了我前几轮一直挂着的"OOM-kill 形态"猜测**(§478/§482/§493 都拿它当过头号嫌疑)。
+
+### 死点与"症状 vs 病因"
+* 死点:`determine_available_memory()`(装载期那次剖析 forward,`core.py:312`);
+* `XTSIG/SIGSEGV` 计数 = **0**(不是我们引擎的 SIGSEGV 处理器);
+* 父进程侧唯一可见的错误是 **症状**:
+  ```
+  .../distributed/device_communicators/shm_broadcast.py  raise RuntimeError("cancelled")
+  .../v1/executor/multiproc_executor.py  status, result = mq.dequeue(...)
+  RuntimeError: cancelled
+  ```
+  这是**父进程在等 worker 回执时发现 worker 已死、于是取消读取** ——
+  **不是病因**。真实病因在 **worker 自己的 stderr** 里,而它没有出现在父进程日志里。
+
+### 下一轮(拿到 worker 的死因)
+1. worker 的输出被 mp executor 吞掉了 ⇒ 试:①直接把 worker 的 stderr 引到文件
+   (`VLLM_...`/`2>` 重定向到独立文件);②查有没有 core dump(`/var/crash`、`coredumpctl`);
+   ③或在 `determine_available_memory` 前后加显式打点,定位它死在哪个子步骤
+   (是 `profile_run` 的 forward,还是之后的显存统计);
+2. 仍然**没有 V4 基线** ⇒ 继续不下"回归"结论;但可以先做一件更有信息量的事:
+   **在 V4 上把我们的插件关掉**(纯原版 vLLM,`mixed_mode` 关)跑同一脚本 ——
+   若也死,则问题与插件无关(是环境/上游),这条对照比"历史基线"更容易拿到。
