@@ -543,9 +543,20 @@ def _patch_quant_method_cls(cls) -> list[str]:
                 # `_install_device_loading_shim` 把它们排除在"搬上 GPU"之外。
                 # 只标记大张量(≥64 MiB):专家权重是 GB 级,router/bias 之类是小的,
                 # 不标记以免影响它们正常的 device 处理。
-                for _, p in layer.named_parameters(recurse=True):
+                for _pn, p in layer.named_parameters(recurse=True):
                     try:
-                        if p.numel() * p.element_size() >= (64 << 20):
+                        _big = p.numel() * p.element_size() >= (64 << 20)
+                        # 【NOTES §489】按**角色**判,不能只按**体积**判:
+                        # DSpark draft 的 `w2_weight_scale` 只有 47,185,920 B(45 MiB),
+                        # 低于下面的 64 MiB 阈值 ⇒ 曾被漏标 ⇒ `device_loading_context`
+                        # 把它搬到了 **cuda** ⇒ 引擎按 cfg 算出的长度 memcpy 一个
+                        # **设备指针** ⇒ SIGSEGV(无 Python 栈)。
+                        # 专家的**权重与其块缩放是同一角色**,必须一起留在 CPU。
+                        _is_scale = any(
+                            _pn.endswith(_suf) for _suf in
+                            ("_scale", "_scale_inv", "weight_scale", "scales")
+                        )
+                        if _big or _is_scale:
                             setattr(p, _XTU_CPU_EXPERT_ATTR, True)
                     except Exception:  # noqa: BLE001
                         pass
