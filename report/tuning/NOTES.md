@@ -18339,3 +18339,47 @@ File ".../vllm/engine/arg_utils.py", line 3009                          load_gen
 ### (d) 通用教训(值得进 RUNBOOK)
 **"在哪个目录启动"是我们这套代码的一个隐式输入**。凡是"跑对照/跑参考实现/跑基准"的场景,
 启动前必须 `cd` 到仓库外(或显式清 `sys.path`),否则会静默变成"我们的插件 + 对方编排"的混合体。
+
+## §500 §483 同 env A/B 的第一轮结果:**参考实现量到了;我们的引擎在 lvllm-2.5 的参考配置下起不来**(两个独立阻塞,都有现场证据)
+
+完整报告见 **`docs/AB_LK_VS_XIAOTU.md`**。摘要:
+
+### (a) 量到的(arm A = lk_moe,lvllm-2.5,参考配置,TP=2/THREADS=60)
+| C | 聚合 tok/s | TPOT | TTFT | 完成 |
+|---|---|---|---|---|
+| 1 | **21.87** | **26.43 ms** | **2495 ms** | 8/8 |
+| 4 | **33.95** | 49.15 ms | 7075 ms | 8/8 |
+
+(客户端 `bench_lat.sh` 512-in/128-out/N=8,random token 数据集,不依赖 chat template)
+
+### (b) arm B(我们的引擎,同一 env、**逐字相同**的参数)没起来 —— 两条路各自独立的坑
+1. **Mode A(`XIAOTU_OOT_OVERRIDE=1`)+ 参考的 `--compilation-config {mode: VLLM_COMPILE,
+   cudagraph_mode: FULL_DECODE_ONLY}` + `MBT=4096` = GPU 侧死锁**:
+   86 个引擎建完后卡在 profile run;**两个 worker 瞬时 CPU=0**、`gdb` 主线程栈**全在
+   `libcuda.so` 里 `sched_yield`**、**GPU util 0%**、显存停在 **7.4 GiB(只有权重没有 KV)**、
+   **没有 `WATCHDOG fired`** ⇒ 不是我们线程池挂住(那样 300s 后会 dump+abort),而是
+   **GPU 侧等不到对端**。最可能:Mode A 从未在 `VLLM_COMPILE` 下验证过(我们的脚本一直用 `NONE`)。
+2. **Mode B(`XIAOTU_OOT_OVERRIDE=0`,主线 `RoutedExperts` + 我们 CPU 后端)+ `gpu_util=0.90`
+   = CUDA OOM**:
+   `mainline_shims.py:541 create_weights → vllm/.../quantization/mxfp4.py new_tensor →
+   torch.OutOfMemoryError: Tried to allocate 1024.00 MiB, 651.50 MiB free`。
+   ⇒ **专家权重被建到 GPU 上**了:我们"专家留在 CPU"的 `device_loading_context` shim
+   (已 applied)覆盖的是**主线**的实现,lvllm-2.5 的 `mxfp4.create_weights` 是另一份代码、
+   没被覆盖 ⇒ 降到 `gpu_util=0.80` 也救不了(43 层专家在 GPU 上要 ~68 GiB/rank)。
+
+### (c) 因此本轮**能**说什么、**不能**说什么
+* **能说**:参考实现在它自己的配置下 C=1 = 21.87 tok/s(TPOT 26.4 ms),且 5 条 greedy prompt 全对;
+* **不能说**:谁比谁快。B′(`serve_mainline.sh`:MBT=256、无 `VLLM_COMPILE`、12 层常驻)
+  = C=1 13.03 tok/s / TPOT 49.40 ms,**与 A 不是同配置**,两个方向的偏差互相抵消,净效应未知;
+* **同配置 A/B 的前置条件**是移植(Mode B 的 device-loading 覆盖 + Mode A 的 `VLLM_COMPILE` 支持),
+  不是调参。
+* 顺带发现(值得单独修):**Mode A 遇到 `VLLM_COMPILE` 是"死锁"而不是"报错"**
+  —— 死锁是最坏的失败形态(白等 40 分钟),插件应在检测到该组合时**显式拒绝启动**。
+
+### (d) 正确性
+* arm A 5/5 prompt 语义正确(见 `report/tuning/raw/ab_lvllm_a_greedy.json`);
+* **逐 token 对比这次无效**:arm A 带了 `--default-chat-template-kwargs
+  '{"enable_thinking": false}'`(参考脚本里有)而我们的 V4 基线没带 ⇒ prompt 渲染不同。
+  下一步第一个动作就是**对齐这个 kwarg** 再比;
+* 我们引擎自身已有的正确性证据不变:数值门禁 `OK=7 BAD=1`(1.873e-02,逐位一致)、
+  逐位确定性 11/11、服务端 greedy 4/5 逐字节同。
