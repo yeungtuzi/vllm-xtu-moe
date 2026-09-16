@@ -766,8 +766,17 @@ class _XiaotuExpertsMixin:
                   else self._stage_src(layer, "w13_weight"))
         ex_w2 = (getattr(self, "_engine_w2", None) if getattr(self, "_engine_w2", None) is not None
                  else self._stage_src(layer, "w2_weight"))
+        # 先解析 scale:下面的守卫要**连 scale 一起**查 storage 大小
+        # (NOTES §486:DSpark 崩的那一次 memcpy 长度恰好等于 w2 scale 的字节数,
+        #  所以只查 w13/w2 是不够的)。注意本函数后面才正式构造 s13/s2,
+        # 这里用同一条解析链取一份局部副本(上一版直接写 s13/s2 ⇒ UnboundLocalError)。
+        _s13, _s2 = getattr(self, "_scales", (None, None))
+        if _s13 is None:
+            _s13 = self._find_scale(layer, (self._scale_attrs[0],))
+        if _s2 is None:
+            _s2 = self._find_scale(layer, (self._scale_attrs[1],))
         self._validate_weights(layer, ex_w13, ex_w2)
-        self._assert_host_source(ex_w13, ex_w2, s13, s2)
+        self._assert_host_source(ex_w13, ex_w2, _s13, _s2)
         if self._expect_dtype is not None and ex_w13.dtype != self._expect_dtype:
             raise NotImplementedError(
                 f"xiaotu {self._engine_attr} backend expects "
