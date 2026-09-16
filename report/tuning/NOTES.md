@@ -17386,3 +17386,40 @@ V4.1 的 engram 张量一共 **12 个**(layer 1 与 14 各 6 个):
 * **必须真权重跑一次确认**:数值与不开 ENGRAM_LAST 时一致(对拍同一 prompt 的输出),
   并量峰值 RSS —— 预期从 ~833 GB 降到 ~640 GB 上下(省掉 189 GiB 与专家阶段叠加);
 * 这是目标项 (1),也是后面前 20 层 / TP=2 / Patch B 的内存前提。
+
+## §475 【参考项目变更】`Lvllmds4-x` 已**停止更新**,主线改为 `guqiong96/Lvllm`
+
+用户转达 lk-moe 作者公告(Lvllm-v2.5.0),让我更新源码核对。已实测:
+
+### 1. `Lvllmds4-x` 已被作者**明确废弃**
+`git fetch origin main` 后,其 `README.md` 原文:
+> "Now that the mainline vLLM DeepSeek-V4 SM80+ support has essentially matured,
+> **this project will no longer be updated. Please move to the
+> [Lvllm](https://github.com/guqiong96/Lvllm) project instead.**"
+
+(我们本地那份停在 `lvllmds4-x-v2.3.11-3-gfaf95dd5b`,即我们自己的 port commit;
+远端 main 只比它多 3 个文件。⇒ **`serve_lk_port.sh` / `LK_THREADS` 这条参考线应停止跟踪。**)
+
+### 2. 主线 `guqiong96/Lvllm` 已直接支持 SM80 + DS4.1(**用户判断正确**)
+clone 后 `README.md` 的支持矩阵:
+
+| Model | SM80 | spec-decode |
+|---|---|---|
+| **DeepSeek-V4.1-Flash** | **✅ new** | **✅ dspark** |
+| DeepSeek-V4-Flash (0731) | ✅ new | ✅ dspark |
+| Qwen3.8-Flash-Next / GLM-5.3-Flash | ✅ new | ✅ MTP |
+
+其定位:`LvLLM = vLLM + lk_moe + SM80/86/89 适配 + SM120 修复`;
+**`LVLLM_MOE_NUMA_ENABLED=0` 时行为等同原版 vLLM**(混合 MoE 是可选的)。
+另:该仓库还有 `SM80_DEEPSEEK_V4_NOTES.md`、`SM89_DEEPSEEK_V4_NOTES.md`。
+
+### 3. 对我们的意义(下一步的**高价值参考**)
+我们做的是**同一条路线**:V4/V4.1 在 SM80 上跑 + 专家层 CPU/GPU 混合。
+差别只是引擎:LvLLM 集成 **lk_moe**,我们集成 **xiaotu_moe**(vLLM 插件形态)。
+既然主线现在覆盖 V4.1,它就是我们能做到"**看别人的实现**"的最近参照,优先级:
+1. **DSpark**(我们的目标项 3)—— 他们已支持 V4.1 的 dspark,可直接对照接线方式;
+2. **CED / 只跑前 20 层的 prefill**(§468,当前最大杠杆)—— 看他们是否利用了这个捷径;
+3. SM80 侧的 V4.1 attention 处理(我们有自己的 Triton sparse-MLA 回退);
+4. 他们的混合 MoE 阈值/显存决策,与我们 §473 的结论(组装是瓶颈)对照。
+
+(克隆在 `/tmp/lvllm_main`,浅克隆;`RELEASE_NOTES.md` 有逐模型的硬件表与基准。)
