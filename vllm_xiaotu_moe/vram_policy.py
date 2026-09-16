@@ -43,6 +43,9 @@ WEIGHTS_GIB = 7.4               # V4.1 TP=2 每 rank 的模型权重(日志 "Mod
 # 注:早先记的 17.45 GiB/1.116M tok 来自别的配置(TP=1 的 v41el 口径)⇒ 用量级差 7×。
 # 这个数直接决定"优先级 2/3/4 还剩多少显存",所以必须用**本配置**实测值。
 KV_GIB_PER_MTOKEN = 2.71 / 1.290154      # ≈2.1 GiB / 1M tokens
+# 预填充/激活/CUDA graph 之外的**保守余量**:§509 实测"解析式说 6 层常驻、6 层直接 OOM(34.8/40GB);
+# 2 层稳过(27.1GB)" ⇒ 解析式必须留安全垫,否则会把用户推到 OOM。
+VRAM_RESERVE_GIB = 4.0
 GPU_PREFILL_GIB = 3.0           # MBT=8192 的激活/工作区 + ping/pong 双槽的额外部分(待精确测,先保守按 3.0)
                                 # 注:双槽本身 ≈ 2×一层 K-major(TP=2 每层 ~1.7 GB)≈ 3.4 GB,已含在此数内
 DRAFT_GIB_PER_RANK = 7.388 / 2  # mtp 全量 7.388 GiB,TP=2 ⇒ 每 rank 一半
@@ -83,6 +86,8 @@ def plan(*, maxlen: int, free_gib: float | None = None,
 
     kv_gib = kv_per_m * (maxlen / 1_000_000.0)
     budget = free_gib if free_gib is not None else (CARD_TOTAL_GIB - WEIGHTS_GIB - kv_gib)
+    # 留出保守余量(激活/cudagraph/碎片);§509 的实测证据见 VRAM_RESERVE_GIB 注释
+    budget = max(0.0, budget - VRAM_RESERVE_GIB)
 
     steps: list[tuple[str, bool, str]] = []
 
