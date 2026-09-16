@@ -158,14 +158,37 @@ export CUDA_VISIBLE_DEVICES="$GPUS"
 #   ⇒ 60 既不是引擎默认也不是任何一档的最优,是当初"先跑通"钉下的保守值,故改 192。
 #   引擎自身的默认(120)**没有动** —— 那是别的模型的解码最优点(NOTES §424)。
 XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
+# ---- 【§504 修:内存+性能,都在我们自己的环境里实测出来的】-------------------
+# TP=2 时 **每个 rank 的线程数**必须按"本 rank 的 CCD 数 × 4-5"取,而不是按整机核数:
+#   184(/rank)× 2 rank = 368 线程挤 192 物理核(用户规则:至少给每个 worker 留 2 核,
+#   且绝不用满)⇒ 实测 **TPOT 436.7 ms / C=1 1.93 tok/s**;
+#   60/rank(= 12 CCD × 5)⇒ **TPOT 68.1 ms / C=1 9.62 tok/s**(解码快 6.4×)。
+# 184 是**单进程**基准(world=1)的拐点,不能直接搬到 TP=2 服务上 —— 这是本轮踩到的坑。
+THREADS_DEFAULT="${THREADS_DEFAULT:-60}"
+# 自旋 5000 µs 是 §355 记录过的正反馈灾难(48 层 × 3 相 × 5 ms ⇒ 池几乎永不停转),
+# 与上面的超订叠在一起会互相放大 ⇒ 默认 0(完全不自旋,worker 直接 futex 睡)。
+SPIN_DEFAULT="${SPIN_DEFAULT:-0}"
+XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
 {
-  echo "XIAOTU_MOE_THREADS=${XIAOTU_MOE_THREADS:-184}"
+  echo "XIAOTU_MOE_THREADS=${XIAOTU_MOE_THREADS:-$THREADS_DEFAULT}"
   echo "XIAOTU_MOE_NSLICE_SMALL=${XIAOTU_MOE_NSLICE_SMALL:-0}"
   echo "XIAOTU_MOE_ASYNC=${XIAOTU_MOE_ASYNC:-0}"
-  echo "XIAOTU_MOE_SPIN_IDLE_US=${XIAOTU_MOE_SPIN_IDLE_US:-5000}"
+  echo "XIAOTU_MOE_SPIN_IDLE_US=${XIAOTU_MOE_SPIN_IDLE_US:-$SPIN_DEFAULT}"
   echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-}"
   echo "XIAOTU_MOE_RESIDENT_BUDGET_GB=${XIAOTU_MOE_RESIDENT_BUDGET_GB:-0}"
   echo "XIAOTU_RELEASE_SOURCE=${XIAOTU_RELEASE_SOURCE:-1}"
+  # 【§504】**多 rank 同机必须用 CCD 交错切分**(RANK_SPLIT=2)。原因(改自 moe_v2.hpp 的设计):
+  #   nshard_ = max(1, numa_node_count()/world)。NPS1 本机 numa=2、TP=2 ⇒ **nshard_=1**
+  #   ⇒ 分片路径整个失效,退回"每个 socket 一份副本"⇒ **权重存 2 份**;
+  #   而 RANK_SPLIT=2 让**每个 rank 覆盖全部 node**(CCD 交错),于是 nshard_=2 生效
+  #   ⇒ 每个 node 只存自己那 1/2 行 = **整机 1 份权重**(与 lk_moe 的"每 node 一份分片"同构)。
+  #   实测(TP=2/V4.1 真权重,服务进程树总 RSS):峰值 1121 → 989.5 GiB;稳态 1121 → 859 GiB。
+  echo "XIAOTU_MOE_RANK_SPLIT=${XIAOTU_MOE_RANK_SPLIT:-2}"
+  # 【§504】GPU 预填充关闭时(`XIAOTU_MOE_GPU_PREFILL_MIN_TOKENS=0`,本脚本默认),
+  # `gpu_prefill_bridge` 仍在**构造期**给每层复制一份 Python 侧权重副本(为了 GPU prefill
+  # 的 K-major 缓存)——纯浪费,实测 ~6.7 GiB/层。默认关掉;真要用 GPU 预填充时它会
+  # 在第一次调用时惰性复制(源张量那时可能已被 RELEASE_SOURCE 释放 ⇒ 见该文件里的显式报错)。
+  echo "XIAOTU_GPUPREFILL_WCOPY=${XIAOTU_GPUPREFILL_WCOPY:-0}"
   for kv in $EXTRA_ENV; do case "$kv" in *=*) echo "$kv";; esac; done
 } > "$XTU_ENV_FILE"
 export XIAOTU_ENV_FILE
@@ -177,10 +200,12 @@ nohup env \
   VLLM_USE_FLASHINFER_SAMPLER=0 \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
   XIAOTU_RELEASE_SOURCE="${XIAOTU_RELEASE_SOURCE:-1}" \
-  XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-184}" \
+  XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-$THREADS_DEFAULT}" \
   XIAOTU_MOE_NSLICE_SMALL="${XIAOTU_MOE_NSLICE_SMALL:-0}" \
   XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
-  XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-5000}" \
+  XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-$SPIN_DEFAULT}" \
+  XIAOTU_MOE_RANK_SPLIT="${XIAOTU_MOE_RANK_SPLIT:-2}" \
+  XIAOTU_GPUPREFILL_WCOPY="${XIAOTU_GPUPREFILL_WCOPY:-0}" \
   OMP_NUM_THREADS=1 \
   $EXTRA_ENV \
   numactl --interleave=all "$PY" -m vllm.entrypoints.openai.api_server \

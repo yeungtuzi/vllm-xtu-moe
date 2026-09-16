@@ -18530,3 +18530,71 @@ worker 的**领票方式**(每次调用的局部索引 + 领票动作不可被"�
 * 机器在 V4.1 稳态下**只剩 4 GB 空闲**——这把"OOM-kill 风险"从推测变成实测。
 
 完整报告:`docs/MEM_FOOTPRINT_V41.md`。复现:`report/tuning/probes/{ref,xtu}_v41_mem.sh`。
+
+## §504 ✅ **内存异常占用 + 性能问题:一次配置层面的修正解决了大半**(全部在**我们自己的环境**里实测)
+
+用户 2026-09-16 的指点:"NPS=1 时权重切片就是 2 片,这点跟 lk-moe 应该是一样的,不应引入额外内存占用
+和性能损失" —— **完全正确**,而且直接指出了根因。
+
+### (a) 根因:TP=2 时 `nshard_` 退化成 1 ⇒ 分片路径整个失效 ⇒ 每 socket 一份副本
+```cpp
+// moe_v2.hpp:461
+nshard_ = std::max(1, numa_node_count() / _world);     // _world = num_processes(TP)
+```
+本机 NPS1 ⇒ `numa_node_count()=2`,TP=2 ⇒ **`nshard_ = max(1, 2/2) = 1`**。
+而分片路径的门槛是 `NS >= 2` ⇒ `nshard_=1` 时**整个 sharded 路径被跳过**,退回
+代码注释里写明的旧设计:
+> (a) per-SOCKET replication (old): 2 socket copies … **weights read TWICE total, 2x memory**
+
+`XIAOTU_MOE_RANK_SPLIT=2`(CCD 交错,"推荐")让**每个 rank 覆盖全部 node**,于是 `_world=1`
+⇒ `nshard_ = 2` 生效 ⇒ 每个 node 只存自己那 1/2 行 = **整机 1 份权重**
+(与 lk_moe"每 node 一份分片"同构)。**这正是用户说的"2 片"。**
+
+### (b) 第二个浪费:GPU 预填充关闭时仍在构造期复制一份 Python 侧权重
+`xiaotu_moe/gpu_prefill_bridge.py:144` 的 `XIAOTU_GPUPREFILL_WCOPY`(原默认 **1**)在**每层构造期**
+把 4 个权重张量 `clone()` 一份(Python 侧,为 GPU prefill 的 K-major 缓存)。
+本脚本默认 `XIAOTU_MOE_GPU_PREFILL_MIN_TOKENS=0` ⇒ 这份副本**从来用不到**。
+V4.1 每层每 rank ≈ **6.7 GiB**(E=384/2 × 2I×H/2 等),40 层 = **~270 GiB/rank 白占**。
+
+### (c) 第三个问题:TP=2 的线程数用了**单进程**的拐点 + 5 ms 自旋
+`serve_v41.sh` 原默认 `XIAOTU_MOE_THREADS=184`(那是 **world=1 单进程**的拐点)、
+`SPIN_IDLE_US=5000` ⇒ **184×2 = 368 线程挤 192 物理核**,叠加 §355 记录过的自旋正反馈。
+用户规则本来就说清了:每 worker(tp)至少留 2 核、每 CCD 4-5 核、不要用满 ⇒ TP=2 应取 **60/rank**
+(= 12 CCD × 5,整机 120 线程)。
+
+### (d) 实测(V4.1-Flash,**我们自己的 env**,真权重,TP=2;尺子 = 服务进程树总 RSS)
+| 配置 | 峰值 tree RSS | 稳态 tree RSS | ready | C=1 聚合 | TPOT |
+|---|---|---|---|---|---|
+| ① 原默认(RANK_SPLIT=1 / WCOPY=1 / THREADS=184 / SPIN=5000) | **1121 GiB** | 1121 GiB | 719 s | **1.93 tok/s** | **436.7 ms** |
+| ② =① + `RANK_SPLIT=2` | 989.5 GiB | 859 GiB | 523 s | — | — |
+| ③ =② + `WCOPY=0` + `THREADS=60` + `SPIN=0` | **936 GiB** | **589 GiB** | **357 s** | **9.62 tok/s** | **68.1 ms** |
+
+* **稳态内存 1121 → 589 GiB(−47%)**,启动 **719 → 357 s(2×)**,解码 **436.7 → 68.1 ms(6.4×)**;
+* 归因:**内存**是干净的(② 单独量了 RANK_SPLIT 的贡献:−262 GiB 稳态;③−② 是 WCOPY 的贡献:−270 GiB);
+  **性能**这一项**混杂**(THREADS 184→60 与 SPIN 5000→0 是一起改的,没有分开做受控 A/B),
+  但两者都是本项目已经记录过的病态(368 线程超订;5 ms 自旋正反馈),修掉方向无争议。**如实记录这个混杂**。
+
+### (e) V4(Mode A)回归(硬约束)—— 通过
+同一次改动也进了 `serve_mainline.sh`(RANK_SPLIT=2 + WCOPY=0;THREADS=60/SPIN=0 原本就是对的):
+
+| | 改前(干净 env 基线) | 改后 | |
+|---|---|---|---|
+| C=1 聚合 | 13.03 tok/s | **14.18** | +8.8% |
+| C=1 TPOT | 49.40 ms | **45.25 ms** | −8.4% |
+| C=1 TTFT | 3551 ms | **3277 ms** | −7.7% |
+| C=4 聚合 | 29.71 | **32.21** | +8.4% |
+| 服务树总 RSS | (单进程峰值 277.9 GB) | **289.5 GiB(两 worker 各 ~143.6)** | 同一量级,无退化 |
+| 数值门禁 | `OK=7 BAD=1` max_rel **1.873e-02** | **逐位相同** | ✅ |
+| 5 条 greedy 输出 | — | **5/5 与基线逐字节相同** | ✅ |
+| GPU 常驻层 | 12 | 12 | ✅ |
+| 看门狗 | 0 | 0 | ✅ |
+| 2 连测确定性 | 已知 4/5 同型 | 同样 1 条不同(`code`) | 既有现象,非新回归 |
+
+### (f) 落地
+* `scripts/serve_v41.sh`:`THREADS_DEFAULT=60`、`SPIN_DEFAULT=0`、`RANK_SPLIT=2`、`WCOPY=0`
+  (env 桥与 nohup env 两处都改,注释写清为什么);
+* `scripts/serve_mainline.sh`:env 桥 + nohup env 加 `RANK_SPLIT=2`、`WCOPY=0`;
+* 复现探针:`report/tuning/probes/xtu_own_v41_mem.sh`(带 `RANK_SPLIT/WCOPY/THREADS/SPIN` 旋钮);
+* **未做**:把 `nshard_` 的公式本身改掉(让 NPS1+TP2 默认就拿到单份),
+  目前靠脚本设 `RANK_SPLIT=2` 达到同样效果;公式层面改需要连带把 `RANK_SPLIT` 的默认值
+  从 1 改成 2 并复跑全部多 rank 场景 ⇒ 留作下一轮(有脚本兜底,风险已可控)。
