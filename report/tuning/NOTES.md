@@ -17824,3 +17824,51 @@ if self._xiaotu_engine is None:
 判据:①不再有 `XTSIG/SIGSEGV`;②越过 `DSpark draft model loaded: 97 params`;
 ③`Application startup complete`;④然后量 decode 收益(基线 27.5-27.8 tok/s)。
 若仍崩,这次应能拿到**可读的**"某个张量在引擎构造前被释放"错误,直接指向释放顺序。
+
+## §489 【已确认】DSpark 崩溃根因:draft 的 **w2_weight_scale 在 cuda 上**,被 64MiB 阈值漏标
+
+复跑最小 `SPEC=1`(修掉 §487/§488 之后),四条判据:
+
+| 判据 | 结果 |
+|---|---|
+| ① `XTSIG/SIGSEGV` 计数 | **0** ✓(§487 的释放顺序修复生效) |
+| ② 越过 `DSpark draft model loaded: 97 params` | **是** ✓(以前正是死在这之后) |
+| ③ `Application startup complete` | 否(换成另一个**可读**错误) |
+| ④ 量 decode 收益 | 待完成 |
+
+新错误正是 §486 加的那条守卫报出来的,而且**指名的张量与我按寄存器算出来的完全一致**:
+
+```
+RuntimeError: xiaotu MOE_MXFP4: refusing to build the engine from a non-host source
+  (s2: device=cuda numel=47185920 contiguous=True ...)
+```
+
+* `s2` = **w2_weight_scale**;`numel = 47,185,920` —— **正是 §486 从 `RDX` 反推出的那个数**
+  (`E·H·(I/gk)`,E=128),当时我据此判断"崩的是 w2 的 scale 拷贝"——**现已被独立证实**。
+* 而且它是 **device=cuda**,不是"已释放的主机张量"。
+
+### 真正的机制(与项目早期那个 bug 同源,但漏了一个张量)
+项目早期为 `shard_fill_w13` 读到设备指针而加过修法:`device_loading_context` shim +
+给专家参数打 `_xiaotu_cpu_expert` 标记,**让 vLLM 不要把 CPU 专家的权重搬到 GPU**。
+但那个标记的判据是**按大小(≥64 MiB)**:
+
+| 张量(E=128 draft) | 字节 | ≥64MiB? | 被标记? |
+|---|---|---|---|
+| w13_weight | 1,509,949,440 | ✓ | ✓ |
+| w13_weight_scale | 94,371,840 | ✓ | ✓ |
+| **w2_weight_scale** | **47,185,920** | **✗(45 MiB)** | **✗ ← 漏掉** |
+
+⇒ 这个"小"张量没被标记 ⇒ `device_loading_context` 把它搬到了 **cuda** ⇒
+引擎按 cfg 算出的长度去 `memcpy` 一个**设备指针** ⇒ SIGSEGV。
+**目标层的 40 个引擎没崩,是因为它们的同名 scale 都大于 64 MiB。**
+
+### 修法(下一轮,明确)
+把标记判据从"**按大小**"改成"**按 dtype/layout + 归属**":
+凡属于 CPU 专家模块(`_xiaotu_cpu_expert` 语义)的 MXFP4 打包权重**与其 e8m0 块缩放**,
+无论多大的张量都标记 —— 即"按角色"而不是"按体积"。
+(顺带把 `device_loading_context` 的跳过条件也按同一判据,保持一致。)
+
+### 方法论收获(值得单独记)
+§486 那句"把静默 SIGSEGV 变成可读错误"的守卫,**第一次跑就指名道姓**地证实了
+用寄存器算术做出的预测(`RDX == E·H·(I/gk)`)。**先让失败可诊断,再谈修复** ——
+这比连续三轮回过头猜机制(§482/§484/§487 三次假设两次错)有效得多。
