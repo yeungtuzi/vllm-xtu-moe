@@ -23,6 +23,15 @@
 #
 # Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS
 #
+# MBT(默认 **0 = 不传**,用 vLLM 默认 chunk 大小;如 8192):
+#   **这是 GPU prefill 的真正前提**。vLLM 按 max_num_batched_tokens 把 prompt 切成
+#   chunk,而"某层看到多少 token"= **chunk 大小**,不是 prompt 总长。所以
+#   MBT=2048 时任何层都不可能超过 2048 ⇒ `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS`
+#   最多只能在 2048 这一档触发,而该档上**非重叠**的 GPU 流式(~400 ms/层)
+#   仍慢于 CPU(实测 ~257 ms/层)⇒ 只会更慢(NOTES §463)。
+#   要用 GPU prefill 必须同时把 MBT 提到 4096-8192(并相应留出 activation 显存)。
+#   注意:vLLM 会读 `--max-num-batched-tokens` 反推 `max_num_seqs` 等预算,调大前先确认显存。
+#
 # PREFIX_CACHE(默认 1 = 保持 vLLM 默认开启):设为 0 会加 --no-enable-prefix-caching。
 #   **测量长上下文 prefill 时必须设 0** —— 否则不同 prompt 共享前缀会被整段命中,
 #   量出"prefill 几千甚至上万 tok/s"的假象(NOTES §420 连续两次踩到)。
@@ -160,6 +169,7 @@ nohup env \
     --model "$CKPT" --served-model-name dsv41 \
     --load-format "$LOAD" \
     --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-1}" \
+    $( [ "${MBT:-0}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
     --gpu-memory-utilization "$GPU_UTIL" $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager ) \
     $( [ "${PREFIX_CACHE:-1}" = "1" ] || echo --no-enable-prefix-caching ) --trust-remote-code \
     --limit-mm-per-prompt '{"image":0,"video":0}' \

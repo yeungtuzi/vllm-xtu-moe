@@ -17059,3 +17059,29 @@ else { nshard_ = 0; }                            // ⇒ 走 socket 副本安全�
 | **TP=1(唯一可行且带分片)** | **8.2 GiB** | **~10.2 GiB** |
 | TP=2(需 `RANK_SPLIT=0` 才有分片) | 4.1 GiB | ~5.1 GiB |
 | ~~TP=3~~ | — | **不合法** |
+
+## §463 【关键耦合】GPU prefill 的阈值要跟 **chunk 大小**比,不是 prompt 总长
+
+用 `GPU_UTIL=0.70`(KV 11.53 GiB,空闲约 7-12 GiB)在 TP=1 上真跑了一次 7000 token:
+
+```
+warmup : 60.84 s  (115.1 tok/s)
+req#1  : 49.32 s  (141.9 tok/s)
+GPU prefill ACTIVE: first 2048 tokens >= threshold 2048; weights from engine shards
+GPU prefill SKIPPED -> ... needs ~8.2 GiB free VRAM, only 7.1 GiB is free.
+```
+
+**比纯 CPU 基线还慢**(§443 的 `v41split`:6998 tok / 36.22 s = **193 tok/s**)。原因不是 bug:
+
+1. **`serve_v41.sh` 从来没传 `--max-num-batched-tokens`**,于是 vLLM 按默认把 prompt
+   切成 **2048** 的 chunk。**任何一层看到的 token 数 = chunk 大小,永远不可能超过 2048**
+   ⇒ 阈值 2048 恰好卡在边界,而这一档上非重叠的 GPU 流式(~400 ms/层)仍然**慢于**
+   CPU(实测 ~257 ms/层,§443)⇒ 挂上 GPU 只会更慢。
+2. 预检在逐层、逐次调用上做,空闲显存会在 7-12 GiB 之间浮动 ⇒ 同一层有时走 GPU、
+   有时退回 CPU,行为不稳定(这次两种消息都出现了)。
+
+**⇒ 结论(必须写进文档):**
+* 要用 GPU prefill,必须**同时**把 `MBT` 提到 **4096-8192**,让 chunk 真正大于交叉点
+  (非重叠路径的交叉点约 3000-4000 token;重叠后约 2100)。
+* 已给 `serve_v41.sh` 加 `MBT` 旋钮(默认 0 = 不传,保持既有行为逐字不变)。
+* 预检的"浮动"问题应改成**每个模块只决定一次**(首次判断后固定),避免同一层来回切换。
