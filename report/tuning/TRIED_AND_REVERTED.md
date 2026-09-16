@@ -942,3 +942,26 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
   `NSHARD=1/2/4/8` → **333.6 / 660.0 / 446.5 / 333.7 µs/层**。
 - **结论**:NSHARD=8(默认)与 1 并列最优;2/4 反而**大幅变慢**(每 node 的活动专家数变少、
   负载不均)。⇒ 分片数不是固定成本的来源,**保持默认 8**,不再作为旋钮。
+
+## R113(2026-09-16). 「把 `start_ = counter_.load()` 换成 `counter_.fetch_add(n)`」= **原子预留区间** —— 已回退,**单靠这一改必挂**
+
+| 项 | 内容 |
+|---|---|
+| 试了什么 | 针对 §497/§501 两次实测的"线程池丢票导致 300s 后 `abort()`",按 §196 留下的结论动手:①发布侧 `start_ = counter_.fetch_add(n)`(原子预留区间);②worker 侧把两处"无归属丢弃"改成**在 `work_mtx_` 下复核活代**后再判;③re-anchor 路径删掉世代守卫、统一成"领票即必减";④分片孪生同步改成 `node_base_[n] = node_ticket_[n].v.fetch_add(job_counts[n])` |
+| 当时理由 | §196 原话:"正确修法 = 原子预留区间";且它能把"滞留 worker 恰好拿到新调用起点那张票"这个窗口结构性关掉 |
+| 实测(回退前,`test_block23_equiv.py` = 并行路径门禁) | **数值门禁从 `OK=7 BAD=1` 变成"零输出/挂死"**;`XIAOTU_MOE_THREADS=1`(走串行捷径、不进池)**仍然 7/7 全过** ⇒ 故障被隔离在**并行领票路径**。`gdb -p` 主线程:`futex_abstimed_wait … futex_word=pool+696`(= `done_cv_` 的定时等待)、**所有 worker 都停在 `cv_.wait`(park)** ⇒ 调用方在完成屏障上等,而没有任何 worker 在领票。 |
+| 根因(为什么必挂) | `counter_` 在这套协议里是**一身二职**:(a) worker 领票的来源 `fetch_add(1)`;(b) 调用方判断"下一次调用从哪张票开始"的**观察点**。`start_ = counter_.load()` 之所以对,正是因为它**只观察、不消费**。改成 `fetch_add(n)` 后,这次调用**把这 n 张票自己吃掉了** ⇒ worker 之后 `fetch_add(1)` 拿到的必然是 `t >= start_ + n` ⇒ 全部越界 ⇒ (持锁复核时活代未变)被丢弃 ⇒ `break` ⇒ park。于是 `remaining_ = n` 永远不减,调用方永久等待。 |
+| 结论 | **§196 的"原子预留"不是一处 `load→fetch_add` 的替换,而是一次协议重设计**:必须同时把 worker 的**领票方式**改掉(每次调用的局部 job 索引 + 领票动作本身不可被"代数推进"孤立),否则要么吃掉票(本次)、要么回到"重置计数器导致陈旧票别名"的轮 68 事故。 |
+| 什么条件下才允许再试 | ①先**只加无损账**(flat 路径照抄分片的 `issued_/inrange_/abandoned_/underflow_`),拿到"领票即记账"的不变式,能指出故障时**哪一张票**消失;②新协议必须给出**构造性论证**并写进代码注释(领票与代数归属如何原子);③验收 = 数值门禁 7/7 **且** `bench_engine_ab.py` 连跑 + 一次零埋点 120 请求长跑无看门狗(见 §501)。**只靠推理不许再改这段代码。** |
+| 当前状态 | 已 `git checkout` 还原 `numa_pool.hpp` 并重新编译;门禁恢复 `OK=7 BAD=1` + `DEDUP=12 0.95 PASS / DEDUP=23 1.07 PASS`。**丢票的竞态本身依然存在**(§501 两次复现),只是没修。 |
+
+### 附:引擎重编译的正确姿势(本轮踩到)
+`scripts/build_engine_variants.sh` 在本环境**找不到 pybind11**(`vllm-xiaotu-moe` env 里没有
+pybind11 包,`/usr/include/pybind11` 也没有),但 **torch 自带一份**。必须显式给:
+```bash
+PYTHON=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python \
+PYBIND11_INC=/home/user/anaconda3/envs/vllm-xiaotu-moe/lib/python3.12/site-packages/torch/include \
+  bash scripts/build_engine_variants.sh
+```
+注意 `-I` 要给到 **`torch/include`**,不是 `torch/include/pybind11`(头文件路径是
+`pybind11/pybind11.h`)。CUDA 侧脚本能自动探测到 `/usr/local/cuda`。
