@@ -1177,7 +1177,11 @@ class _XiaotuExpertsMixin:
             # 运行时预检:腾不出 staging 就**优雅放弃**(慢但能跑),并给用户选择。
             from vllm_xiaotu_moe.gpu_prefill import fits_device, staging_bytes
 
-            _need = staging_bytes(_E, hidden_size, _I, int(self._group_k))
+            try:
+                _ns = int(engine.shard_geometry()["ns"]) or 2
+            except Exception:  # noqa: BLE001
+                _ns = 2
+            _need = staging_bytes(_E, hidden_size, _I, int(self._group_k), _ns)
             _ok, _free = fits_device(_need, _dev)
             if not _ok:
                 if not getattr(self, "_gpu_pf_warned", False):

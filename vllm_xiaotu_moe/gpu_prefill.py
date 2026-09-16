@@ -776,15 +776,24 @@ def install_profile_guard() -> list[str]:
     return applied
 
 
-def staging_bytes(n_experts: int, hidden: int, inter: int, group_k: int = 32) -> int:
-    """Peak device bytes one layer's streaming path needs (raw + K-major)."""
+def staging_bytes(n_experts: int, hidden: int, inter: int, group_k: int = 32,
+                  ns: int = 2) -> int:
+    """Peak device bytes one layer's streaming path needs.
+
+    `kmajor_from_engine_shards` now fills the K-major target directly and finishes
+    w13 (including freeing its shard buffers) before allocating w2, so the peak is
+        max(w13_kmajor + w13_node_shard,
+            w13_kmajor + w2_kmajor + w2_node_shard) + 2 * scales
+    rather than the old raw+K-major double (which was ~2x dense = 13.4 GiB).
+    """
     E, H, I = int(n_experts), int(hidden), int(inter)
     gk = int(group_k) if int(group_k) > 0 else 1
-    dense = (E * (2 * I) * (H // 2)          # w13 raw
-             + E * H * (I // 2)              # w2 raw
-             + E * (2 * I) * (H // gk)       # w13 scales
-             + E * H * (I // gk))            # w2 scales
-    return 2 * dense                          # + the K-major copies
+    n = max(1, int(ns))
+    w13d = E * (2 * I) * (H // 2)
+    w2d = E * H * (I // 2)
+    s13d = E * (2 * I) * (H // gk)
+    s2d = E * H * (I // gk)
+    return max(w13d + w13d // n, w13d + w2d + w2d // n) + 2 * (s13d + s2d)
 
 
 def fits_device(need_bytes: int, device, margin: float = 1.25):
@@ -841,33 +850,48 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
     H, I, E = int(hidden), int(inter), int(n_experts)
     rb13 = H // 2
     rb2 = I // 2
+    gk = int(group_k) if int(group_k) > 0 else 1
 
-    gate_parts, up_parts = [], []
+    # Fill the K-major TARGET directly, one shard part at a time, instead of
+    # building a raw [E,2I,H/2] copy and transposing it afterwards: that halves the
+    # peak (raw + K-major) to just K-major + one node's shard. Doing w13 fully
+    # before touching w2 keeps the peak at ~7.5 GiB instead of ~13.4 GiB
+    # (NOTES §461 "下一步"), which is what makes TP=2 (and TP=1 at a lower
+    # --gpu-memory-utilization) actually fit.
+    # Node n's gate block IS canonical rows [n*crows,(n+1)*crows), i.e. K-major
+    # columns [n*crows,(n+1)*crows); its up block is the same rows offset by I.
+    c13 = int(geo["w13_cbytes"])
+    cr13 = int(geo["w13_crows"])
+    w13_t = torch.empty((E, rb13, 2 * I), dtype=torch.uint8, device=device)
     for n in range(ns):
         buf = _dma_hostbuf(engine, 0, n, int(geo["w13_node_bytes"]), device)
-        # per expert: [gate cbytes][up cbytes]
-        blk = buf.view(E, 2, int(geo["w13_cbytes"]))
-        crows = int(geo["w13_crows"])
-        gate_parts.append(blk[:, 0, :].reshape(E, crows, rb13))
-        up_parts.append(blk[:, 1, :].reshape(E, crows, rb13))
-    w13_raw = torch.cat(
-        [torch.cat(gate_parts, dim=1), torch.cat(up_parts, dim=1)], dim=1
-    )                                                     # [E, 2I, H/2]
+        blk = buf.view(E, 2, c13)
+        c0 = n * cr13
+        w13_t[:, :, c0:c0 + cr13].copy_(
+            blk[:, 0, :].reshape(E, cr13, rb13).transpose(1, 2))
+        w13_t[:, :, I + c0:I + c0 + cr13].copy_(
+            blk[:, 1, :].reshape(E, cr13, rb13).transpose(1, 2))
+        del buf, blk
 
-    w2_parts = []
+    c2 = int(geo["w2_cbytes"])
+    cr2 = int(geo["w2_crows"])
+    w2_t = torch.empty((E, rb2, H), dtype=torch.uint8, device=device)
     for n in range(ns):
         buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
-        w2_parts.append(buf.view(E, int(geo["w2_crows"]), rb2))
-    w2_raw = torch.cat(w2_parts, dim=1)                    # [E, H, I/2]
+        c0 = n * cr2
+        w2_t[:, :, c0:c0 + cr2].copy_(buf.view(E, cr2, rb2).transpose(1, 2))
+        del buf
 
-    gk = int(group_k) if int(group_k) > 0 else 1
-    s13_raw = _dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device) \
-        .view(E, 2 * I, H // gk)
-    s2_raw = _dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device) \
-        .view(E, H, I // gk)
+    # Scales are a single (unsharded) copy each and tiny (283+141 MB), so a plain
+    # raw->K-major transpose is fine.
+    s13_t = _kmajor_bytes(
+        _dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device)
+        .view(E, 2 * I, H // gk))
+    s2_t = _kmajor_bytes(
+        _dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device)
+        .view(E, H, I // gk))
+    return (w13_t, s13_t, w2_t, s2_t)
 
-    return (_kmajor_bytes(w13_raw), _kmajor_bytes(s13_raw),
-            _kmajor_bytes(w2_raw), _kmajor_bytes(s2_raw))
 
 
 def prebuild_pinned_kmajor(tensors: list, workers: int = 6) -> None:
