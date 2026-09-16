@@ -17009,3 +17009,53 @@ GPU prefill SKIPPED -> staying on CPU (slower but correct). Layer staging needs
 **下一步(把门槛降下来)**:当前 staging 是 **2×**(先建 raw `[E,2I,H/2]` 再
 `_kmajor_bytes` 出 K-major)。改成**按分片块直接填 K-major 目标张量**即可省掉 raw 中间体,
 峰值 ~13.4 → ~7.2 GiB ⇒ TP=2 立刻变宽裕,TP=1 在较低 util 下也可行。
+
+## §462 【更正 §461 的表】TP=3 对 V4.1 **不合法**;而 TP=2 会**关掉单份分片**
+
+用户指出"很多引擎只允许 tp=1/2/4/8",我表里擅自写了 TP=3。核查后,**两行都得改**。
+
+### (1) TP=3 不合法(不是"不利",是直接被拒)
+`vllm/config/model.py:1426`:
+```python
+if total_num_attention_heads % tensor_parallel_size != 0:
+```
+V4.1 的可整除维度:
+
+| 维度 | 值 | ÷2 | ÷3 | ÷4 |
+|---|---|---|---|---|
+| `num_attention_heads` | 64 | ✓ | **✗** | ✓ |
+| `o_groups` | 8 | ✓ | **✗** | ✓ |
+| `index_n_heads` | 32 | ✓ | **✗** | ✓ |
+| `n_routed_experts` | 384 | ✓ | ✓ | ✓ |
+
+⇒ **只有专家并行能整除 3,而 attention/o_groups/indexer 都不能** ⇒ TP=3 起不来。
+这也解释了用户观察到的"只允许 1/2/4/8"。**我表里的 TP=3 行作废。**
+
+### (2) 更要紧:在这台 **2 NUMA node** 的机器上,TP=2 会让引擎**放弃单份分片**
+`moe_v2.hpp:453-490`(默认 `XIAOTU_MOE_RANK_SPLIT=1`):
+```cpp
+_world  = max(1, cfg_.num_processes);            // = TP
+nshard_ = max(1, numa_node_count() / _world);
+const int NS = nshard_;
+if (NS >= 2 && (I % NS == 0) && (H % NS == 0)) { <建分片> }
+else { nshard_ = 0; }                            // ⇒ 走 socket 副本安全网
+```
+`numa_node_count() = 2` 本机:
+
+| TP | `nshard_` | 单份分片? | 后果 |
+|---|---|---|---|
+| **1** | 2 | **是** | 分片 = 一份权重(269 GiB);`shard_geometry().ns=2` ⇒ GPU 流式可用 |
+| **2** | `max(1, 2/2)=1` | **否** | 走 `sock_fill` **每 socket 一份副本**;`w13_shard_` 被清空 ⇒ `ns=0` ⇒ **GPU 流式的分片路径返回 None**,退回 checkpoint 源张量(需 `RELEASE_SOURCE=0` = 269 GiB,本机放不下) |
+| 4 / 8 | 1 | 否 | 同上(还需 4/8 张卡) |
+
+**⇒ 本机(3 卡、2 NUMA node)只有 TP=1 同时拿到"单份分片"和"分片式 GPU prefill"。**
+若坚持 TP=2 且要保住分片路径,必须显式 `XIAOTU_MOE_RANK_SPLIT=0`
+(那时 `_world=1` ⇒ nshard_=2,分片会建;代价是两个 rank 都横跨全部 node,
+即 `rank_node_base_` 都为 0,注释里警告的"每个 node 承受两个 rank 的量"会回来)。
+
+### 更正后的配方(TP=1,先用 `staging_bytes` 预检)
+| 配置 | staging | 预检需要空闲 |
+|---|---|---|
+| **TP=1(唯一可行且带分片)** | **8.2 GiB** | **~10.2 GiB** |
+| TP=2(需 `RANK_SPLIT=0` 才有分片) | 4.1 GiB | ~5.1 GiB |
+| ~~TP=3~~ | — | **不合法** |
