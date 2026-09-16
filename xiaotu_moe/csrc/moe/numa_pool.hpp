@@ -321,6 +321,24 @@ inline int numa_node_count() {
     return n;
 }
 
+// 权重分片是否按 **socket** 计(否则按 NUMA node)。两条路必须与 moe_v2.hpp 的
+// `nshard_` 用同一判据,否则 worker 会拿 node 下标去取 socket 分片的票 ⇒ 死等。
+//
+// 【§505 用户 2026-09-16 的指导】**EPYC/Xeon 上无视 NPS,直接按 socket 分片**
+// (上面已有的 `numa_socket_count()`),核心按 CCD 交错分配:
+//   * 真正要保的局部性边界是 **socket**:同一 socket 内 node 距离 10/12,跨 socket 32;
+//     按 socket 分片 ⇒ 每个 worker 读自己 socket 的那份,既拿到访存局部性,
+//     又天然沿 CCD 均衡(每 socket 的 CCD 数相同 ⇒ 不会出现某个 CCD 抢不到活);
+//   * 按 node 分片(NPS4 ⇒ 8 片)会**让行为随 NPS 变化**:同一份配置在 NPS1/NPS4 上
+//     分片数不同(2 vs 8),NPS1+TP=2 时甚至退化成 nshard=1 ⇒ 分片路径失效 ⇒ 权重存 2 份(§504);
+//   * NPS=4 且精确知道 CCD 分布时按 node 分片**可能**再快一点(片更细、更贴 L3),
+//     但那需要按 CPU 型号维护"CCD 分布"配置表,且差异不大 ⇒ 不作为默认。
+// 想回到按 node 分片:`XIAOTU_MOE_SHARD_BY_NODE=1`(或显式 `XIAOTU_MOE_NSHARD=<node 数>`)。
+inline bool shard_by_socket_env() {
+    if (std::getenv("XIAOTU_MOE_SHARD_BY_NODE") != nullptr) return false;
+    return true;
+}
+
 // NUMA node of the calling worker thread (sched_getcpu -> node). Builds the
 // cpu->node map once; the worker is pinned stably so this is a single lookup.
 inline int current_node() {
@@ -913,7 +931,14 @@ private:
         //        ⇒ 可以继续用 nshard=8(最快),两个 rank 也不抢核。
         static const int rank_split_mode = [] {
             const char* e = std::getenv("XIAOTU_MOE_RANK_SPLIT");
-            return e ? std::atoi(e) : 1;
+            // 【§505】**默认改成 2(CCD 交错)**。理由:
+            //   * mode 1 按"NUMA node 子集"切 ⇒ 每个 rank 只覆盖一半 node ⇒ 引擎只能
+            //     nshard = node/world。NPS1+TP=2 时那等于 **1** ⇒ 分片路径整体失效,
+            //     退回"每 socket 一份副本" ⇒ **权重存 2 份**(§504 实测 1121 vs 589 GiB);
+            //   * mode 2 按 CCD 交错切:核互不重叠 **且每个 rank 覆盖全部 socket** ⇒
+            //     nshard = socket 数 ⇒ 整机 1 份权重,且天然沿 CCD 均衡。
+            // 想要旧行为:XIAOTU_MOE_RANK_SPLIT=1。
+            return e ? std::atoi(e) : 2;
         }();
         if (rank_split_mode != 0 && world_ > 1 && cores_.size() >= (size_t)world_ * 2) {
             std::vector<int> mine;
@@ -953,22 +978,43 @@ private:
             }
             if (!mine.empty()) cores_ = mine;
         }
-        // Record which NUMA nodes at least one worker is pinned to (used to
-        // validate node-scoped sharding: every sharded node must have a worker).
+        // Record which shards at least one worker is pinned to (used to
+        // validate shard-scoped scheduling: every sharded unit must have a worker).
+        // 【§505】"shard 单位"由 `shard_by_socket_` 决定(见 start_workers 顶部):
+        //   * socket 分片(EPYC/Xeon 的**默认**,无视 NPS):shard 下标 = 该 cpu 的 socket id
+        //     (topo_.node_socket 已经是紧凑的 0..k-1),且 mode 2 下每个 rank 覆盖**全部** socket
+        //     ⇒ base = 0;
+        //   * node 分片(旧行为,`XIAOTU_MOE_SHARD_BY_NODE=1` 或 rank_split≠2):shard = 绝对
+        //     node − rank_node0_。
+        // 这两处与 moe_v2.hpp 的 `nshard_` 必须用**同一个单位**,否则 worker 会用 node 下标去
+        // 取 socket 分片的票 ⇒ 有的分片没人领 ⇒ 死等/看门狗。
+        // 分片单位必须与 moe_v2.hpp 的 nshard_ 完全一致(见那里的同款判据)。
+        {
+            static const int _rs = [] {
+                const char* e = std::getenv("XIAOTU_MOE_RANK_SPLIT");
+                return e ? std::atoi(e) : 2;
+            }();
+            shard_by_socket_ = shard_by_socket_env() && (world_ <= 1 || _rs >= 2);
+        }
+        auto shard_of_node = [&](int abs_node) -> int {
+            if (!shard_by_socket_) return abs_node - rank_node0_;
+            if (abs_node < 0 || abs_node >= (int)topo_.node_socket.size()) return 0;
+            return topo_.node_socket[(size_t)abs_node];
+        };
         node_present_ = 0;
         for (int cpu : cores_) { auto it = topo_.cpu_node.find(cpu);
             if (it != topo_.cpu_node.end()) {
-                const int rel = it->second - rank_node0_;   // 相对 shard 下标
+                const int rel = shard_of_node(it->second);
                 if (rel >= 0 && rel < 63) node_present_ |= (1UL << rel);
             } }
-        // Publish every worker's NUMA node HERE, before the thread is spawned:
-        // the worker loop reads worker_node_[w] to pick its node-scoped ticket
+        // Publish every worker's shard index HERE, before the thread is spawned:
+        // the worker loop reads worker_node_[w] to pick its shard-scoped ticket
         // queue, so a first call racing with thread startup would otherwise see
-        // the default 0 and steal another node's jobs (dropping them).
+        // the default 0 and steal another shard's jobs (dropping them).
         for (size_t w = 0; w < nt_; ++w) {
             int cpu = cores_[w % cores_.size()];
             worker_node_[w] = topo_.cpu_node.count(cpu)
-                            ? std::max(0, topo_.cpu_node[cpu] - rank_node0_) : 0;
+                            ? std::max(0, shard_of_node(topo_.cpu_node[cpu])) : 0;
         }
         // pin workers round-robin across the physical-core list
         for (size_t w = 0; w < nt_; ++w) {
@@ -1336,7 +1382,11 @@ private:
 
     std::vector<std::thread> workers_;
     std::vector<int> worker_node_;    // per-worker pinned node [w]
-    unsigned long node_present_ = 0;  // bitset: nodes that have >=1 worker
+    unsigned long node_present_ = 0;  // bitset: shards that have >=1 worker
+    // 【§505】权重分片单位:true = 按 socket(默认),false = 按 NUMA node。
+    // 只在"每个 rank 覆盖全部 socket"(world<=1 或 rank_split==2)时才能按 socket 分片;
+    // 否则 rank 只拿到一部分 node,按 socket 分片会让无人领取的分片死等。
+    bool shard_by_socket_ = true;
 
     // --- node-scoped (single-copy sharded) scheduling state -----------------
     // parallel_for_sharded splits a call into per-node job lists; each node's

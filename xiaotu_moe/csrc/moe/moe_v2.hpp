@@ -452,19 +452,24 @@ public:
                 // (与 numa_pool 的核表切分一致)。world<=1 时行为与以前完全一致。
                 static const int _rank_mode = [] {
                     const char* e = std::getenv("XIAOTU_MOE_RANK_SPLIT");
-                    return e ? std::atoi(e) : 1;
+                    return e ? std::atoi(e) : 2;      // 【§505】默认 2(CCD 交错)
                 }();
                 // mode 2(CCD 交错)时每 rank 仍覆盖全部 node ⇒ 分片数**不切**
                 const int _world = (_rank_mode >= 2) ? 1
                                  : (_rank_mode == 1 ? std::max(1, cfg_.num_processes) : 1);
-                rank_node_base_ = std::max(0, cfg_.process_id) * (numa_node_count() / _world);
-                nshard_ = std::max(1, numa_node_count() / _world);
-                // XIAOTU_MOE_NSHARD=N 覆盖分片数。本机 NPS=4 ⇒ numa_node_count()=8,
-                // 但 ACPI 距离矩阵显示**同 socket 内 10/12/12/12、跨 socket 32**:
-                // 真正的局部性边界是 socket,不是 NUMA node。NPS=1(BIOS)时
-                // numa_node_count()=2 会自动得到同样的效果;在不能重启的机器上
-                // 用 NSHARD=2 等价地得到"每个 socket 一份 1/2 分片、1 份权重"。
-                // 分片越细 ⇒ 每片的线程数越少(nthreads/NS),node 内并行不足。
+                // 【§505】**分片单位 = socket(无视 NPS)**,与 numa_pool 的 shard_by_socket_ 同判据。
+                // 只有在"每个 rank 覆盖全部 socket"(world<=1 或 rank_split==2)时才按 socket 分片;
+                // 否则(rank 只拿到一部分 node)必须退回按 node 分片,不然会有分片没人领 ⇒ 死等。
+                const bool _sock = shard_by_socket_env() && (_world <= 1 || _rank_mode >= 2);
+                const int _units = _sock ? numa_socket_count() : numa_node_count();
+                rank_node_base_ = std::max(0, cfg_.process_id) * (_units / _world);
+                nshard_ = std::max(1, _units / _world);
+                // 【§505 用户指导】EPYC/Xeon 上**无视 NPS,直接按 socket 分片**(+ 核心 CCD 交错):
+                // 既保住访存局部性(socket 内 node 距离 10/12,跨 socket 32),又天然沿 CCD 均衡,
+                // 而且同一份配置在 NPS1/NPS4 上行为一致(不需要"CPU 型号 ⇒ CCD 分布"配置表)。
+                // NPS=4 且精确知道 CCD 分布时按 node 分片**可能**更快一点,但差异不大 ⇒ 不做默认。
+                // 回到按 node 分片:XIAOTU_MOE_SHARD_BY_NODE=1(或显式 XIAOTU_MOE_NSHARD=<node 数>)。
+                // 注:分片越细 ⇒ 每片的线程数越少(nthreads/NS),片内并行不足。
                 if (const char* _ns = std::getenv("XIAOTU_MOE_NSHARD")) {
                     const int v = std::atoi(_ns);
                     if (v >= 2) nshard_ = v;
