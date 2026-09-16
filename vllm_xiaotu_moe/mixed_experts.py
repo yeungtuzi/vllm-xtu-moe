@@ -805,6 +805,24 @@ class _XiaotuExpertsMixin:
         cfg.groupN = int(self._group_n)
         cfg.groupK = int(self._group_k)
         engine_cls = getattr(xiaotu_moe, self._engine_attr)
+        # 【诊断·NOTES §484】ctor 只拿到 **裸 data_ptr**,而 shard_fill 会在里面按
+        # cfg 推出来的几何 memcpy;DSpark 的 draft 层让这个 memcpy 读到了映射尽头
+        # (SIGSEGV in MOE_V2<MXFP4>::MOE_V2)。这里把"cfg 期望的字节数"与
+        # "张量实际的字节数/形状"摆在一起打一次 —— 不一致一眼可见。
+        if not getattr(self, "_eng_shape_dbg", False):
+            self._eng_shape_dbg = True
+            _e13 = int(cfg.expert_num) * 2 * int(cfg.intermediate_size) * (int(cfg.hidden_size) // 2)
+            _e2 = int(cfg.expert_num) * int(cfg.hidden_size) * (int(cfg.intermediate_size) // 2)
+            print(
+                f"[xtu-eng-shape] {getattr(layer, 'layer_name', '?')} "
+                f"cfg(E={cfg.expert_num} H={cfg.hidden_size} I={cfg.intermediate_size} "
+                f"gN={cfg.groupN} gK={cfg.groupK}) "
+                f"| w13 shape={tuple(ex_w13.shape)} dtype={ex_w13.dtype} "
+                f"bytes={ex_w13.numel() * ex_w13.element_size()} contig={ex_w13.is_contiguous()} "
+                f"| w2 shape={tuple(ex_w2.shape)} bytes={ex_w2.numel() * ex_w2.element_size()} "
+                f"| expect(w13)={_e13} expect(w2)={_e2}",
+                flush=True,
+            )
         self._xiaotu_engine = engine_cls(
             cfg,
             ex_w13.data_ptr(), ex_w2.data_ptr(),
