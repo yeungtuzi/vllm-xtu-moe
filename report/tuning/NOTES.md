@@ -17962,3 +17962,38 @@ RuntimeError: xiaotu MOE_MXFP4: refusing to build the engine from a non-host sou
 ### 顺带
 `test_engine_determinism.py` 是目前最省事、最不受机器状态影响的回归门(不需要起服务),
 建议作为每次改引擎相关代码后的**默认第一道检查**。
+
+## §493 V4 服务回归**跑挂**了,但**无法归因于我本轮的改动**(缺少同条件基线)
+
+`serve_mainline.sh`(默认 V4-Flash-0731,Mode A)启动过程:
+
+```
+  worker[0] slot=576 ... worker[183] slot=576        ← 引擎线程池建立(184 workers)
+ERROR [multiproc_executor.py:314] Worker proc VllmWorker-0 died unexpectedly (exit code: None), shutting down
+INFO  [multiproc_executor.py:472] [shutdown] Executor: waiting for worker exit count=2
+```
+
+`exit code: None` = **被信号杀死**(不是 Python 异常;日志里 586 行内**零** Traceback/Error),
+发生在**引擎线程池建立之后** ⇒ 头号嫌疑仍是**被内核 OOM-kill**(本项目历史上多次这种形态)。
+
+### 为什么**不能**说这是我的回归
+* 本 session **从未跑过 V4 的服务**(只跑过 V4 的**微基准**与**确定性测试**),
+  而这两者都**直接调 `xiaotu_moe`、完全绕开插件** ⇒ 对"V4 + 插件"这条路径**没有基线**;
+* 因此"以前能起、现在不能起"这个前提**不成立** —— 它在本次改动之前就未必能起。
+
+### 一个需要正视的覆盖缺口
+我用来当"廉价回归门"的 `test_engine_determinism.py` 和微基准**都绕开插件**,
+所以**它们并不能验证我改的那三处共享路径**(`_maybe_release_source`、
+`_xiaotu_cpu_expert` 标记、`_assert_host_source`)。
+**⇒ 严格说:V4 的插件路径目前"未被任何我跑过的检查覆盖"。** 这是 §492 里
+"无回归是推理而非实测"那句话更严重的一个版本,必须记下来。
+
+### 下一轮(把这件事做干净)
+1. 复跑 V4 服务,带 **`MEMTRACE=1`** ⇒ 用每 node 空闲 + 峰值 RSS 区分"OOM"还是"崩溃"
+   (而不是像本轮这样只能猜);
+2. 若确认是 OOM:量清是我的标记改动**多留了多少主机内存**(scale 张量总量很小,
+   V4 约 0.4 GB 量级,理论上不该致命),还是别的;
+3. 若确认是崩溃:现在 `_assert_host_source` 已扩到 4 张量 + storage 检查,
+   应当给出可读错误而不是静默死 —— 若仍静默,说明它没走到那条路径;
+4. **给 V4 补一个真正覆盖插件的回归门**(例如 V4 的短服务冒烟 + 同一 prompt 输出比对),
+   否则"不破坏既有模型"这条硬约束实际上一直没有被检验。
