@@ -17798,3 +17798,29 @@ if self._xiaotu_engine is None:
 2. 量 **decode 收益**(基线 plain 27.5-27.8 tok/s;参考实现报 +~48%);
 3. 顺带确认 `max_num_scheduled_tokens` 那条 warning(`MAXSEQS` 与 spec tokens 的配合);
 4. 然后再做 §483(lvllm 环境 lk-moe vs xiaotu-moe A/B)。
+
+## §488 守卫自测通过;但 §487(释放顺序)的修复**仍未经运行验证**
+
+### 守卫单测(不需起服务)
+用 `_XiaotuExpertsMixin._assert_host_source` 直接测:
+
+| 输入 | 结果 |
+|---|---|
+| 正常 uint8 张量 ×4 | **PASS**(接受) |
+| 模拟"已释放"的张量(`empty_strided((128,4608,2560),(0,0,0))`) | **PASS**(拒绝并给出可读错误) |
+
+注意**是哪一条分支拦住的**:该模拟张量 `contiguous=False`(零 stride),
+所以**旧的 `is_contiguous()` 检查本来也能拦**。而真实 DSpark 运行里诊断打印的是
+`contig=True` ⇒ 那一次**只有我新加的 storage 大小检查**能拦住。**两条分支都有用,保留。**
+
+### 仍未验证的事(诚实记录)
+§487 那次运行**没能走到构造函数** —— 它先死在我自己引入的 `UnboundLocalError`
+(`_ensure_engine` 里 `s13/s2` 要到函数后段才构造,我却在第 770 行直接引用)。
+该 bug 已修(`_s13/_s2` 局部解析,commit 8aa4c86),但意味着:
+* **§487 的"引擎未建不释放"修复尚未被运行证实**;
+* §486 的守卫扩展也尚未在真实路径上跑过(单测过了)。
+
+**下一轮就一件事**:复跑最小 `SPEC=1` 配置(`MAXLEN=2048 MAXSEQS=1 GPU_UTIL=0.70`)。
+判据:①不再有 `XTSIG/SIGSEGV`;②越过 `DSpark draft model loaded: 97 params`;
+③`Application startup complete`;④然后量 decode 收益(基线 27.5-27.8 tok/s)。
+若仍崩,这次应能拿到**可读的**"某个张量在引擎构造前被释放"错误,直接指向释放顺序。
