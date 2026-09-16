@@ -18744,3 +18744,28 @@ V4.0 的对应数字是 3.33 GiB/层、mtp 10.12 GiB、无 Engram、无 CED。**
   预填充优化(对 V4.1 而言):按报告,预填充算力可**接近减半**;
   对应到实测:GPU 预填充 TTFT@8192 = 1003 ms ⇒ 理论上可到 ~500 ms 量级。
 * 顺带:V4.0 没有 CED ⇒ 那条路上不存在这个优化,不要套用。
+
+## §507 上游漂移检查(R10 纪律,用户 2026-09-16 再次提醒):**有漂移,但无可行动破坏;升级目标已确定**
+
+`bash scripts/check_upstream_drift.sh --full`(三个问题:能不能装/补丁还对不对/API 面还在不在):
+
+| 问题 | 结果 |
+|---|---|
+| **0. 能不能采用更新的上游?** | 我们的基线 `dabc4362b47a` 之后上游走了 **122 个提交**;main HEAD = `f8b5c11468f6`(**今天** 13:24);**但 HEAD 没有预编译 wheel**(比最新 wheel 多 3 个提交)⇒ 本机**装不了**(本机无 Rust 工具链、nvcc 12.1 vs torch cu130 ⇒ **无法从源码构建**)。**可安装的升级目标 = `903285fbc`(cu130)**;我们的基线有 wheel ✓ |
+| **1. 我们的补丁还适用吗?** | ✅ 三个补丁(`xtu/pr1-experts-load-device`、`pr2-fp8-sm80-o-proj`、`pr3-sm80-port`)对**当前 main** 全部**干净适用(exact context)** |
+| **2. 插件依赖的上游 API 还在吗?** | 23 个上游模块 **0 缺失**;31 个符号里只有 1 个报缺:`cpu_moe.select_experts` |
+
+### 唯一的"缺失"是**误报**(已核实)
+`mixed_experts.py:49-59` 是**双路径守卫式导入**:
+```python
+try:    from vllm...fused_moe.router.cpu_router import select_experts   # 新位置(>= 我们的基线)
+except ImportError: from vllm...fused_moe.experts.cpu_moe import select_experts  # 旧位置(<= 6c73b08dec)
+```
+新位置在我们基线之后一直存在,所以**新位置命中、旧位置本来就不该有** ⇒ 检查器把"兜底分支"当成了缺失。
+⇒ **没有真正的 API 破坏**;升级到 `903285fbc` 的风险因此很低(补丁干净 + API 面完整)。
+
+### 结论与后续
+* **行动**:升级目标 `903285fbc` 已明确;真正升级时需要复跑全部门禁(数值 1.873e-02 + 确定性 + 服务端回归)
+  与 `check_mainline_env.sh`。**本轮不做**(属于"重大修改",且当前没有 wheel 更新的 HEAD);
+* **节奏**:按 R10,每次会话都应跑一次本检查并记录;`check_upstream_drift.sh` 已经把
+  "有没有 wheel" 当成了第一判据(本机不能从源码构建这一点是硬约束)。

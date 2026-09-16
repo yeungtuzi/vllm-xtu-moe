@@ -78,7 +78,10 @@ CKPT="${CKPT:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Fla
 TAG="${TAG:-v41}"
 PORT="${PORT:-8077}"
 GPUS="${GPUS:-0}"
-TP="${TP:-1}"
+# 【R-VRAM/§507】**TP 默认 2**(用户 2026-09-16 指示:TP=1 不满足就明确说、并以 TP=2 为默认)。
+# 按显存优先级算同一张 40 GB 卡:TP=2 每层常驻 3.36 GiB ⇒ 1M KV 之后还能放 3 层(20-22)+投机;
+# TP=1 每层 6.72 GiB ⇒ 只能放 1 层。TP=1 只在"单卡/没有第二张卡"时才用。
+TP="${TP:-2}"
 MAXLEN="${MAXLEN:-2048}"
 LOAD="${LOAD:-dummy}"          # dummy = no disk read, exercises the kernels
 GPU_UTIL="${GPU_UTIL:-0.85}"
