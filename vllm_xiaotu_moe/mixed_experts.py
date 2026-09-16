@@ -578,7 +578,7 @@ class _XiaotuExpertsMixin:
         instead of silently computing garbage.
         """
 
-    def _assert_host_source(self, ex_w13, ex_w2) -> None:
+    def _assert_host_source(self, ex_w13, ex_w2, ex_s13=None, ex_s2=None) -> None:
         """引擎只接受**连续、非空、在主机上**的源张量。
 
         这些指针会被直接交给 C++ 引擎,引擎在里面按 `[E][2I][H/2]` 的定长步长
@@ -586,8 +586,11 @@ class _XiaotuExpertsMixin:
         `shard_fill_w13` 里读到不可读地址然后 **SIGSEGV**(2026-09-15 cellC 实测),
         没有 Python 栈可看。所以在这里先拦下来,给出可读的错误。
         """
-        for nm, t in (("w13", ex_w13), ("w2", ex_w2)):
+        for nm, t in (("w13", ex_w13), ("w2", ex_w2),
+                      ("s13", ex_s13), ("s2", ex_s2)):
             if t is None:
+                if nm in ("s13", "s2"):
+                    continue      # 未量化后端可以没有 scale
                 raise RuntimeError(f"xiaotu {self._engine_attr}: {nm} is None")
             bad = (
                 t.device.type != "cpu"
@@ -601,6 +604,22 @@ class _XiaotuExpertsMixin:
                     f"numel={t.numel()} contiguous={t.is_contiguous()} "
                     f"shape={tuple(t.shape)}); handing this to the C++ engine "
                     f"would segfault in shard_fill_*."
+                )
+            # ⚠️【NOTES §486】**必须**检查 storage 大小。`XIAOTU_RELEASE_SOURCE=1`
+            # 的释放用 `empty_strided(shape, (0,)*ndim)` —— **shape/ndim/contiguous
+            # 都还正常**,只有 storage 掉到近 0 字节。上面三项检查全部通过,
+            # 但 `data_ptr()` 已经悬空,引擎按 cfg 算出的长度 memcpy 就会读到映射尽头
+            # 而 **SIGSEGV**(无 Python 栈)。只查 w13/w2 也不够:释放同时覆盖
+            # `_scale_attrs`(w13_weight_scale / w2_weight_scale),而实测 DSpark draft
+            # 崩的那一次 memcpy 长度恰好 == E·H·(I/gk),**就是 w2 的 scale 拷贝**。
+            _need = t.numel() * t.element_size()
+            _have = t.untyped_storage().nbytes()
+            if _have < _need:
+                raise RuntimeError(
+                    f"xiaotu {self._engine_attr}: {nm} was RELEASED before the engine "
+                    f"was built (need {_need} bytes, storage {_have} bytes, "
+                    f"shape={tuple(t.shape)}) — reading it would SIGSEGV in the C++ "
+                    f"engine. Fix the release ordering for this layer."
                 )
 
     def _prepare_weights(self, layer) -> None:
@@ -732,7 +751,7 @@ class _XiaotuExpertsMixin:
         ex_w2 = (getattr(self, "_engine_w2", None) if getattr(self, "_engine_w2", None) is not None
                  else self._stage_src(layer, "w2_weight"))
         self._validate_weights(layer, ex_w13, ex_w2)
-        self._assert_host_source(ex_w13, ex_w2)
+        self._assert_host_source(ex_w13, ex_w2, s13, s2)
         if self._expect_dtype is not None and ex_w13.dtype != self._expect_dtype:
             raise NotImplementedError(
                 f"xiaotu {self._engine_attr} backend expects "

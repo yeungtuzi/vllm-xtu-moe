@@ -17710,3 +17710,42 @@ w2  shape=(128,5120,1152) bytes= 754974720   expect(w2) = 754974720   ✓ 完全
 或在 `XIAOTU_MOE_SHARD_DIAG=1` 下先打印几何再拷贝。哪一步越界、越界多少,一次就能看到。
 (比 `-O0 -g` 重编再 addr2line 更直接,且顺带把这条路径永久加上守卫 —— 对 §482 那类
 "静默 SIGSEGV" 也是止血。)
+
+## §486 【破案】DSpark 崩溃 = 引擎构造时**源已被 RELEASE_SOURCE 释放**,且守卫从来没查 storage 大小
+
+### 用算术锁定是哪一次 memcpy
+SysV 下 RDX 是 memcpy 的**长度**。已知 `RDX = 0x2d00000 = 47,185,920`。逐项比对:
+
+| 候选长度 | 值 | 是否等于 RDX |
+|---|---|---|
+| `cbytes`(单专家块,NS=2) | 2,949,120 | ✗(它是 16×cbytes) |
+| `w13g_bytes`(E=128 的 w13 scale) | 94,371,840 | ✗(恰好是它的 1/2) |
+| **`w2g_bytes`(E=128 的 w2 scale)** | **47,185,920** | **✓ 完全相等** |
+
+⇒ 崩掉的那一次 memcpy **是构造器里的 w2 **scale** 拷贝**(`memcpy(buf_w2_g_, w2_g, w2g_bytes)`),
+**不是专家权重块的拷贝**(§485 里"16×cbytes"那个表面倍数把我带偏了 —— 它其实与 cbytes 无关)。
+
+### 守卫的缺口(两个)
+1. `_assert_host_source(ex_w13, ex_w2)` 只查 `device / numel==0 / is_contiguous()` ——
+   **从不检查 storage 大小**;
+2. 而且**只查 w13/w2,不查 scale** —— 而崩的偏偏是 scale。
+
+### 释放做了什么(与其隐蔽性)
+`_release_source_weights` 释放的名字是 `["w13_weight","w2_weight"] + _scale_attrs`
+(即 **w13_weight_scale / w2_weight_scale 也一起释放**),手法是
+`empty_strided(shape, (0,)*ndim)` ⇒ **shape、ndim、is_contiguous() 全都还"正常"**,
+只有 `untyped_storage().nbytes()` 掉到近 0 ⇒ 上面三项检查**全部通过**,
+但 `data_ptr()` 已悬空;引擎按 cfg 算出的长度去 memcpy 就**读到映射尽头 → SIGSEGV**。
+这解释了为什么它"没有 ERROR/Traceback":它根本不是 Python 异常。
+
+### 已修(把崩溃变成可读错误)
+`_assert_host_source` 扩展到 4 个张量(w13/w2/**s13/s2**),并加上
+`untyped_storage().nbytes() >= numel*element_size()` 检查;调用点同步传 scale。
+⇒ 下一次运行会**指名道姓**说出"哪个张量在引擎构造前就被释放了"。
+
+### 下一轮
+1. 跑最小 SPEC=1 配置 → 读那条新的可读错误(哪个 layer / 哪个张量 / need vs have);
+2. 据此修**释放顺序**。最可能的两个来源:
+   * eager 释放路径(`_eager_build_ok` / `pwal` 之后那次释放)对 draft 层误判;
+   * draft 模块与某个目标层**共享 layer 引用**,于是别的模块的 `apply()` 先把它的源释放了。
+3. 修好后**再**验证 dspark 的收益,并把 §483(lvllm 环境 lk-moe vs xiaotu-moe)作为旁证。
