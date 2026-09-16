@@ -184,11 +184,6 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   #   ⇒ 每个 node 只存自己那 1/2 行 = **整机 1 份权重**(与 lk_moe 的"每 node 一份分片"同构)。
   #   实测(TP=2/V4.1 真权重,服务进程树总 RSS):峰值 1121 → 989.5 GiB;稳态 1121 → 859 GiB。
   echo "XIAOTU_MOE_RANK_SPLIT=${XIAOTU_MOE_RANK_SPLIT:-2}"
-  # 【§504】GPU 预填充关闭时(`XIAOTU_MOE_GPU_PREFILL_MIN_TOKENS=0`,本脚本默认),
-  # `gpu_prefill_bridge` 仍在**构造期**给每层复制一份 Python 侧权重副本(为了 GPU prefill
-  # 的 K-major 缓存)——纯浪费,实测 ~6.7 GiB/层。默认关掉;真要用 GPU 预填充时它会
-  # 在第一次调用时惰性复制(源张量那时可能已被 RELEASE_SOURCE 释放 ⇒ 见该文件里的显式报错)。
-  echo "XIAOTU_GPUPREFILL_WCOPY=${XIAOTU_GPUPREFILL_WCOPY:-0}"
   for kv in $EXTRA_ENV; do case "$kv" in *=*) echo "$kv";; esac; done
 } > "$XTU_ENV_FILE"
 export XIAOTU_ENV_FILE
@@ -205,7 +200,6 @@ nohup env \
   XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
   XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-$SPIN_DEFAULT}" \
   XIAOTU_MOE_RANK_SPLIT="${XIAOTU_MOE_RANK_SPLIT:-2}" \
-  XIAOTU_GPUPREFILL_WCOPY="${XIAOTU_GPUPREFILL_WCOPY:-0}" \
   OMP_NUM_THREADS=1 \
   $EXTRA_ENV \
   numactl --interleave=all "$PY" -m vllm.entrypoints.openai.api_server \

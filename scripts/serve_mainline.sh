@@ -231,8 +231,6 @@ XTU_ENV_FILE="${XTU_ENV_FILE_OVERRIDE:-$OUTDIR/$TAG.envfile}"
   # nshard_=max(1,node/world)=1(NPS1+TP=2)⇒ 分片路径失效、退回"每 socket 一份副本"
   # ⇒ 权重存 2 份(实测 V4.1:峰值 1121→989.5 GiB、稳态 1121→859 GiB)。
   echo "XIAOTU_MOE_RANK_SPLIT=${XIAOTU_MOE_RANK_SPLIT:-2}"
-  # 【§504】GPU 预填充关闭时,构造期那份 Python 侧权重副本是纯浪费(~6.7 GiB/层)。
-  echo "XIAOTU_GPUPREFILL_WCOPY=${XIAOTU_GPUPREFILL_WCOPY:-0}"
   [ -n "${XIAOTU_RELEASE_SOURCE:-}" ] && echo "XIAOTU_RELEASE_SOURCE=$XIAOTU_RELEASE_SOURCE"
   for kv in $EXTRA_ENV; do case "$kv" in *=*) echo "$kv";; esac; done
 } > "$XTU_ENV_FILE"
@@ -260,7 +258,6 @@ nohup env \
   XIAOTU_MOE_ASYNC="$ASYNC" \
   XIAOTU_MOE_SPIN_IDLE_US="$SPIN_IDLE_US" \
   XIAOTU_MOE_RANK_SPLIT="${XIAOTU_MOE_RANK_SPLIT:-2}" \
-  XIAOTU_GPUPREFILL_WCOPY="${XIAOTU_GPUPREFILL_WCOPY:-0}" \
   XIAOTU_MOE_GPU_RESIDENT_LAYERS="$RESIDENT" \
   OMP_NUM_THREADS=1 \
   $EXTRA_ENV \

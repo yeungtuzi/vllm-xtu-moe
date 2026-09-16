@@ -120,6 +120,41 @@ def _dev_tensor(ptr: int, shape, dtype, device):
 _ENGINES: list = []
 
 
+def _gpu_prefill_requested() -> bool:
+    """GPU 预填充**在启动时**是否被打开(决定要不要在构造期保住一份权重副本)。
+
+    `XIAOTU_GPUPREFILL_WCOPY` 的默认值必须跟着这个走(§504):
+      * GPU 预填充 **关**(本项目默认,`XIAOTU_MOE_GPU_PREFILL_MIN_TOKENS=0`)
+        ⇒ 构造期那份 Python 侧副本**永远用不到**,而 V4.1 是 ~6.7 GiB/层/rank,
+          40 层就是 ~270 GiB 白占 ⇒ 默认 **0**;
+      * GPU 预填充 **开** ⇒ 必须默认 **1**:vLLM 随后会 `clean_weights_after_loading`
+        删掉 CPU 侧 `w13_weight/w2_weight`,源页会被回收/置 PROT_NONE ⇒
+        惰性复制就会读到已释放的内存(该文件下方注释记录的 lkport21 原生崩溃)。
+    阈值可能来自环境变量,也可能来自运行时**文件桥**(两条都要看)。
+    """
+    # 三个名字都要认:`vllm_xiaotu_moe/gpu_prefill.py:80` 读的是 VLLM_ 前缀那个
+    # (规范名),而文档/脚本里这三个都出现过 —— 少认一个就会在"用户以为开了 GPU 预填充"
+    # 时仍然不复制权重 ⇒ 惰性复制读到已释放内存 ⇒ 原生崩溃。
+    for k in ("VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS",
+              "XIAOTU_MOE_GPU_PREFILL_MIN_TOKENS",
+              "XIAOTU_GPU_PREFILL_MIN_TOKENS"):
+        try:
+            if int(os.environ.get(k) or 0) > 0:
+                return True
+        except ValueError:
+            pass
+    f = (os.environ.get("XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE")
+         or os.environ.get("VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE"))
+    if f:
+        try:
+            with open(f) as fh:
+                if int((fh.read() or "0").strip() or 0) > 0:
+                    return True
+        except (OSError, ValueError):
+            pass
+    return False
+
+
 def wrap_engine_class(native_cls, kind: str):
     """把原生引擎类包一层:加 `gpu_prefill`,其余属性原样转发。"""
 
@@ -141,7 +176,8 @@ def wrap_engine_class(native_cls, kind: str):
             _ENGINES.append(self)
             self._slot = None            # 上一层为本层预取好的设备槽
             self._km = None              # K-major 锁页缓存(惰性)
-            if os.environ.get("XIAOTU_GPUPREFILL_WCOPY", "1") == "1":
+            _wcopy_default = "1" if _gpu_prefill_requested() else "0"
+            if os.environ.get("XIAOTU_GPUPREFILL_WCOPY", _wcopy_default) == "1":
                 try:
                     self._warr = tuple(_cpu_view(int(p), sh)
                                        for p, sh in zip(self._wptrs, self._shapes()))
