@@ -188,6 +188,25 @@ done
 cd /tmp
 export PATH="$ENV/bin:$PATH"
 NCTL=()
+if [ "${MEMTRACE:-0}" = "1" ]; then
+  MEMLOG="$OUTDIR/$TAG.mem"
+  (
+    while true; do
+      echo "### $(date -Is)" >> "$MEMLOG"
+      numactl --hardware 2>/dev/null | grep -E "^node [0-9]+ free" >> "$MEMLOG"
+      fat=$(ps -eo pid,rss --sort=-rss --no-headers 2>/dev/null | head -1 | awk '{print $1}')
+      if [ -n "$fat" ] && [ -r "/proc/$fat/smaps_rollup" ]; then
+        echo "-- fattest pid=$fat" >> "$MEMLOG"
+        grep -E "^(Rss|Pss|Shared_Clean|Shared_Dirty|Private_Dirty|Anonymous):" \
+          "/proc/$fat/smaps_rollup" >> "$MEMLOG" 2>/dev/null
+      fi
+      sleep "${MEMTRACE_INTERVAL:-60}"
+    done
+  ) &
+  echo $! > "$OUTDIR/$TAG.mem.pid"
+  echo "[v41] memtrace -> $MEMLOG"
+fi
+
 if [ "$INTERLEAVE" = "1" ] && command -v numactl >/dev/null 2>&1; then
   NCTL=(numactl --interleave=all)
 fi
