@@ -17749,3 +17749,52 @@ SysV 下 RDX 是 memcpy 的**长度**。已知 `RDX = 0x2d00000 = 47,185,920`。
    * eager 释放路径(`_eager_build_ok` / `pwal` 之后那次释放)对 draft 层误判;
    * draft 模块与某个目标层**共享 layer 引用**,于是别的模块的 `apply()` 先把它的源释放了。
 3. 修好后**再**验证 dspark 的收益,并把 §483(lvllm 环境 lk-moe vs xiaotu-moe)作为旁证。
+
+## §487 【根因·已修】`_maybe_release_source` 在**引擎还没建**时就释放了源 ⇒ 惰性构造读到悬空指针
+
+### 真正的 bug(纯逻辑错,与 DSpark 无关)
+`_EagerBuildMixin.__init__`(mixed_experts.py:300-310)那条 eager 路径:
+
+```python
+if _release_source_enabled() and self._xiaotu_engine is None:
+    ok, why = self._eager_build_ok(layer)
+    if ok:
+        self._ensure_engine(layer)
+    else:
+        print("deferring engine build to first forward ...")   # ← 只打印,不 return
+self._maybe_release_source(layer)                              # ← 仍然执行!
+```
+
+而 `_maybe_release_source` 只挡了三种情况:`_release_source_enabled()`、
+`_src_released`(幂等)、`_is_resident_layer(layer)` —— **没有挡"引擎是否已建"**。
+于是 `_eager_build_ok` 判 **False** 时:源被释放,引擎却推迟到第一次 forward 才建 ⇒
+那一刻 `data_ptr()` 已悬空 ⇒ 构造器 memcpy 读到映射尽头 ⇒ **SIGSEGV**。
+
+为什么普通跑批没事:**40 层的 eager 都成功**(先建引擎、后释放,顺序正确),
+只有触发"推迟"的组合才崩 —— DSpark 恰好制造了这种组合。
+
+### 为什么旧守卫全都查不出来(§486)
+`_release_source_weights` 用 `empty_strided(shape, (0,)*ndim)`:
+**shape / ndim / is_contiguous() 全部照旧**,只有 `untyped_storage().nbytes()` 掉到近 0。
+`_assert_host_source` 当时查 device/numel/contiguous —— 三项全过;而且**只查 w13/w2,
+不查 scale**,而崩的正是 w2 的 scale 拷贝(RDX = E·H·(I/gk) = 47,185,920,E=128)。
+
+### 修法(一处,已落地并 grep 验证)
+```python
+if self._xiaotu_engine is None:
+    return 0        # 引擎还没建 —— 绝不能释放,否则惰性构造会 SIGSEGV
+```
+放在幂等检查之后、`_src_released = True` 之前。
+**不削弱既有行为**:惰性路径(`apply()`)里 `_ensure_engine` 本来就在
+`_maybe_release_source` **之前**,所以"切一层释一层"(IRON_RULES R9 / NOTES §378)照旧生效。
+
+### 附带产物
+* `_assert_host_source` 已扩到 4 个张量 + **storage 大小**检查(§486)⇒ 这类问题以后是
+  可读的 Python 错误,不再是"进程静默消失";
+* `[xtu-eng-shape]` 一次性诊断(cfg 与四个张量的 shape/bytes vs 期望)保留,排查同类问题很快。
+
+### 下一轮(验证)
+1. 最小 `SPEC=1` 配置复跑 → 期望**不再 SIGSEGV**,`DSpark draft model loaded` 之后继续;
+2. 量 **decode 收益**(基线 plain 27.5-27.8 tok/s;参考实现报 +~48%);
+3. 顺带确认 `max_num_scheduled_tokens` 那条 warning(`MAXSEQS` 与 spec tokens 的配合);
+4. 然后再做 §483(lvllm 环境 lk-moe vs xiaotu-moe A/B)。

@@ -389,6 +389,22 @@ class _XiaotuExpertsMixin:
         if self._is_resident_layer(layer):
             self._src_released = True          # 标记已处理,避免反复判
             return 0
+        # ⚠️⚠️ 【NOTES §487 根因】**引擎还没建就绝不能释放**。
+        # `__init__` 里那条 eager 路径是:
+        #     ok, why = self._eager_build_ok(layer)
+        #     if ok: self._ensure_engine(layer)
+        #     else:  print("deferring engine build to first forward ...")   # ← 只是打印!
+        #     self._maybe_release_source(layer)                              # ← 仍然执行
+        # 于是 `_eager_build_ok` 判 False 时,源**被释放**,而引擎推迟到第一次 forward
+        # 才惰性构造 —— 那一刻 `data_ptr()` 已悬空(`empty_strided(shape,(0,)*ndim)`
+        # 把 storage 压到近 0,而 shape/ndim/contiguous 全都正常,所以旧守卫查不出来),
+        # 引擎按 cfg 算出的长度 memcpy 就**读到映射尽头 ⇒ SIGSEGV**(DSpark draft 的
+        # w2 scale 拷贝,长度恰好 E·H·(I/gk))。普通跑批里 40 层 eager 都成功,所以只有
+        # 触发"推迟"的组合才崩。
+        # 惰性路径(`apply()`)里 `_ensure_engine` 在 `_maybe_release_source` **之前**,
+        # 所以这条守卫不会削弱既有的"切一层释一层"。
+        if self._xiaotu_engine is None:
+            return 0
         self._src_released = True
         return self._release_source_weights(layer)
 
