@@ -1209,9 +1209,22 @@ class _XiaotuExpertsMixin:
             _pf_reason = "engine shards"
             if _gpu_pf:
                 try:
+                    import time as _time
+
+                    _t_split = os.environ.get("XIAOTU_GP_SPLIT") == "1"
+                    _t0 = _time.perf_counter() if _t_split else 0.0
                     _km = kmajor_from_engine_shards(
                         engine, _dev, hidden_size, _I, _E, int(self._group_k)
                     )
+                    if _t_split:
+                        torch.cuda.synchronize()
+                        _asm = (_time.perf_counter() - _t0) * 1e3
+                        _free, _tot = torch.cuda.mem_get_info(_dev)
+                        print(f"[gp-split] layer={getattr(layer,'layer_name','?')} "
+                              f"qlen={qlen} asm={_asm:.1f}ms free={_free/2**30:.2f}GiB "
+                              f"alloc={torch.cuda.memory_allocated(_dev)/2**30:.2f}GiB "
+                              f"reserved={torch.cuda.memory_reserved(_dev)/2**30:.2f}GiB",
+                              flush=True)
                     if _km is None:
                         _pf_reason = "checkpoint source (engine has no shards)"
                 except torch.OutOfMemoryError:
@@ -1235,12 +1248,17 @@ class _XiaotuExpertsMixin:
                 _slot.bufs = _km
                 _slot.ready = torch.cuda.Event()
                 _slot.ready.record(torch.cuda.current_stream(_dev))
+                _t1 = _time.perf_counter() if _t_split else 0.0
                 out = gpu_moe_layer(
                     h_bf16, ids_i32, wts_f32, _km[0], _km[1], _km[2], _km[3],
                     H=hidden_size, I=_I,
                     K=int(self.moe_config.experts_per_token),
                     device=_dev, slot=_slot,
                 )
+                if _t_split:
+                    torch.cuda.synchronize()
+                    print(f"[gp-split] layer={getattr(layer,'layer_name','?')} "
+                          f"kernels={(_time.perf_counter()-_t1)*1e3:.1f}ms", flush=True)
             elif _gpu_pf:
                 # 退回源张量(需要源没被释放——`_gp_on` 已保证这一点)。
                 self._prepare_weights(layer)
