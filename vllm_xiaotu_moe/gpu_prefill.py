@@ -805,11 +805,28 @@ def fits_device(need_bytes: int, device, margin: float = 1.25):
     return (free >= int(need_bytes * margin)), int(free)
 
 
+# 复用中间缓冲:实测一次性函数 789 ms/层,而各段相加只有 424 ms —— 差额 ~365 ms
+# 全是**每层重新分配**那些中间张量(w13/w2 的 node 缓冲 + raw + K-major,约 13 GB)
+# 造成的 allocator churn(NOTES §466)。这些缓冲在同一 stream 上是安全可复用的:
+# 下一层的 copy_ 排在前一层 kernel 之后,stream 会保证顺序。
+_BUF_CACHE: dict = {}
+
+
+def _reuse(key, shape, device):
+    """Get a reusable uint8 buffer of `shape` (allocates once per backend)."""
+    k = (str(device), int(shape[0]) if len(shape) == 1 else -1, tuple(shape))
+    t = _BUF_CACHE.get(k)
+    if t is None or t.shape != tuple(shape) or t.device != torch.device(device):
+        t = torch.empty(tuple(shape), dtype=torch.uint8, device=device)
+        _BUF_CACHE[k] = t
+    return t
+
+
 def _dma_hostbuf(engine, which: int, node: int, nbytes: int, device) -> torch.Tensor:
     """DMA one of the ENGINE's own host buffers to a fresh device tensor."""
     if nbytes <= 0:
         raise RuntimeError(f"gpu-prefill: engine buffer which={which} node={node} is empty")
-    t = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    t = _reuse(("dma", int(which), int(node)), (int(nbytes),), device)
     stream = torch.cuda.current_stream(device).cuda_stream
     got = engine.copy_hostbuf_to_device(int(which), int(node), t.data_ptr(), stream)
     if int(got) != int(nbytes):
@@ -852,36 +869,39 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
     rb2 = I // 2
     gk = int(group_k) if int(group_k) > 0 else 1
 
-    # Assemble the CANONICAL raw layout (contiguous view+cat), then let
-    # `_kmajor_bytes` do one optimized transpose per tensor.
-    #
-    # ⚠️ 不要改回"直接把分片块填进 K-major 目标":那样每个元素都要跨 stride 读
-    # (转置读)再跨 stride 写,实测 **593 ms/层 vs 375 ms/层**(NOTES §464)——
-    # 省了 ~5 GiB 峰值显存却慢 218 ms/层,40 层就是 8.7 s/次,得不偿失。
-    # 峰值高就靠 staging_bytes/预检 去拦,不要拿速度换。
-    gate_parts, up_parts = [], []
+    # Assemble by copy_ into the RAW target's row ranges: both sides are contiguous
+    # runs of `cbytes` bytes, so each node's part is a plain contiguous copy.
+    # (Measured: `view`+`cat` of the strided gate/up views then one transpose cost
+    # **894 ms/layer**, because cat of strided views falls back to a slow kernel;
+    # this form keeps the copies contiguous. See NOTES §466.)
+    w13_raw = _reuse(("raw13",), (E, 2 * I, rb13), device)
+    c13 = int(geo["w13_cbytes"])
+    cr13 = int(geo["w13_crows"])
     for n in range(ns):
         buf = _dma_hostbuf(engine, 0, n, int(geo["w13_node_bytes"]), device)
-        blk = buf.view(E, 2, int(geo["w13_cbytes"]))
-        crows = int(geo["w13_crows"])
-        gate_parts.append(blk[:, 0, :].reshape(E, crows, rb13))
-        up_parts.append(blk[:, 1, :].reshape(E, crows, rb13))
-    w13_raw = torch.cat(
-        [torch.cat(gate_parts, dim=1), torch.cat(up_parts, dim=1)], dim=1
-    )                                                     # [E, 2I, H/2]
-    del gate_parts, up_parts
+        blk = buf.view(E, 2, c13)
+        c0 = n * cr13
+        w13_raw[:, c0:c0 + cr13, :].copy_(blk[:, 0, :].reshape(E, cr13, rb13))
+        w13_raw[:, I + c0:I + c0 + cr13, :].copy_(blk[:, 1, :].reshape(E, cr13, rb13))
+        del buf, blk
 
-    w2_parts = []
+    w2_raw = _reuse(("raw2",), (E, H, rb2), device)
+    c2 = int(geo["w2_cbytes"])
+    cr2 = int(geo["w2_crows"])
     for n in range(ns):
         buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
-        w2_parts.append(buf.view(E, int(geo["w2_crows"]), rb2))
-    w2_raw = torch.cat(w2_parts, dim=1)                    # [E, H, I/2]
-    del w2_parts
+        c0 = n * cr2
+        w2_raw[:, c0:c0 + cr2, :].copy_(buf.view(E, cr2, rb2))
+        del buf
 
     s13_raw = _dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device) \
         .view(E, 2 * I, H // gk)
     s2_raw = _dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device) \
         .view(E, H, I // gk)
+    # K-major outputs are returned FRESH: `_kmajor_bytes` is a fast contiguous
+    # transpose (73 ms total), whereas `reused.copy_(t.transpose(1,2))` is a
+    # strided read and cost ~126 ms extra (NOTES §466). Reuse is worth it for the
+    # big INTERMEDIATES (node DMA buffers + raw, ~13 GB of churn); not here.
     return (_kmajor_bytes(w13_raw), _kmajor_bytes(s13_raw),
             _kmajor_bytes(w2_raw), _kmajor_bytes(s2_raw))
 
