@@ -164,6 +164,22 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
 #   且绝不用满)⇒ 实测 **TPOT 436.7 ms / C=1 1.93 tok/s**;
 #   60/rank(= 12 CCD × 5)⇒ **TPOT 68.1 ms / C=1 9.62 tok/s**(解码快 6.4×)。
 # 184 是**单进程**基准(world=1)的拐点,不能直接搬到 TP=2 服务上 —— 这是本轮踩到的坑。
+# ---- 显存优先级策略(R-VRAM,用户 2026-09-16 定为固定规则)------------------
+# 顺序固定:1) 1M 上下文(KV 先留够,不可降级) 2) GPU 预填充 3) GPU 投机解码 4) 专家层常驻;
+# 任何一项不满足就 fallback(预填充退回 CPU / 投机关闭 / 常驻全放主机),**且不得额外多占系统内存**。
+# 规划器把这条规则算成具体开关;显式设的 env 仍然优先(便于做对照实验)。
+VRAM_POLICY="${VRAM_POLICY:-1}"
+POLICY_GP_MIN=""; POLICY_RESIDENT=""; POLICY_DRAFT=""
+if [ "$VRAM_POLICY" = "1" ]; then
+  _PLAN="$(MAXLEN="$MAXLEN" "$PY" -m vllm_xiaotu_moe.vram_policy --maxlen "$MAXLEN" --emit-env 2>/dev/null \
+            | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' || true)"
+  if [ -n "$_PLAN" ]; then
+    POLICY_GP_MIN="$(printf '%s\n' "$_PLAN" | sed -n 's/^VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=//p')"
+    POLICY_RESIDENT="$(printf '%s\n' "$_PLAN" | sed -n 's/^XIAOTU_GPU_RESIDENT_LAYERS=//p')"
+    POLICY_DRAFT="$(printf '%s\n' "$_PLAN" | sed -n 's/^XIAOTU_DRAFT_ON_GPU=//p')"
+    echo "[v41] R-VRAM 规划(maxlen=$MAXLEN):gpu_prefill_min=${POLICY_GP_MIN:-?} resident='${POLICY_RESIDENT:-}' draft_on_gpu=${POLICY_DRAFT:-?}"
+  fi
+fi
 THREADS_DEFAULT="${THREADS_DEFAULT:-60}"
 # 自旋 5000 µs 是 §355 记录过的正反馈灾难(48 层 × 3 相 × 5 ms ⇒ 池几乎永不停转),
 # 与上面的超订叠在一起会互相放大 ⇒ 默认 0(完全不自旋,worker 直接 futex 睡)。
@@ -174,8 +190,9 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   echo "XIAOTU_MOE_NSLICE_SMALL=${XIAOTU_MOE_NSLICE_SMALL:-0}"
   echo "XIAOTU_MOE_ASYNC=${XIAOTU_MOE_ASYNC:-0}"
   echo "XIAOTU_MOE_SPIN_IDLE_US=${XIAOTU_MOE_SPIN_IDLE_US:-$SPIN_DEFAULT}"
-  echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-}"
+  echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-$POLICY_RESIDENT}"
   echo "XIAOTU_MOE_RESIDENT_BUDGET_GB=${XIAOTU_MOE_RESIDENT_BUDGET_GB:-0}"
+  echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-${POLICY_GP_MIN:-0}}"
   echo "XIAOTU_RELEASE_SOURCE=${XIAOTU_RELEASE_SOURCE:-1}"
   # 【§504】**多 rank 同机必须用 CCD 交错切分**(RANK_SPLIT=2)。原因(改自 moe_v2.hpp 的设计):
   #   nshard_ = max(1, numa_node_count()/world)。NPS1 本机 numa=2、TP=2 ⇒ **nshard_=1**
@@ -194,6 +211,7 @@ nohup env \
   VLLM_HANDSHAKE_TIMEOUT_MINS=120 \
   VLLM_USE_FLASHINFER_SAMPLER=0 \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
+  VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-${POLICY_GP_MIN:-0}}" \
   XIAOTU_RELEASE_SOURCE="${XIAOTU_RELEASE_SOURCE:-1}" \
   XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-$THREADS_DEFAULT}" \
   XIAOTU_MOE_NSLICE_SMALL="${XIAOTU_MOE_NSLICE_SMALL:-0}" \

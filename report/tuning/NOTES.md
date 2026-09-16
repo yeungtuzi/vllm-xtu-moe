@@ -18703,3 +18703,44 @@ checkpoint 自带的 `inference/model.py`(官方参考实现)、`DeepSeek_V41_Te
 接着跑的"门禁通过"**验证的是旧二进制**。修好后(去掉重复定义、不再用管道吞退出码)才拿到上面的真结果。
 ⇒ 规则:**凡是"改了引擎源码后跑门禁",必须同时核对 .so 时间戳或 `strings`/`nm` 里的新符号**,
 否则会把"旧二进制的结果"当成"新代码已验收"。
+
+## §506 【更正 + 定界】CED(预填充只跑前一半)**只属于 V4.1**;V4.0(0731)没有 CED;本机 vLLM **尚未实现 CED**
+
+用户指正:"有 CED 的是 4.1 不是 4.0" —— **对**,并且这个界定很重要。两个 checkpoint 的 config 对比:
+
+| | **V4.0-Flash-0731** | **V4.1-Flash** |
+|---|---|---|
+| 层数 / 专家 / hidden / moe_inter | 43 / 256 / 4096 / 2048 | 40 / 384 / 5120 / 2304 |
+| 逐层大小(实测) | **3.32–3.34 GiB**(均匀) | **6.88 GiB**(均匀);**L1/L14 = 101.4 GiB**(Engram) |
+| `mtp`(草稿,DSpark) | **10.12 GiB** | 7.39 GiB |
+| **CED 键** | ❌ **一个都没有** | ✅ `candidate_source_layer_id=20` / `kv_source_layer_ids=[2,8,14,20]` / `index_source_layer_ids` |
+| DSpark 键 | ✅ | ✅ |
+| Engram | ❌ | ✅(layers 1,14) |
+
+⇒ **§505 的全部结论(每层 6.88、Engram 在 1/14、草稿是独立 mtp)只适用于 V4.1**;
+V4.0 的对应数字是 3.33 GiB/层、mtp 10.12 GiB、无 Engram、无 CED。**此前若有把两者混用的表述,以本表为准。**
+
+### (a) "预填充只需要前 20 层"——**对,但仅限 V4.1**,而且有条件
+技术报告 2.2 节原文(用 `pdf_text.py` 抽的):
+* 全局注意力:"CED treats the bottom **L/2 layers** as the causal encoder … they are projected directly
+  from the hidden state of the (L/2)-th layer … **This design allows CED to compute only the first half
+  of the layers during the prefill phase**";
+* **但 SWA 不是**:`For sliding window attention (SWA), CED maintains the conventional layer-wise
+  computation across all layers` ⇒ 需要一次 **SWA 重放**;报告进一步给了
+  **Decoder SWA Bounded Replay**:`only prefills the last n_win tokens of the prompt for the SWA computation`;
+* 综合复杂度:`O(N·L) → O(N·L/2 + n_win·L/2) ≈ O(N·L/2)` ⇒ **约减半**。
+  本机 `sliding_window = 128` ⇒ 解码器只需重放**最后 128 个 token** ⇒ 代价很小。
+* **解码能不能省层?不能。** 报告的另一句给了答案:解码 `16B/token` vs 预填充 `8B/token`
+  ⇒ 解码每个 token 都要跑**全部 40 层**(要先用编码器算出新 token 的 `h_{L/2}`,
+  才能把解码器各层的 KV 投影出来)。**省层只发生在预填充。**
+  (我上一轮写过"解码只跑解码器 20-39",**那是错的,已在 IRON_RULES R-VRAM 里更正**。)
+
+### (b) 实现了吗?—— **没有**
+* 我们实际用的 vLLM 是源码 checkout(`/home/user/lvllm/process_data/ref/repos/vllm-mainline`,
+  `vllm.__file__` 指向它),在其中:
+  * `grep -rn "causal_encoder|n_win|bounded_replay|encoder_only|skip_decoder"` ⇒ **零命中**;
+  * 整个 `vllm/` 树里连 `CED` 这个词都没有。
+* ⇒ **我们目前预填充跑满 40 层,付的是架构允许值的约 2 倍**。这是一条**尚未动用的、量级最大**的
+  预填充优化(对 V4.1 而言):按报告,预填充算力可**接近减半**;
+  对应到实测:GPU 预填充 TTFT@8192 = 1003 ms ⇒ 理论上可到 ~500 ms 量级。
+* 顺带:V4.0 没有 CED ⇒ 那条路上不存在这个优化,不要套用。
