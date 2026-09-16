@@ -17347,3 +17347,42 @@ asm=492.8ms  free=0.17GiB  kernels=89.0ms
 ⇒ §471 的 ping/pong 方案(主机侧合并下一层 + 双缓冲 + 读完即释放)
 **是下一步该做的正确的第一件事**,预期每层 600 → ~430-450 ms(DMA 为主),
 同时把设备端 peak 从 ~13.4 GiB 降下来。之后才谈 `MIN_TOKENS` 默认值与用户文档。
+
+## §474 Enram-LAST 真实权重补载:待延迟的其实**只有 4 个大张量**,方案已定
+
+现状(§423 起):`XIAOTU_ENGRAM_LAST=1` 只把 `ParallelEngramEmbedding._allocate_weights`
+换成 meta 占位,物化时**只做 dummy 填充** ⇒ 真实权重下必须开着(不能用)。
+
+### 先量清楚"到底要延迟什么"(checkpoint 实际清单)
+V4.1 的 engram 张量一共 **12 个**(layer 1 与 14 各 6 个):
+
+| 名称 | 形状 | dtype | 大小/层 |
+|---|---|---|---|
+| `layers.{1,14}.engram.embed.weight` | [384006168/384016682, 256] | F8_E4M3 | **98.3 GB** |
+| `layers.{1,14}.engram.embed.scale` | [同, 8] | F8_E8M0 | **3.07 GB** |
+| `layers.{1,14}.engram.wkv.weight` | [25600, 6144] | F8_E4M3 | 157 MB |
+| `layers.{1,14}.engram.wkv.scale` | [800, 192] | F8_E8M0 | 0.15 MB |
+| `layers.{1,14}.engram.q_weight` / `k_weight` | [4, 5120] | BF16 | 各 0.04 MB |
+
+⇒ **`embed.weight` + `embed.scale` = 101.4 GB/层 × 2 层 = 202 GB = 189 GiB** —— 正是
+`_allocate_weights` 那两个 `pin_memory=True` 的分配,**也正是 ENGRAM_LAST 要消除的那 189 GiB**。
+其余 6 个小张量(合计 ~315 MB/层)根本不需要延迟,第一次 pass 正常加载即可。
+
+### 补载方案(复用上游的命名映射,不自己重实现)
+上游把 checkpoint 名映射到模块参数用的是 `model.py` 里的正则:
+`(engram\.embed)\.scale → \1_tokens.weight_scale_inv`(所以模块参数是 `embed_tokens.weight`
+/ `embed_tokens.weight_scale_inv`)。**自己按名字拼字符串很容易错**,改为**借上游的加载器**:
+
+1. 在 `_install_engram_materialize_shim` 里**同时**包一层
+   `DefaultModelLoader.load_weights`,把 `(loader_self, model, model_config)` 存到模块全局;
+2. `_materialize_engram_tables` 分配完真实 pinned 缓冲后,再跑**第二遍**:
+   `it = loader._get_weights_iterator(Source(model_config.model))`
+   → 过滤 `"engram" in name` → `model.load_weights(filtered)`;
+3. 这样命名映射/切分逻辑**完全走上游**,只搬 engram 那 12 个(实际只有 4 个大)张量。
+
+### 注意事项 / 待验证
+* 第二遍只搬 engram,不要让它再碰专家(过滤必须严格);
+* `load_weights` 可能有副作用(断言/计数),需实测;
+* **必须真权重跑一次确认**:数值与不开 ENGRAM_LAST 时一致(对拍同一 prompt 的输出),
+  并量峰值 RSS —— 预期从 ~833 GB 降到 ~640 GB 上下(省掉 189 GiB 与专家阶段叠加);
+* 这是目标项 (1),也是后面前 20 层 / TP=2 / Patch B 的内存前提。
