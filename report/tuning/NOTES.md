@@ -17423,3 +17423,61 @@ clone 后 `README.md` 的支持矩阵:
 4. 他们的混合 MoE 阈值/显存决策,与我们 §473 的结论(组装是瓶颈)对照。
 
 (克隆在 `/tmp/lvllm_main`,浅克隆;`RELEASE_NOTES.md` 有逐模型的硬件表与基准。)
+
+## §476 Engram-LAST 真实权重**功能验证通过**,但**不省内存**(峰值由稳态主导)
+
+`XIAOTU_ENGRAM_LAST=1` + 真权重,TP=1:
+
+```
+streamed layers.1.engram.embed.weight  -> (384006168, 256)  91.6 GiB
+streamed layers.1.engram.embed.scale   -> (384006168, 8)     2.9 GiB
+streamed layers.14.engram.embed.weight -> (384016682, 256)  91.6 GiB
+streamed layers.14.engram.embed.scale  -> (384016682, 8)     2.9 GiB
+re-loaded 4 real Engram tensor(s) from the checkpoint into the pinned tables (no extra peak)
+materialized 2 Engram table(s) AFTER the expert phase (IRON_RULES R11)
+```
+
+**正确性 ✓**:同一 prompt 输出正确 —— `"Count from 1 to 1000"` → `"...1000. The sum of
+these numbers is 500500."`(Σ1..1000 = 500500),说明流式灌进去的是**真表**而非 dummy。
+
+**但 `peak Rss = 833.4 GB`,与不开 ENGRAM_LAST 的基线(≈833 GB)完全一样。**
+原因(推断,但算术吻合):**峰值是"稳态"而非"叠加"决定的** ——
+
+```
+routed experts 分片 253 + Engram 189 + 上游每层 +9.18 GiB 的匿名(≈367,目标项 5)+ 非专家 ~25
+≈ 834 GiB   ← 与实测 833.4 吻合
+```
+
+Engram 反正**运行时必须常驻**,把它推迟只是消除了"与专家装载阶段叠加"的那段**瞬态**;
+而稳态本身已经更高 ⇒ 峰值不变。
+⇒ **ENGRAM_LAST 现在可用了(功能完整、对"瞬态才是峰值"的机器有价值),但它解决不了
+本机的内存问题;那个问题在目标项 (5) 的 +9.18 GiB/层(≈367 GiB)。**
+
+**待查**:本次解码 21.16 tok/s,低于我们 27.5 的基线。可能是 `MAXSEQS=4`(基线用 8)或
+"晚分配"改变了 Engram pinned 表的 NUMA 落位。**不能当成结论**,要单独 A/B。
+
+## §477 参考项目定位:主干化(不是私有 fork),且 dspark +~50%
+
+### LvLLM 正在向主线靠拢,不再是私有 fork
+* README 自述:`LvLLM = vLLM + lk_moe + SM80/86/89 适配 + SM120 修复`,
+  且 **`LVLLM_MOE_NUMA_ENABLED=0` 时行为等同原版 vLLM** ⇒ 混合 MoE 是**可选附加件**;
+* 支持矩阵把 SM90/SM100 标为 **native(上游)**,SM80/86/89 标为 **new(本发行补的)**;
+* 旧的 DS4 专用 fork `Lvllmds4-x` 已**明确退役**("mainline vLLM ... has matured");
+* FlashInfer 也不是自己 fork,而是**钉一个未发布的上游 ref**(§475)。
+⇒ 形态与我们**同构**:vLLM 插件/集成层 + 可选引擎 + 一层低架构适配补丁。
+(仍是"发行版",SM8x 适配仍自带代码,所以不等于纯上游。)
+
+### 性能对照:我们的 plain decode 确实不吃亏
+| 来源 | 硬件 | plain decode | dspark |
+|---|---|---|---|
+| LvLLM RELEASE_NOTES | 2× RTX 3090(SM86,TP2),2× EPYC 7642 192t NPS4,**8 NUMA**,peak ≈590 GB | **27 t/s** | 26-40(**+~48%**) |
+| LvLLM | 2× RTX 5060 Ti(SM120,TP2) | 25 | 32-37 |
+| **我们** | **1× A100-40GB,TP=1,NPS=1(2 NUMA)** | **27.5-27.8** | 未启用 |
+
+**注意口径**:他们是 **2 张卡** 拿到 27,我们是 **1 张** 拿到 27.5 —— 但要诚实说,
+A100 的算力远高于 3090,所以这不等于我们实现更好;只说明**当前 plain decode 没有明显落后**。
+
+**⇒ 他们最亮的是 dspark(+~50% decode)**,比 prefill 轴上剩下的任何东西都大
+(§473 组装优化预期 ~25%)。**DSpark 应提到优先级最前**(目标项 3),
+而且他们已发布可直接对照的启动脚本 `commands/dsv41_serve_tp2_3090_dspark.sh`
+(注意其中 `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024`、`VLLM_ENGRAM_DROP_PAGE_CACHE=0` 等可参考)。
