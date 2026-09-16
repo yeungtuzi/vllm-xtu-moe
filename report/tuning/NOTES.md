@@ -17481,3 +17481,34 @@ A100 的算力远高于 3090,所以这不等于我们实现更好;只说明**当
 (§473 组装优化预期 ~25%)。**DSpark 应提到优先级最前**(目标项 3),
 而且他们已发布可直接对照的启动脚本 `commands/dsv41_serve_tp2_3090_dspark.sh`
 (注意其中 `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024`、`VLLM_ENGRAM_DROP_PAGE_CACHE=0` 等可参考)。
+
+## §478 DSpark:主线**已内置**,旗标被接受,但启动期 EngineCore **静默死亡**(待查)
+
+### 已确认(正面)
+* 参考实现(LvLLM-v2.5)启用 dspark 用的是**标准 vLLM 旗标**,没有私有开关:
+  `--speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'`
+* **我方主线已内置 dspark**:`vllm/config/speculative.py:68 DSparkModelTypes = Literal["dspark"]`,
+  并有 `dspark_target_layer_ids` / `dspark_block_size` / `dspark_bonus_anchor` / `dspark_noise_token_id` 等校验。
+* V4.1 的 config:`dspark_block_size=5`、`dspark_target_layer_ids=[37,38,39]`
+  ⇒ `num_speculative_tokens` **必须 = 5**(与 Qwen3 的校验一致)。
+* **旗标里不需要 `model`**:实测我方解析出的 `SpeculativeConfig` 自动把 draft 指向**目标 checkpoint 自身**
+  (`model='/home/user/.cache/.../DeepSeek-V4.1-Flash/...'`),即用内置的 MTP/dspark 层,
+  不是外挂 draft —— 符合预期。另打印 "Overriding draft model max model len from 1048576 to 8192"。
+* ⇒ **`serve_v41.sh` 已加 `SPEC` 旋钮**(默认 0=关,行为逐字不变),见 §477/commit 360860e。
+
+### 失败(待查)
+`SPEC=1` + 真权重(TP=1, MAXLEN=8192, MAXSEQS=4, GPU_UTIL=0.70)启动到 EngineCore **静默死亡**:
+```
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+```
+**但日志里一条 ERROR / Traceback 都没有** —— 与本项目历史上 OOM-kill 的形态一致
+(`constraint=CONSTRAINT_MEMORY_POLICY` 那类:进程被内核直接杀掉,Python 层来不及打印)。
+最后一个采样 RSS = **735.9 GB 且仍在上升**(基线 plain 峰值 833 GB),所以**内存超限是头号嫌疑**:
+dspark 的 draft 层(layer 37-39,且 `dspark_n_routed_experts=128`)会额外吃内存/显存。
+
+**下一轮要做的**:
+1. 带 `MEMTRACE=1` 重跑,量到峰值与**每个 NUMA node 的剩余**(历史上是"单 node 先耗尽"而不是总量);
+2. 先把 `MAXLEN`/`MAXSEQS` 压到最小(如 2048/1)确认是内存还是别的;
+3. 若确认内存:draft 的专家层是否也需要走我们的 CPU 引擎(现在很可能没被 `XiaotuCPUExpertsMxfp4` 接住,
+   而是落在 GPU/主机默认路径上);必要时用 `XIAOTU_RELEASE_SOURCE=1` + 更小 `GPU_UTIL` 组合;
+4. **不要**在没量清之前把 `SPEC` 默认改成 1。
