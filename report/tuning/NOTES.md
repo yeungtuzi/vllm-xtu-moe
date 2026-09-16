@@ -18064,3 +18064,42 @@ ERROR [multiproc_executor.py:314] Worker proc VllmWorker-0 died unexpectedly (ex
 2. 仍然**没有 V4 基线** ⇒ 继续不下"回归"结论;但可以先做一件更有信息量的事:
    **在 V4 上把我们的插件关掉**(纯原版 vLLM,`mixed_mode` 关)跑同一脚本 ——
    若也死,则问题与插件无关(是环境/上游),这条对照比"历史基线"更容易拿到。
+
+## §496 V4 的死因推进:**SIGABRT**,且**不是从 Python 侧发出的**(C++ 侧 abort)
+
+`PYTHONFAULTHANDLER=1`(一个环境变量)让 worker 在致命信号时吐出 Python 栈 —— 手段生效:
+
+```
+  worker[182] slot=208
+  worker[183] slot=208
+Fatal Python error: Aborted                      ← SIGABRT(不是 SIGSEGV)
+Thread 0x...9640: multiprocessing/connection.py:395 _recv   ← 全部线程都在**闲着**
+Thread 0x...f640: queue.py:171 get
+Thread 0x...5640: tqdm/_monitor.py:69 run
+```
+
+**关键读法:dump 里列出的每个线程都阻塞在等待上**(`_recv` / `queue.get` / `tqdm.wait`),
+**没有任何一个 Python 线程正在执行** ⇒ **SIGABRT 不是 Python 抛的,而是非 Python(C++)线程
+abort 的**(或是 glibc 在 C++ 上下文里检测到堆损坏后 abort)。
+而且紧邻崩溃前的两行正是**我们引擎自己的线程池 dump**(`worker[N] slot=`),
+说明 abort 发生时引擎的 184 个 worker 正活着。
+
+### 至此 V4 问题的事实链(全部有数据)
+| 结论 | 依据 |
+|---|---|
+| **不是 OOM** | 峰值 RSS 277.9 GB,单 node 最低空闲 **134.5 GB**(§495) |
+| **是 abort,不是 segfault** | `Fatal Python error: Aborted`(§496) |
+| **不是 Python 抛的** | faulthandler 列出所有线程均空闲,无执行中帧 |
+| 死点 | `determine_available_memory()`(装载期剖析 forward) |
+| 不是我们引擎的 SIGSEGV 处理器 | `XTSIG` 计数 = 0 |
+
+**头号嫌疑:C++/glibc 侧的堆或映射损坏**(SIGABRT 是 glibc 检测到 `malloc/free` 不一致,
+或代码里 `std::abort()`/断言失败时的典型表现)。这与本项目**已经证实过的**
+"引擎按几何 memcpy 越界"那一类 bug 同族(§486/§489 就是这类)。
+
+### 下一轮(两个都很便宜)
+1. 加 **`MALLOC_CHECK_=3`**(或 `GLIBC_TUNABLES=glibc.malloc.check=3`)复跑 ——
+   glibc 会把"哪次分配/释放不一致"直接打到 stderr,**比 faulthandler 更靠近病因**;
+2. 同时开 `XIAOTU_MOE_SHARD_DIAG=1`:它会在**每个 node 分片填充成功后**打印
+   `[SHARD-DIAG] ... sharding OK shard=..GiB`,从而判断 abort 发生在**填充中**还是**填充后**;
+3. 仍然**没有 V4 基线**,继续不下"回归"结论。
