@@ -18598,3 +18598,75 @@ V4.1 每层每 rank ≈ **6.7 GiB**(E=384/2 × 2I×H/2 等),40 层 = **~270 GiB/
 * **未做**:把 `nshard_` 的公式本身改掉(让 NPS1+TP2 默认就拿到单份),
   目前靠脚本设 `RANK_SPLIT=2` 达到同样效果;公式层面改需要连带把 `RANK_SPLIT` 的默认值
   从 1 改成 2 并复跑全部多 rank 场景 ⇒ 留作下一轮(有脚本兜底,风险已可控)。
+
+## §505 【核实】V4.1 的层结构到底是怎样的 —— 用 checkpoint 索引 + 官方 config + 参考实现代码逐条查证
+
+用户转述了另一处 AI 的说法(0-3 是"哈希路由层"、37-39"内嵌 128 专家草稿")并要求核实。
+**证据源**(权威):`config.json`、`model.safetensors.index.json`(逐张量 shape/dtype 算字节)、
+checkpoint 自带的 `inference/model.py`(官方参考实现)、`DeepSeek_V41_Tech_Report.pdf`。
+
+### (a) 每层权重字节(从索引 + shard header 直接算,不加载权重)
+| 层 | GiB | 说明 |
+|---|---|---|
+| 0-39 全部 | **6.882** | **每层一样大**,`n_routed_experts=384`、`num_experts_per_tok=6` |
+| 1 | 101.444 | +94.5 GiB **Engram 表**(`engram_layer_ids=[1,14]`) |
+| 14 | 101.462 | 同上 |
+| 合计(layers.\*) | 464.5 | 另:`mtp.*` **7.388**、embed/head 各 1.233、vision 0.766 |
+
+### (b) "0-3 是哈希路由层" —— ❌ **不成立**
+* `config.json` 里**根本没有 `num_hash_layers`**(也没有任何含 `hash` 的键);
+* `inference/model.py` 的 `get_moe_config(layer_id)`:
+  `if layer_id < self.n_layers: return self.n_routed_experts, ...` ⇒ **0-39 全是 384 专家**;
+* 实测字节:0/1/2/3 层各 **6.882 GiB**,与其它层**完全相同** ⇒ 不存在"每层只 0.2 GiB 的稠密/哈希层"。
+
+### (c) "37-39 内嵌 128 专家草稿" —— ❌ **不成立**
+* 草稿是**独立的 `mtp.0/1/2`**(`n_mtp_layers=3`;`model.py` 原话 "extra draft layers appended
+  after the backbone, indices n_layers.." ⇒ 索引 40,41,42,**不是 37-39**);
+* `mtp.*` 合计 **7.388 GiB**(2.470+2.397+2.520),每个 mtp 层里都有 `ffn.experts.*`,
+  张量数 801/层、其中 `experts` 权重 **384 个张量 = 128 专家 × 3 个矩阵(w1/w2/w3)**
+  ⇒ 正好对应 `dspark_n_routed_experts=128`、`dspark_num_experts_per_tok=3`;
+* `layers.37/38/39` 各 **6.882 GiB**,与普通层一致;`dspark_target_layer_ids=[37,38,39]` 的用途是
+  `main_proj = Linear(dim*3 → dim)` —— 草稿**读取**这三层的 hidden,**没有任何草稿权重存在里面**。
+
+### (d) 第 20 层**确实特殊** —— 但特殊在**语义**,不在"更小/更值得常驻"
+* `candidate_source_layer_id = 20`:它负责构建候选池;`uses_candidates = 0 <= 20 < layer_id`
+  ⇒ **21-39 层都消费它**;
+* `kv_source_layer_ids = [2, 8, 14, 20]`、`index_source_layer_ids = [2,8,14,20,24,28,32,36]`
+  ⇒ 20 是 KV/索引源之一;
+* 但它的 **MoE 权重和别的层一样是 6.882 GiB**。**"特殊"不等于"常驻更划算"**:
+  常驻层的收益来自"少做 CPU↔GPU 的 MoE 权重搬运",而这件事**每层代价相同**;
+* **21、22 层没有任何特殊性**。
+
+### (e) 结论(对用户两个问题的直接回答)
+1. **要把投机解码放 GPU,需要的是 `mtp` 模块(7.39 GiB),不是 37-39 整层(3×6.88=20.6 GiB)。**
+   注意:我们插件目前**没有**"把 draft 专家放 GPU"的旋钮 ——
+   `XIAOTU_MOE_GPU_RESIDENT_LAYERS` 只按目标模型的 `layers.N` 下标匹配
+   (`GPU-resident(V4.1) language_model.model.layers.20.ffn.experts`),draft 只在
+   `reserve_draft_bytes()` 里被**预留**额度。⇒ 这是个明确的待补缺口。
+2. **0-3 与 20-22 都没有"优先常驻"的依据**。合理规则只有两条:
+   (i) 显存还剩多少;(ii) 这层是否在**解码路径**上。既然每层一样大、每 token 的 MoE 工作量一样,
+   **任意 6 层收益相同**。
+
+### (f) 40 GB 卡上的显存现实(实测,不是估算)
+| 配置(A100-40G ×2,V4.1,TP=2) | 结果 |
+|---|---|
+| gpu_util .90 + GPU 预填充(MBT 8192)+ **无**常驻层 | ✅ 起来;TTFT **824 ms@2048 / 1003 ms@8192**(热),TPOT ~70 ms |
+| gpu_util .90 + GPU 预填充 + `RESIDENT=0-3,20-22`(6 层) | ❌ **CUDA OOM**(20-22 层已成功常驻 3.36 GiB/层后挂) |
+| gpu_util .60 + GPU 预填充 + `RESIDENT=0-3`(4 层) | ❌ `No available memory for the cache blocks`(权重+常驻+激活 ≈ 整个池) |
+
+* 常驻层开销:**V4.1 = 3.36 GiB/层/rank**(V4 只有 1.59) ⇒ 6 层 = **20.2 GiB/rank**;
+* ⇒ **在 40 GB 卡上,"GPU 预填充"与"多层常驻"基本互斥**;再加上"上下文 >1M"更不可能。
+  现实取舍:① 要 GPU 预填充的 TTFT(0.8-1.0 s)⇒ 常驻层最多 0-1 层;
+  ② 要多层常驻(解码省 CPU)⇒ 关掉 GPU 预填充(预填充回到 CPU 的秒级);
+  ③ 折中:把 MBT 降到 2048-4096 腾出激活显存,再放 1-2 层常驻(下一轮量这个折中点)。
+
+### (g) 顺带回答"为什么两个 worker 各占 500-547 GiB"(用户截图)
+* `RANK_SPLIT=2`(socket 分片)确实生效了 —— 但这一轮的 env 是 **GPU 预填充开**
+  (`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1024`),于是 §504 的**条件默认**把
+  `XIAOTU_GPUPREFILL_WCOPY` 判成 **1** ⇒ **构造期那份 Python 侧权重副本又回来了**:
+  实测 **547 GiB/worker、树 1096.9 GiB**,比 GPU 预填充关闭时的 589 GiB 多出 **~253 GiB/rank**;
+* ⇒ **GPU 预填充当前的代价 ≈ 253 GiB/rank 主机内存**。根因是"为了 GPU prefill 的 K-major 缓存
+  而复制一份权重";而**引擎的 C++ 侧本来就已经快照过权重**(`moe_v2.hpp` 的 COPY 注释),
+  并且引擎已经暴露 `shard_geometry()`/`copy_hostbuf_to_device()` ——
+  **正确的修法是让 GPU prefill 用引擎自己的快照,而不是在 Python 里再 clone 一份**。
+  这是下一轮内存方向的首选(能一次性把 GPU 预填充的 253 GiB/rank 拿掉)。
