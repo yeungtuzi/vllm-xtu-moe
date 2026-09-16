@@ -18289,3 +18289,53 @@ nshard=2 时每个 node 要拿 **1/2 的行**(≈75 MB),早已超过单 CCD 32 M
 3. **未完成(诚实记账)**:没有做"旧 commit 重新编译 vs 现 commit"的逐位 A/B
    ⇒ "无代码退化"目前是**推断**(两条基准的分歧模式 + NSHARD 实验),不是构造性证明。
    若要彻底钉死,需要 worktree 检出 `893173d^` 重编译引擎再跑同一门禁。
+
+## §499 【踩坑·已修】从**仓库根目录**启动 `python -m vllm...` 会**静默加载我们的插件**(egg-info 被当成已安装发行版)
+
+### (a) 现象
+做 §483 的同 env A/B 时,arm A(参考实现 lk_moe,**故意**设了 `XTU_PLUGIN=0`、`XIAOTU_MAINLINE_SHIMS=0`、
+`XIAOTU_OOT_OVERRIDE=0`,且 lvllm 环境里装的 `lk_moe` 也确实打印了
+`lk_moe module is available`)**却同时把我们的插件也加载了**:
+
+```
+Detected CPU with AVX512-VNNI support
+Loading _lk_moe_C_avx512_vnni.so
+INFO  [routed_experts.py:41] lk_moe module is available, lk::MOE implementation will be used
+[vllm-xtu-moe] GPU/CPU Mixed: CPU backends -> xiaotu engine (BF16, MXFP4, FP8, INT4; ...)
+[vllm-xtu-moe] OOT DS-V4 model override DISABLED (XIAOTU_OOT_OVERRIDE=0) -> ...
+```
+⇒ 这个"参考"其实是"lk_moe + 我们的插件"的混合体,**A/B 直接作废**。
+(而且它还顺带把 §497 又复现了一遍:`/tmp/xiaotu_env` 里 V4.1 的 `THREADS=184/SPIN=5000`
+被套上 ⇒ 184 个 worker 自旋、`determine_available_memory` 里看门狗 `abort()`。)
+
+### (b) 定位(用 `traceback.print_stack()` 打在插件 `__init__` 顶部,60 秒即出栈)
+```
+File "<frozen runpy>", line 198, in _run_module_as_main
+File ".../vllm/entrypoints/openai/api_server.py", line 59, in <module>   main()
+File ".../vllm/entrypoints/launchers/api_server/entry.py", line 222     parser = make_arg_parser(parser)
+File ".../vllm/entrypoints/launchers/cli_args.py", line 425             AsyncEngineArgs.add_cli_args(parser)
+File ".../vllm/engine/arg_utils.py", line 3009                          load_general_plugins()
+```
+**不是** `.pth`(那条路走 `<frozen site>`),而是 vLLM 自己的插件加载器。
+为什么 `load_general_plugins()` 能发现我们:仓库根目录下有
+`vllm_xiaotu_moe.egg-info/`(以及 `vllm_xtu_moe.egg-info/`)—— `pip install -e .` 的产物。
+而 **`python -m pkg` 会把 CWD 放进 `sys.path[0]`**,`importlib.metadata` 顺着 `sys.path`
+扫描时会把"带 `*.egg-info` 的目录"当成**一个已安装发行版** ⇒ 我们的
+`vllm.general_plugins` 入口点被找到并执行。
+
+**为什么之前没发现**:所有手动复现我都习惯性 `cd /tmp`;而 `serve_mainline.sh` /
+`serve_v41.sh` 里也都有 `cd /tmp`(注释写的是 `attr` 模块遮蔽问题,但**顺带躲过了这一枪**)。
+我的 A/B 脚本开头 `cd "$ROOT"` 之后**再没离开**,于是踩中。
+
+### (c) 修复与护栏(都已落地)
+1. `scripts/ab_lvllm_vs_xiaotu.sh`:`launch_arm` 里 **`cd /tmp` 再启动**(arm B 的插件由
+   `.pth` 门控负责,**不依赖 CWD**);
+2. 同脚本加 **纯度断言**:arm A 的日志里出现 `vllm-xtu-moe` ⇒ 立刻判本次 A/B 作废并报错;
+   arm B 必须出现 —— 不允许"参考实现被污染了还当参考"这种事再发生一次;
+3. 顺带修掉 `stop_arm` 的一个 bash 坑:`local arm="$1" pidf="$OUTDIR/abl_$arm.pid"` 会在
+   `local` 执行前展开**所有**词 ⇒ `$arm` 取外层未定义值,`set -u` 下直接
+   `arm: unbound variable`(必须分两句 `local`)。
+
+### (d) 通用教训(值得进 RUNBOOK)
+**"在哪个目录启动"是我们这套代码的一个隐式输入**。凡是"跑对照/跑参考实现/跑基准"的场景,
+启动前必须 `cd` 到仓库外(或显式清 `sys.path`),否则会静默变成"我们的插件 + 对方编排"的混合体。

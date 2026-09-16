@@ -49,6 +49,15 @@ THREADS="${THREADS:-60}"
 # 11 = 只测 MoE 层(留 2 核/worker 的规则由 60 满足);0 = 不设常驻层(**参考发布的配置就是没有常驻层**)
 RESIDENT="${RESIDENT:-}"
 SPEC="${SPEC:-0}"          # 1 = 加 dspark(两边都加;参考发布参数里有它,但会引入投机解码这个额外变量)
+# arm B 走哪条集成路径:
+#   0 = **Mode B**(主线 RoutedExperts + 我们的 CPU experts 后端)—— 与 lk_moe 的挂钩位置**同形**
+#       (lk_moe 也是改 RoutedExperts),所以这是与参考最可比的形态;
+#   1 = Mode A(OOT 覆盖 DeepseekV4 模型类)。
+# 【实测 2026-09-16】`OOT=1` + 参考的 `--compilation-config VLLM_COMPILE` + `MBT=4096` 会在
+# profile run 里**死锁**:两个 worker 主线程都在 `libcuda.so` 里 `sched_yield`、瞬时 CPU=0、
+# GPU util=0%、显存停在 7.4 GiB(只有权重、没有 KV)⇒ 不是我们引擎在算,是 GPU 侧等不到对端。
+# Mode A 此前只在主线的 `CompilationMode.NONE` 下验证过(VLLM_COMPILE 没验证)⇒ 默认改用 Mode B。
+OOT="${OOT:-0}"
 SPEC_CFG='{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
 PORT_A="${PORT_A:-8190}"
 PORT_B="${PORT_B:-8191}"
@@ -104,15 +113,20 @@ launch_arm() {   # $1=arm(a|b)
   )
   if [ "$arm" = a ]; then
     # ---- lk_moe(参考)------------------------------------------------------
+    # `XTU_PLUGIN=0` 是**双保险**:arm A 绝不允许加载我们的插件(否则就不是 A/B 了)。
+    # 曾经咬过一次:arm A 意外加载了插件、而 `/tmp/xiaotu_env` 还是 V4.1 的
+    # `THREADS=184/SPIN=5000` ⇒ 服务在 `determine_available_memory` 里被我们引擎的
+    # worker 池看门狗 abort —— 与 V4 那次崩溃**同一个签名**(等于把 §497 又复现了一遍)。
     envs+=( LVLLM_MOE_NUMA_ENABLED=1 LK_THREADS="$THREADS" LK_THREAD_BINDING=CPU_CORE
             LVLLM_GPU_PREFETCH_WINDOW=1 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024
-            LVLLM_ENABLE_NUMA_INTERLEAVE=1 LK_POWER_SAVING=1 )
+            LVLLM_ENABLE_NUMA_INTERLEAVE=1 LK_POWER_SAVING=1
+            XTU_PLUGIN=0 XIAOTU_MAINLINE_SHIMS=0 XIAOTU_OOT_OVERRIDE=0 )
     [ -n "$RESIDENT" ] && envs+=( LVLLM_GPU_RESIDENT_MOE_LAYERS="$RESIDENT" )
   else
-    # ---- xiaotu(我们的):lvk_moe 关掉,只留我们的插件 ------------------------
+    # ---- xiaotu(我们的):lk_moe 关掉,只留我们的插件 ------------------------
     envs+=( XTU_PLUGIN=1 LVLLM_MOE_NUMA_ENABLED=0
             XIAOTU_MOE_THREADS="$THREADS" XIAOTU_MOE_NSLICE_SMALL=0 XIAOTU_MOE_ASYNC=0
-            XIAOTU_MOE_SPIN_IDLE_US=0 )
+            XIAOTU_MOE_SPIN_IDLE_US=0 XIAOTU_OOT_OVERRIDE="$OOT" )
     [ -n "$RESIDENT" ] && envs+=( XIAOTU_MOE_GPU_RESIDENT_LAYERS="$RESIDENT" )
     # 我们插件的 env 桥:显式指定文件 ⇒ 覆盖语义(且不会污染别的脚本)
     printf 'XIAOTU_MOE_THREADS=%s\nXIAOTU_MOE_NSLICE_SMALL=0\nXIAOTU_MOE_ASYNC=0\nXIAOTU_MOE_SPIN_IDLE_US=0\nXIAOTU_MOE_GPU_RESIDENT_LAYERS=%s\n' \
@@ -121,24 +135,78 @@ launch_arm() {   # $1=arm(a|b)
   fi
 
   note "启动 arm $arm: port=$port log=$log threads=$THREADS resident='${RESIDENT:-none}' spec=$SPEC"
+  # ⚠️ **必须在仓库外启动**(与 serve_mainline.sh 的 `cd /tmp` 同因):
+  # `python -m ...` 会把 **CWD** 放进 `sys.path[0]`,而仓库根下有 `vllm_xiaotu_moe.egg-info/`
+  # ⇒ `importlib.metadata` 会把它当成一个**已安装的发行版**,于是
+  # `vllm/engine/arg_utils.py:add_cli_args → load_general_plugins()` **自动加载我们的插件**。
+  # 实测(2026-09-16):arm A 因此在 `XTU_PLUGIN=0` 的情况下也被污染(栈已抓到:
+  # `api_server.py:59 main → launchers/api_server/entry.py:222 make_arg_parser →
+  #  cli_args.py:425 add_cli_args → arg_utils.py:3009 load_general_plugins`)。
+  # arm B 的插件由 .pth 门控负责,**不依赖 CWD**。
+  cd /tmp
   nohup env "${envs[@]}" "$PY" -m vllm.entrypoints.openai.api_server "${args[@]}" > "$log" 2>&1 &
   echo $! > "$OUTDIR/abl_$arm.pid"
+  cd "$ROOT"
 
+  # ---- 纯度断言(ready 之后判定):arm A 必须**没有**我们的插件,arm B 必须**有** ----
   local t0=$SECONDS
+  local last_mod now_s stall_s
+  STALL_S="${STALL_S:-420}"
   while [ $((SECONDS - t0)) -lt "$READY_TIMEOUT" ]; do
     if curl -sf --max-time 3 "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1; then
-      note "arm $arm READY(用时 $((SECONDS - t0))s)"; return 0
+      note "arm $arm READY(用时 $((SECONDS - t0))s)"
+      _assert_purity "$arm" "$log" || return 1
+      return 0
     fi
     if ! kill -0 "$(cat "$OUTDIR/abl_$arm.pid")" 2>/dev/null; then
-      warn "arm $arm 进程已退出;日志尾部:"; tail -30 "$log"; return 1
+      warn "arm $arm 进程已退出;日志尾部:"; tail -30 "$log"
+      _assert_purity "$arm" "$log" || true
+      return 1
+    fi
+    # 停滞检测:日志 STALL_S 秒没动 ⇒ 打印现场(CPU/GPU 利用率)并按失败处理。
+    # 为什么要它:2026-09-16 arm B 在 profile run 里**死锁**,只看"等 ready"的循环
+    # 会白等满 40 分钟还不知道发生了什么;而"两个 worker 主线程卡在 libcuda +
+    # GPU util 0% + 显存只有权重"这一组事实是能一眼定性"GPU 侧等不到对端"的。
+    last_mod=$(stat -c %Y "$log" 2>/dev/null || echo 0)
+    now_s=$(date +%s)
+    stall_s=$((now_s - last_mod))
+    if [ "$stall_s" -ge "$STALL_S" ]; then
+      warn "arm $arm 停滞 ${stall_s}s(日志不再增长)⇒ 判定为 hang,打印现场后退出"
+      nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader | sed 's/^/[ab]   gpu /'
+      ps -eo pid,pcpu,comm --sort=-pcpu --no-headers | head -5 | sed 's/^/[ab]   cpu /'
+      tail -5 "$log" | cut -c1-200 | sed 's/^/[ab]   /'
+      return 1
     fi
     sleep 10
   done
   warn "arm $arm 等待超时;日志尾部:"; tail -20 "$log"; return 1
 }
 
+# arm A 里出现 `vllm-xtu-moe` = 我们的插件被加载了 ⇒ **这个 A/B 无效**(必须立刻报错,
+# 不能再像第一次那样把一个"我们引擎的服务"当成参考实现去比)。
+_assert_purity() {
+  local arm="$1" log="$2"
+  if grep -qE 'vllm-xtu-moe' "$log" 2>/dev/null; then
+    if [ "$arm" = a ]; then
+      warn "!! arm A 的日志里出现了 vllm-xtu-moe ⇒ 参考实现被我们的插件污染,本次 A/B 作废"
+      return 1
+    fi
+    note "arm B 纯度 OK(插件已加载)"
+  else
+    if [ "$arm" = b ]; then
+      warn "!! arm B 的日志里没有 vllm-xtu-moe ⇒ 插件没加载,这次跑的不是 xiaotu 引擎"
+      return 1
+    fi
+    note "arm A 纯度 OK(没有加载我们的插件)"
+  fi
+  return 0
+}
+
 stop_arm() {    # $1=arm
-  local arm="$1" pidf="$OUTDIR/abl_$arm.pid"
+  # 【bash 坑】`local a="$1" b="$a"` 会在 `local` 执行前就把**所有**词展开 ⇒ `$a` 取的是
+  # 外层的(unset)值,`set -u` 下直接 `arm: unbound variable`。必须分两句写。
+  local arm="$1"
+  local pidf="$OUTDIR/abl_$arm.pid"
   [ -f "$pidf" ] || return 0
   local pid; pid="$(cat "$pidf")"
   note "停止 arm $arm(pid=$pid)"
