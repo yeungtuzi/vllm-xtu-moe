@@ -164,14 +164,90 @@ def _engram_last_on() -> bool:
     return os.environ.get("XIAOTU_ENGRAM_LAST") == "1"
 
 
-def _materialize_engram_tables() -> int:
+def _stream_engram_from_ckpt(model, model_path, pending, chunk_rows: int = 2_000_000):
+    """把 checkpoint 里的 Engram 大表**分块流式**读进已物化的 pinned 缓冲。
+
+    为什么不用 `model.load_weights` 再跑一遍:那需要拿到 loader 的 weights iterator,
+    而 `process_weights_after_loading` 的钩子上拿不到 loader。这里只涉及 **4 个大张量**
+    (`layers.{1,14}.engram.embed.{weight,scale}`),命名映射简单,自己按名取更直接。
+
+    **绝不能 `get_tensor(name)` 整块拿**:`embed.weight` 单层 98 GB,整块读会再吃一份
+    内存,正好抵消掉 ENGRAM_LAST 的意义。用 `safe_open(...).get_slice(name)[a:b]`
+    分块(默认 2e6 行 ≈ 512 MB/块)拷进目标,峰值只多一个 chunk。
+
+    返回成功流式的张量数;失败只告警、不抛(让服务能起来,便于诊断)。
+    """
+    import glob
+    import json
+    import os
+    import re
+
+    from safetensors import safe_open
+
+    if not model_path or not os.path.isdir(model_path):
+        print(f"[xtu-engram-last] no checkpoint dir at {model_path!r}; cannot re-load",
+              flush=True)
+        return 0
+    files = sorted(glob.glob(os.path.join(model_path, "model-*.safetensors")))
+    if not files:
+        print(f"[xtu-engram-last] no safetensors under {model_path!r}", flush=True)
+        return 0
+    # key -> file (读 header 很便宜,shard 数 ~48)
+    where = {}
+    for f in files:
+        try:
+            with open(f, "rb") as fh:
+                hl = int.from_bytes(fh.read(8), "little")
+                hdr = json.loads(fh.read(hl))
+        except Exception:  # noqa: BLE001
+            continue
+        for k in hdr:
+            if "engram" in k and "embed" in k:
+                where[k] = f
+
+    name_of = {id(mm): n for n, mm in model.named_modules()}
+    n_ok = 0
+    for m in pending:
+        q = name_of.get(id(m), "")
+        mo = re.search(r"layers\.(\d+)\.", q)
+        if not mo:
+            print(f"[xtu-engram-last] cannot locate layer index for {q!r}; skipped",
+                  flush=True)
+            continue
+        li = mo.group(1)
+        for ck, attr in ((f"layers.{li}.engram.embed.weight", "weight"),
+                         (f"layers.{li}.engram.embed.scale", "weight_scale_inv")):
+            f = where.get(ck)
+            dst = getattr(m, attr, None)
+            if f is None or dst is None:
+                print(f"[xtu-engram-last] missing {ck} (file={f}) — skipped", flush=True)
+                continue
+            try:
+                with safe_open(f, "pt") as fh:
+                    sl = fh.get_slice(ck)
+                    n = int(dst.shape[0])
+                    for a in range(0, n, chunk_rows):
+                        b = min(n, a + chunk_rows)
+                        dst[a:b].copy_(sl[a:b])
+                n_ok += 1
+                print(f"[xtu-engram-last] streamed {ck} -> {tuple(dst.shape)} "
+                      f"({dst.numel() * dst.element_size() / 2**30:.1f} GiB)", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[xtu-engram-last] FAILED to stream {ck}: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+    return n_ok
+
+
+def _materialize_engram_tables(model=None, model_path=None) -> int:
     """把延后的 Engram pinned 大表真正建出来(专家阶段全部结束之后调用)。
 
-    ⚠️ 范围与边界:目前只实现 **dummy 填充**(与 `--load-format dummy` 语义一致,
-    即 `dummy_weight_value` = 1.0 / 127)。真实权重需要"物化后补跑一次 Engram 加载",
-    尚未实现 —— 那种情况下**显式报错**,绝不静默给出未初始化的表。
+    **真实权重支持**(NOTES §474/§476):分配好 pinned 缓冲后,若 checkpoint 里确实有
+    Engram 张量,就**分块流式**读进这些缓冲(`_stream_engram_from_ckpt`);只有
+    `--load-format dummy`(checkpoint 找不到表)才退回 dummy 填充。
+    这样 `XIAOTU_ENGRAM_LAST=1` 在真实权重下可用:189 GiB pinned 表**不再与专家阶段叠加**。
     """
     n = 0
+    _real = []
     for m in list(_ENGRAM_LAST_PENDING):
         try:
             w = torch.empty(
@@ -182,8 +258,10 @@ def _materialize_engram_tables() -> int:
                 m.part_num_embeddings, m.dim // m.block_size,
                 dtype=torch.uint8, device="cpu", pin_memory=True,
             )
+            # 真实权重优先:分块流式读真正的表(dummy 才 fill)
             w.fill_(1.0)      # 与主线 set_weight_attrs(dummy_weight_value=1.0) 一致
             s.fill_(127)      # ue8m0 的 1.0 = 指数 127
+            _real.append((m, w, s))
             # ⚠️ 不能写 `m.weight.data = w`:占位是 **meta** 张量,而 `nn.Parameter`
             # 的 `.data=` 要求两侧 tensor type 相容(meta vs cpu 会抛
             # "incompatible tensor type")。所以**换掉整个 Parameter**,
@@ -201,6 +279,15 @@ def _materialize_engram_tables() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"[xtu-engram-last] materialize FAILED: {type(exc).__name__}: {exc}",
                   flush=True)
+    # 真实权重:把 checkpoint 的真表分块流式灌进刚物化的 pinned 缓冲。
+    # 找不到表(如 --load-format dummy)就保留 dummy 填充(见 §474/§476)。
+    if _real and model is not None:
+        _m = [mm for (mm, _w, _s) in _real]
+        _ok = _stream_engram_from_ckpt(model, model_path, _m)
+        if _ok:
+            print(f"[xtu-engram-last] re-loaded {_ok} real Engram tensor(s) from the "
+                  f"checkpoint into the pinned tables (no extra peak)", flush=True)
+    del _real
     _ENGRAM_LAST_PENDING.clear()
     if n:
         print(f"[xtu-engram-last] materialized {n} Engram table(s) AFTER the expert "
@@ -231,7 +318,9 @@ def _install_engram_materialize_shim() -> list[str]:
     def process_weights_after_loading(model, model_config, target_device, *a, **kw):
         res = orig(model, model_config, target_device, *a, **kw)
         if _ENGRAM_LAST_PENDING:
-            _materialize_engram_tables()
+            _materialize_engram_tables(
+                model, getattr(model_config, "model", None)
+            )
         return res
 
     process_weights_after_loading._xtu_shim = True  # type: ignore[attr-defined]
