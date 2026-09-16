@@ -17679,3 +17679,34 @@ pybind11::cpp_function::dispatcher                     (so +0x116fad)
 **下一轮**:①先跑这个诊断(最小 SPEC=1 配置)拿到数字;②若 w13 实际字节 < expect,
 就查 draft 层是否复用了目标层的模块/dims;③顺带把 `XIAOTU_MOE_SHARD_DIAG=1` 一起开
 (它在 `shard_fill_w13` **成功之后**才打印,所以这次崩前不会出现 —— 反过来也说明能用它判断是否走完)。
+
+## §485 DSpark 崩溃:cfg 与张量尺寸**全部正确** —— 前两个假设都作废,得靠内核侧边界打印
+
+用 §484 的形状诊断跑最小 SPEC=1 配置,拿到 **41 个引擎**的完整参数:
+
+```
+40 x  cfg(E=384 H=5120 I=2304 gN=1 gK=32)   language_model.model.layers.{0..39}.ffn.experts
+ 1 x  cfg(E=128 H=5120 I=2304 gN=1 gK=32)   model.layers.40.ffn.experts      ← DSpark draft(MTP)层
+```
+
+**draft 那一行的关键数字**:
+```
+w13 shape=(128,4608,2560) bytes=1509949440   expect(w13)=1509949440   ✓ 完全相等
+w2  shape=(128,5120,1152) bytes= 754974720   expect(w2) = 754974720   ✓ 完全相等
+```
+(cfg 也对:E=128 与 `dspark_n_routed_experts=128` 一致;H/I 与目标相同。)
+
+⇒ **§484 里"源缓冲比构造器要读的小"的推断不成立**(至少不是张量尺寸层面的)。
+⇒ 连同 §482 的"设备指针",**两个假设都被数据否掉了**。张量:主机、连续、非空、尺寸恰好符合 cfg。
+
+**仍然成立的硬事实**:
+* 崩溃在 `MOE_V2<MXFP4>::MOE_V2(...)` 构造器内(so `+0x402e4`),由 pybind11 从 Python 调起;
+* SysV:RDI=dst、**RSI=源指针(页对齐,跑到映射尽头)**、**RDX=memcpy 长度 = 0x2d00000**;
+* `0x2d00000 / cbytes(NS=2) = 47,185,920 / 2,949,120 = **16**` —— 长度是 **16 × cbytes**,
+  而单次 `shard_fill_w13` 的 memcpy 长度本应**恰好是 cbytes**。**"16 倍"这个倍数才是线索。**
+
+**下一轮(不要再猜,直接让内核说出来)**:给 `shard_fill_w13`/`shard_fill_w2` 的每个
+`memcpy` 前加**边界断言 + 打印**(`E/NS/crows/cbytes/stride/total/e/rs/src_off/dst_off`),
+或在 `XIAOTU_MOE_SHARD_DIAG=1` 下先打印几何再拷贝。哪一步越界、越界多少,一次就能看到。
+(比 `-O0 -g` 重编再 addr2line 更直接,且顺带把这条路径永久加上守卫 —— 对 §482 那类
+"静默 SIGSEGV" 也是止血。)
