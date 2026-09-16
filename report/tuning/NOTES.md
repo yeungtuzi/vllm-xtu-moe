@@ -17997,3 +17997,36 @@ INFO  [multiproc_executor.py:472] [shutdown] Executor: waiting for worker exit c
    应当给出可读错误而不是静默死 —— 若仍静默,说明它没走到那条路径;
 4. **给 V4 补一个真正覆盖插件的回归门**(例如 V4 的短服务冒烟 + 同一 prompt 输出比对),
    否则"不破坏既有模型"这条硬约束实际上一直没有被检验。
+
+## §494 V4 服务死的**确切位置**:`determine_available_memory()`(装载期显存/内存剖析),且我的 MEMTRACE 手段**没生效**
+
+### 复跑(可复现)
+`serve_mainline.sh`(V4,Mode A)第二次运行**同样死**,且这次拿到了栈:
+
+```
+ERROR [multiproc_executor.py:314] Worker proc VllmWorker-0 died unexpectedly (exit code: None)
+[vllm-xtu-moe] startup finished (KV cache sized) -> GPU prefill is now allowed ...
+  ... core.py:312 in _initialize_kv_caches
+      available_gpu_memory = self.model_executor.determine_available_memory()
+```
+⇒ 死在 **`determine_available_memory()`**,即**装载期的内存剖析那次 forward**,
+与我这一路查的 V4.1 GPU prefill/DSpark 是**同一个阶段**(那个阶段本来就要建引擎、吃主机内存)。
+
+### 我的两个 shim 在栈上,但只是**过路帧**
+`gpu_prefill.py:766` 的 `_initialize_kv_caches` 包装(§461 的 startup 守卫)
+在栈里是 `return orig_kv(self, *a, **kw)` —— 纯透传,所以**不能据此说是它导致的**。
+(另一个 `GPUModelRunner.profile_run` 包装同理。)
+
+### 又一次"手段失效"(值得记)
+我为了区分 OOM/崩溃给这次运行加了 `MEMTRACE=1`,结果 **一个采样都没有** ——
+因为 **`serve_mainline.sh` 根本没有 MEMTRACE 那段**(那是 `serve_v41.sh` 才有的,
+`grep -c MEMTRACE` 在 mainline 里是 0)。**我第二次在同一个坑里浪费了一轮**:
+(§479 那次是路径写错,这次是把只有脚本 A 才有的开关用在脚本 B 上。)
+⇒ **教训:用一个诊断开关前,先确认它在当前脚本里真的存在**(`grep` 一下),否则"没数据"会被误读成"没问题"。
+
+### 下一轮
+1. 把 `serve_v41.sh` 的 MEMTRACE 段**移植到 `serve_mainline.sh`**(或直接手工跑 tracer),
+   再复跑 V4,用**每 node 空闲 + 峰值 RSS** 判定 OOM;
+2. 若确认 OOM:查 `determine_available_memory` 期间的峰值来自哪里(V4 的 43 层引擎 138 GB +
+   源 + 非专家;我这两轮改的标记只多留 ~0.4 GB 量级,**理论上不该致命**);
+3. **仍然没有 V4 基线** —— "是否回归"这个问题依旧悬着,不要下结论。
