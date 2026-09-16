@@ -17617,3 +17617,28 @@ xiaotu_moe/build/_xiaotu_moe_C_avx512_bf16....so(+0x2ab2a)
    覆盖 draft 的小张量;或在 `hybrid_model.py` 的引擎构造前补一个**主机指针断言**
    (把 SIGSEGV 变成可读的 Python 错误 —— 这一步无论如何都该做);
 3. 复跑最小配置确认不再崩,再谈 `num_speculative_tokens`/收益。
+
+## §483 【用户追加任务·排在 DSpark 之后】lvllm 环境下 **lk-moe vs xiaotu-moe 的 A/B**
+
+用户已在 conda env **`lvllm`** 里装好最新的 **lvllm-2.5**。要求:
+按 LvLLM 项目手册 + release notes 里引用过的运行参数(**可适当调整**),在 lvllm 环境下做
+**lk-moe vs xiaotu-moe 的 A/B**,对比 **性能与正确性**。
+
+**为什么这条对我们价值很大**:它把变量收敛到**只剩引擎** —— 同一个 vLLM 分支、
+同一套编排、同一台机器,只换 CPU 引擎(kk_moe vs xiaotu_moe)。这样:
+* 能直接量出**引擎差异**(而我们现在所有结论都被自家插件的编排扰动着);
+* 对 §480 的内存线索是**决定性对照**:我们常驻 833 GB vs 参考 590 GB,
+  如果同一编排下 xiaotu_moe 也高出一大截,就说明多出来的开销在**引擎/装载接口**这一侧;
+* 对 §482 的 DSpark 崩溃同理:若 lk-moe 在同样 dspark 配置下能起来,问题就锁定在我们把
+  专家权重喂给引擎的那条路径上。
+
+**执行要点(待做)**
+* env:`/home/user/anaconda3/envs/lvllm`(待确认其确切路径与 python);
+* 参数基线:`commands/dsv41_serve_tp2_3090_dspark.sh` 与 `commands/` 下 V4.1 的普通版
+  (注意它们是 **TP2 + 2×3090**;我们只有 3×A100-40GB,需按显存/卡数适当调整,
+  例如 TP=1、`--gpu-memory-utilization` 下调、`MAXLEN` 先小);
+* 换引擎的开关:`LVLLM_MOE_NUMA_ENABLED=1`(开启混合)与 `0`(等同原版 vLLM)可作对照;
+  以及 `LK_THREADS` 等 lk_moe 侧旋钮;
+* 正确性:同一 prompt、greedy,比输出文本;性能:单请求 decode tok/s(与我们的 27.5 对照);
+* **不改** LvLLM 仓库代码(它在我们 `/tmp/lvllm_main` 是浅克隆,且是别人的项目);
+  我们只跑它、量它。
