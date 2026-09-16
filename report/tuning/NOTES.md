@@ -17908,3 +17908,29 @@ RuntimeError: xiaotu MOE_MXFP4: refusing to build the engine from a non-host sou
 2. 顺带确认 `max_num_scheduled_tokens` 那条 warning(MAXSEQS 与 spec tokens 的配合);
 3. 然后做 §483(lvllm 环境 lk-moe vs xiaotu-moe A/B) —— 现在 DSpark 已通,
    这个 A/B 还可以顺带对照两边的 dspark 收益。
+
+## §491 DSpark 收益的**可信区间**(多 prompt + 显式 warmup + 查 tok 数)
+
+在已起来的 DSpark 服务(8177,TP=1/MAXLEN=2048/MAXSEQS=1/GPU_UTIL=0.70/THREADS=184)上,
+逐个 prompt 取**第二个请求**(避开一次性预热):
+
+| prompt 类型 | 稳态 decode | vs plain 27.5 | `tok` 有效? |
+|---|---|---|---|
+| 枚举("数到 1000") | 64.2 tok/s | **≈2.3×** | ✓ 64 |
+| 枚举("前 50 个质数") | **63.6 tok/s** | **≈2.3×** | ✓ 64 |
+| 散文("进程 vs 线程") | **32.5 tok/s**(req#1 只有 7.1) | **≈1.18×** | ✓ 64 |
+| 随机词(`--synth`) | 27.3 tok/s | ≈1.0× | ✓ 64 |
+| 代码("反转链表") | — | — | **✗ 只生成 1 token 就 EOS** |
+
+**⇒ 可信结论:DSpark 在本机的收益 ≈1.0×–2.3×,与文本可预测性正相关;
+枚举/计数类内容最好(≈2.3×),散文类 ≈1.2×,随机内容 ≈1.0×。**
+与参考实现报的 26-40 t/s 宽区间一致(同一个机制)。
+
+### 两个必须记住的测量陷阱
+1. **先看 `tok` 再信吞吐**。两个散文/代码 prompt 只生成 **1 个 token 就 EOS**,
+   此时 `tok/s = 1/延迟` 毫无意义(会报出 4.7/5.1 tok/s 这种假数)。
+   **待查(独立问题)**:为什么这些 prompt 立刻 EOS?可能是 chat-template / stop-token
+   或 `--default-chat-template-kwargs` 的配合问题,会影响任何吞吐测量与体感。
+2. **每个新 prompt 形状都有一次性成本**:散文 prompt 的 req#1 = 8.98 s(7.1 tok/s)、
+   req#2 = 1.97 s(32.5 tok/s)。无 prefix cache + MAXSEQS=1 时,vLLM 对不同 batch/长度
+   会各自捕获图 ⇒ **必须显式 warmup 同形状后计时**,否则会低估(甚至低估 4×)。
