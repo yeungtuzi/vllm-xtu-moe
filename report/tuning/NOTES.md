@@ -17642,3 +17642,40 @@ xiaotu_moe/build/_xiaotu_moe_C_avx512_bf16....so(+0x2ab2a)
 * 正确性:同一 prompt、greedy,比输出文本;性能:单请求 decode tok/s(与我们的 27.5 对照);
 * **不改** LvLLM 仓库代码(它在我们 `/tmp/lvllm_main` 是浅克隆,且是别人的项目);
   我们只跑它、量它。
+
+## §484 DSpark 崩溃的**确切位置**(符号已解析)—— §482 的"设备指针"假设作废
+
+用 `addr2line`/`nm` 解析 §482 那份栈(崩溃与 §482 同形,加了 Mode A 断言后**仍然崩**):
+
+```
+pybind11::cpp_function::dispatcher                     (so +0x116fad)
+  → bind_moe_class<MXFP4WeightTraits,BF16Activation>::lambda   (so +0xc3403)
+    → MOE_V2<MXFP4Traits,BF16Activation>::MOE_V2(...)          (so +0x402e4)  ← **引擎构造函数**
+      → libc memcpy → SIGSEGV
+```
+
+⇒ 崩溃在 **`xiaotu_moe.MOE_MXFP4(cfg, w13, w2, s13, s2, …)` 的构造过程**(即 `shard_fill_*`),
+不是解码、不是推理。
+
+**而且两个断言都没触发**:我新加的 Mode A 断言(CPU/连续/非空)与 Mode B 早有的
+`_assert_host_source` 都**通过了** ⇒ 传进去的张量**确实是主机内存、连续、非空**。
+⇒ **§482 里"读到设备指针"的判断是错的,作废。**
+
+**SysV 调用约定读出来的新事实**(x86-64: RDI=dst, RSI=src, RDX=len):
+
+| 寄存器 | 值 | 含义 |
+|---|---|---|
+| RSI | `0x7e54e4000000` | 源指针,**页对齐** = 正好跑到了映射尽头 |
+| RDX | `0x2d00000` = 47,185,920 | **memcpy 的长度** = **恰好 16 × cbytes**(V4.1 的 cbytes = (I/NS)·(H/2) = 1152×2560 = 2,949,120) |
+
+⇒ **是"源缓冲区比构造器要读的小"** —— 读到映射末端就段错误。
+而且 `num_local_experts = int(ex_w13.shape[0])`(mixed_experts.py:746)本来就从张量取 E,
+所以"E 配置不一致"也被排除 ⇒ **嫌疑落在 H/I/布局 或 draft 层走的是另一套 dims**。
+
+**已加的诊断(下一轮直接跑)**:`_ensure_engine` 里一次性打印
+`E/H/I/groupN/groupK` + `w13/w2` 的实际 shape/dtype/字节数 + 按 cfg 推出来的期望 w13 字节数
+(`expect_w13 = E·2I·(H/2)`)。三者一对比,尺寸/布局不一致会立刻现形。
+
+**下一轮**:①先跑这个诊断(最小 SPEC=1 配置)拿到数字;②若 w13 实际字节 < expect,
+就查 draft 层是否复用了目标层的模块/dims;③顺带把 `XIAOTU_MOE_SHARD_DIAG=1` 一起开
+(它在 `shard_fill_w13` **成功之后**才打印,所以这次崩前不会出现 —— 反过来也说明能用它判断是否走完)。
