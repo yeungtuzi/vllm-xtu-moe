@@ -18103,3 +18103,111 @@ abort 的**(或是 glibc 在 C++ 上下文里检测到堆损坏后 abort)。
 2. 同时开 `XIAOTU_MOE_SHARD_DIAG=1`:它会在**每个 node 分片填充成功后**打印
    `[SHARD-DIAG] ... sharding OK shard=..GiB`,从而判断 abort 发生在**填充中**还是**填充后**;
 3. 仍然**没有 V4 基线**,继续不下"回归"结论。
+
+## §497 【破案】V4 的 abort **是我们自己的看门狗**;而它被触发的真正原因是**陈旧 env 桥**让 V4 套用了 V4.1 的旋钮
+
+§496 的"头号嫌疑 = glibc/C++ 堆损坏"**方向错了**。把日志按行号读全,结论是**确定性**的:
+
+### (1) abort 的调用点就是我们自己
+`report/tuning/logs/v4reg4.log` 第 397 行起:
+
+```
+[pool] WATCHDOG fired: gen=208 n=96 start=34438 end=34534 counter=34718 remaining=1 current_gen=208 dropped=1
+  worker[0] slot=208
+  ...
+  worker[183] slot=208
+Fatal Python error: Aborted
+```
+
+`[pool] WATCHDOG fired` 后面紧跟的 `worker[N] slot=` 是 `numa_pool.hpp:588` 的 dump,
+而它的下一句就是 `numa_pool.hpp:591` 的 **`abort()`**:`parallel_for` 等了 **300 s**
+(`deadline = t0 + 300s`)还没等到 `remaining_ == 0`,按设计 dump + abort。
+时间线也对得上:worker 在 `06:50:5x` 进入这一次 `parallel_for`,`06:55:5x` 触发看门狗,
+`06:55:56` EngineCore 报 `Worker proc VllmWorker-0 died unexpectedly`。
+
+⇒ **`Fatal Python error: Aborted` 的 faulthandler dump 具有误导性**:它列的是"abort 那一刻
+各线程在哪",主线程恰好在 `hc_head_fused_kernel_tilelang`(tilelang JIT),但**abort 是 C++ 侧
+我们自己的代码发的**,不是 tilelang、不是 glibc、不是上游。§496 表格里"不是我们引擎"的两条依据
+(线程全空闲 / `XTSIG=0`)其实只说明"不是 SIGSEGV 处理器那条路",**不能推出"与我们无关"**。
+
+### (2) 一次挂死(而不是崩溃)的机制:一张**已领票的递减被跳过**
+`parallel_for` 的完成屏障是"`remaining_` 从 n 倒数到 0"。dump 的数字可以精确排除
+"某个 worker 卡在任务体里":
+
+* `nt_ = 184`(dump 打印了 184 个 worker),`counter - end = 34718 - 34534 = **184** = nt_`。
+  快路径里 `if (i >= n) break;` 一旦判定越界就**退出领票循环**,所以**每个 worker 至多领一张越界票**
+  ⇒ 越界票恰好 184 张 ⇔ **184 个 worker 全都走完了领票循环** ⇔ **没有任何 worker 卡在任务体里**。
+* 区间内 96 张票全部被领走(`counter_` 已越过 `end`),却只发生了 95 次递减 ⇒ `remaining_ = 1`。
+
+⇒ 性质是**账目丢了一次递减**,不是"任务体死循环"。
+
+### (3) 这个坑的**触发原因(已证实):`/tmp/xiaotu_env` 陈旧 + 桥"覆盖语义"**
+`vllm_xiaotu_moe/__init__.py` 的环境变量文件桥**以文件为准覆盖真实环境**(这是为了救
+EngineCore spawn 时被静默丢弃的 `XIAOTU_*`,见 §382/§414)。问题是:
+
+| 脚本 | 是否写该文件 |
+|---|---|
+| `scripts/serve_v41.sh` | **写**(每次启动重写,`XTU_ENV_FILE=${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}`) |
+| `scripts/serve_mainline.sh` | **不写** ⇒ 直接吃上一个 V4.1 跑剩的文件 |
+
+实测证据(`/tmp/xiaotu_env`,mtime 05:50 = v41dsp2 那次):
+
+```
+XIAOTU_MOE_THREADS=184            # V4 脚本要 60
+XIAOTU_MOE_SPIN_IDLE_US=5000      # V4 脚本要 0
+XIAOTU_MOE_GPU_RESIDENT_LAYERS=   # 空!V4 脚本的 RESIDENT=0-11(12 层常驻)被清掉
+XIAOTU_RELEASE_SOURCE=1
+```
+
+对 V4(Mode A,TP=2)的后果,每一条都指向已被本项目证实的病态:
+
+* **`THREADS=184`**:两 rank × 184 = **368 个 worker 线程挤 192 个物理核**(SMT 已关),
+  而本脚本的 60 是"每 rank 12 CCD × 5 核"。日志 dump 里确实是 **184** 个 worker(不是 60),
+  这是"桥真的覆盖了"的直接证据。
+* **`SPIN_IDLE_US=5000`**:本脚本的注释就是围绕这个值写的 —— 引擎默认 5 ms 会让
+  "池几乎永不停转",实测 worker 1433-1552% CPU、`load average` 冲到 40+,并且
+  **"自己制造的那 30 核争抢又反过来拖慢调用线程"**(§355)。叠加 368 个线程,抢占更极端。
+* **`GPU_RESIDENT_LAYERS` 被清空**:V4 的 12 层常驻静默失效(纯性能/显存污染)。
+
+**为什么这能触发丢票**:`numa_pool.hpp` 自己的文档把这类故障的机制写得很清楚 ——
+"故障发生在**发布者推进到下一代时,还有 worker 处在上一代的某个状态**"
+(§184/§189/§196/§226)。worker 被 OS 抢占得越久,**持有旧代票的滞留 worker 就越多**,
+窗口越宽。§196 甚至给出了机制的单句描述:
+
+> 发布时占位用 `v.load()` 而非原子预留:计数器单调且滞留 worker 持续 `fetch_add`,
+> 发布者读到 `base=X` 就宣布拥有 `[X, X+nj)`,而滞留 worker 紧接着 `fetch_add` 拿到 `X`
+> 并按**旧代**判定丢弃 ⇒ 新调用实际只剩 `nj-1` 张而 `total` 算了 `nj` 张。
+
+**这条诊断当时只落在分片(sharded)路径上修/查;而 flat 路径是同一个结构**:
+`parallel_for_impl` 里同样是 `start_ = counter_.load();`(**读**而不是
+`counter_.fetch_add(n)` 的**原子预留**),且 worker 判越界时
+`if (i >= n) break;`(快路径)/ `if (i >= n) { dropped_++; break; }`(re-anchor 路径)
+**都只与 worker 自己缓存的 `gen` 比一次**,没有"判定前再复读一次代数、若变了就按活代重新归属"的兜底。
+⇒ 恰好命中 §196 描述的那张票:**新的 flat 调用拿到 `start_=X`,而一个滞留 worker 手里正握着 `X`
+并按旧代把它丢掉**,新调用少执行一张 ⇒ `remaining_` 永远差 1 ⇒ 300 s 后 abort。
+
+### (4) 本轮修复(已改,待运行验证)
+1. **`scripts/serve_mainline.sh` 自建 env 桥**:写 **per-TAG** 文件
+   `$OUTDIR/$TAG.envfile` 并显式 `export XIAOTU_ENV_FILE`,两个脚本互不污染;
+   文件里只放本脚本确实要设的键。
+2. **`vllm_xiaotu_moe/__init__.py` 的桥加护栏**:
+   * `XIAOTU_ENV_FILE` **显式指定** ⇒ 保持原来的覆盖语义(serve_*.sh 都会显式导出);
+   * **没指定**(退到全局 `/tmp/xiaotu_env`)⇒ 改成 **只补缺失的键**,冲突只告警不覆盖;
+   * 无论哪种模式**逐行打印实际生效的键** —— 这个桥再不允许"设了没生效且无声"。
+
+### (5) 待办(正确性,不能只靠"环境干净了")
+* **flat 路径的票据账目**目前**没有**任何 `issued_/inrange_/abandoned_` 之类的无损账
+  (sharded 路径有,§200/§201 就是靠它定位的)⇒ 下一步照抄一份到 flat 路径,拿到
+  "领票即记账"的不变式,才能把"哪一张票、在哪条分支丢的"钉死;
+* 真正的**构造性修复**:发布侧改 `start_ = counter_.fetch_add(n)` 原子预留 +
+  把 `n_/start_/remaining_` 的写入全部放进"奇数→偶数"窗口(对齐 §184 的不变式),
+  worker 侧把"越界判定"改成**在 `work_mtx_` 下复核活代**后再决定丢弃
+  (只有"发布者没有在发布、且下一个调用的预留尚未发生"时才允许丢)。
+* 在改这两处之前,**任何"V4 与插件无关"的结论都不能下**;同理,§493/§495/§496 里
+  所有"V4 的显存/性能数字"都要在**干净 env** 下重测(12 层常驻此前根本没生效)。
+
+### 下一轮
+1. 用修好的 env 桥**复跑 V4** `TAG=v4reg5`(已启动):验收 = 起来 + `worker` 数确实是 60 +
+   `[vllm-xtu-moe/env]` 那几行显示 60/0/0-11;
+2. 起来之后立刻做**同条件回归**:确定性门(5 次逐字节)+ 微基准,与历史 125.64 ms 对齐;
+3. 再做 flat 路径无损账 + 原子预留修复(独立提交,带 120 请求零看门狗长跑验收)。

@@ -207,6 +207,33 @@ if [ "${MEMTRACE:-0}" = "1" ]; then
   echo "[v41] memtrace -> $MEMLOG"
 fi
 
+# ---- 环境变量文件桥(**必须在本脚本里自己写,否则会继承别的脚本的陈旧值**) ----
+# 背景:`vllm_xiaotu_moe/__init__.py` 会从 `$XIAOTU_ENV_FILE`(默认 `/tmp/xiaotu_env`)
+# 读取 XIAOTU_* 并**覆盖**真实环境(因为 EngineCore 子进程 spawn 时会静默丢掉这些名字)。
+# `serve_v41.sh` 每次启动都重写该文件;本脚本原先**没有**写 ⇒ 只要之前跑过 V4.1,
+# V4(Mode A)就会静默套用 V4.1 的旋钮。**实测(2026-09-16)**:V4 复跑时
+# `/tmp/xiaotu_env` 里还是 v41dsp2 留下的
+#     XIAOTU_MOE_THREADS=184  (本脚本要 60 ⇒ 两 rank 共 368 线程挤 192 物理核)
+#     XIAOTU_MOE_SPIN_IDLE_US=5000(本脚本要 0 ⇒ 每层每相自旋 5ms 的正反馈灾难,见 §355)
+#     XIAOTU_MOE_GPU_RESIDENT_LAYERS=(空 ⇒ `RESIDENT=0-11` 被清掉,12 层常驻全部失效)
+# ⇒ 服务在 `determine_available_memory` 里被自家 worker 池看门狗 abort(§497),
+#   而且此前的"V4 性能回归/显存数字"全部不可信。
+# 现在:写成 **per-TAG** 文件并显式导出 `XIAOTU_ENV_FILE`,两个脚本互不污染;
+# 文件里只放本脚本**确实要设**的键(未列出的键不会被覆盖,保持引擎默认)。
+XTU_ENV_FILE="${XTU_ENV_FILE_OVERRIDE:-$OUTDIR/$TAG.envfile}"
+{
+  echo "XIAOTU_MOE_THREADS=$THREADS"
+  echo "XIAOTU_MOE_NSLICE_SMALL=$NSLICE_SMALL"
+  echo "XIAOTU_MOE_ASYNC=$ASYNC"
+  echo "XIAOTU_MOE_SPIN_IDLE_US=$SPIN_IDLE_US"
+  echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=$RESIDENT"
+  [ -n "${XIAOTU_RELEASE_SOURCE:-}" ] && echo "XIAOTU_RELEASE_SOURCE=$XIAOTU_RELEASE_SOURCE"
+  for kv in $EXTRA_ENV; do case "$kv" in *=*) echo "$kv";; esac; done
+} > "$XTU_ENV_FILE"
+export XIAOTU_ENV_FILE="$XTU_ENV_FILE"
+echo "[mainline] env-bridge -> $XTU_ENV_FILE"
+sed 's/^/[mainline]   /' "$XTU_ENV_FILE"
+
 if [ "$INTERLEAVE" = "1" ] && command -v numactl >/dev/null 2>&1; then
   NCTL=(numactl --interleave=all)
 fi
