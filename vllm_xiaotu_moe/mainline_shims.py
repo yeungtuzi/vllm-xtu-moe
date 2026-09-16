@@ -374,6 +374,20 @@ def _install_engram_last_shim() -> list[str]:
     return ["ParallelEngramEmbedding._allocate_weights"]
 
 
+def _install_gpu_prefill_profile_guard() -> list[str]:
+    """把 vLLM 的 `profile_run` 变成 GPU prefill 能看到的标志。
+
+    为什么必须挡(NOTES §460):vLLM 用 profile run 那次 forward 的**峰值显存**给
+    KV cache 定容。若流式 GPU prefill 在那期间生效,~14 GiB 的逐层 staging 会被算进
+    峰值 ⇒ 实测 `Available KV cache memory: -1.57 GiB` ⇒ **服务起不来**。
+    挡住之后 KV 按 CPU 路径正常定容,运行时再用预检决定是否真的走 GPU
+    (腾不出显存就留在 CPU 并提示用户)。**默认不改变任何既有行为**(阈值默认 0)。
+    """
+    from vllm_xiaotu_moe.gpu_prefill import install_profile_guard
+
+    return install_profile_guard()
+
+
 def _release_on() -> bool:
     """释放开关是否打开(与 mixed_experts._release_source_enabled 同一判据)。
 
@@ -828,6 +842,7 @@ def apply_mainline_shims() -> list[str]:
         _install_mxfp4_cpu_convert_shim,
         _install_input_ids_shim,
         _install_router_extras_shim,
+        _install_gpu_prefill_profile_guard,
     ):
         try:
             applied += step()

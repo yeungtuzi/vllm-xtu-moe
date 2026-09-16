@@ -696,6 +696,76 @@ def _pinned_kmajor(t: torch.Tensor) -> torch.Tensor:
     return _ensure_pinned(key, ent)
 
 
+# --------------------------------------------------------------------------
+# 显存预算与"优雅放弃"(用户 2026-09-15 指示)
+#
+# 逐层流式要在**设备上**再放一份当前层的权重(raw + K-major,约 2x 单层专家大小;
+# V4.1@TP=1 单层 6.72 GiB ⇒ 峰值 ~14 GiB)。这块内存与 vLLM 的 KV cache 竞争,
+# 而 vLLM 是在 **profile run** 之后按"峰值显存"给 KV 定容的。若不挡住,
+# profile 期间走 GPU 路径会把峰值抬高,直接得到
+#   `Available KV cache memory: -1.57 GiB` ⇒ **整个服务起不来**。
+#
+# 所以两层保护:
+#   1. profile run 期间**绝不**走 GPU 路径(否则定容就崩);
+#   2. 运行时先做一次**预检**:腾不出 staging 就留在 CPU,并打印一次明确提示 ——
+#      "慢但能跑"优于"起不来"。用户的选择:TP>=2(每 rank staging 减半)、
+#      换更大显存的卡、或调低 --gpu-memory-utilization 给它留地方。
+# --------------------------------------------------------------------------
+_IN_PROFILE_RUN = False
+
+
+def in_profile_run() -> bool:
+    """True while vLLM is measuring peak memory to size the KV cache."""
+    return _IN_PROFILE_RUN
+
+
+def install_profile_guard() -> list[str]:
+    """Make ``GPUModelRunner.profile_run`` visible to us as a flag."""
+    global _IN_PROFILE_RUN
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    except Exception:  # noqa: BLE001
+        return []
+    orig = getattr(GPUModelRunner, "profile_run", None)
+    if orig is None or getattr(orig, "_xtu_shim", False):
+        return []
+
+    import functools
+
+    @functools.wraps(orig)
+    def profile_run(self, *a, **kw):
+        global _IN_PROFILE_RUN
+        _IN_PROFILE_RUN = True
+        try:
+            return orig(self, *a, **kw)
+        finally:
+            _IN_PROFILE_RUN = False
+
+    profile_run._xtu_shim = True  # type: ignore[attr-defined]
+    GPUModelRunner.profile_run = profile_run
+    return ["GPUModelRunner.profile_run"]
+
+
+def staging_bytes(n_experts: int, hidden: int, inter: int, group_k: int = 32) -> int:
+    """Peak device bytes one layer's streaming path needs (raw + K-major)."""
+    E, H, I = int(n_experts), int(hidden), int(inter)
+    gk = int(group_k) if int(group_k) > 0 else 1
+    dense = (E * (2 * I) * (H // 2)          # w13 raw
+             + E * H * (I // 2)              # w2 raw
+             + E * (2 * I) * (H // gk)       # w13 scales
+             + E * H * (I // gk))            # w2 scales
+    return 2 * dense                          # + the K-major copies
+
+
+def fits_device(need_bytes: int, device, margin: float = 1.25):
+    """(ok, free_bytes). Compare the staging need against FREE device memory."""
+    try:
+        free, _total = torch.cuda.mem_get_info(torch.device(device))
+    except Exception:  # noqa: BLE001
+        return True, -1        # cannot tell -> let it try (still guarded by try/except)
+    return (free >= int(need_bytes * margin)), int(free)
+
+
 def _dma_hostbuf(engine, which: int, node: int, nbytes: int, device) -> torch.Tensor:
     """DMA one of the ENGINE's own host buffers to a fresh device tensor."""
     if nbytes <= 0:

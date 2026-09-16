@@ -1062,13 +1062,21 @@ class _XiaotuExpertsMixin:
         _gp_on = False          # 本模块是否启用了 GPU prefill(与本次 qlen 无关)
         _gpu_pf = False         # 本次调用是否真的走 GPU
         if getattr(self, "_engine_attr", "") == "MOE_MXFP4" and not _resident:
-            from vllm_xiaotu_moe.gpu_prefill import gpu_prefill_min_tokens
+            from vllm_xiaotu_moe.gpu_prefill import (
+                gpu_prefill_min_tokens,
+                in_profile_run,
+            )
 
             _gp_min = gpu_prefill_min_tokens()
             _gp_on = _gp_min > 0
+            # ⚠️ profile run 期间**必须**留在 CPU:vLLM 用那次 forward 的峰值显存
+            # 给 KV cache 定容,而流式 staging 有 ~14 GiB(V4.1@TP=1);不挡住就会
+            # 得到 `Available KV cache memory: -1.57 GiB` ⇒ **服务起不来**
+            # (实测,NOTES §460)。挡住之后 KV 按 CPU 路径定容(正常),运行时再预检。
             _gpu_pf = (
                 _gp_on
                 and qlen >= _gp_min
+                and not in_profile_run()
                 and not torch.cuda.is_current_stream_capturing()
             )
         # ⚠️ 释放条件是 `_gp_on`,不是 `_gpu_pf`。引擎是**惰性**建的:第一个请求
@@ -1166,9 +1174,46 @@ class _XiaotuExpertsMixin:
                 _shp = tuple(_w2live.shape)
             _E, _I = int(_shp[0]), 2 * int(_shp[2])
             _dev = h_bf16.device
-            _km = kmajor_from_engine_shards(
-                engine, _dev, hidden_size, _I, _E, int(self._group_k)
-            )
+            # 运行时预检:腾不出 staging 就**优雅放弃**(慢但能跑),并给用户选择。
+            from vllm_xiaotu_moe.gpu_prefill import fits_device, staging_bytes
+
+            _need = staging_bytes(_E, hidden_size, _I, int(self._group_k))
+            _ok, _free = fits_device(_need, _dev)
+            if not _ok:
+                if not getattr(self, "_gpu_pf_warned", False):
+                    self._gpu_pf_warned = True
+                    print(
+                        f"[vllm-xtu-moe] GPU prefill SKIPPED -> staying on CPU "
+                        f"(slower but correct). Layer staging needs ~"
+                        f"{_need / 2**30:.1f} GiB free VRAM, only "
+                        f"{_free / 2**30:.1f} GiB is free.\n"
+                        f"    To use GPU prefill, pick one of:\n"
+                        f"      * --tensor-parallel-size 2 (halves the staging per rank),\n"
+                        f"      * a larger-VRAM GPU,\n"
+                        f"      * a lower --gpu-memory-utilization to leave room for it.\n"
+                        f"    Or set VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0 to silence this.",
+                        flush=True,
+                    )
+                _gpu_pf = False
+            _km = None
+            if _gpu_pf:
+                try:
+                    _km = kmajor_from_engine_shards(
+                        engine, _dev, hidden_size, _I, _E, int(self._group_k)
+                    )
+                except torch.OutOfMemoryError:
+                    # 预检与真实分配之间可能被别的分配抢走 -> 同样优雅退回 CPU
+                    torch.cuda.empty_cache()
+                    _gpu_pf = False
+                    _km = None
+                    if not getattr(self, "_gpu_pf_warned", False):
+                        self._gpu_pf_warned = True
+                        print(
+                            "[vllm-xtu-moe] GPU prefill OOM -> falling back to CPU "
+                            "prefill for this layer (slower but correct). Consider "
+                            "TP=2, a larger-VRAM GPU, or a lower --gpu-memory-utilization.",
+                            flush=True,
+                        )
             if _km is not None:
                 _slot = PrefetchSlot()
                 _slot.bufs = _km
@@ -1180,7 +1225,7 @@ class _XiaotuExpertsMixin:
                     K=int(self.moe_config.experts_per_token),
                     device=_dev, slot=_slot,
                 )
-            else:
+            elif _gpu_pf:
                 # 退回源张量(需要源没被释放——`_gp_on` 已保证这一点)。
                 self._prepare_weights(layer)
                 w13h = getattr(self, "_engine_w13", None)
@@ -1222,7 +1267,7 @@ class _XiaotuExpertsMixin:
                     f"{'engine shards' if _km is not None else 'checkpoint source'}",
                     flush=True,
                 )
-        else:
+        if not _resident and not _gpu_pf:
             engine.cpu_decode(
                 stream.cuda_stream, qlen, self.moe_config.experts_per_token,
                 h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
