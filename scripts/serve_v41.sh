@@ -32,6 +32,18 @@
 #   要用 GPU prefill 必须同时把 MBT 提到 4096-8192(并相应留出 activation 显存)。
 #   注意:vLLM 会读 `--max-num-batched-tokens` 反推 `max_num_seqs` 等预算,调大前先确认显存。
 #
+# SPEC(默认 **0 = 不启用**):开启 **DSpark** 投机解码(目标项 3)。
+#   实测依据:参考实现 LvLLM-v2.5 在 V4.1 上报告 dspark 使 decode **+~48%**
+#   (2x RTX3090 TP2:27 -> 26-40 t/s),而它用的就是**标准 vLLM 旗标**:
+#     --speculative-config '{"method":"dspark","num_speculative_tokens":5,
+#                            "draft_sample_method":"probabilistic"}'
+#   我们的主线已内置 dspark(`vllm/config/speculative.py:68 DSparkModelTypes`,
+#   以及 dspark_target_layer_ids / dspark_block_size 等校验),
+#   且 V4.1 的 config 里 `dspark_block_size=5`、`dspark_target_layer_ids=[37,38,39]`
+#   ⇒ **num_speculative_tokens 必须等于 5**。无需单独 draft model(旗标里没有 model 字段)。
+#   可用 SPEC_CONFIG 覆盖;注意 draft 层要显存,配合 GPU_UTIL 一起调。见 NOTES §478。
+SPEC_CONFIG="${SPEC_CONFIG:-{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"probabilistic\"}}"
+
 # PREFIX_CACHE(默认 1 = 保持 vLLM 默认开启):设为 0 会加 --no-enable-prefix-caching。
 #   **测量长上下文 prefill 时必须设 0** —— 否则不同 prompt 共享前缀会被整段命中,
 #   量出"prefill 几千甚至上万 tok/s"的假象(NOTES §420 连续两次踩到)。
@@ -177,6 +189,7 @@ nohup env \
     --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-1}" \
     $( [ "${MBT:-0}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
     --gpu-memory-utilization "$GPU_UTIL" $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager ) \
+    $( [ "${SPEC:-0}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" ) \
     $( [ "${PREFIX_CACHE:-1}" = "1" ] || echo --no-enable-prefix-caching ) --trust-remote-code \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --kernel-config '{"enable_jit_warmup": false}' \
