@@ -16963,3 +16963,49 @@ ValueError: No available memory for the cache blocks.
 **要写进文档**(用户自己按卡的显存/PCIe 决定)。
 **可优化点(下一步)**:直接按分片块填 K-major 目标张量,省掉 `raw` 中间体
 (峰值 ~14 → ~9.5 GiB)。
+
+## §461 startup 守卫的**正确锚点**,以及"显存不足就优雅放弃"的实测
+
+### startup 守卫:只挡 `profile_run` **不够**
+第一次实现只包了 `GPUModelRunner.profile_run`(shim 确实装上了,日志可见),
+但 KV 仍然变成 `Available KV cache memory: **-0.77 GiB**` —— 峰值显存的测量发生在
+`profile_run` **外面**。
+
+**改为以 `EngineCore._initialize_kv_caches` 返回作为 "startup 结束" 的锚点**:
+它与"KV cache 已定容"是同一件事,profile / CUDA graph 捕获 / warmup 全都落在窗口内,
+不用去找具体的 profile 调用。实测(`GPU_UTIL=0.85`,阈值 2048):
+
+| | 修改前 | 修改后 |
+|---|---|---|
+| Available KV cache memory | **-0.77 / -1.57 / -11.44 GiB** | **+17.47 GiB** |
+| 服务能否起来 | 否(ValueError) | **是** ✓ |
+| EngineCore RSS | — | 833 GB(健康) |
+
+日志可见新锚点生效:
+`[vllm-xtu-moe] startup finished (KV cache sized) -> GPU prefill is now allowed subject to the VRAM preflight`
+
+### 运行时"优雅放弃"(用户指示:慢但能跑 > 起不来)
+用 3500 token 的 prompt 实测(`MAXLEN=4096`,util=0.85):**输出正确、服务不崩**,
+并打印一次明确提示:
+
+```
+GPU prefill SKIPPED -> staying on CPU (slower but correct). Layer staging needs
+~13.4 GiB free VRAM, only 8.5 GiB is free.
+    To use GPU prefill, pick one of:
+      * --tensor-parallel-size 2 (halves the staging per rank),
+      * a larger-VRAM GPU,
+      * a lower --gpu-memory-utilization to leave room for it.
+```
+
+### 量化后的配方(本机 1×A100-40GB,staging = 2×单层专家,预检要求 1.25×)
+| 配置 | 每 rank staging | 预检需要空闲 | util=0.85 实测空闲 8.5 GiB |
+|---|---|---|---|
+| TP=1 | ~13.4 GiB | ~16.8 GiB | **不够 ⇒ 放弃(实测)** |
+| TP=2 | ~6.7 GiB | ~8.4 GiB | 临界;util≈0.75-0.80 舒适 |
+| TP=3 | ~4.5 GiB | ~5.6 GiB | **可以** |
+
+⇒ 与用户的判断一致:**TP=1 显存不足就放弃 GPU prefill(慢但能跑),要 GPU prefill 就用 TP≥2 或更大显存的卡。**
+
+**下一步(把门槛降下来)**:当前 staging 是 **2×**(先建 raw `[E,2I,H/2]` 再
+`_kmajor_bytes` 出 K-major)。改成**按分片块直接填 K-major 目标张量**即可省掉 raw 中间体,
+峰值 ~13.4 → ~7.2 GiB ⇒ TP=2 立刻变宽裕,TP=1 在较低 util 下也可行。
