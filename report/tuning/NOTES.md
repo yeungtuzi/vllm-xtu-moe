@@ -18670,3 +18670,21 @@ checkpoint 自带的 `inference/model.py`(官方参考实现)、`DeepSeek_V41_Te
   并且引擎已经暴露 `shard_geometry()`/`copy_hostbuf_to_device()` ——
   **正确的修法是让 GPU prefill 用引擎自己的快照,而不是在 Python 里再 clone 一份**。
   这是下一轮内存方向的首选(能一次性把 GPU 预填充的 253 GiB/rank 拿掉)。
+
+### §505 补:技术报告原文(`DeepSeek_V41_Tech_Report.pdf`,就在 checkpoint 目录里)逐条对上
+用新加的 `report/tuning/probes/pdf_text.py`(本机没有 pdftotext/pypdf,这是自带的极简抽取器)
+抽出全文后逐条核对:
+
+| 报告原话 | 对应我们的判断 |
+|---|---|
+| "The 40-layer network is divided into a **causal encoder and a decoder, each with 20 layers**." | ✅ **层 20 是编码器/解码器分界**(0-19 编码器,20-39 解码器)—— 用户的说法**成立** |
+| "**All feed-forward layers use standard DeepSeekMoE.**" | ✅ **不存在"哈希路由层"**:所有 FFN 都是标准 384 专家 MoE(与 config/index 的 6.882 GiB/层一致) |
+| "The **first two encoder layers use sliding window attention (SWA)**; the rest use CSA2" | 0-1 层的特殊性在**注意力类型**(SWA-only),与 MoE/常驻收益无关 |
+| "multi-head **hashing** ... modules are placed at **layers 1 and 14**" | "hash"在报告里**只**出现在 **Engram**(n-gram 多哈希),这就是"哈希路由层"说法的来源 —— 张冠李戴 |
+| "The drafter comprises **three Transformer blocks** with a sliding attention window of 128 tokens." | ✅ 草稿 = **3 个 block**(= `mtp.0/1/2`,7.388 GiB),独立于主干 |
+| "activates 16B parameters per token during **decode** but only 8B during **prefill**" | CED 的非对称(解码跑解码器 20-39;预填充在编码器 20 层处结束) |
+| "support for contexts of up to **one million tokens**" | 用户说的"上下文 >1M"是模型规格 |
+
+⇒ **修正后的优先级判断**:既然解码只跑**解码器(20-39)**,而所有层 MoE 大小相同(6.88 GiB),
+那么"要让常驻层对解码最有用"应当优先**解码器那 20 层(先用 20-39 的靠前几层)**,而不是 0-3。
+0-3 与 21-22 都没有任何"更划算"的依据(0-1 只是注意力类型不同)。
