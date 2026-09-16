@@ -30,7 +30,8 @@ SPIN="${SPIN:-0}"
 GP_MIN="${GP_MIN:-0}"      # VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:>0 时 qlen>=该值 的层走 GPU 预填充
 RESIDENT="${RESIDENT:-}"  # XIAOTU_MOE_GPU_RESIDENT_LAYERS,如 0-3,20-22
 RESIDENT_BUDGET_GB="${RESIDENT_BUDGET_GB:-}"   # 常驻额度(§509:必须在 KV 之后预算,否则会挤掉 1M 上下文)
-SPEC="${SPEC:-0}"          # 1 = 开 DSpark 投机(draft=mtp,默认常驻 GPU)
+SPEC="${SPEC:-0}"
+COMPILE="${COMPILE:-0}"      # 1 = 参考脚本的 --compilation-config {"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_DECODE_ONLY"}          # 1 = 开 DSpark 投机(draft=mtp,默认常驻 GPU)
 MBT="${MBT:-}"            # --max-num-batched-tokens(留空 = 不传)   # serve_v41.sh 的默认;0 = 完全不自旋(serve_mainline.sh 的默认,§355 证明 5000 是正反馈灾难)
 RANK_SPLIT="${RANK_SPLIT:-2}"   # 与代码默认一致(§505:按 socket 分片 + CCD 交错)   # 1=按 node 子集切(默认;NPS1+TP2 会退化成 2×socket 副本) 2=CCD 交错(每 rank 覆盖全部 node ⇒ nshard=node 数 ⇒ 1 份权重)
 
@@ -72,4 +73,5 @@ RUN_ENV="$RUN_ENV" READY_TIMEOUT="${READY_TIMEOUT:-2400}" \
   --trust-remote-code --enable-prefix-caching --enable-chunked-prefill \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --kernel-config '{"enable_jit_warmup": false}' \
+  $( [ "$COMPILE" = "1" ] && echo --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","mode":"VLLM_COMPILE"}' ) \
   $( [ "$SPEC" = "1" ] && echo --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' ) \
