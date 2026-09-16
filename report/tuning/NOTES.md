@@ -17566,3 +17566,54 @@ routed experts 253 + Engram 189 + 非专家 ~25  = 467 GB   ← 两边共同的"
 而多出来的量正好对得上那 367 GB。**这强烈暗示 +9.18 GiB/层 是我们插件装载路径的产物
 (很可能是装载期某处多留了一份专家权重),而不是上游固有的。**
 ⇒ 目标项 (5) 应升级为最高优先的内存项,并且"对照 LvLLM 的常驻集"是一条新的定位手段。
+
+## §481 【更正】带宽算术错了 8×:漏乘通道宽度(64bit = 8B)
+
+用户指出"我们的理论带宽是 900 多 GB/s",并直接点出原因:**每个通道是 64bit(8 byte),我漏乘了 8**。
+
+| | 通道 × 速率 × 8B | 理论带宽 |
+|---|---|---|
+| 参考(2× EPYC 7642,16ch) | 16 × 3200 MT/s | **409.6 GB/s** |
+| 我们(2× EPYC 9654,24ch) | 24 × 4800 MT/s | **921.6 GB/s**(= 每 socket 460.8,与 Genoa 规格一致) |
+
+我先前发的 **51.2 / 115.2 都小了 8 倍**(表里写了"× 8 B"却没真的乘)。
+**比率 2.25× 恰好没变**,因为同一个错对两行都成立 —— 这正是它"看起来合理"的原因。
+(同一次调用里我写的自检脚本又把 MB 除了 1e9 而不是 1e3,打印出 0.0 —— **同一类错连犯两次**。)
+
+⇒ 结论方向不变(我们内存侧宽 2.25×,§480 的常驻集拆分不受影响),但**绝对数字必须用修正值**。
+
+## §482 【定位】DSpark 启动崩溃 = 老熟人:`shard_fill` 读到**非主机指针**而 SIGSEGV
+
+最小配置(`MAXLEN=2048 MAXSEQS=1 SPEC=1`)也会死,而且**不是内存问题**:
+最后一个采样 `node 1 free: 524623 MB`(524 GB 空闲),EngineCore 却已消失 ⇒ **是崩溃**。
+
+日志给出了确切的崩溃点(§479 里我说"没有 ERROR/Traceback",是因为崩溃走的是 `[XTSIG]` 处理,
+不是 Python 异常 —— 当时没去搜 `XTSIG`/`SIGSEGV`,是我的检索口径漏了):
+
+```
+INFO [dspark.py:515] DSpark draft model loaded: 97 params      ← 关键上下文
+INFO [default_loader.py:430] Loading weights took 3.74 seconds
+[XTSIG] SIGSEGV at faulting address 0x7e5cc0000000 signal 11
+[XTSIG] RSI=0x7e5cc0000000  RDX=0x2d00000  RDI=0x7f2ba0b78010
+xiaotu_moe/build/_xiaotu_moe_C_avx512_bf16....so(+0x2ab2a)
+```
+
+**这是本项目早期修过的同一个 bug 形态**:当时 `shard_fill_w13` 在引擎构造期 SIGSEGV,
+`si_addr == RSI`、`RDX` 是那个 0x2d… 量级的大偏移 —— 根因是
+**`layer.w13_weight` 那一刻在 cuda 上**,引擎把设备指针当主机指针 `memcpy`。
+当时的修法是 `device_loading_context` shim + 给 ≥64 MiB 的专家参数打 `_xiaotu_cpu_expert` 标记,
+让 vLLM 不要把它们来回搬 GPU。
+
+**⇒ 现在的判断(待验证):DSpark 的 draft 走的是 `dspark.py` 自己的加载路径
+("97 params"),它的专家参数没有被上面那套标记/断言覆盖** ⇒ 被搬到 GPU ⇒
+我们的引擎在 `process_weights_after_loading` 里拿到设备指针 ⇒ SIGSEGV。
+旁证:Mode B(`mixed_experts.py`)里**有** `_assert_host_source` 会显式抛错,
+而我们看到的是 SIGSEGV 而不是 Python 报错 ⇒ **draft 的专家根本没走 Mode B 那条带断言的路**
+(很可能走了 Mode A / `hybrid_model.py` 的路径,那条没有等价的断言)。
+
+**下一轮要做的(具体)**:
+1. 在 `dspark.py` 的 draft 加载路径上确认专家参数是否被打标记(看 draft 模块的 `_xiaotu_*` 属性);
+2. 把 `device_loading_context` 的标记判据从"≥64 MiB"改成**按 dtype/layout 判**(MXFP4 打包权重一律标记),
+   覆盖 draft 的小张量;或在 `hybrid_model.py` 的引擎构造前补一个**主机指针断言**
+   (把 SIGSEGV 变成可读的 Python 错误 —— 这一步无论如何都该做);
+3. 复跑最小配置确认不再崩,再谈 `num_speculative_tokens`/收益。
