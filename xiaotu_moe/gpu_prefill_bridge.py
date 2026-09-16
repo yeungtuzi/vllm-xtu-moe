@@ -123,7 +123,9 @@ _ENGINES: list = []
 def _gpu_prefill_requested() -> bool:
     """GPU 预填充**在启动时**是否被打开(决定要不要在构造期保住一份权重副本)。
 
-    `XIAOTU_GPUPREFILL_WCOPY` 的默认值必须跟着这个走(§504):
+    【§508 更正】这个函数**不再**决定 `XIAOTU_GPUPREFILL_WCOPY` 的默认值
+    (那个默认现在是恒 0,见构造处的注释:活路径从引擎分片直接填 K-major,
+    不需要 Python 副本)。保留它只为诊断/日志。历史说明(§504)如下:
       * GPU 预填充 **关**(本项目默认,`XIAOTU_MOE_GPU_PREFILL_MIN_TOKENS=0`)
         ⇒ 构造期那份 Python 侧副本**永远用不到**,而 V4.1 是 ~6.7 GiB/层/rank,
           40 层就是 ~270 GiB 白占 ⇒ 默认 **0**;
@@ -176,8 +178,15 @@ def wrap_engine_class(native_cls, kind: str):
             _ENGINES.append(self)
             self._slot = None            # 上一层为本层预取好的设备槽
             self._km = None              # K-major 锁页缓存(惰性)
-            _wcopy_default = "1" if _gpu_prefill_requested() else "0"
-            if os.environ.get("XIAOTU_GPUPREFILL_WCOPY", _wcopy_default) == "1":
+            # 【§508 更正】默认**永远是 0**:我们 GPU 预填充的**活路径**是
+            # `kmajor_from_engine_shards()` —— K-major 目标缓冲**直接从引擎自己的
+            # 分片**用 `engine.copy_hostbuf_to_device()` 填(`mixed_experts.py:1278`),
+            # **不需要** Python 侧再留一份权重副本;配合 ping/pong 双槽
+            # (`gpu_prefill.prefetch_layer`,`nslots=2`,每槽 ≈ 一层权重),
+            # 官方设计的显存代价就是"两层",主机侧代价是 **0**。
+            # 这份 `_warr` 副本只服务于**兜底路径**(引擎没有分片时走 checkpoint 源张量),
+            # 那时才需要它 —— 所以别在正常路径上预先付这笔钱(实测白占 ~6.7 GiB/层/rank)。
+            if os.environ.get("XIAOTU_GPUPREFILL_WCOPY", "0") == "1":
                 try:
                     self._warr = tuple(_cpu_view(int(p), sh)
                                        for p, sh in zip(self._wptrs, self._shapes()))
@@ -198,7 +207,19 @@ def wrap_engine_class(native_cls, kind: str):
             return shape_rule(E, I, H, gK)
 
         def _weights(self):
+            """兜底路径:引擎没有分片时,才在 Python 侧建一份权重视图/副本。
+
+            【§508】正常路径走 `kmajor_from_engine_shards()`(引擎分片直接填 K-major),
+            **不会**到这里。一旦走到这里,说明我们在用 checkpoint 源张量 ——
+            源张量此时可能已被 `clean_weights_after_loading` 释放,
+            所以必须**大声告警**(这正是 lkport21 那次原生崩溃的入口)。
+            """
             if self._warr is None:
+                import sys as _sys
+                print("[vllm-xtu-moe] ⚠️ GPU prefill 走的是**兜底路径**(引擎无分片 ⇒ "
+                      "用 checkpoint 源张量建 K-major)。这条路径会额外占主机内存,"
+                      "且源张量若已被释放会崩;请检查引擎分片(nshard_)与 RANK_SPLIT。",
+                      file=_sys.stderr, flush=True)
                 self._warr = tuple(_cpu_view(int(p), s)
                                    for p, s in zip(self._wptrs, self._shapes()))
             return self._warr

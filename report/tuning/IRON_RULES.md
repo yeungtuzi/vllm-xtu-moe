@@ -289,10 +289,12 @@ ENV=... TAG=... bash scripts/serve_mainline.sh   # 端到端(最贵,最后做)
 
 ### 两条硬约束(与优先级同等重要)
 * **总约束:不允许额外多占系统内存** —— 任何"为了 GPU 功能而在主机侧多留一份"的做法都不允许。
-  这条**直接判定**了当前的 GPU 预填充:**它今天会为 K-major 缓存再复制一份权重
-  (实测 **+253 GiB/rank**,§505g)⇒ 在把这份拷贝消掉之前,按本规则 GPU 预填充应当
-  **默认关闭、退回 CPU 预填充**,而不是"开了 GPU 预填充然后多占 253 GiB/rank"。**
-  (修法已明确:用引擎 C++ 侧已有的权重快照 + `copy_hostbuf_to_device()`,不要在 Python 里 clone。)
+  **⚠️ 本条曾被我用错,已更正(见 R-VERIFY)**:我一度据此判定"GPU 预填充不可用",
+  理由是"它会 +253 GiB/rank"。**那是错的** —— GPU 预填充的活跃路径
+  (`kmajor_from_engine_shards → copy_hostbuf_to_device`)直接从**引擎分片**填 K-major,
+  主机侧代价 **0**;显存侧是 **ping/pong 双槽 ≈ 两层权重**。
+  那 253 GiB/rank 是我自己把 `XIAOTU_GPUPREFILL_WCOPY` 与"GPU 预填充开启"绑在一起造成的,
+  现已把该默认改回**恒 0**(只在兜底路径才建副本,并打告警)。
 * **优先级 4 的"收益最高的层"(已按报告原文更正)**:
   * CED 报告关于激活量的原话是"**16B/token during decode** but only **8B during prefill**"
     ⇒ **预填充**只跑前一半(编码器 20 层,见下条);**解码每 token 都要跑全部 40 层**
@@ -315,3 +317,29 @@ ENV=... TAG=... bash scripts/serve_mainline.sh   # 端到端(最贵,最后做)
 
 ⇒ 按本规则执行时,**先把 17.5 GiB 的 KV 锁死**,再依次试 预填充 / 投机 / 常驻;
 上限算式:`7.4 + 17.5 + 预填充激活 + 投机 + 3.36×N ≤ 39.5`。
+
+## R-VERIFY(2026-09-16). **判断"一项能力的代价/可行性"必须读活跃调用路径** —— 不许从 env 开关或我自己的默认值反推
+
+**踩的坑(严重,用户当场纠正)**:我写了"GPU 预填充今天必须判为不可用,因为它会给 K-major 缓存
+再复制一份权重(+253 GiB/rank)"。**错。** 真相:
+* GPU 预填充的**活跃路径**是 `mixed_experts.py:1278 → gpu_prefill.kmajor_from_engine_shards()`
+  → `engine.copy_hostbuf_to_device()`:K-major 目标缓冲**直接从引擎自己的分片**填,
+  **主机侧代价 0**;
+* 配合 `gpu_prefill.prefetch_layer()` 的 **ping/pong 双槽**(`nslots=max(2, XIAOTU_MOE_PREFETCH_SLOTS)`,
+  每槽 ≈ 一层权重)与 `_prefetch_stream` 的异步 H2D ⇒ **显存代价就是"两层"**;
+* 那份 Python 权重副本(`XIAOTU_GPUPREFILL_WCOPY`)**只服务兜底路径**(引擎没有分片时用 checkpoint 源张量),
+  而且**是我上一轮自己加的条件默认**把它和"GPU 预填充开启"绑在一起的
+  ⇒ **那 253 GiB/rank 是我自己造出来的代价,然后我把自己的产物当成了系统的必要条件。**
+
+### 两条强制做法
+1. **要判断"某功能贵不贵/能不能开",去读它被调用时真正走的那条路**(`grep` 调用点 → 逐层展开),
+   而不是看"有哪些 env 开关"、更不是看"我上一轮设的默认值"。
+2. **不许把"压缩后的会话摘要 / NOTES 里的旧结论"当作现状**。摘要里写着"ping/pong 未实现",
+   而代码里 `prefetch_layer` 的双槽环 + 异步 H2D 一直都在 ⇒ **结论必须重新落回当前代码验证**,
+   尤其当你要用它去**关掉**一个用户明确要的功能时。
+
+### 推论(立即生效)
+* R-VRAM 的优先级 2(GPU 预填充)**不再被"不得额外占系统内存"挡住** —— 它本来就是零主机代价;
+* `XIAOTU_GPUPREFILL_WCOPY` 默认**恒 0**;真走到兜底路径时打**显式告警**;
+* 规划器 `GPU_PREFILL_HOST_GIB = 0`;1M 上下文下的规划变为
+  **GPU 预填充 ✅ + GPU 投机 ✅ + 常驻 2 层(20-21)**。

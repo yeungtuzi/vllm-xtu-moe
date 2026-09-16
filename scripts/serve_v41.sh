@@ -179,7 +179,7 @@ if [ "$VRAM_POLICY" = "1" ]; then
   if [ -n "$_PLAN" ]; then
     POLICY_GP_MIN="$(printf '%s\n' "$_PLAN" | sed -n 's/^VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=//p')"
     POLICY_RESIDENT="$(printf '%s\n' "$_PLAN" | sed -n 's/^XIAOTU_GPU_RESIDENT_LAYERS=//p')"
-    POLICY_DRAFT="$(printf '%s\n' "$_PLAN" | sed -n 's/^XIAOTU_DRAFT_ON_GPU=//p')"
+    POLICY_DRAFT="$(printf '%s\n' "$_PLAN" | sed -n 's/^XIAOTU_MOE_RESIDENT_DRAFT=//p')"
     echo "[v41] R-VRAM 规划(maxlen=$MAXLEN):gpu_prefill_min=${POLICY_GP_MIN:-?} resident='${POLICY_RESIDENT:-}' draft_on_gpu=${POLICY_DRAFT:-?}"
   fi
 fi

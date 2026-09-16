@@ -37,12 +37,19 @@ import os
 # ---- 账本默认值(全部来自本机实测;可用 CLI/env 覆盖)---------------------------
 CARD_TOTAL_GIB = 39.49          # A100-40G 实际可用
 WEIGHTS_GIB = 7.4               # V4.1 TP=2 每 rank 的模型权重(日志 "Model loading took 7.79 GiB")
-# 1M 上下文 KV:实测 `Available KV cache memory 17.45 GiB → 1,116,005 tokens`
-KV_GIB_PER_MTOKEN = 17.45 / 1.116005      # ≈15.6 GiB / 1M tokens
-GPU_PREFILL_GIB = 3.0           # MBT=8192 的激活/工作区(待精确测,先按 3.0 保守)
+# 1M 上下文 KV —— **实测,§509**(V4.1 / TP=2 / MBT=8192 / maxlen=1M):
+#   `Available KV cache memory 2.71 GiB → GPU KV cache size 1,290,154 tokens`
+#   ⇒ 2.20 KiB/token ⇒ **1M 上下文 ≈ 2.2 GiB/卡**(不是 16.4!)
+# 注:早先记的 17.45 GiB/1.116M tok 来自别的配置(TP=1 的 v41el 口径)⇒ 用量级差 7×。
+# 这个数直接决定"优先级 2/3/4 还剩多少显存",所以必须用**本配置**实测值。
+KV_GIB_PER_MTOKEN = 2.71 / 1.290154      # ≈2.1 GiB / 1M tokens
+GPU_PREFILL_GIB = 3.0           # MBT=8192 的激活/工作区 + ping/pong 双槽的额外部分(待精确测,先保守按 3.0)
+                                # 注:双槽本身 ≈ 2×一层 K-major(TP=2 每层 ~1.7 GB)≈ 3.4 GB,已含在此数内
 DRAFT_GIB_PER_RANK = 7.388 / 2  # mtp 全量 7.388 GiB,TP=2 ⇒ 每 rank 一半
 RESIDENT_GIB_PER_LAYER = 3.36   # V4.1:6.72/TP(=2)
-GPU_PREFILL_HOST_GIB = 253.0    # 当前实现下 GPU 预填充要额外占的**主机**内存/rank(§505g)
+GPU_PREFILL_HOST_GIB = 0.0      # 【§508 更正】GPU 预填充走 ping/pong(2 槽)+ 从**引擎分片**直接填 K-major
+                                # ⇒ 主机侧代价 **0**。此前记的 253 GiB/rank 是"Python 侧再 clone 一份"
+                                # 的**兜底路径**被我的条件默认误开所致,不是 GPU 预填充的必要代价。
 
 # 优先级 4 的"收益最高"顺序:解码只跑解码器 ⇒ 解码器(20-39)在前,且靠前的更早被执行
 RESIDENT_PRIORITY = [f"{i}" for i in range(20, 40)] + [f"{i}" for i in range(0, 20)]
@@ -96,7 +103,8 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     pref_ok = (budget >= pref) and host_ok
     why = f"剩余 {budget:.1f} GiB,需要 {pref:.1f} GiB"
     if not host_ok:
-        why += f"; **额外占主机内存 {host_cost:.0f} GiB/rank ⇒ 按总约束判为不可用**(除非 XIAOTU_VRAM_ALLOW_HOST_COST=1)"
+        why += (f"; **额外占主机内存 {host_cost:.0f} GiB/rank ⇒ 按总约束判为不可用**"
+                f"(除非 XIAOTU_VRAM_ALLOW_HOST_COST=1)")
     elif not (budget >= pref):
         why += " ⇒ 不够"
     steps.append(("2. GPU 预填充", pref_ok, why + ("(启用)" if pref_ok else " ⇒ fallback: CPU 预填充")))
@@ -149,9 +157,23 @@ def emit_env(p: dict) -> str:
     # 总约束:GPU 预填充要么用"零主机代价"的实现,要么不开
     lines.append(f"VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS={1024 if p['gpu_prefill'] else 0}")
     lines.append(f"XIAOTU_GPU_RESIDENT_LAYERS={p.get('resident_spec','')}")
-    # 投机解码:draft 上不上 GPU 由插件侧预留额度决定;这里给出"是否允许"
-    lines.append(f"XIAOTU_DRAFT_ON_GPU={1 if p['spec_on_gpu'] else 0}")
-    lines.append(f"XIAOTU_GPUPREFILL_WCOPY={1 if p['gpu_prefill'] else 0}")
+    # 【§508 更正】draft 上不上 GPU **不需要新旋钮**:hybrid_model.py:669-686 里
+    # "同一 prefix 第二次构造 = draft",默认 `XIAOTU_MOE_RESIDENT_DRAFT=1` ⇒
+    # **draft 层永远在 GPU**(实测 draft 走 CPU 时投机净负:7.11 vs 10.76 t/s)。
+    # 所以这里只输出"要不要显式关掉它",而 spec 本身由 `--speculative-config` 决定。
+    if p["spec_on_gpu"]:
+        lines.append("XIAOTU_MOE_RESIDENT_DRAFT=1")   # 默认值,显式写出便于审计
+    else:
+        lines.append("XIAOTU_MOE_RESIDENT_DRAFT=0")   # 显存真不够时:关掉投机(优先级 3 的 fallback)
+    # 【§508】**恒 0**:GPU 预填充的活跃路径从引擎分片直接填 K-major,不需要 Python 副本;
+    # 只有"引擎没有分片"的兜底路径才建副本(那时会打告警)。
+    lines.append("XIAOTU_GPUPREFILL_WCOPY=0")
+    # 【§509】**顺序问题的唯一可靠解法**:常驻层是在模型加载期分配的,而 KV cache
+    # 是**之后**才由 vLLM 定尺寸的 ⇒ 若不设预算,常驻层会先吃掉 KV 的空间,
+    # 就会出现"1M 上下文(优先级 1)反而被挤掉"——违反 R-VRAM。
+    # 所以这里把"优先级 1/2/3 之后剩下的 GiB"显式交给引擎的预算旋钮,
+    # 让常驻层**只能在这个额度内**贪心放置(引擎会逐层试、超了就跳过)。
+    lines.append(f"XIAOTU_MOE_RESIDENT_BUDGET_GB={max(0.0, p.get('budget_gib', 0.0)):.1f}")
     return "\n".join(lines)
 
 
