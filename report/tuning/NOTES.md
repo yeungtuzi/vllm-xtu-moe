@@ -17872,3 +17872,39 @@ RuntimeError: xiaotu MOE_MXFP4: refusing to build the engine from a non-host sou
 §486 那句"把静默 SIGSEGV 变成可读错误"的守卫,**第一次跑就指名道姓**地证实了
 用寄存器算术做出的预测(`RDX == E·H·(I/gk)`)。**先让失败可诊断,再谈修复** ——
 这比连续三轮回过头猜机制(§482/§484/§487 三次假设两次错)有效得多。
+
+## §490 ✅ DSpark 起来了,并量到收益(但**收益强依赖 prompt 可预测性**)
+
+### 三/grep 判据全过(§489 的标记修复生效)
+| 判据 | 结果 |
+|---|---|
+| `XTSIG/SIGSEGV` | **0** ✓ |
+| 越过 `DSpark draft model loaded: 97 params` | ✓ |
+| `Application startup complete` | **✓ 起来了**(rss 847 GB) |
+| 无任何 RuntimeError | ✓ |
+
+配置:TP=1、`MAXLEN=2048`、`MAXSEQS=1`、`GPU_UTIL=0.70`、THREADS=184、
+`--speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'`。
+
+### 收益(真权重,单请求 greedy,64 token)
+| prompt | decode | 对比 plain 27.5-27.8 |
+|---|---|---|
+| "Count from 1 to 1000, separated by commas: 1, 2, 3," | **64.21 tok/s**(P90 66.14) | **≈2.3×** |
+| 随机词 prompt(`--synth 40`)第 2 个请求 | **27.32 tok/s** | **≈1.0×** |
+| 散文 prompt(TCP/UDP) | **无效**(只生成 1 token 就 EOS) | — |
+
+**⇒ 诚实结论:DSpark 的收益在 ~1.0× 到 ~2.3× 之间,取决于 prompt 的可预测性。**
+"数到 1000"这类高度可预测的文本让 draft 几乎全中(所以 2.3× 是**上界**);
+随机词文本几乎不中(≈1.0×)。参考实现报的 26-40 t/s 也是一个**宽区间**,同一个道理。
+
+**测量方法上的坑(记下来)**:
+* 散文 prompt **只生成 1 token 就 EOS** ⇒ `tok/s = 1/延迟` 完全无意义 ——
+  **必须检查 `tok` 数**再采信吞吐(以后所有 spec 相关测量都要先看 tok);
+* 随机词 prompt 的**第 1 个请求含一次性成本**(spec 路径的图/内核预热),第 2 个才稳态
+  ⇒ 单请求采样会得出 3.06 tok/s 这种假数。**spec 路径必须显式 warmup 后再计时。**
+
+### 下一轮
+1. 用**多 prompt + 显式 warmup + 排除 EOS 早停**的方式重测,给出可信的收益区间;
+2. 顺带确认 `max_num_scheduled_tokens` 那条 warning(MAXSEQS 与 spec tokens 的配合);
+3. 然后做 §483(lvllm 环境 lk-moe vs xiaotu-moe A/B) —— 现在 DSpark 已通,
+   这个 A/B 还可以顺带对照两边的 dspark 收益。
