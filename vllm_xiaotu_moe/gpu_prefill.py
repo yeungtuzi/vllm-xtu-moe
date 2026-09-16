@@ -712,11 +712,17 @@ def _pinned_kmajor(t: torch.Tensor) -> torch.Tensor:
 #      换更大显存的卡、或调低 --gpu-memory-utilization 给它留地方。
 # --------------------------------------------------------------------------
 _IN_PROFILE_RUN = False
+# 更宽的窗口:从进程起来到 KV cache 初始化完成之前都算 **startup**
+# (profile run / CUDA graph 捕获 / warmup 都落在里面)。实测只挡 `profile_run`
+# **不够** —— 峰值显存的测量发生在它外面,`Available KV cache memory` 仍然变成
+# 负数(NOTES §460.1)。用 "_initialize_kv_caches 返回" 作为 startup 结束的锚点,
+# 它与"KV cache 已定容"是同一件事,比去找具体的 profile 调用稳。
+_IN_STARTUP = [True]
 
 
 def in_profile_run() -> bool:
-    """True while vLLM is measuring peak memory to size the KV cache."""
-    return _IN_PROFILE_RUN
+    """True during startup (profiling/capture/warmup) -- GPU prefill must not run."""
+    return _IN_PROFILE_RUN or _IN_STARTUP[0]
 
 
 def install_profile_guard() -> list[str]:
@@ -743,7 +749,31 @@ def install_profile_guard() -> list[str]:
 
     profile_run._xtu_shim = True  # type: ignore[attr-defined]
     GPUModelRunner.profile_run = profile_run
-    return ["GPUModelRunner.profile_run"]
+    applied = ["GPUModelRunner.profile_run"]
+
+    # 关键的一半:KV cache 定容完成 = startup 结束。
+    try:
+        from vllm.v1.engine.core import EngineCore
+    except Exception:  # noqa: BLE001
+        return applied
+    orig_kv = getattr(EngineCore, "_initialize_kv_caches", None)
+    if orig_kv is None or getattr(orig_kv, "_xtu_shim", False):
+        return applied
+
+    @functools.wraps(orig_kv)
+    def _initialize_kv_caches(self, *a, **kw):
+        try:
+            return orig_kv(self, *a, **kw)
+        finally:
+            _IN_STARTUP[0] = False
+            print("[vllm-xtu-moe] startup finished (KV cache sized) -> "
+                  "GPU prefill is now allowed subject to the VRAM preflight",
+                  flush=True)
+
+    _initialize_kv_caches._xtu_shim = True  # type: ignore[attr-defined]
+    EngineCore._initialize_kv_caches = _initialize_kv_caches
+    applied.append("EngineCore._initialize_kv_caches")
+    return applied
 
 
 def staging_bytes(n_experts: int, hidden: int, inter: int, group_k: int = 32) -> int:
