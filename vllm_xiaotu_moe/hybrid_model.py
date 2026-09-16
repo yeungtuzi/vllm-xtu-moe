@@ -1020,6 +1020,28 @@ class CpuXiaotuMoE(nn.Module):
         cfg.groupN = 1
         cfg.groupK = 32  # raw e8m0 block=32(与 checkpoint/引擎契约一致)
 
+        # ---- 引擎只能吃**主机**指针:构造前显式断言(NOTES §482)----------------
+        # 引擎内部按 [E][2I][H/2] 定长步长 memcpy;喂设备/空/非连续张量会在 C++ 里
+        # 直接 SIGSEGV(**没有 Python 栈**),表现为"进程静默消失"。
+        # Mode B(mixed_experts)早就有等价的 _assert_host_source;Mode A 一直没有,
+        # 于是 DSpark draft(走这条路径)的专家权重把 SIGSEGV 暴露了出来。
+        for _nm, _t in (("w13", w13), ("w2", w2), ("s13", s13), ("s2", s2)):
+            _bad = (
+                _t is None
+                or _t.device.type != "cpu"
+                or _t.numel() == 0
+                or not _t.is_contiguous()
+            )
+            if _bad:
+                raise RuntimeError(
+                    f"xiaotu(Mode A) {self.prefix}: refusing to build the engine from "
+                    f"a non-host source ({_nm}: device="
+                    f"{getattr(_t, 'device', None)} numel="
+                    f"{getattr(_t, 'numel', lambda: '?')()} contiguous="
+                    f"{getattr(_t, 'is_contiguous', lambda: '?')()} "
+                    f"shape={tuple(getattr(_t, 'shape', ()))}) — handing this to the "
+                    f"C++ engine would segfault in shard_fill_*."
+                )
         self.engine = xiaotu_moe.MOE_MXFP4(
             cfg,
             w13.data_ptr(), w2.data_ptr(),
