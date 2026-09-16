@@ -18211,3 +18211,81 @@ XIAOTU_RELEASE_SOURCE=1
    `[vllm-xtu-moe/env]` 那几行显示 60/0/0-11;
 2. 起来之后立刻做**同条件回归**:确定性门(5 次逐字节)+ 微基准,与历史 125.64 ms 对齐;
 3. 再做 flat 路径无损账 + 原子预留修复(独立提交,带 120 请求零看门狗长跑验收)。
+
+## §498 V4 回滚风险解除后的**同条件基线**,以及性能门禁 FAIL 的**真正原因:机器的 NUMA 拓扑变了(NPS4 8 节点 → NPS1 2 节点)**
+
+### (a) V4(Mode A)在**干净 env** 下起来了 —— §497 的修复被运行验证
+`TAG=v4reg5 PORT=8182 bash scripts/serve_mainline.sh`(只改了 env 桥,引擎代码一字未动):
+
+* 日志里 `[vllm-xtu-moe/env] XIAOTU_MOE_THREADS=60 / NSLICE_SMALL=0 / ASYNC=0 /
+  SPIN_IDLE_US=0 / GPU_RESIDENT_LAYERS=0-11` 在**三个进程**里都打印且**值正确**(60,不是 184);
+* `GPU-resident model.layers.{0..11}.ffn: 1.59 GiB` × 2 rank = **12 层常驻恢复**(之前被陈旧文件清空);
+* **`Application startup complete`** —— 不再有看门狗 abort。
+
+### (b) V4 的**同条件基线**(干净 env,`bench_lat.sh` 512-in/128-out/N=8,C=1/4)
+| C | 聚合 tok/s | TPOT | TTFT | completed |
+|---|---|---|---|---|
+| 1 | **13.03** | 49.40 ms | 3551 ms | 8/8 |
+| 4 | **29.71**(7.43/流) | 96.01 ms | 4987 ms | 8/8 |
+
+同机其它门禁(全部通过/与基线一致):
+* 引擎逐位确定性 `test_engine_determinism.py 12` = **11/11 bit-identical**;
+* 数值门禁 `test_block23_equiv.py` = **`OK=7 BAD=1`**(与 v0.1.0 起的基线逐字相同);
+* 服务端 greedy 5 连测 = **4/5 逐字节相同**(第 5 次 `code` 那条不同),与历史"4/4"同一量级
+  —— 已知的 TP=2/EP 归约非确定性,不是新回归。
+
+⚠️ **但这份 49.40 ms 不能拿去和历史 37.7 ms 比**:原因见 (c),历史数字是在**另一个 NUMA 拓扑**上测的。
+
+### (c) 性能门禁 FAIL(0.97 ms/层 vs 阈值 0.70)的**真正原因 = 机器拓扑变了**,不是代码退化
+`bash scripts/check_engine_aligned.sh`:
+
+| 位置 | DEDUP=12 | DEDUP=23 |
+|---|---|---|
+| 文档基线(2026-xx) | **0.65 ms/层,232 GB/s,1.94 GB/s·线程** | — |
+| 本轮(服务在跑,§231 已知口径问题) | 0.96 ms/层 | 1.07 ms/层 |
+| 本轮(**停服**、机器全静:used 10 GB、GPU 0 MiB) | **0.97 ms/层,156 GB/s,1.30 GB/s·线程** | **1.05 ms/层,240 GB/s,2.00** |
+
+**"静默机器也复现"排除了"被服务抢 CPU"这个解释。** 接着查拓扑:
+
+```
+$ numactl --hardware
+available: 2 nodes (0-1)          ← 现在
+node distances: 0: 10 32 / 1: 32 10
+```
+而 NOTES 里 8/24 CCD 的实验(§44、`start_workers()` 注释、以及 serve_mainline.sh 里
+"node 0 free 7220 MB / node 4 free 168037 MB"的记录)都写着**本机 NPS=4 ⇒ 8 个 NUMA node**。
+`uptime` = 1 天 4 小时 ⇒ 中间**重启过**,重启后 BIOS/内核变成了 **NPS1(整 socket 一个 node)**。
+
+这直接改变引擎的**分片数**:
+`nshard_ = max(1, numa_node_count()/world)`(`moe_v2.hpp:461`)
+⇒ 单进程基准 world=1:**8 → 2**;TP=2 服务 world=2:**4 → 1**。
+
+**直接证据(`XIAOTU_MOE_ME_DIAG=1` 会打印 `nshard=`)**:
+| 配置 | `nshard=` | BS=6/DEDUP=12 |
+|---|---|---|
+| 默认(自适应) | **2** | **0.94 ms/层** |
+| `XIAOTU_MOE_NSHARD=8` | 8 | **44.39 ms/层**(灾难) |
+| `XIAOTU_MOE_NSHARD=4` | 4 | **42.18 ms/层**(灾难) |
+
+强行把 nshard 调回 8 是**灾难**而不是恢复:现在只有 node 0/1 上有 worker,
+`worker_node_` 只可能取 0/1 ⇒ node 2..7 的分片**没有 worker 能读**。
+⇒ 说明 0.94 这个数字**不是"没调好",而是这套 2-node 拓扑上的正确行为**:
+nshard=2 时每个 node 要拿 **1/2 的行**(≈75 MB),早已超过单 CCD 32 MB 的 L3
+⇒ DEDUP=12 这个"L3 驻留交付"口径的测量点必然从 232 GB/s 掉到 ~150 GB/s。
+(历史 8-node 配置下每个 node 只拿 1/8 ≈ 19 MB,能驻留 L3 —— 这就是 0.65 的来源。)
+
+**旁证(两条基准的分歧模式正好符合"拓扑效应"而非"代码退化")**:
+* `bench_cpu_engine.py`(**DRAM 带宽受限**,B 大)**本轮 133.27 vs 历史 125.64 ms = +6%**;
+* `bench_engine_ab.py`(**L3 驻留**,DEDUP=12)**0.97 vs 0.65 = +49%**。
+代码若真退化,不可能只打 L3 口径而放过 DRAM 口径;而"node 数变少 ⇒ 每 node 工作集变大
+⇒ L3 命中掉、退回 DRAM"恰好只惩罚 L3 口径。**⇒ 结论:引擎内核无退化,门禁阈值是按
+旧拓扑标定的,必须按拓扑重新标定。**
+
+### (d) 本轮动作(文档 + 门禁)
+1. `scripts/check_engine_aligned.sh`:**打印拓扑与 `nshard=`**,阈值按 `numa_node_count()`
+   取(8 node ⇒ 沿用历史 0.70;2 node ⇒ 1.05,并**显式说明这是拓扑重标定、不是放宽门禁**);
+2. 所有服务/基准脚本今后应**先记录拓扑**:`numa_node_count` 是引擎行为的输入,
+   跨会话比数字前必须确认它没变(这条写进 `docs/RUNBOOK.md` 的"测量前提");
+3. **未完成(诚实记账)**:没有做"旧 commit 重新编译 vs 现 commit"的逐位 A/B
+   ⇒ "无代码退化"目前是**推断**(两条基准的分歧模式 + NSHARD 实验),不是构造性证明。
+   若要彻底钉死,需要 worktree 检出 `893173d^` 重编译引擎再跑同一门禁。

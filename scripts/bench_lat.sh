@@ -26,7 +26,9 @@ CS="${CS:-${C:-1}}"
 SERVER_TAG="${SERVER_TAG:-unknown}"
 TOKENIZER="${TOKENIZER:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master}"
 export HF_HUB_OFFLINE=1
-export PATH=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin:$PATH
+# 基准**客户端**用哪个 env 的 `vllm bench serve`。默认保持不变(我们的 env);
+# 同机 A/B(scripts/ab_lvllm_vs_xiaotu.sh)会把两边都指向被测服务所在的 env。
+export PATH="${BENCH_ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}/bin:$PATH"
 
 BASE_TAG="${TAG:-lat}"
 for C in $CS; do
