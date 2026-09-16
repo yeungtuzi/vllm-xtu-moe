@@ -18407,3 +18407,54 @@ File ".../vllm/engine/arg_utils.py", line 3009                          load_gen
 故 2-node 阈值取 **1.15**(对最慢的 DEDUP=23 留 ~6% 余量)。数值门禁在这之后仍是
 `OK=7 BAD=1`(逐位一致)⇒ §500 那处 shim 改动对引擎内核**零影响**(它只在
 `hasattr(layer,'is_gpu_resident_layer')` 时生效,主线没有该属性)。
+
+## §501 ✅ §483 同 env A/B **完成**:同参数下 lk_moe 的解码比我们快 **~2.1-2.3×**;并**第二次独立复现**了线程池丢票(这次 env 是干净的)
+
+### (a) 打通 arm B 的关键一步(本轮新增 shim)
+lvllm 把 CPU MoE 执行**硬绑在 lk_moe** 上(`routed_experts.py:1841 _cpu_prefill →
+self.lk_moe.cpu_prefill`),没有主线的"换后端类"缝。但我们的引擎本来就是 **lk_moe ABI 的等价实现**
+(config 字段名/构造签名/`cpu_prefill`+`gpu_prefill` 全同),所以新 shim
+`_install_lvllm_engine_substitution` **只做一件事**:把 fork 模块命名空间里的 `lk_moe`
+指向 `xiaotu_moe`。判据严格:仅当该模块把 `is_lk_moe_feature_enabled` import 进自己命名空间
+(⇒ 是 fork)、`mixed_mode_enabled()`、且**真 lk_moe 不在场**时才替换;异常只记录。
+**验证**:`routed_experts.lk_moe is xiaotu_moe == True`,config 18 个字段全在,
+shim 从 30 → **31** 条;arm B 随后 **READY(231s)**。
+
+### (b) 同参数 A/B 结果(env/模型/TP/全部 vLLM 参数逐字相同,两边都不设常驻层,THREADS=60)
+| C | A(lk_moe) | B(xiaotu) | B/A |
+|---|---|---|---|
+| 1 | 21.87 tok/s · TPOT **26.43 ms** · TTFT 2495 ms | 10.37 · **61.06 ms** · 4586 ms | **0.47×** |
+| 4 | 33.95 · TPOT 49.15 ms · TTFT 7075 ms | 16.22 · 100.38 ms · 14940 ms | **0.48×** |
+
+* **TPOT 差 ~2.31×**(C=4 ~2.04×):这是"引擎自己的活儿",不受 GPU 预填充开关影响 ⇒ 最干净的数字;
+* TTFT 差 ~1.84× **不能**当作同功能对比:参考脚本开了 lk_moe 的 GPU 预填充
+  (`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024`+`PREFETCH_WINDOW=1`),而我们对应的开关没设(=0,走 CPU 预填充);
+* 线程扫描(arm B):**60 最好(61.06 ms)**、96 更慢(72.33 ms,且 C=4 只完成 2/8)、120 直接崩(见 c)
+  ⇒ **这 2.1-2.3× 不是"线程数没调对"**,更可能是结构性:`nshard_=max(1,node/world)` 在本机
+  (2 node、TP=2)= **1**(逐 socket 整份副本),而 8-node 时代是 4;§498 已实测同代码 8→2 node
+  后 DEDUP=12 退化 1.5×。
+
+### (c) ⚠️ **第二次独立复现线程池丢票 —— 这次 env 是干净的**
+`THREADS=120` 那次服务被自家看门狗 abort:
+```
+[pool] WATCHDOG fired: gen=2086 n=192 start=454774 end=454966 counter=455086 remaining=1 current_gen=2086 dropped=2
+  worker[0] slot=2086 …(120 个)
+```
+`counter - end = 455086 - 454966 = 120 = nt_` ⇒ 与 §497 完全同型:**所有 worker 都走完了领票循环、
+但一张已领的区间内票没有递减** ⇒ `remaining_` 永远差 1 ⇒ 300s 后 `abort()`。
+这一次:显式 `XIAOTU_ENV_FILE`、`SPIN_IDLE_US=0`、`THREADS` 显式、无陈旧桥 ⇒
+**§497 的判断("陈旧 env 只是触发器,底层账目竞态是真 bug")成立**。
+⇒ 优先级:**flat 路径的无损账 + 原子预留 + `work_mtx_` 下复核活代** 这个构造性修复
+必须做(否则"随负载/线程数变化,服务随时可能 300s 后自杀")。
+
+### (d) 正确性(同参数、同 chat-template kwargs,这是第一次真正可比)
+两边都带 `--default-chat-template-kwargs '{"enable_thinking": false}'`:
+| prompt | 逐字节相同 | 说明 |
+|---|---|---|
+| cap_fr | ✅ `Paris` | 短、确定 |
+| list | ✅ `2, 3, 5, 7, 11, 13, 17, 19` | 短、确定 |
+| math | ✗(共同前缀 11 字符) | 都是 **410**,措辞不同 |
+| code | ✗(共同前缀 92 字符) | 都是正确的 one-liner |
+| zh | ✗(共同前缀 25 字符) | 都是正确的 MoE 解释 |
+⇒ **2/5 逐字节相同,3/5 在 11-92 字符后分叉但语义都正确** —— 这正是两个不同 MoE 数值实现
+在 greedy 下的**预期**表现(一个 token 翻转后文本合法分叉),**没有正确性缺陷**。

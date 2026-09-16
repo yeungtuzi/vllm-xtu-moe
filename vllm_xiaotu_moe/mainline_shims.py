@@ -939,6 +939,57 @@ def _install_router_extras_shim() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+def _install_lvllm_engine_substitution() -> list[str]:
+    """**LvLLM fork(guqiong96/Lvllm)专用**:把 `RoutedExperts` 用的引擎换成我们的。
+
+    为什么需要(§500 实测):LvLLM fork 把 **CPU MoE 的执行硬绑在 lk_moe 上** ——
+        routed_experts.py:1841  _cpu_prefill -> self.lk_moe.cpu_prefill(...)
+        routed_experts.py:~1770                self.lk_moe = lk_moe.MOE_MXFP4(config, w13,w2,s13,s2,0,0)
+    而 `LVLLM_MOE_NUMA_ENABLED=0`(我们的混合模式**必须**关掉 lk_moe)时
+    `self.lk_moe = None` ⇒ `AttributeError: 'NoneType' object has no attribute 'cpu_prefill'`。
+    ❗主线(mainline)有"换后端类"的缝(`cpu_moe.CPUExpertsMxfp4` 等,见
+    `register_mixed_cpu_backend`),**这个 fork 没有**。
+
+    这个 shim 为什么这么小:我们的引擎本来就是 **lk_moe ABI 的等价实现** ——
+      * `MOEConfigV2` 的字段名逐个相同(num_processes/process_id/gpu_id/has_gate_proj/
+        expert_num/top_k/hidden_size/intermediate_size/max_batch_size/max_num_seqs/stride/
+        group_min_len/group_max_len/groupN/groupK/activation_type/swiglu_*/use_gpu_prefill);
+      * 构造签名相同 `MOE_MXFP4(cfg, w13, w2, s13, s2, gs13=0, gs2=0)`;
+      * `cpu_prefill(qlen, top_k, eids, wts, x, out)` 与
+        `gpu_prefill(x, out, ids, wts, qlen, k, stream)` 也相同
+        (前者是我们引擎的原生 ABI,后者由 `xiaotu_moe/gpu_prefill_bridge.py` 提供)。
+    ⇒ 只要把 fork 模块命名空间里的 `lk_moe` 这个名字指向我们的模块即可。
+
+    安全性(逐条都可验证):
+      * 只在 **LvLLM fork** 上生效:判据 = 该模块把 `is_lk_moe_feature_enabled`
+        import 进了自己的命名空间(主线没有这个名字);
+      * 只在 `mixed_mode_enabled()`(`VLLM_EXPERTS_LOAD_DEVICE=cpu`)时生效;
+      * **真的 lk_moe 可用时绝不覆盖**(`self`/模块里的 `lk_moe` 非 None)⇒
+        参考实现(lk_moe 自己跑)与"我们的 A/B arm A"都不受影响;
+      * 发生任何异常都只记录、不影响启动。
+    """
+    try:
+        import vllm.model_executor.layers.fused_moe.routed_experts as _re
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip lvllm engine substitution: {type(exc).__name__}: {exc}")
+        return []
+    if not hasattr(_re, "is_lk_moe_feature_enabled"):
+        return []                      # 主线:没有这个 fork 的挂钩点,什么都不做
+    if getattr(_re, "lk_moe", None) is not None:
+        return []                      # 真 lk_moe 在场 ⇒ 不抢
+    try:
+        import xiaotu_moe as _xtu
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip lvllm engine substitution (no xiaotu_moe): {exc}")
+        return []
+    if not all(hasattr(_xtu, a) for a in ("MOEConfigV2", "MOE_MXFP4")):
+        _log("skip lvllm engine substitution: xiaotu_moe lacks MOEConfigV2/MOE_MXFP4")
+        return []
+    _re.lk_moe = _xtu
+    return ["routed_experts.lk_moe -> xiaotu_moe(LvLLM fork)"]
+
+
+# ---------------------------------------------------------------------------
 def apply_mainline_shims() -> list[str]:
     """Idempotently install all shims; returns the list of things applied."""
     if not mixed_mode_enabled():
@@ -961,6 +1012,7 @@ def apply_mainline_shims() -> list[str]:
         _install_input_ids_shim,
         _install_router_extras_shim,
         _install_gpu_prefill_profile_guard,
+        _install_lvllm_engine_substitution,
     ):
         try:
             applied += step()

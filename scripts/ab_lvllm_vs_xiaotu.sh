@@ -66,6 +66,8 @@ READY_TIMEOUT="${READY_TIMEOUT:-2400}"
 OUTDIR="$ROOT/report/tuning/logs"; RAW="$ROOT/report/tuning/raw"
 mkdir -p "$OUTDIR" "$RAW"
 PTH="$ENV/lib/python3.12/site-packages/zz_xiaotu_plugin.pth"
+# 产物后缀:做线程/旋钮扫描时用 ATAG=<suffix> 避免覆盖正式 arm 结果
+ATAG="${ATAG:-}"
 
 note() { printf '\033[36m[ab]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[ab]\033[0m %s\n' "$*"; }
@@ -231,15 +233,15 @@ measure_arm() {  # $1=arm
   if [ "$arm" = a ]; then port="$PORT_A"; else port="$PORT_B"; fi
   local blog="$OUTDIR/abl_$arm.bench.log"
   note "arm $arm 性能测量(bench_lat.sh:L=$L OUT=$OUT N=$N CS='$CS')"
-  PORT="$port" MODEL="$MODEL_NAME" TAG="ab_lvllm_$arm" SERVER_TAG="abl_$arm" \
+  PORT="$port" MODEL="$MODEL_NAME" TAG="ab_lvllm_${arm}${ATAG}" SERVER_TAG="abl_${arm}${ATAG}" \
     L="$L" OUT="$OUT" N="$N" CS="$CS" TOKENIZER="$CKPT" ENVBENCH="$ENV" \
     bash scripts/bench_lat.sh > "$blog" 2>&1 || warn "arm $arm bench_lat 有失败项(见 $blog)"
   grep -h '^\[bench_lat\]' "$blog" || true
   note "arm $arm 正确性探针(probe_greedy.py → ab_lvllm_${arm}_greedy.json)"
-  timeout 3600 "$PY" scripts/probe_greedy.py "$RAW/ab_lvllm_${arm}_greedy.json" "$port" "$MODEL_NAME" \
+  timeout 3600 "$PY" scripts/probe_greedy.py "$RAW/ab_lvllm_${arm}${ATAG}_greedy.json" "$port" "$MODEL_NAME" \
     >> "$blog" 2>&1 || warn "arm $arm greedy 探针失败(见 $blog)"
   # arm A 不把 JSON 直接比对(不同引擎的逐 token 差异要单独看),这里只确认文件有内容
-  [ -s "$RAW/ab_lvllm_${arm}_greedy.json" ] && note "  greedy 存档 OK" || warn "  greedy 存档为空"
+  [ -s "$RAW/ab_lvllm_${arm}${ATAG}_greedy.json" ] && note "  greedy 存档 OK" || warn "  greedy 存档为空"
 }
 
 report() {
@@ -268,10 +270,14 @@ cs = sorted({c for (a, c) in rows if c != "greedy"}, key=lambda x: int(x))
 for c in cs:
     A, B = rows.get(("a", c)), rows.get(("b", c))
     if not A or not B: continue
-    a_agg, b_agg = g(A, "agg"), g(B, "agg")
+    # `vllm bench serve` 的原始 JSON 用 output_throughput/mean_tpot_ms/mean_ttft_ms;
+    # 我们自己攒的 rec 用 agg/tpot/ttft。两种都认。
+    a_agg, b_agg = g(A, "agg", "output_throughput"), g(B, "agg", "output_throughput")
+    a_tp, a_tt = g(A, "tpot", "mean_tpot_ms"), g(A, "ttft", "mean_ttft_ms")
+    b_tp, b_tt = g(B, "tpot", "mean_tpot_ms"), g(B, "ttft", "mean_ttft_ms")
     ratio = f"{b_agg/a_agg:.2f}x" if (a_agg and b_agg) else "-"
-    print(f"{c:>4} | {a_agg or 0:>11.2f} {g(A,'tpot') or 0:>9.2f} {g(A,'ttft') or 0:>9.0f} | "
-          f"{b_agg or 0:>11.2f} {g(B,'tpot') or 0:>9.2f} {g(B,'ttft') or 0:>9.0f} | {ratio:>7}")
+    print(f"{c:>4} | {a_agg or 0:>11.2f} {a_tp or 0:>9.2f} {a_tt or 0:>9.0f} | "
+          f"{b_agg or 0:>11.2f} {b_tp or 0:>9.2f} {b_tt or 0:>9.0f} | {ratio:>7}")
 print("(agg = 服务端聚合 output tok/s;B/A > 1 ⇒ xiaotu 更快)")
 ga, gb = rows.get(("a", "greedy")), rows.get(("b", "greedy"))
 if ga and gb:

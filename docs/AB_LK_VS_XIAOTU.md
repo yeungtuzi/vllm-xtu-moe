@@ -31,28 +31,74 @@
 
 ---
 
-## 2. 结果(性能)
+## 2. 结果(性能)—— **同 env、同参数、逐字对齐的 A/B 已经拿到**
 
 参考配置 = `LVLLM_RELEASE_NOTES` + `commands/dsv4_0731_serve_tp2_3090_dspark.sh` 去掉投机解码,
 并按本机做了两处最小调整:线程 96→60(见上)、`--kernel-config enable_jit_warmup=false`
 (本机是 SM80,与我们的脚本同因)。
 
-| arm | 环境 | 配置 | C=1 聚合 tok/s | C=1 TPOT | C=1 TTFT | C=4 聚合 tok/s | 完成 |
-|---|---|---|---|---|---|---|---|
-| **A: lk-moe(参考)** | `lvllm` | 参考配置:`gpu_util .90` / `maxlen 32768` / `MBT 4096` / `VLLM_COMPILE`+`FULL_DECODE_ONLY` / 无常驻层 / 60 线程 | **21.87** | **26.43 ms** | **2495 ms** | **33.95** | 8/8 |
-| **B: xiaotu-moe** | `lvllm` | 与 A **逐字相同** | ✗ 起不来(见 §3) | — | — | — | — |
-| B′: xiaotu-moe(不是同配置,仅供数量级) | `vllm-xiaotu-moe` | 我们自己的 `serve_mainline.sh`:`gpu_util .80` / `maxlen 8192` / `MBT 256` / 12 层 GPU 常驻 / 60 线程 | 13.03 | 49.40 ms | 3551 ms | 29.71 | 8/8 |
+| arm | C | 聚合 tok/s | TPOT | TTFT | 完成 | B/A |
+|---|---|---|---|---|---|---|
+| **A: lk-moe(参考)** | 1 | **21.87** | **26.43 ms** | **2495 ms** | 8/8 | — |
+| **B: xiaotu-moe** | 1 | 10.37 | 61.06 ms | 4586 ms | 8/8 | **0.47×** |
+| **A: lk-moe** | 4 | **33.95** | **49.15 ms** | 7075 ms | 8/8 | — |
+| **B: xiaotu-moe** | 4 | 16.22 | 100.38 ms | 14940 ms | 8/8 | **0.48×** |
 
-**怎么读这张表**:
-* A vs B′ **不是**同配置,不能直接下"谁快谁慢"的结论 —— B′ 的 `MBT=256`、没有
-  `VLLM_COMPILE`/`FULL_DECODE_ONLY` 都是**对解码不利**的设置(参考的优化建议就是把
-  `compilation-config` 设成 `{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_DECODE_ONLY"}`),
-  而 B′ 多出的 12 层 GPU 常驻对解码有利。两者方向相反,净效应未知。
-* **唯一可以直接说的**:在本机本模型上,**参考实现在它自己的配置下 C=1 是 21.87 tok/s
-  (TPOT 26.4 ms)**;我们的引擎目前**没有**在参考配置下跑起来(原因见 §3),
-  所以"同配置 A/B"这个问题**尚未有答案**。
-* 参考的 C=1 21.9 tok/s 与它 release notes 里 V4-Flash 在 2×3090 上的 30.6-31.1 t/s 同量级
-  (本机是 A100-40G、2 NUMA node、LK_THREADS 60 而非 48,不是同一硬件口径)。
+两边**逐字相同**的东西:`lvllm` 环境 / 同一个模型快照 / TP=2(GPU 0,1)/ `gpu_util .90` /
+`maxlen 32768` / `MBT 4096` / `--kv-cache-dtype fp8_ds_mla` /
+`--compilation-config {mode: VLLM_COMPILE, cudagraph_mode: FULL_DECODE_ONLY}` /
+`--enable-prefix-caching --enable-chunked-prefill` / THREADS=60(`LK_THREADS` 与
+`XIAOTU_MOE_THREADS` 取同一值)/ **两边都不设 GPU 常驻层** / 同一个客户端与协议。
+
+### 2.1 结论(可以说出口的)
+1. **纯解码一步的代价:lk_moe 26.43 ms,我们 61.06 ms ⇒ 我们慢 ~2.31×**(C=4 时
+   49.15 vs 100.38 ms,同样 ~2.04×)。这是引擎自己的活儿,**不受 GPU 预填充开关影响**,
+   所以是本轮最干净的一个数字。
+2. **预填充 TTFT:2495 vs 4586 ms(~1.84×)** —— 但这里有**已知的不对称**:
+   参考脚本设了 `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024` + `LVLLM_GPU_PREFETCH_WINDOW=1`,
+   **lk_moe 的 GPU 预填充是开着的**;而我们对应的开关(`XIAOTU_MOE_GPU_PREFILL_MIN_TOKENS`)
+   **没设 = 0**,走的是 CPU 预填充。⇒ TTFT 这一项**不能**当作"同样功能下谁快"。
+   (我们自己此前测过:我们的 GPU 预填充目前**打不过** CPU,所以默认关着 —— 这正是待办。)
+3. 因此**"引擎算力"层面的对比用 TPOT**:**lk_moe 在本机本模型上比我们快约 2.1-2.3×**。
+
+### 2.2 这个 2.1× 是"引擎本身"还是"引擎在这台机器上的调参"?—— 必须再走一步
+两条已知线索都指向**调参/拓扑**,而不是内核:
+* **§498**:同一份我们的代码,机器从 8 NUMA node(NPS4)变成 2 node(NPS1)后,
+  `nshard_` 8→2,DEDUP=12 的微基准从 **0.65 → 0.95 ms/层(1.5×)**;
+  而 `lk_moe` 的架构是"每个 node 一份分片",对 node 数变化可能没有那么敏感;
+* 我们把两边线程数**都钉在 60**(我们的"每 CCD 4-5 核"规则)。而参考自己的规则是
+  "物理核 ÷ GPU 数" = **96** ⇒ 60 对 lk_moe **可能不是它的最优点**。
+  所以下一步是**线程数扫描**(见 §2.3),把"引擎质量"与"引擎调参"分开。
+
+### 2.3 arm B 的线程数扫描(把"引擎"与"调参"分开)
+
+`THREADS` 就是 arm B 的 `XIAOTU_MOE_THREADS`;其余参数与 §2 完全一致。
+
+| `THREADS` | C=1 聚合 tok/s | C=1 TPOT | C=1 TTFT | C=1 完成 | C=4 完成 | 备注 |
+|---|---|---|---|---|---|---|
+| **60**(正式 arm B) | **10.37** | **61.06 ms** | 4586 ms | 8/8 | 8/8 | 目前最好 |
+| 96 | 9.18 | 72.33 ms | 4755 ms | 8/8 | **2/8** | 更慢;C=4 有 6 个请求没完成 |
+| 120 | — | — | — | — | — | **服务被自家线程池看门狗 abort**(见下) |
+
+**结论**:
+1. **我们的引擎在这台机器上的线程最优点是 ≤60**,96 更慢、120 直接不稳
+   ⇒ **与 lk_moe 的 2.1-2.3× 差距不是"线程数没调对"造成的**;
+2. 那么差距更可能来自**结构性原因**:`nshard_ = max(1, node/world)` 在本机(2 node、TP=2)
+   等于 **1**(逐 socket 整份副本),而 8-node 时代是 4;§498 已实测同一份代码在 8→2 node 之后
+   DEDUP=12 微基准退化 1.5×。**lk_moe 的分片/预取策略对 node 数变化的敏感度需要单独量**
+   (它的架构是"每 node 一份分片",可能天然更适应 2 node);
+3. ⚠️ **`THREADS=120` 这一次是我们引擎的又一个真 bug,必须单独修**(与"谁快谁慢"无关):
+   ```
+   [pool] WATCHDOG fired: gen=2086 n=192 start=454774 end=454966
+                          counter=455086 remaining=1 current_gen=2086 dropped=2
+     worker[0] slot=2086 …(120 个 worker)
+   ```
+   `counter - end = 120 = nt_` ⇒ 又一次"**所有 worker 都走完了领票循环、但有一张已领的
+   区间内票没有递减**"⇒ `remaining_` 永远差 1 ⇒ 300s 后 `abort()`。**这一次 env 是干净的**
+   (显式 `XIAOTU_MOE_ENV_FILE`、`SPIN_IDLE_US=0`、`THREADS` 显式)⇒ 说明 §497 里
+   "陈旧 env 只是**触发器**、底层账目竞态是**真 bug**"这个判断成立。修法见 §497(5):
+   flat 路径补无损账 + 发布侧 `counter_.fetch_add(n)` 原子预留 + worker 侧在 `work_mtx_`
+   下复核活代后再决定丢弃。
 
 ---
 
