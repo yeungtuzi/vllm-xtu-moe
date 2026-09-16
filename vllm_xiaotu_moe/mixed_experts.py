@@ -1182,40 +1182,52 @@ class _XiaotuExpertsMixin:
             except Exception:  # noqa: BLE001
                 _ns = 2
             _need = staging_bytes(_E, hidden_size, _I, int(self._group_k), _ns)
-            _ok, _free = fits_device(_need, _dev)
-            if not _ok:
-                if not getattr(self, "_gpu_pf_warned", False):
-                    self._gpu_pf_warned = True
+            # 判定**每个模块只做一次**:预检看的是瞬时空闲显存,逐次判定会让同一层
+            # 在 GPU/CPU 之间来回跳(实测一次 forward 内 24 层走分片、16 层退回源张量,
+            # 另一半 forward 全部 SKIPPED,NOTES §464),行为不可复现。
+            _ok = getattr(self, "_gpu_pf_ok", None)
+            if _ok is None:
+                _ok, _free = fits_device(_need, _dev)
+                self._gpu_pf_ok = bool(_ok)
+                if not _ok:
                     print(
-                        f"[vllm-xtu-moe] GPU prefill SKIPPED -> staying on CPU "
-                        f"(slower but correct). Layer staging needs ~"
-                        f"{_need / 2**30:.1f} GiB free VRAM, only "
-                        f"{_free / 2**30:.1f} GiB is free.\n"
-                        f"    To use GPU prefill, pick one of:\n"
-                        f"      * --tensor-parallel-size 2 (halves the staging per rank),\n"
-                        f"      * a larger-VRAM GPU,\n"
-                        f"      * a lower --gpu-memory-utilization to leave room for it.\n"
-                        f"    Or set VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0 to silence this.",
+                        f"[vllm-xtu-moe] GPU prefill DISABLED for this layer -> staying "
+                        f"on CPU (slower but correct).\n"
+                        f"    per-layer staging ~{_need / 2**30:.1f} GiB; preflight wants "
+                        f"~{_need * 1.25 / 2**30:.1f} GiB free VRAM (25% margin), "
+                        f"only {_free / 2**30:.1f} GiB is free.\n"
+                        f"    Options: --tensor-parallel-size 2 together with "
+                        f"XIAOTU_MOE_RANK_SPLIT=0 (halves staging AND keeps the shard "
+                        f"path), a larger-VRAM GPU, or a lower "
+                        f"--gpu-memory-utilization.\n"
+                        f"    VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0 silences this.",
                         flush=True,
                     )
+            if not _ok:
                 _gpu_pf = False
             _km = None
+            _pf_reason = "engine shards"
             if _gpu_pf:
                 try:
                     _km = kmajor_from_engine_shards(
                         engine, _dev, hidden_size, _I, _E, int(self._group_k)
                     )
+                    if _km is None:
+                        _pf_reason = "checkpoint source (engine has no shards)"
                 except torch.OutOfMemoryError:
-                    # 预检与真实分配之间可能被别的分配抢走 -> 同样优雅退回 CPU
+                    # 预检与真实分配之间可能被别的分配抢走 -> 同样优雅退回 CPU,
+                    # 并且**粘住**这个否定结论,避免每次 forward 反复试错。
                     torch.cuda.empty_cache()
                     _gpu_pf = False
                     _km = None
-                    if not getattr(self, "_gpu_pf_warned", False):
-                        self._gpu_pf_warned = True
+                    if getattr(self, "_gpu_pf_ok", None) is not False:
+                        self._gpu_pf_ok = False
                         print(
-                            "[vllm-xtu-moe] GPU prefill OOM -> falling back to CPU "
-                            "prefill for this layer (slower but correct). Consider "
-                            "TP=2, a larger-VRAM GPU, or a lower --gpu-memory-utilization.",
+                            "[vllm-xtu-moe] GPU prefill OOM while staging a layer -> "
+                            "falling back to CPU prefill for this layer and disabling "
+                            "GPU prefill from here on (slower but correct). Consider "
+                            "TP=2 (+ XIAOTU_MOE_RANK_SPLIT=0), a larger-VRAM GPU, or a "
+                            "lower --gpu-memory-utilization.",
                             flush=True,
                         )
             if _km is not None:
@@ -1267,8 +1279,7 @@ class _XiaotuExpertsMixin:
                 self._gpu_pf_dbg = True
                 print(
                     f"[vllm-xtu-moe] GPU prefill ACTIVE: first {qlen} tokens >= "
-                    f"threshold {_gp_min}; weights from "
-                    f"{'engine shards' if _km is not None else 'checkpoint source'}",
+                    f"threshold {_gp_min}; weights from {_pf_reason}",
                     flush=True,
                 )
         if not _resident and not _gpu_pf:

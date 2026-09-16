@@ -793,7 +793,7 @@ def staging_bytes(n_experts: int, hidden: int, inter: int, group_k: int = 32,
     w2d = E * H * (I // 2)
     s13d = E * (2 * I) * (H // gk)
     s2d = E * H * (I // gk)
-    return max(w13d + w13d // n, w13d + w2d + w2d // n) + 2 * (s13d + s2d)
+    return 2 * (w13d + w2d + s13d + s2d)
 
 
 def fits_device(need_bytes: int, device, margin: float = 1.25):
@@ -852,45 +852,39 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
     rb2 = I // 2
     gk = int(group_k) if int(group_k) > 0 else 1
 
-    # Fill the K-major TARGET directly, one shard part at a time, instead of
-    # building a raw [E,2I,H/2] copy and transposing it afterwards: that halves the
-    # peak (raw + K-major) to just K-major + one node's shard. Doing w13 fully
-    # before touching w2 keeps the peak at ~7.5 GiB instead of ~13.4 GiB
-    # (NOTES §461 "下一步"), which is what makes TP=2 (and TP=1 at a lower
-    # --gpu-memory-utilization) actually fit.
-    # Node n's gate block IS canonical rows [n*crows,(n+1)*crows), i.e. K-major
-    # columns [n*crows,(n+1)*crows); its up block is the same rows offset by I.
-    c13 = int(geo["w13_cbytes"])
-    cr13 = int(geo["w13_crows"])
-    w13_t = torch.empty((E, rb13, 2 * I), dtype=torch.uint8, device=device)
+    # Assemble the CANONICAL raw layout (contiguous view+cat), then let
+    # `_kmajor_bytes` do one optimized transpose per tensor.
+    #
+    # ⚠️ 不要改回"直接把分片块填进 K-major 目标":那样每个元素都要跨 stride 读
+    # (转置读)再跨 stride 写,实测 **593 ms/层 vs 375 ms/层**(NOTES §464)——
+    # 省了 ~5 GiB 峰值显存却慢 218 ms/层,40 层就是 8.7 s/次,得不偿失。
+    # 峰值高就靠 staging_bytes/预检 去拦,不要拿速度换。
+    gate_parts, up_parts = [], []
     for n in range(ns):
         buf = _dma_hostbuf(engine, 0, n, int(geo["w13_node_bytes"]), device)
-        blk = buf.view(E, 2, c13)
-        c0 = n * cr13
-        w13_t[:, :, c0:c0 + cr13].copy_(
-            blk[:, 0, :].reshape(E, cr13, rb13).transpose(1, 2))
-        w13_t[:, :, I + c0:I + c0 + cr13].copy_(
-            blk[:, 1, :].reshape(E, cr13, rb13).transpose(1, 2))
-        del buf, blk
+        blk = buf.view(E, 2, int(geo["w13_cbytes"]))
+        crows = int(geo["w13_crows"])
+        gate_parts.append(blk[:, 0, :].reshape(E, crows, rb13))
+        up_parts.append(blk[:, 1, :].reshape(E, crows, rb13))
+    w13_raw = torch.cat(
+        [torch.cat(gate_parts, dim=1), torch.cat(up_parts, dim=1)], dim=1
+    )                                                     # [E, 2I, H/2]
+    del gate_parts, up_parts
 
-    c2 = int(geo["w2_cbytes"])
-    cr2 = int(geo["w2_crows"])
-    w2_t = torch.empty((E, rb2, H), dtype=torch.uint8, device=device)
+    w2_parts = []
     for n in range(ns):
         buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
-        c0 = n * cr2
-        w2_t[:, :, c0:c0 + cr2].copy_(buf.view(E, cr2, rb2).transpose(1, 2))
-        del buf
+        w2_parts.append(buf.view(E, int(geo["w2_crows"]), rb2))
+    w2_raw = torch.cat(w2_parts, dim=1)                    # [E, H, I/2]
+    del w2_parts
 
-    # Scales are a single (unsharded) copy each and tiny (283+141 MB), so a plain
-    # raw->K-major transpose is fine.
-    s13_t = _kmajor_bytes(
-        _dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device)
-        .view(E, 2 * I, H // gk))
-    s2_t = _kmajor_bytes(
-        _dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device)
-        .view(E, H, I // gk))
-    return (w13_t, s13_t, w2_t, s2_t)
+    s13_raw = _dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device) \
+        .view(E, 2 * I, H // gk)
+    s2_raw = _dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device) \
+        .view(E, H, I // gk)
+    return (_kmajor_bytes(w13_raw), _kmajor_bytes(s13_raw),
+            _kmajor_bytes(w2_raw), _kmajor_bytes(s2_raw))
+
 
 
 
