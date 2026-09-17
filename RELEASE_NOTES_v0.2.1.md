@@ -1,0 +1,79 @@
+# vllm-xtu-moe v0.2.1 — GPU 预填充真正可用 + 显存口径修正
+
+**主题:把 GPU 预填充从"能开、但更慢还会 OOM"修成"能开、快 2-2.8×、显存算得准";
+并在过程中撤回了我们自己一个假的性能数字。**
+
+v0.2.0 把整条链搬回 vLLM 主线。v0.2.1 只做一件事:**让"长 prompt 走 GPU 预填充"这条路真正可用**,
+并把这一路上踩到的**显存口径错误**修掉。发行号取 `0.2.1`(上一版 `0.2.0`)。
+
+---
+
+## 1. 为什么值得做
+
+长 prompt 的预填充在本项目里一直由 **CPU 引擎**承担(约 **258-285 tok/s**),GPU 预填充的路径
+`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` **默认关闭**,因为历史上它要么更慢、要么 OOM。
+本次把它修到"可开"。
+
+## 2. 关键修复(全部有实测证据;详见 `report/tuning/NOTES.md` §594-§602)
+
+| # | 问题 | 修复 | 证据 |
+|---|---|---|---|
+| 1 | **字节转置只有 ~90 GB/s** —— K-major 需要对 uint8 做逐字节转置,`transpose(1,2).contiguous()` 退化成 elementwise kernel,4 个张量合计 **42.8 ms/层** | 新增分块 Triton kernel(`byte_transpose.py`,支持 `out=` 原地写) | **6.5 ms/层,快 5-6.9×**,`torch.equal` **逐位相同**;`XIAOTU_GPF_TT=0` 可回滚 |
+| 2 | **每层新分配 3.589 GiB**(K-major 输出)+ `inter` 382 MB ⇒ 缓存分配器无法回收 ⇒ `reserved` 单调上涨 ⇒ **free 跌破预检阈值** ⇒ **第 9 层起逐层退回 CPU**(一次 forward 内 GPU/CPU 混合,最坏形态) | ①改用同文件里**早已写好却没用上**的 `_SLOTS` 环形槽(写进复用缓冲);②`inter` 按形状复用 | 指针级:`inter_ptr` 12 层**恒定**;`[gpf-delta] staging_alloc=+0.0 MiB` |
+| 3 | **GPU/CPU 判定是"每层模块各判一次"** ⇒ 前半 GPU、后半 CPU | 改为**设备级**(第一个模块的决定即全局) | 日志从"40×`DISABLED`"变为"**80×`ACTIVE`**"(40 层×2 rank) |
+| 4 | **`staging_bytes` 只算了 ping/pong 两槽(6.72 GiB)**,漏了 `raw`(3.16)+ DMA 暂存 ⇒ **预检放过了注定 OOM 的配置** | 口径改为真实峰值;**同步路径单槽**(同流有序 ⇒ 安全)⇒ **7.2 GiB**;preflight margin 1.25→1.10 | §600/§601 |
+| 5 | **`--enforce-eager` 反而更吃显存** | 明确记录:**不要开**(实测 free 12.95→**1.4** GiB,预填充被拒) | §600(c) |
+| 6 | 我们自己发布的 **"1725 tok/s"是无效数据** | **撤回**:该次响应 `chunks=1` 且无 `usage` ⇒ 是错误/截断响应;探针增加校验 | §602 |
+
+## 3. 真实收益(同一服务、同一批唯一 prompt、客户端 TTFT)
+
+| prompt | CPU 预填充(基线) | **GPU 预填充** | 加速 |
+|---|---|---|---|
+| ~3.7K | 24.17 s → 151 tok/s | **12.11 s → 302 tok/s** | **2.0×** |
+| ~7.0K | 42.17 s → 165 tok/s | **15.19 s → 460 tok/s** | **2.8×** |
+
+成本结构(实测):**每个 chunk ≈ 8.9 s 固定 + 0.79 ms/token**。
+固定项 = 每个 chunk 都要把 **143.6 GiB/rank** 的专家权重搬一遍(TP=2,40 层 × 3.589 GiB)——
+所以 **chunk(MBT)越大越划算**,这也是"预填充吞吐随 prompt 变长而提高"的原因。
+
+## 4. 端到端性能(官方 `vllm bench serve`)
+
+> 口径:`--backend openai-chat`,`--dataset-name random`,`--ignore-eos`,`--random-output-len 128`,
+> 预热轮与正式轮**不同 seed**(同 seed 会整段命中前缀缓存,TTFT 假快 —— §603),
+> 服务端**关前缀缓存**以量到真实预填充。原始结果:`report/tuning/logs/bench_serve_acc2/`。
+
+<!-- BENCH_TABLE -->
+
+## 5. 推荐配置(详见 `docs/RUNBOOK.md` §5.9)
+
+```bash
+TAG=harness PORT=8700 GPUS=0,1 TP=2 MAXLEN=1048576 SEQS=8 MBT=8192 LOAD=auto GPU_UTIL=0.55 \
+SPEC=1 COMPILE=0 THREADS=60 SPIN=300 KV_CACHE_BYTES=4294967296 \
+VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1024 \
+  bash scripts/serve_v41.sh
+```
+显存配方(TP=2/MBT=8192):非KV 10 + KV 4 + staging 7.2 + 首请求一次性增长 7.7 + 激活 ≈ **33 GiB**。
+
+## 6. 已知限制(必须知道)
+
+* **`MBT` 上限 8192**:`16384` 会 OOM,且 OOM 点是 **attention** 的
+  `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`(不是 MoE)——40 GB 卡上
+  `16K chunk 的激活 + staging` 放不下;
+* 开了 GPU 预填充就**必须**按 §5.8 显式封顶 KV 池(`--kv-cache-memory`),
+  否则 vLLM 会把显存填满、预填充被逐层拒绝;
+* 短期(<1024 token)prompt **仍走 CPU**(固定成本使它更划算),TTFT 约 1-5 s 且随并发上升;
+* 剩余优化(未做):把 H2D 从 `cudaLaunchHostFunc` 回调里挪出以与上一层计算重叠;
+  让 GEMM 直接读非 K-major 布局以彻底省掉转置与 `raw` 那 3.16 GiB。
+
+## 7. 复现
+
+```bash
+# 引擎三门禁(数值 / 性能 / 确定性)
+bash scripts/check_engine_aligned.sh
+python scripts/test_engine_determinism.py 11
+# 预填充曲线(自研诊断探针,已修好尺子:UNIQUE=1 且校验 chunks>=2)
+PORT=<port> LENS=4096,8000,16000 REP=2 UNIQUE=1 python scripts/probe_ttft.py
+# 官方验收扫描
+PORT=<port> TAG=acc2 LENS=32,256,1024,4096,16384,32768 CONC=1,2,4,8 bash scripts/bench_serve_sweep.sh
+python scripts/summarize_bench_serve.py report/tuning/logs/bench_serve_acc2
+```
