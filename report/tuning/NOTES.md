@@ -21584,3 +21584,49 @@ RuntimeError: Worker failed with error 'CUDA out of memory. Tried to allocate 2.
   | 32768 | ~20 GiB | 38 GiB(+staging 8.4 = 46) | ❌ 实测 OOM |
 * ⇒ 想上 32K-chunk,必须**先把激活压下来**(降 KV 到最小 + 保证 staging 之后仍有 ≥20 GiB),
   或者接受"MBT=16384 封顶"。**§593(f) 的"hang"标注作废**(已更正为 OOM)。
+
+## §596 ⭐ 字节转置:torch 的 `transpose().contiguous()` 对 uint8 只有 ~90 GB/s,分块 kernel 快 5-7×
+### 实测(GPU2,A100,4 个真实形状)
+| 张量 | 形状 | `torch.contiguous` | 分块 Triton | 加速 |
+|---|---|---|---|---|
+| w13 | (384,2304,2560) | 25.88 ms(87.5 GB/s) | **3.74 ms**(606 GB/s) | **6.9×** |
+| w2 | (384,5120,576) | 12.39 ms(91.4) | **1.86 ms**(610) | **6.7×** |
+| s13 | (384,2304,160) | 1.43 ms(98.8) | **0.28 ms**(513) | 5.2× |
+| s2 | (384,5120,160) | 3.11 ms(101.0) | **0.61 ms**(517) | 5.1× |
+| **合计/层** | | **42.8 ms** | **6.5 ms** | **省 36.3 ms/层** |
+* 根因:uint8 逐字节转置在 torch 里退化成 elementwise kernel(1 字节元素无法向量化 + 非合并访问);
+  分块 kernel 用 `tl.trans` 经寄存器/shared 中转,`torch.equal` **逐位相同**(4/4 形状都验过)。
+* 落地:`vllm_xiaotu_moe/byte_transpose.py`(`ktranspose_bytes`,支持 `out=` 原地写),
+  `_kmajor_bytes` 默认走它;`XIAOTU_GPF_TT=0` 一键回滚到 torch。
+* ⚠️ 坑:Triton 里 `e*stride` 必须 **int64**(`e` 最大 383 × stride 5.9e6 > 2^31 ⇒ 越界/非法访问)。
+
+## §597 ⭐⭐ 真正的性能 bug:engine-shards 路径**每层新分配 3.589 GiB** ⇒ 逐层退回 CPU 的**混合模式**
+### (a) 现象(`big2`:TP=2/MBT=16384/qlen=13816)
+```
+layer0 asm=345.8ms free=11.68GiB alloc=25.39GiB reserved=26.70GiB
+layer1 asm=309.3ms free=10.62GiB alloc=26.84GiB reserved=27.75GiB
+layer2 asm=413.6ms free=10.25GiB alloc=26.71GiB reserved=28.13GiB
+layer3 asm=392.9ms free=10.25GiB alloc=27.11GiB reserved=28.13GiB
+layer4 asm=389.5ms free= 9.89GiB alloc=27.50GiB reserved=28.49GiB   ← 每层 +0.42 GiB
+```
+* 只有 **8 层**打了 `gp-split`(应 40 层),然后日志出现大量
+  `GPU prefill DISABLED for this layer -> staying on CPU`;`cd-timing` 显示大 qlen 步的
+  `compute=3254 ms(engine)` ⇒ **其余 32 层是 CPU 引擎在算**。
+* 结果:**13.8K prompt TTFT = 76.5 s(181 tok/s)** —— 比纯 CPU(~54 s 估)还慢,比纯 GPU(应 ~13 s)差 6×。
+* 每层 +0.42 GiB ≈ **转置后的 scales(s13_t+s2_t = 0.425 GiB)**,即每层新分配的
+  `_kmajor_bytes(...)` 输出无法被缓存分配器完整回收 ⇒ 碎片化把 free 一路压到 8.4 GiB 预检阈值之下。
+### (b) 两个修复(都在 §597 这一轮)
+1. **复用环形槽**:同文件里**早就写好了** `prefetch_layer` + `_SLOTS` 环形槽 + 侧流预取,
+   但 engine-shards 路径**绕过了它**:每层 `PrefetchSlot()` 新建 + 新分配。
+   现在改成 `slot_for_shapes(shapes, dev)` 取**全局共享**(按形状键、深度 2)的槽,
+   并让 `kmajor_from_engine_shards(..., dst=slot.bufs)` **写进复用缓冲**(`_kmajor_bytes` 新增 `dst=`)。
+   ⇒ 驻留量恒定,不再随层数上涨。
+2. **GPU/CPU 判定改为设备级**:原先 `self._gpu_pf_ok` 是**每层模块各判一次** ⇒
+   前 8 层过、第 9 层起不过 ⇒ **一次 forward 内 GPU/CPU 混合**(最坏形态)。
+   现在 `_GPF_OK[dev_index]` 由**第一个做判定的模块**钉住,后续所有层沿用。
+   (OOM 回退路径也改写全局,保证"要么全走 GPU、要么全走 CPU"。)
+### (c) 顺带的架构发现(下一步的大机会)
+`prefetch_layer` 的设计(侧流 + `slot.ready` 事件 + ping/pong)**本来就是为"重叠"准备的**:
+现在 staging 与 GEMM 全在同一条流上串行,而 staging(310-414 ms/层)远大于 GEMM(137-155 ms/层)
+⇒ 理论上 `max(staging, GEMM)` 能把这 13.8 s/chunk 再砍一截,但**前提是先把 staging 提到线速**
+(见 §593/§594),否则 `max` 仍等于 staging。
