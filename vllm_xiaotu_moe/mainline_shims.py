@@ -226,12 +226,28 @@ def _stream_engram_from_ckpt(model, model_path, pending, chunk_rows: int = 2_000
                 with safe_open(f, "pt") as fh:
                     sl = fh.get_slice(ck)
                     n = int(dst.shape[0])
+                    # 【§563 修】必须拷**本 rank 的 head shard**,不能总是从第 0 行开始!
+                    # 依据上游 `_engram_head_shard_weight_loader`(deepseek_v41/common/engram.py:567):
+                    #     shard = loaded_weight.narrow(0, param.engram_vocab_start, param.shape[0])
+                    # 即偏移 = `engram_vocab_start`、长度 = 本 rank 的 part 行数。
+                    # 表按 tp*dp 个 head shard 切(checkpoint 里是完整表 384,006,168 行,
+                    # 每 rank 只有 192,009,666 行)⇒ 原先固定拷 [0:part] 会让**每个 rank 都拿前半张表**,
+                    # rank≠0 的 Engram 查表全错 ⇒ 输出改变(greedy A/B 1/5,§562d)。
+                    off = int(getattr(dst, "engram_vocab_start", 0) or 0)
+                    n_full = int(sl.get_shape()[0])
+                    assert off + n <= n_full, (
+                        f"engram shard overrun: off={off} n={n} full={n_full}")
                     for a in range(0, n, chunk_rows):
                         b = min(n, a + chunk_rows)
-                        dst[a:b].copy_(sl[a:b])
+                        src = sl[off + a:off + b]
+                        # ue8m0 尺度以 float8_e8m0fnu 到达,而 param 存 uint8 ⇒ 保持原始字节
+                        if src.dtype == torch.float8_e8m0fnu:
+                            src = src.view(torch.uint8)
+                        dst[a:b].copy_(src)
                 n_ok += 1
                 print(f"[xtu-engram-last] streamed {ck} -> {tuple(dst.shape)} "
-                      f"({dst.numel() * dst.element_size() / 2**30:.1f} GiB)", flush=True)
+                      f"(vocab_start={off} of {n_full} rows, "
+                      f"{dst.numel() * dst.element_size() / 2**30:.1f} GiB)", flush=True)
             except Exception as exc:  # noqa: BLE001
                 print(f"[xtu-engram-last] FAILED to stream {ck}: "
                       f"{type(exc).__name__}: {exc}", flush=True)

@@ -20424,3 +20424,39 @@ t=436s  READY(稳态 590 GiB)
 * 下一步(独立小任务):把"我们流式读进的 Engram 表"与"vLLM 自己物化的表"**逐张量比对**
   (dtype/layout/scale 处理/slice 偏移),找出差异来源;若只是 dtype 舍入,则可能需要让流式路径
   逐位复刻原路径 —— 之后再谈默认开启。
+
+## §563 ✅ `ENGRAM_LAST` 的正确性问题**已修好**:不是"最后加载"的错,而是我们流式拷贝**漏了本 rank 的 shard 偏移**
+### (a) 根因(证据)
+* 表按 **head shard** 切:上游 `engram.py::_get_shard_info()` 返回 `(tp_size*dp_size, engram_head_shard_rank())`,
+  而 `_engram_head_shard_weight_loader`(`deepseek_v41/common/engram.py:567`)写得很清楚:
+  ```python
+  shard = loaded_weight.narrow(0, param.engram_vocab_start, param.shape[0])
+  ```
+  ⇒ **偏移 = `param.engram_vocab_start`**。
+* checkpoint 里是**完整表**:实测 `layers.1.engram.embed.weight: shape=[384006168, 256] dtype=F8_E4M3`
+  (scale `[384006168, 8] F8_E8M0`);而每个 rank 的 part 只有 **192M 行**。
+* 我们的 `_stream_engram_from_ckpt` 原实现固定 `dst[a:b].copy_(sl[a:b])` ⇒ **每个 rank 都拷前半张表**
+  ⇒ rank≠0 的 Engram 查表全错 ⇒ §562d 的 greedy 1/5。
+
+### (b) 修复
+按上游口径加偏移,并复刻 ue8m0 的字节处理:
+```python
+off = int(getattr(dst, "engram_vocab_start", 0) or 0)
+assert off + n <= n_full
+src = sl[off + a : off + b]
+if src.dtype == torch.float8_e8m0fnu: src = src.view(torch.uint8)
+dst[a:b].copy_(src)
+```
+
+### (c) 验证(打补丁后重跑)
+* 日志:`rank0 vocab_start=0`、**`rank1 vocab_start=192001740`**(layer14: `0` / `192007016`),`of 384006168 rows` ✓
+* **greedy 5 条对拍(修复后 `ENGRAM_LAST=1` vs 基线 `=0`):5/5 逐字节相同** ✓,0 错误;
+* **内存收益保持**:峰值 **645.4 GiB**(基线 1087.6)。
+⇒ **两个问题被彻底分开了**:"最后加载"带来内存收益(−41%);输出变化是**我们的切片 bug**,与"最后加载"无关。
+
+### (d) 现在它是"分片加载"吗?能保证引擎读对?
+* 是:流式**按 chunk 读 + 按本 rank 的 `vocab_start` 偏移拷进分片**,并且**只多一个 chunk(512 MB)** 的主机内存。
+* 保证方式(逐层加固):①偏移/长度断言(`off + n <= n_full`);②与 vLLM 自己的 loader 用**同一个
+  `engram_vocab_start` 语义**(不是我们自己推的公式);③服务级 greedy 逐字节对拍(当前 5/5);
+  ④**尚缺**一条更强的"表内容级"校验 —— 建议补:装载后对**每张表的若干随机行**做 CRC,
+  与 `safe_open` 直接读 checkpoint 同位置比对(几秒,能覆盖全 384M 行分布)。
