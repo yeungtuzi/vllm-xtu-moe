@@ -1363,12 +1363,19 @@ class _XiaotuExpertsMixin:
                 _slot.ready = torch.cuda.Event()
                 _slot.ready.record(torch.cuda.current_stream(_dev))
                 _t1 = _time.perf_counter() if _t_split else 0.0
+                _a_before = torch.cuda.memory_allocated(_dev) if (
+                    os.environ.get("XIAOTU_GPF_STAGE") == "1") else 0
                 out = gpu_moe_layer(
                     h_bf16, ids_i32, wts_f32, _km[0], _km[1], _km[2], _km[3],
                     H=hidden_size, I=_I,
                     K=int(self.moe_config.experts_per_token),
                     device=_dev, slot=_slot,
                 )
+                if _a_before:
+                    _a_after = torch.cuda.memory_allocated(_dev)
+                    print(f"[gpf-split2] qlen={qlen} "
+                          f"moe_alloc={(_a_after - _a_before) / 2**20:+.1f}MiB "
+                          f"total_alloc={_a_after / 2**20:.1f}MiB", flush=True)
                 if _t_split:
                     torch.cuda.synchronize()
                     _al = torch.cuda.memory_allocated(_dev) / 2**20

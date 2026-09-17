@@ -1326,6 +1326,11 @@ def gpu_moe_layer(
         inter = _reuse_moe("inter", (A, 2 * I), torch.bfloat16, device)
     else:
         inter = torch.empty((A, 2 * I), dtype=torch.bfloat16, device=device)
+    if os.environ.get("XIAOTU_GPF_STAGE") == "1":
+        import torch as _tp
+        print(f"[gpf-ptr] out_ptr={out.data_ptr()} inter_ptr={inter.data_ptr()} "
+              f"alloc={_tp.cuda.memory_allocated(device)/2**20:.1f}MiB "
+              f"reserved={_tp.cuda.memory_reserved(device)/2**20:.1f}MiB", flush=True)
 
     W13_E = w13_t.stride(0)
     S13_E = s13_t.stride(0)
