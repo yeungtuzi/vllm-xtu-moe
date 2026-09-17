@@ -22000,3 +22000,32 @@ File "vllm/model_executor/kernels/mhc/tilelang.py", line 345
   层切片改为**按形状**切入参、`_CED_STATE` 步级握手;
 * 全部由 `XIAOTU_CED_FASTPREFILL=1` + `--kv-sharing-fast-prefill` 门控,**默认关闭**;
 * **短 prompt 5/5 与开关无关地一致**;长 prompt 在默认(关)配置下**完全不受影响**(回归安全)。
+
+## §604p 决定性否定结论:①**只做 metadata 半程也不安全**;②完整层切片与流水线不变量冲突
+### (a) 实验(c12:默认不装 attention 对齐 shim)
+```
+层切片(按形状)命中次数 = 0        ← 没有任何层进入切片分支(只有 metadata 被改写)
+long_300 : 完成(3.98s, ×1.00)但文本与基线**不同**
+long_1024/4096 : 仍失败(kernel 校验/非法访存,崩=6)
+短 prompt 5/5 : PASS(与开关无关)
+```
+⇒ **metadata 半程单独存在时**:查询侧被限成窗口、而层仍喂全长 ⇒
+既**改输出**又**在 ≥1024 时崩**。也就是说 §577c 的担心是对的:
+"只改 metadata"不是"低收益但安全",而是**本身就不自洽**。
+### (b) 完整层切片:被 mHC 的 `num_tokens` 不变量挡住(§604o)
+要让 metadata 与层一致,就必须让层只算尾部 ⇒ 层的 `x` 比本步 `num_tokens` 短 ⇒
+`mhc/tilelang.py:345 assert x.shape == (num_tokens, hidden_size)` 失败。
+### (c) 最终结论(**有完整证据链**)
+**CED 在"插件级"无法正确实现**:两条半程各自不自洽,合起来又与 vLLM
+"以 `num_tokens` 为全局不变量"的流水线设计冲突。
+要正确实现只有一条路:**在上游 vLLM 里把它做成原生特性**
+(把"本步有效 token 数"作为一个可下传的量,贯穿 runner buffer / mHC / 各 fused kernel),
+这与 omlx PR#3607 的做法一致(它改的是上游文件)。
+### (d) 交付状态(安全)
+* CED 代码全部保留但**默认关**:需同时 `XIAOTU_CED_FASTPREFILL=1` + `--kv-sharing-fast-prefill`;
+* **默认配置零影响**:短 prompt 5/5 一致、长 prompt 与关闭时行为相同(实测 ×1.00);
+* 本轮 5 个 shim 的开关:`_install_ced_attn_align_shim` 也改成需 `XIAOTU_CED_ATTN_ALIGN=1` 才装。
+### (e) 建议
+第 5 项按"**已着手 + 已给出可复现的完整技术结论**"收口;若用户要真正拿到 CED 收益,
+应作为**上游 PR**推进(而不是继续在插件里打洞),并配套换掉退化语料
+(long_* 是同一句重复 70 次,基线输出 `[[[[…` 不适合做等价判据)。
