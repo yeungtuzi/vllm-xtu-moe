@@ -20186,3 +20186,23 @@ R-VRAM 的次序是 **1) 1M 上下文 > 2) GPU 预填充 > 3) 投机 > 4) 专家
 同样的 1M 服务 + KV 上限,但**关掉常驻层**(`XIAOTU_MOE_GPU_RESIDENT_LAYERS=`),再打 32K 预填充。
 * 若通过 ⇒ 结论成立:**长上下文下常驻层必须让位**(并写进规划器:maxlen 大时 resident 直接给 0);
 * 若仍失败 ⇒ 说明还有别的常驻占用(vLLM 的 graph/activation 池),需要进一步降 util 或减 max_num_seqs。
+
+### §553 32K 预填充 OOM **已修复并验证**(1M 上下文下),边界是实测的
+修复三件套(已提交):
+1. **KV 显式上限**:规划器输出 `XIAOTU_KV_CACHE_BYTES`(= maxlen 所需 KV × 1.15)→ `--kv-cache-memory`;
+   实测 `GPU KV cache size: 1,206,255 tokens`(1M 请求 1.15× 并发)⇒ **优先级 1 保住**;
+2. **reserve 随 maxlen 变化**:基础 4 GiB + 序列长度相关工作区(按 32K 锚点、封顶 6 GiB);
+3. **长 maxlen 的常驻层硬上限**(实测标定):1M⇒2 层、≥256K⇒3 层。
+
+**验证(TP=2,maxlen=1M,规划器默认、无 env 覆盖)**:
+| 请求 | 结果 | 峰值显存 |
+|---|---|---|
+| 2 × 32K 输入 | **2/2 成功**,`total_input_tokens=65536`(无截断) | 38,251 MiB |
+| 1 × 64K 输入 | **1/1 成功**,`total_input_tokens=65536`(无截断) | 38,279 MiB |
+| 3 层常驻(旧默认) | **OOM**(EngineDeadError,stable-ABI op 内 `aten::new_empty` 失败) | — |
+
+* **关键定量**:峰值在 32K 与 64K 下**几乎相同**(38.25 vs 38.28 GiB)⇒ 该工作区是
+  **per-chunk(MBT=8192)有界**的,不随总序列长度增长(就是那个 padded-q 张量 512 MiB/层·chunk);
+* 剩余余量 **~2.2 GiB**;3 层会多要 3.36 GiB ⇒ 必 OOM(与实测一致)⇒ **边界 2 层是实测的上限**。
+* 顺带回答"设了 1M 会不会截断 32K 输入":**不会** —— maxlen 是上限;两次测试的
+  `total_input_tokens` 都等于输入总长,完整处理。
