@@ -657,8 +657,18 @@ _PIN_CACHE: dict[tuple, tuple] = {}
 
 
 def _kmajor_bytes(t):
-    """[E, A, B] u8 -> [E, B, A] u8 (byte transpose; nibbles stay within bytes)."""
-    return t.transpose(1, 2).contiguous()
+    """[E, A, B] u8 -> [E, B, A] u8(字节转置;nibble 仍留在字节内)。
+
+    【§596】**默认改用分块 Triton kernel**:实测 `transpose(1,2).contiguous()`
+    对这种 uint8 逐字节转置只有 **~90 GB/s**(4 个张量合计 42.8 ms/层),
+    而 128×128 分块版有 **~600 GB/s**(合计 6.5 ms/层),快 5-7× 且逐位相同。
+    `XIAOTU_GPF_TT=0` 可退回旧实现(出问题时的一键回滚)。
+    """
+    try:
+        from vllm_xiaotu_moe.byte_transpose import ktranspose_bytes
+        return ktranspose_bytes(t)
+    except Exception:  # noqa: BLE001
+        return t.transpose(1, 2).contiguous()
 
 
 def _kmajor_cached(t: torch.Tensor):
