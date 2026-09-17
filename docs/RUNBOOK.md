@@ -296,7 +296,7 @@ curl -s http://127.0.0.1:8070/metrics | grep -E "num_requests_running|spec_decod
 | `XIAOTU_MOE_SPIN_IDLE_US` | **300** | 5000 = 正反馈灾难;0 更慢(§356/R14;本机 1.84 vs 1.14 ms/层) |
 | `XIAOTU_ENGRAM_LAST` | **1**(2026-09-17 起) | 峰值 **1087.6 → 642 GiB(−41%)**;正确性已闭环(§563-565) |
 | `XIAOTU_ENGRAM_VERIFY` | **1** | 表内容逐 chunk 抽验、失败 fail-closed(§564) |
-| GPU 预填充 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` | 由 `vram_policy` 给(**1M 时 1024**) | 实测交点 384;GPU 路径非逐位确定(§572),但更快 |
+| GPU 预填充 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` | 由 `vram_policy` 给(**3072**;§603 按实测盈亏平衡 ~2860 token 定) | GPU 路径非逐位确定(§572),但更快;低于 ~2860 反而更慢 |
 | 投机解码 | `--speculative-config dspark` | R-VRAM 优先级 3 |
 
 ### 5.2 R-VRAM 策略(权威输出)
@@ -521,7 +521,7 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 | 主机内存峰值 | 629.4 GiB | §570 |
 | 数值/确定性 | `OK=7 BAD=1 max_rel=1.873e-02`;greedy ×2 逐字节 5/5 | §570 |
 
-**⭐ GPU 预填充(§594-§602 修完后,推荐开启)**:`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1024`
+**⭐ GPU 预填充(§594-§602 修完后,推荐开启)**:`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=3072`
 + **必须**按 §5.8 封顶 KV 池 + `MBT=8192`(见下表的显存账)。
 
 | 项 | 值 | 依据 |

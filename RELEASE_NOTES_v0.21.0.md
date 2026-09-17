@@ -76,8 +76,9 @@
 * **TTFT 随并发明显上升**(L=16384:C=1 34.5 s → C=8 170 s):预填充是**串行共享资源**,
   并发只增加排队,不增加预填充吞吐 —— 这正是"要做 CED/更大 chunk"的动机;
 * **短 prompt(L=32/256)TTFT 亚秒级**(474 ms / 1.98 s),走 CPU 路径;
-* **L=1024 的 TTFT 10.0 s 偏高**,原因是它刚好越过当时的 GPU 阈值 1024 而白付固定成本;
-  已把默认阈值改为 **3072**(盈亏平衡 ~2860 token)。
+* **L=1024 的 TTFT 10.0 s 偏高**:该组数据是用**旧阈值 1024** 跑的,1K prompt 刚好越过阈值
+  而白付了 ~9 s 固定成本。按实测成本模型(`8.9 s/chunk + 0.79 ms/token` vs CPU `3.9 ms/token`)
+  **盈亏平衡 ≈2860 token**,所以**推荐阈值已改为 3072**(`vram_policy` 现在直接输出 3072)。
 
 
 ## 5. 推荐配置(详见 `docs/RUNBOOK.md` §5.9)
@@ -85,7 +86,7 @@
 ```bash
 TAG=harness PORT=8700 GPUS=0,1 TP=2 MAXLEN=1048576 SEQS=8 MBT=8192 LOAD=auto GPU_UTIL=0.55 \
 SPEC=1 COMPILE=0 THREADS=60 SPIN=300 KV_CACHE_BYTES=4294967296 \
-VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1024 \
+VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=3072 \
   bash scripts/serve_v41.sh
 ```
 显存配方(TP=2/MBT=8192):非KV 10 + KV 4 + staging 7.2 + 首请求一次性增长 7.7 + 激活 ≈ **33 GiB**。

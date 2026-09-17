@@ -26,7 +26,7 @@
 | C4 | `XIAOTU_MOE_RANK_SPLIT` | `1` | **`1`(不要动)** | 设 `2`(强制 fork 式全 node 布局)实测**请求全部挂死** | §361 |
 | C5 | CPU 权重 NUMA 放置 | 需宿主传真实 rank/world | **必须传真实 `tp`/`rank`** | 硬编码 `num_processes=1/process_id=0` ⇒ 两个 rank 都把分片/线程池铺到**全部 8 node / 24 CCD** ⇒ 每 node 承受双份 ⇒ `oom-kill: CONSTRAINT_MEMORY_POLICY, nodemask=0`,进程**静默死亡** | §344 |
 | C6 | `numactl --interleave=all` | — | **必需** | vLLM 加载期每个 rank 装**全部 256 专家**(≈138 GB/worker,EP 不在加载期切分存储),是**未绑定**的 first-touch 分配;实测总空闲 863 GB 时 node 0/2 已用 185/193 GB | §345 |
-| C7 | `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` | 无(插件不设=0) | 长预填充场景设 **1024** | `_gp_min > 0` 是 GPU 预填充分支的**唯一**开关;不设 ⇒ 非常驻层永远走 CPU | §340 |
+| C7 | `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` | 无(插件不设=0) | 长预填充场景设 **3072**(§603:实测盈亏平衡 ~2860 token,用 1024 会让 1-3K prompt 白付 ~9 s) | `_gp_min > 0` 是 GPU 预填充分支的**唯一**开关;不设 ⇒ 非常驻层永远走 CPU | §340 |
 | C8 | `--max-num-batched-tokens` ≥ 阈值 | — | **`MBT ≥ GP_MIN`** | 阈值语义是 `size(0) >= T`;`T > MBT` ⇒ 一个 chunk 永远到不了阈值 ⇒ GPU 预填充**静默失效** | §340 |
 | C9 | 预填充形状**不被 CUDA 图捕获** | PIECEWISE(会捕获) | 需显式 `--cudagraph-capture-sizes <解码尺寸>` | 捕获时走的是 CPU 分支,重放永远重放该分支 ⇒ **GPU 预填充形同虚设**。上游原生解法:只列解码尺寸,对应 `CUDAGraphMode.FULL_DECODE_ONLY` | §340c |
 

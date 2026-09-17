@@ -6,8 +6,8 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 当前版本:v0.21.0**(2026-09-17)——
-> **GPU 预填充从"能开但更慢还会 OOM"修成"能开、快 2.0-2.8×、显存算得准"**,
+> **📌 当前版本:v0.21.0**(2026-09-17)——**支持 DeepSeek-V4.1-Flash(748B)**:
+> **1M 上下文 + GPU 预填充 + 投机解码**全链路验收通过;其中 **GPU 预填充快 2.0-2.8×**,
 > 并补齐官方 `vllm bench serve` 的完整验收数据(6 种 prompt 长度 × C=1/2/4/8)。
 > 发行说明:[`RELEASE_NOTES_v0.21.0.md`](RELEASE_NOTES_v0.21.0.md) ·
 > Releases: <https://github.com/yeungtuzi/vllm-xtu-moe/releases/tag/v0.21.0>
@@ -121,11 +121,19 @@ DeepSeek-V4-Flash 的**推荐参数与实测数据**见
 > 小 batch 路径 `NSLICE_SMALL=0`、**EP 存储分片**)。**除 DeepSeek-V4-Flash 外均需复验**,
 > 复验清单与命令见 **[`docs/HANDOFF_v0.2.md`](docs/HANDOFF_v0.2.md)** §5.1。
 
-> **新模型提示**:**DeepSeek-V4.1-Flash**(748B,2026-09-10 发布)的资源账与可行性分析见
-> **[`docs/V41_FLASH_ANALYSIS.md`](docs/V41_FLASH_ANALYSIS.md)**:它的 38.5% 权重是**纯查找表**
-> (Engram,183 GiB,每 token 只需 ~12 KB 主机流量),官方生产栈也把这张表放在**主机内存**里
-> 用 RDMA 预取 —— 与本项目的 `XIAOTU_PLE_CPU=1` 思路一致;但整条模型(CED/CSA2/FP4 KV/DSpark)
-> 需要 vLLM 主线先支持 `deepseek_v41`,本插件只覆盖 MoE 层,无法独自提供。
+### 已验证模型
+
+| 模型 | 状态 | 关键数据(均为本机实测) |
+|---|---|---|
+| **DeepSeek-V4.1-Flash**(748B) | ✅ **v0.21.0** | **1M 上下文 + GPU 预填充 + 投机**全链路;主机峰值 **629.4 GiB(−42%)**;KV **6.72M tokens(1M 并发 6.41×)**;单流 **16.64 tok/s / TPOT 36.75 ms**;greedy ×2 **5/5 逐字节相同** |
+| **DeepSeek-V4-Flash** | ✅ v0.2.0 | 主线端到端(服务 / `bench_lat` C=1/2/4 / 数值门禁 `OK=7 BAD=1` / 启动自检) |
+
+* **V4.1-Flash 为什么能支持**:38.5% 的权重是**纯查找表**(Engram,183 GiB,每 token 只需 ~12 KB
+  主机流量),官方生产栈也把它放在**主机内存**里 —— 与本项目 `XIAOTU_PLE_CPU=1` 思路一致;
+  其余(CED / CSA2 / FP4 KV / DSpark 投机)由 vLLM 主线 `deepseek_v41` 提供,本插件负责 **MoE 层**。
+  发布当天的可行性分析见 [`docs/V41_FLASH_ANALYSIS.md`](docs/V41_FLASH_ANALYSIS.md);
+  **落地实测与配置**见 [`RELEASE_NOTES_v0.21.0.md`](RELEASE_NOTES_v0.21.0.md) 与
+  [`docs/RUNBOOK.md`](docs/RUNBOOK.md) §5.9。
 
 ## 性能实测(v0.21.0)
 

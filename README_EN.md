@@ -7,12 +7,30 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.21.0** (2026-09-17) — **GPU prefill went from
-> "can be enabled but slower / OOMs" to "can be enabled, 2.0-2.8× faster, with honest
-> memory accounting"**, plus a full official `vllm bench serve` acceptance sweep
-> (6 prompt lengths × C=1/2/4/8).
+> **📌 Current release: v0.21.0** (2026-09-17) — **DeepSeek-V4.1-Flash (748B) support**:
+> the full chain (**1M context + GPU prefill + speculative decoding**) is verified
+> end to end; GPU prefill is **2.0-2.8x faster** than the CPU path, plus a full official
+> `vllm bench serve` acceptance sweep (6 prompt lengths × C=1/2/4/8).
 > [Release notes](RELEASE_NOTES_v0.21.0.md) ·
 > [Releases](https://github.com/yeungtuzi/vllm-xtu-moe/releases/tag/v0.21.0)
+
+---
+
+## Verified models
+
+| Model | Status | Key numbers (measured on our machine) |
+|---|---|---|
+| **DeepSeek-V4.1-Flash** (748B) | ✅ **v0.21.0** | full chain (**1M context + GPU prefill + speculative**); host peak **629.4 GiB (-42%)**; KV **6.72M tokens (6.41x 1M concurrency)**; single stream **16.64 tok/s / TPOT 36.75 ms**; greedy ×2 **5/5 byte-identical** |
+| **DeepSeek-V4-Flash** | ✅ v0.2.0 | end to end on the mainline (serve / `bench_lat` C=1/2/4 / numeric gate `OK=7 BAD=1` / startup self-check) |
+
+* **Why V4.1-Flash works**: 38.5% of its weights are a **pure lookup table**
+  (Engram, 183 GiB, only ~12 KB of host traffic per token) and the official production
+  stack keeps that table in **host memory** too — the same idea as our `XIAOTU_PLE_CPU=1`.
+  The rest (CED / CSA2 / FP4 KV / DSpark speculation) comes from upstream vLLM's
+  `deepseek_v41`; this plugin supplies the **MoE layer**. The day-of-release feasibility
+  analysis is in [`docs/V41_FLASH_ANALYSIS.md`](docs/V41_FLASH_ANALYSIS.md); the landed
+  measurements and config are in
+  [`RELEASE_NOTES_v0.21.0.md`](RELEASE_NOTES_v0.21.0.md) and `docs/RUNBOOK.md` §5.9.
 
 ---
 
