@@ -1461,8 +1461,12 @@ def _install_ced_kvinsert_shim() -> list[str]:
     @functools.wraps(orig)
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
         try:
+            # 【§604k】**必须是"步级"条件,不能用"逐层"**:实测(§604j)把门控收紧成
+            # "只对本层被切片的 attn 生效"后,**层 22..39 也崩了** —— 因为它们收到的是
+            # 已被切短的 t(=w)、自己没被切片,但它们的 SWA `slot_mapping` **仍是全长**
+            # (那一组 metadata 不走 FastPrefill 改写),所以**同样需要对它们做对齐**。
+            # ⇒ 只要"本步做过 CED 改写"(`win>0`),凡 slot_mapping 比 q 行数长的都要对齐。
             if (int(_CED_STATE.get("win", 0)) > 0
-                    and _CED_STATE.get("sliced_attn") == id(self)
                     and isinstance(attn_metadata, dict)):
                 swa = getattr(self, "swa_cache_layer", None)
                 pfx = getattr(swa, "prefix", None)
