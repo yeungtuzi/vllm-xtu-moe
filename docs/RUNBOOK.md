@@ -430,10 +430,23 @@ TAG=gpf KV_CACHE_BYTES=4729960528 GP_MIN=1024 MAXLEN=1048576 SEQS=2   bash repor
 1. **关掉 GPU 预填充**:`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0`(上下文不变,预填充回 CPU);或
 2. **缩小上下文**:`--max-model-len` 降到策略给出的建议值(策略会直接打印"≤ N")。
 
-**性能量级(§592 实测,必须按 chunk 大小读)**:GPU 预填充每个 chunk 都要把**该步 40 层的专家权重
-H2D 搬一遍**(TP=2 每 rank ≈144 GiB)⇒ 单 chunk 成本**近似固定**:
+**性能量级(§592/§593 实测,必须按 chunk 大小读)**:GPU 预填充每个 chunk 都要把**该步 40 层的
+专家权重 H2D 搬一遍**(TP=2 每 rank **143.6 GiB** = 40 × 3.589)⇒ 单 chunk 成本**近似固定**。
+分解(§593,已排除硬件:PCIe 实测 26.8 GB/s = Gen4 x16 线速):
 ```
-吞吐(chunk) ≈ chunk_tokens / 11.8 s        # 2048 → 174 tok/s;8192 → 694;32768 → 2777
+纯 pinned 拷贝        5.74 s/chunk     ← 已经是线速
++ GPU 侧 K-major 转置 7.40 s/chunk     ← 多 1.66 s
+= 服务当前实测        11.6 s/chunk     ← 另有 4.2 s 未解释(疑似 host 回调串行、未预取)
 ```
-⇒ **chunk 越大越划算**:`--max-num-batched-tokens` 建议 ≥ 8192,要摸到 1500+ tok/s 需 ≥ 16384~32768。
-短 chunk 下 GPU 预填充**比 CPU 还慢**(CPU 约 3.9 ms/token ≈ 258 tok/s),这正是 §592 的实测结论。
+| chunk | 当前 11.6 s | 修掉转置 7.4 s | 线速+重叠 5.74 s |
+|---|---|---|---|
+| 2048 | 174 | 277 | 357 |
+| 8192 | 694 | 1107 | 1427 |
+| **17400** | **1500** | 2351 | 3031 |
+
+⇒ **chunk 越大越划算**:`--max-num-batched-tokens` 建议 ≥ 8192;要摸到 1500+ tok/s
+当前需 ≥ ~17400,把上面两项修掉后只需 **~8.6K~11K**。
+短 chunk 下 GPU 预填充**比 CPU 还慢**(CPU 约 3.9 ms/token ≈ 258 tok/s)——
+盈亏平衡在 **chunk ≈ 3000 token**。
+⚠️ **`--max-num-batched-tokens=32768` 目前会 hang**(§593(f),启动后 GPU 0%、日志刷
+`shm_broadcast...60 seconds`)⇒ 先别用,修好再上。
