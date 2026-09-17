@@ -19761,3 +19761,34 @@ lk 内层 **58 条指令里 20 条 `vfmadd231ps`,访存只有 3 条(每条 FMA 0
   一条命令即可,不必再靠推理 —— 本 session 四次同类错误(§527/§531/§533/§536b)都源于缺它。
 * 下一步(唯一):读 `moe_v2.hpp` 的分片 A/B 段(约 1150-1250 行)找到 subA/subB 的 `pfor` 与内核调用,
   在**那里**插探针确认,然后按 lk 的口径(每条 FMA 配几次访存)做对照与优化。
+
+### §536(h) 解码调用链(证据版)与**剩下的唯一矛盾点**
+**已确认的链**(逐层都有源码行号 + 插桩支持):
+```
+forward_many (moe_v2.hpp:544)
+  └─ nshard_ >= 2 ⇒ forward_many_nsliced(M,k,…,0,…)         [:583-586]  ← 插桩 nsliced-ENTER ✅
+       ├─ Phase A: wt::gate_up_slice_batched(...)            [:1156 分片 / :1196 socket 副本]
+       │     └─ WeightTraitsBase::gate_up_slice_batched      [moe_v2.hpp:192]  **纯转发**
+       │           └─ Derived::gate_up_slice_batch_impl      [moe_v2.hpp:201 默认实现 / packed4 自己那份]
+       │                 └─ (packed4 那份会调 matmul_packed4_group ×4,见 §531)
+       ├─ Phase B: wt::down_slice_batched(...)               [:1258 分片 / :1275 socket]
+       └─ Phase C: pfor(M)                                   [:1283]      ← 插桩 ✅
+```
+* 注意我上一轮 grep `pfor(` **漏掉了分片的派发助手**(`pfor_sharded(` 不含 `pfor(` 子串),
+  所以"只有 3 个 pfor"是错的;分片 A/B 的循环在 1130/1230 附近,用的是另外的助手。
+
+### ⚠️ 剩下的矛盾(下一步只查这一件事)
+§531 我反汇编的 `Packed4WeightTraitsBase<E2M1, MXFP4Tag, true,true,false>::gate_up_slice_batch_impl`
+**会调用 `matmul_packed4_group<true,true>` ×4**;而 §536f 的插桩证明 `matmul_packed4_group`
+的**两个 FAST_FP4 块在 M=1 下都不执行**。两者不能同时成立 ⇒ 只有两种可能:
+1. **解码用的 `gate_up_slice_batch_impl` 不是那份**(`kNParallel` 的 batched 那族,见
+   `moe_v2_packed4.hpp:1041+` 的 "Batched N-sliced variants",调用点 1058/1060/1086/1178/1181/1222);
+2. 或者它调的是 **`matmul_packed4_group<false,…>`(FAST_FP4 关)** ⇒ FAST_FP4 块整个被跳过,
+   走的是下面**通用/scalar/AVX2** 路径 ⇒ 我的探针当然不响。
+
+**下一步的唯一动作(不再推理)**:在
+① `matmul_packed4_group` **函数入口**(在 `if (FAST_FP4…)` **之前**)、
+② `Packed4WeightTraitsBase::gate_up_slice_batch_impl` 入口、
+③ `moe_v2_packed4.hpp:1041+` batched 那族的入口
+各插一个 `XTU_PROBE`(env 门控,已就位),跑一次 M=1 bench ⇒ **哪条亮就走哪条**,然后在那条路径上
+按 lk 口径(每条 FMA 配几次访存,lk=0.15)做对照与优化。
