@@ -87,8 +87,17 @@ def choose_variant(force: str | None = None) -> str:
 
     `force` may be one of the ladder names (e.g. "avx2") or a full module
     suffix (e.g. "_avx2") to override CPU detection.
+
+    `XIAOTU_MOE_VARIANT`（如 `avx512_bf16`）在没有显式 `force` 时优先，
+    用于**按 CPU 型号选分支**与 A/B（见 §566）：
+
+    * 变体的 pybind11 类型是**全局注册**的，同一进程**不能**加载两个变体
+      （`ImportError: generic_type: type "MOEConfigV2" is already registered!`），
+      所以 A/B 必须**一变体一进程** —— 只能在导入前用环境变量选，不能在进程内切换。
     """
     global _chosen
+    if force is None:
+        force = os.environ.get("XIAOTU_MOE_VARIANT") or None
     if force is not None:
         suffix = force if force.startswith("_") else f"_{force}"
         build_dir = _variant_dir()

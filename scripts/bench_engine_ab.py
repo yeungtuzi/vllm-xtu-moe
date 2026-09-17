@@ -179,7 +179,15 @@ def main():
         else:
             ids_b = rng.integers(0, E, size=(B, K)).astype(np.int32)
         wts_b = rng.uniform(-1, 1, size=(B, K)).astype(np.float32)
-        _pf(engine, B, K, ids_b, wts_b, x, out)
+        # 【§566】**预热次数可调**(默认 1)。为什么必须能调:实测同一份权重/同一线程数下,
+        # 我们的引擎在**前几百次调用**里逐次变快(REP=30→1.15、60→1.02、120→0.85、
+        # 240→0.77、480→0.74、960→0.71 ms/层),而 **lk 与 REP 无关(恒 0.58)**
+        # ⇒ 短跑会把暂态灌进均值,导致"同日比值门"给出**假 FAIL**(REP=60 报 1.62×,
+        # 同尺子 REP=480 才是 1.28×)。服务里引擎每秒被调用上万次,始终处于热态,
+        # 所以**验收口径必须用热态**:`WARMUP=200 REP=60`,或大 REP。
+        warmup = int(os.environ.get("WARMUP", "1"))
+        for _ in range(max(0, warmup)):
+            _pf(engine, B, K, ids_b, wts_b, x, out)
         t0 = time.perf_counter()
         if rr:
             for i in range(rep):

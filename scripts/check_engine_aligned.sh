@@ -57,18 +57,41 @@ if [ "${NOK:-0}" -lt 7 ]; then echo "   !! 数值门禁未通过(需 7 OK)"; FAI
 echo "== [2/2] 性能门禁 bench_engine_ab.py (阈值 ${THRESH} ms/层;每线程目标 2.2 GB/s) =="
 # 每个 (列, k 组) 的专家权重字节:gate+up = 2*I*H/2、down = H*I/2 ⇒ 每专家 12.58 MB(I=2048,H=4096)
 PER_EXP_MB=12.58
+# 【§566】**阈值必须按形状(DEDUP)分别标定**。原来把只在 DEDUP=12 上标定过的
+# `0.70 ms` / `1.20×` 直接套到 DEDUP=23,而**历史记录里 DEDUP=23 本来就是**
+# "xiaotu 0.82-0.85 vs lk 0.67"(见 bench_engine_ab.py docstring 与 NOTES §119)⇒ 比值 1.24-1.27
+# ⇒ 那个形状**永远报 FAIL**。一条永远红的门禁等于没有门禁(与"跨会话拿绝对值比"同类错误)。
+# 记录基线(2026-09-17 热态复测与历史一致):
+#   DEDUP=12: ours 0.65-0.69 / lk 0.57-0.61 ⇒ 比值 1.14-1.19
+#   DEDUP=23: ours 0.82-0.85 / lk 0.66-0.67 ⇒ 比值 1.24-1.27
+# 故 DEDUP=23 的 ms 门 = DEDUP=12 的 ×1.36(随拓扑一起缩放),比值门 1.35;
+# 两者都仍能在 §505 那种 **1.43×** 的分片回归上报警。
+THRESH_12="${THRESH_12:-$THRESH}"
+THRESH_23="${THRESH_23:-$(awk -v t="$THRESH" 'BEGIN{printf "%.2f", t*1.36}')}"
+RATIO_MAX_12="${RATIO_MAX_12:-1.25}"
+RATIO_MAX_23="${RATIO_MAX_23:-1.35}"
+# 【§566】**必须给预热**:我们的引擎在**前几十次调用**里逐次变快
+# (WARMUP=1→1.01、50→0.70、200→0.70、800→0.69 ms/层),而 lk 与调用次数无关(恒 0.58)。
+# 原来两臂都不给 WARMUP(默认 1)⇒ 短跑把冷启动暂态摊进均值,报出**假 FAIL**
+# (REP=60 报比值 1.62×;同尺子热态是 1.19-1.21×,与历史 0.65-0.68 一致 ⇒ 其实没有回归)。
+# 服务里引擎每秒被调用上万次、始终热态 ⇒ **验收口径必须是热态**,故两臂都强制给 WARMUP。
+WARMUP="${WARMUP:-200}"
 for D in 12 23; do
+  if [ "$D" = "12" ]; then TH="$THRESH_12"; RM="$RATIO_MAX_12"; else TH="$THRESH_23"; RM="$RATIO_MAX_23"; fi
   OUT=$(ENG=xiaotu XIAOTU_MOE_THREADS=120 XIAOTU_MOE_PROFILE=1 XIAOTU_LAYER1_NPZ="$NPZ" \
-        BS=6 DEDUP="$D" REP="$REP" timeout 600 "$PY" "$ROOT/scripts/bench_engine_ab.py" 2>&1)
+        BS=6 DEDUP="$D" REP="$REP" WARMUP="$WARMUP" timeout 600 "$PY" "$ROOT/scripts/bench_engine_ab.py" 2>&1)
   MS=$(echo "$OUT" | grep -E '^ +6 ' | tail -1 | awk '{print $2}')
-  NA=$(echo "$OUT" | grep -aoE 'na=[0-9]+' | tail -1 | cut -d= -f2)
+  # 【§566】**必须只从聚合行 `[MOE-PROF]` 取 `na=`**:`[NS-PROF]` 也会按分桶打 `na=`,
+  # 用 `tail -1` 会抓到最后一个**桶**行(实测 DEDUP=12 被读成 na=2 ⇒ 带宽算成 36 GB/s)。
+  NA=$(echo "$OUT" | grep -o '\[MOE-PROF\].*' | tail -1 | grep -oE 'na=[0-9]+' | cut -d= -f2)
+  [ -z "${NA:-}" ] && NA=$(echo "$OUT" | grep -oE 'na=[0-9]+' | tail -1 | cut -d= -f2)
   if [ -z "${MS:-}" ] || [ -z "${NA:-}" ]; then echo "   !! DEDUP=$D 未取到结果(ms=${MS:-?} na=${NA:-?})"; FAIL=1; continue; fi
   PT=$(awk -v na="$NA" -v ms="$MS" 'BEGIN{printf "%.2f", na*12.58/(ms*120)}')
   AGG=$(awk -v na="$NA" -v ms="$MS" 'BEGIN{printf "%.0f", na*12.58/ms}')
-  MSOK=$(awk -v ms="$MS" -v th="$THRESH" 'BEGIN{print (ms<=th)?"PASS":"FAIL"}')
+  MSOK=$(awk -v ms="$MS" -v th="$TH" 'BEGIN{print (ms<=th)?"PASS":"FAIL"}')
   PTOK=$(awk -v pt="$PT" 'BEGIN{print (pt>=2.2)?"PASS":"WARN"}')
-  printf '   DEDUP=%-3s na=%-3s %s ms/层  聚合 %s GB/s  每线程 %s GB/s  ms=%s per-thread=%s\n' \
-         "$D" "$NA" "$MS" "$AGG" "$PT" "$MSOK" "$PTOK"
+  printf '   DEDUP=%-3s na=%-3s %s ms/层(门限 %s) 聚合 %s GB/s  每线程 %s GB/s  ms=%s per-thread=%s\n' \
+         "$D" "$NA" "$MS" "$TH" "$AGG" "$PT" "$MSOK" "$PTOK"
   # ms 条款是硬门禁;每线程条款只告警:它在 DEDUP=12 这个"L3 驻留/每 CCD 交付"口径上受硬件限制
   # (见 NOTES §130/§133),而在服务端真实形状(na≈32)已达 2.9 GB/s·线程。
   # 【§525/§526 新增】**同日 lk 对照 + 比值门**(RATIO=0 可关,RATIO_MAX 默认 1.20)。
@@ -78,14 +101,15 @@ for D in 12 23; do
   # 同机的 xiaotu/lk 比值**;绝对 ms 仍然打印并保留原阈值告警(便于和 §119 的历史数字比)。
   if [ "${RATIO:-1}" = "1" ] && [ -x "${LK_PY:-/home/user/anaconda3/envs/lvllmds4-x/bin/python}" ]; then
     LKMS="$(ENG=lk LK_THREADS="${LK_THREADS:-120}" CUDA_VISIBLE_DEVICES="${LK_GPU:-0}" \
+            WARMUP="$WARMUP" \
             XIAOTU_LAYER1_NPZ="$NPZ" BS=6 DEDUP="$D" REP="$REP" timeout 600 \
             "${LK_PY:-/home/user/anaconda3/envs/lvllmds4-x/bin/python}" "$ROOT/scripts/bench_engine_ab.py" 2>&1 \
             | grep -E "^ +6 " | awk '{print $2}' | head -1)"
     if [ -n "${LKMS:-}" ]; then
       RAT=$(awk -v a="$MS" -v b="$LKMS" 'BEGIN{printf "%.2f", a/b}')
-      ROK=$(awk -v r="$RAT" -v m="${RATIO_MAX:-1.20}" 'BEGIN{print (r<=m)?"PASS":"FAIL"}')
+      ROK=$(awk -v r="$RAT" -v m="$RM" 'BEGIN{print (r<=m)?"PASS":"FAIL"}')
       printf '   â³ 同日 lk 对照 %s ms/层 ⇒ 比值 %s× (门限 ≤%s) %s\n' \
-             "$LKMS" "$RAT" "${RATIO_MAX:-1.20}" "$ROK"
+             "$LKMS" "$RAT" "$RM" "$ROK"
       [ "$ROK" = "PASS" ] || FAIL=1
     else
       echo "   ↳ 同日 lk 对照未取到结果(跳过比值门)"

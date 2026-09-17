@@ -1383,7 +1383,12 @@ private:
     // the 5 phases across calls; prints a breakdown every prof_every_ calls.
     bool prof_ = false;
     size_t prof_every_ = 40;
-    size_t prof_calls_ = 0;
+    size_t prof_calls_ = 0;     // 累计调用数(只增,用于标注)
+    // 【§566 修】**窗口计数必须与累计计数分开**:打印时把 prof_na_/prof_M_ 等累加器
+    // 归零了,却用**从不归零的 prof_calls_** 当分母 ⇒ 打印出的 na/M 会逐次衰减
+    // (实测 calls=40 na=12 → 80 na=6 → 120 na=4 → 160 na=3 → 200 na=2),
+    // 而门禁/报告取的是最后一行 ⇒ 读到垃圾值(带宽被算成 36 GB/s)。
+    size_t prof_win_ = 0;       // 本窗口内的调用数(打印后归零),用作分母
     int64_t prof_A_ = 0, prof_A2_ = 0, prof_B0_ = 0, prof_B_ = 0, prof_C_ = 0, prof_ovh_ = 0;
     size_t prof_M_ = 0, prof_na_ = 0;
     static bool diag_barrier() {
@@ -1431,11 +1436,12 @@ private:
             }
         }
         prof_A_ += dA; prof_A2_ += dA2; prof_B0_ += dB0; prof_B_ += dB;
-        prof_C_ += dC; prof_ovh_ += dovh; prof_M_ += M; prof_na_ += na; ++prof_calls_;
-        if (prof_calls_ % prof_every_ == 0) {
+        prof_C_ += dC; prof_ovh_ += dovh; prof_M_ += M; prof_na_ += na; ++prof_calls_; ++prof_win_;
+        if (prof_win_ >= prof_every_) {
             double S = (double)(prof_A_ + prof_A2_ + prof_B0_ + prof_B_ + prof_C_ + prof_ovh_) / 1e6;
-            double navg = (double)prof_na_ / (double)prof_calls_;
-            double mavg = (double)prof_M_ / (double)prof_calls_;
+            // 分母用**窗口**计数(§566);累计值只用于标注 calls=
+            double navg = (double)prof_na_ / (double)prof_win_;
+            double mavg = (double)prof_M_ / (double)prof_win_;
             // routing-skew histogram over the last call's active experts
             int maxme = 0; long b1=0,b8=0,b32=0,b128=0,bb=0;
             for (int e : active_) {
@@ -1447,7 +1453,7 @@ private:
                 prof_calls_, navg, mavg, maxme, b1,b8,b32,b128,bb,
                 prof_A_/1e6, prof_A2_/1e6, prof_B0_/1e6,
                 prof_B_/1e6, prof_C_/1e6, prof_ovh_/1e6, S);
-            prof_A_=prof_A2_=prof_B0_=prof_B_=prof_C_=prof_ovh_=prof_M_=prof_na_=0;
+            prof_A_=prof_A2_=prof_B0_=prof_B_=prof_C_=prof_ovh_=prof_M_=prof_na_=0; prof_win_=0;
         }
     }
 
