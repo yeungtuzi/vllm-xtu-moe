@@ -1474,6 +1474,10 @@ def _install_ced_slice_shim() -> list[str]:
             _attn = getattr(self, "attn", None)
             _swa = getattr(_attn, "swa_cache_layer", None)
             _pfx = getattr(_swa, "prefix", None)
+            if os.environ.get("XIAOTU_CED_DIAG") == "1" and _CED_STATE["log"] < 3:
+                _CED_STATE["log"] += 1
+                _log(f"[ced-diag] SWA 前缀={_pfx!r} | metadata 键({len(_md) if isinstance(_md, dict) else 'NA'})="
+                     f"{list(_md.keys())[:6] if isinstance(_md, dict) else _md}")
             if isinstance(_md, dict) and _pfx is not None and _pfx in _md:
                 _sm = getattr(_md[_pfx], "slot_mapping", None)
                 if _sm is not None:
