@@ -21630,3 +21630,30 @@ layer4 asm=389.5ms free= 9.89GiB alloc=27.50GiB reserved=28.49GiB   ← 每层 +
 现在 staging 与 GEMM 全在同一条流上串行,而 staging(310-414 ms/层)远大于 GEMM(137-155 ms/层)
 ⇒ 理论上 `max(staging, GEMM)` 能把这 13.8 s/chunk 再砍一截,但**前提是先把 staging 提到线速**
 (见 §593/§594),否则 `max` 仍等于 staging。
+
+## §598 ⭐ engine-shards GPU 预填充:两级修复后 **1725 tok/s @13.8K chunk**(原来 181)
+### (a) 增量诊断(决定性,`XIAOTU_GPF_STAGE=1`)
+```
+[gpf-delta] staging_alloc=+4252.5 MiB (dst 复用路径)   ← 仅第 0 层:环形槽 2×3.36 GiB 首次分配
+[gpf-delta] staging_alloc=+0.0 MiB    (dst 复用路径)   ← 之后每层恒为 0 ⇒ staging 零泄漏 ✅
+```
+但 `alloc` 仍每层 **+0.42 GiB**(23.21→23.47→23.87→24.27→24.66→25.06),
+⇒ 增长**不在 staging,而在 GEMM 路径**:`gpu_moe_layer` 里两个每层新分配
+* `inter = torch.empty((T*K, 2I), bf16)` —— qlen=13816 时 **382 MB**(0.373 GiB)← 主项
+* `out  = torch.zeros((T, H), bf16)` —— **141 MB**
+### (b) 三级修复与效果(同一 13.8K prompt,客户端 TTFT)
+| 版本 | 改动 | TTFT | tok/s |
+|---|---|---|---|
+| big2 | 基线(改前) | **76.5 s** | 181 |
+| big3 | 环形槽复用 + 设备级判定 + 快速转置 | **8.008 s** | **1725** |
+| big4 | 同上但 KV 只留 1 GiB(泄漏仍在,反向验证) | 18.35 s | 872 |
+| big5 | +`inter` 按形状复用(`_reuse_moe`) | 待测 | 待测 |
+⇒ **9.6× 提升**,已超过用户目标 1500 tok/s;对照 CPU 预填充(13.8K×3.9 ms ≈ **54 s**)是 **6.7×**。
+### (c) 为什么"每层新分配"会致命(机制)
+不是"多占 0.42 GiB"这么简单:每层新分配 → 缓存分配器**无法复用**这些块(与环形槽的
+3.36 GiB 大块交错)⇒ `reserved` 单调上涨 ⇒ **free 跌破 8.4 GiB 预检阈值** ⇒
+(a) 每层模块各自判定 ⇒ 第 9 层起逐层退回 CPU ⇒ **混合模式**(最坏);
+(b) 改成设备级判定后不再混合,但继续涨 ⇒ **GPU OOM**(big3 末尾实测崩溃)。
+⇒ 所以 §597(b) 的两个修复必须**成对**:环形槽(稳住 staging)+ 设备级判定(不混合),
+再加 §598 的 `inter` 复用(稳住 GEMM 侧),才真正闭环。
+### (d) 坑:Triton `e*stride` 必须 int64(否则 `illegal memory access`)。

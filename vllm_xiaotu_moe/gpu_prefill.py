@@ -407,6 +407,22 @@ def _down_kernel_split(
         mt += 1
 
 
+# 【§598】按形状复用 GPU MoE 的**中间缓冲**(`inter`)与输出(`out`)。
+# 背景:每层新分配 inter=(T*K, 2I)(qlen=13816 时 382 MB)会让 `alloc/reserved`
+# 逐层上涨 ~0.42 GiB,40 层就是 ~17 GiB —— 直接把 free 压到预填充阈值之下。
+# `inter` 是 `torch.empty` 语义(只读被写过的段)⇒ 复用完全等价。
+_BUF_MOE: dict = {}
+
+
+def _reuse_moe(key, shape, dtype, device):
+    k = (str(device), key, tuple(int(v) for v in shape), dtype)
+    t = _BUF_MOE.get(k)
+    if t is None or tuple(t.shape) != tuple(int(v) for v in shape):
+        t = torch.empty(tuple(int(v) for v in shape), dtype=dtype, device=device)
+        _BUF_MOE[k] = t
+    return t
+
+
 def _build_segmentation(topk_ids, topk_weights, num_experts, device):
     """把 [T,K] 路由压成按专家分段的排序列表(供两个 Triton 内核按段遍历)。
 
@@ -1026,6 +1042,10 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
     # **894 ms/layer**, because cat of strided views falls back to a slow kernel;
     # this form keeps the copies contiguous. See NOTES §466.)
     import time as _time
+    _a0 = None
+    if os.environ.get("XIAOTU_GPF_STAGE") == "1":
+        import torch as _t0
+        _a0 = _t0.cuda.memory_allocated(device)
     _t_dma = _time.perf_counter()
     w13_raw = _reuse(("raw13",), (E, 2 * I, rb13), device)
     c13 = int(geo["w13_cbytes"])
@@ -1067,10 +1087,18 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
         _kmajor_bytes(w2_raw, dst[2])
         _kmajor_bytes(s2_raw, dst[3])
         _stage_mark(_t_dma_end, "tr")
+        if _a0 is not None:
+            import torch as _t2
+            _d = (_t2.cuda.memory_allocated(device) - _a0) / 2**20
+            print(f"[gpf-delta] staging_alloc={_d:+.1f} MiB (dst 复用路径)", flush=True)
         return tuple(dst)
     res = (_kmajor_bytes(w13_raw), _kmajor_bytes(s13_raw),
            _kmajor_bytes(w2_raw), _kmajor_bytes(s2_raw))
     _stage_mark(_t_dma_end, "tr")
+    if _a0 is not None:
+        import torch as _t1
+        _d = (_t1.cuda.memory_allocated(device) - _a0) / 2**20
+        print(f"[gpf-delta] staging_alloc={_d:+.1f} MiB", flush=True)
     return res
 
 
@@ -1293,7 +1321,11 @@ def gpu_moe_layer(
     # inter(`inter_ptr + g_rows*inter_ld`),只有写 out 时才换成 token id。
     # 曾经按 T 行分配 ⇒ 越界写,cudaErrorIllegalAddress(第 19 轮实测)。
     # 想省这块分配只能改成"排序后行数=有效项数"或持久缓冲,不能再动行数语义。
-    inter = torch.empty((A, 2 * I), dtype=torch.bfloat16, device=device)
+    # 【§598】复用:见 `_reuse_moe` 的注释。`XIAOTU_GPF_REUSE=0` 可回退到每层新分配。
+    if os.environ.get("XIAOTU_GPF_REUSE", "1") == "1":
+        inter = _reuse_moe("inter", (A, 2 * I), torch.bfloat16, device)
+    else:
+        inter = torch.empty((A, 2 * I), dtype=torch.bfloat16, device=device)
 
     W13_E = w13_t.stride(0)
     S13_E = s13_t.stride(0)

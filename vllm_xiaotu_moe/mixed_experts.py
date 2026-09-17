@@ -1371,8 +1371,10 @@ class _XiaotuExpertsMixin:
                 )
                 if _t_split:
                     torch.cuda.synchronize()
+                    _al = torch.cuda.memory_allocated(_dev) / 2**20
                     print(f"[gp-split] layer={getattr(layer,'layer_name','?')} "
-                          f"kernels={(_time.perf_counter()-_t1)*1e3:.1f}ms", flush=True)
+                          f"kernels={(_time.perf_counter()-_t1)*1e3:.1f}ms "
+                          f"alloc_after_gemm={_al:.1f}MiB", flush=True)
             elif _gpu_pf:
                 # 退回源张量(需要源没被释放——`_gp_on` 已保证这一点)。
                 self._prepare_weights(layer)
