@@ -36,13 +36,27 @@ import os
 
 # ---- 账本默认值(全部来自本机实测;可用 CLI/env 覆盖)---------------------------
 CARD_TOTAL_GIB = 39.49          # A100-40G 实际可用
-WEIGHTS_GIB = 7.4               # V4.1 TP=2 每 rank 的模型权重(日志 "Model loading took 7.79 GiB")
+WEIGHTS_GIB = 9.78              # 【§592 实测修正】V4.1/TP=2 每 rank 的**非 KV 常驻占用**
+                                # = vLLM 启动日志 "Actual usage is 9.78 GiB for consumed memory
+                                #   (weights + non-torch)"(gpf3,util=0.90,无常驻)。
+                                # 原值 7.4 只等于 "Model loading took 7.79 GiB" 里的一部分,
+                                # 漏掉了 non-torch(CUDA context/通信缓冲等)⇒ 预算偏乐观。
+                                # 峰值激活(0.73~1.22)+ CUDAGraph(0.12~0.70)由下面 reserve 覆盖。
 # 1M 上下文 KV —— **实测,§509**(V4.1 / TP=2 / MBT=8192 / maxlen=1M):
 #   `Available KV cache memory 2.71 GiB → GPU KV cache size 1,290,154 tokens`
 #   ⇒ 2.20 KiB/token ⇒ **1M 上下文 ≈ 2.2 GiB/卡**(不是 16.4!)
 # 注:早先记的 17.45 GiB/1.116M tok 来自别的配置(TP=1 的 v41el 口径)⇒ 用量级差 7×。
 # 这个数直接决定"优先级 2/3/4 还剩多少显存",所以必须用**本配置**实测值。
 KV_GIB_PER_MTOKEN = 2.71 / 1.290154      # ≈2.1 GiB / 1M tokens
+# ⚠️【§592 实测异常,未解释】KV 的"每 token 成本"**随 maxlen 变化**,不是常数:
+#   maxlen=1M  : 2.53 GiB → 1,206,255 tok(2.25 KiB/tok);12.01 GiB → 6,724,586 tok(1.79 KiB/tok);
+#                 2.71 GiB → 1,290,154 tok(2.20 KiB/tok)   ← 三次互洽
+#   maxlen=8192: 25.03 GiB → 1,600,788 tok(16.79 KiB/tok);11.21 GiB → 716,861 tok(16.74 KiB/tok)
+#   ⇒ 1M 档的有效开销 ≈ 4 个独立 KV 组(正好是 `kv_source_layer_ids=[2,8,14,20]`),
+#     而 8K 档 ≈ 26 层各自独立 —— 疑似 vLLM 的 hybrid allocator 在短 maxlen 下没走 KV 共享。
+#   **本常量按 maxlen=1M 的口径标定**(对 1M 是保守的:实测 1.79 < 2.1);
+#   短 maxlen 下 2.1 GiB/Mtoken 也只是 0.017 GiB,而 8K 真正需要的上界是
+#   8192 × 16.8 KiB = 0.13 GiB ⇒ 两者都远小于 0.5 GiB 的下限,不影响判定。
 # 预填充/激活/CUDA graph 之外的**保守余量**:§509 实测"解析式说 6 层常驻、6 层直接 OOM(34.8/40GB);
 # 2 层稳过(27.1GB)" ⇒ 解析式必须留安全垫,否则会把用户推到 OOM。
 VRAM_RESERVE_GIB = 4.0
@@ -142,7 +156,9 @@ def plan(*, maxlen: int, free_gib: float | None = None,
          gpu_prefill_gib: float | None = None,
          draft_gib: float | None = None,
          resident_per_layer_gib: float | None = None,
-         allow_host_cost: bool | None = None) -> dict:
+         allow_host_cost: bool | None = None,
+         max_num_seqs: int | None = None,
+         gpu_mem_util: float | None = None) -> dict:
     """按 R-VRAM 顺序给出判定。
 
     `free_gib` 给了就用**实测**口径(KV 之后的剩余显存);否则用解析口径
@@ -165,7 +181,15 @@ def plan(*, maxlen: int, free_gib: float | None = None,
         allow_host_cost = os.environ.get("XIAOTU_VRAM_ALLOW_HOST_COST") == "1"
     host_cost = _env_gib("XIAOTU_GPUPREFILL_HOST_GIB", GPU_PREFILL_HOST_GIB)
 
-    kv_gib = kv_per_m * (maxlen / 1_000_000.0)
+    # 【§592,用户要求"用户不知道填多少 ⇒ 我们动态算"】**KV 需求量按 maxlen × 并发**算:
+    # 服务承诺的是"每个请求都能用满 maxlen",所以 KV 必须至少装下 `maxlen × max_num_seqs`。
+    # 这样"优先级 1 不被降级"是可验证的,而且剩余量可以**显式**留给预填充/投机
+    # (见下面的 `--kv-cache-memory` 建议)。
+    _seqs = max(1, int(max_num_seqs if max_num_seqs is not None else _env_gib(
+        "XIAOTU_VRAM_MAX_SEQS", float(os.environ.get("MAXSEQS") or os.environ.get("MAX_NUM_SEQS") or 1.0))))
+    _util = float(gpu_mem_util if gpu_mem_util is not None else _env_gib(
+        "XIAOTU_VRAM_GPU_UTIL", float(os.environ.get("GPU_UTIL") or 0.90)))
+    kv_gib = kv_per_m * (maxlen / 1_000_000.0) * _seqs
     budget = free_gib if free_gib is not None else (CARD_TOTAL_GIB - WEIGHTS_GIB - kv_gib)
     # 留出保守余量(激活/cudagraph/碎片);§509 的实测证据见 VRAM_RESERVE_GIB 注释
     # 【§551】基础安全垫 + 序列长度相关工作区(按 32K 锚点线性、封顶;§513c 的 32K OOM 处方)
@@ -196,7 +220,7 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     steps.append((
         "1. 1M 上下文(KV)",
         kv_ok,
-        f"需要 {kv_gib:.1f} GiB/卡(maxlen={maxlen});"
+        f"需要 {kv_gib:.1f} GiB/卡(maxlen={maxlen} × {_seqs} 并发);"
         + ("" if kv_ok else " **不满足 ⇒ 整条链终止(本规则不允许降级上下文)**"),
     ))
     if not kv_ok:
@@ -210,6 +234,14 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     pref_need = pref * GPU_PREFILL_MARGIN
     pref_ok = (budget >= pref_need) and host_ok
     why = f"剩余 {budget:.1f} GiB,需要 {pref_need:.1f} GiB(staging {pref:.2f}×{GPU_PREFILL_MARGIN})"
+    # 【§592,用户裁决】TP=1 **不支持** GPU 预填充:staging 不随 TP 摊薄
+    # (TP=2 每 rank 是 I/2,TP=1 是 I ⇒ staging 翻倍到 13.4 GiB、preflight 要 16.8),
+    # 单卡还要放 KV+投机 ⇒ 必然逐层被拒、静默退化成 CPU。用户明确"没指望 TP=1 跑起来"。
+    # 所以这里**直接判否**(而不是给个注定的乐观值),让调用方一眼看到要 TP≥2。
+    if _tp_eff <= 1:
+        pref_ok = False
+        why = (f"TP=1:staging {pref:.2f} GiB ⇒ preflight 要 {pref_need:.1f} GiB 空闲,单卡放不下"
+               f" ⇒ **GPU 预填充要求 --tensor-parallel-size >= 2**")
     if not host_ok:
         why += (f"; **额外占主机内存 {host_cost:.0f} GiB/rank ⇒ 按总约束判为不可用**"
                 f"(除非 XIAOTU_VRAM_ALLOW_HOST_COST=1)")
@@ -260,7 +292,24 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     free_for_kv = max(0.0, CARD_TOTAL_GIB - WEIGHTS_GIB - reserve - held)
     kv_bytes = int(max(0.5, min(kv_gib, free_for_kv)) * 2**30)
     warn = None
-    if pref_ok and kv_gib > free_for_kv + 1e-9:
+    # 【§592 实测】**净空显存 = (1 − util) × CARD_TOTAL**,因为 vLLM 会把 KV 池填到 util 为止
+    # (gpf3: util=0.90 ⇒ 只剩 3.09 GiB;gpf_on: util=0.55 ⇒ 17.77 GiB)。
+    # 所以"策略说开、preflight 逐层拒绝"的根因就是**没显式给 --kv-cache-memory**。
+    _guard_free = max(0.0, CARD_TOTAL_GIB * (1.0 - max(0.0, min(1.0, _util))))
+    _need_all = pref_need + (draft if spec_ok else 0.0) + 0.5
+    if pref_ok and _guard_free < _need_all:
+        warn = (
+            f"⚠️ `--gpu-memory-utilization={_util}` 会让 vLLM 把 KV 池填到 "
+            f"{CARD_TOTAL_GIB * _util:.1f} GiB/卡,启动后只剩 {_guard_free:.1f} GiB 空闲;"
+            f"而 GPU 预填充的 preflight 要 {pref_need:.1f} GiB"
+            + (f" + 投机 {draft:.1f} GiB" if spec_ok else "")
+            + " ⇒ **会被逐层拒绝并静默退回 CPU 预填充(比纯 CPU 还慢)**。\n"
+            f"      解法:显式传 `--kv-cache-memory {kv_bytes}`(把 KV 池按 maxlen×{_seqs} 并发封顶),"
+            f"剩下的 {CARD_TOTAL_GIB - WEIGHTS_GIB - reserve - kv_gib:.1f} GiB 才留给预填充/投机。\n"
+            f"      这就是 R-VRAM 优先级 1(KV)之后、优先级 2/3 能拿到显存的**唯一**途径。"
+            f"(详见 docs/RUNBOOK.md §5.8)"
+        )
+    if warn is None and pref_ok and kv_gib > free_for_kv + 1e-9:
         maxlen_ok = int(free_for_kv / max(1e-9, kv_per_m) * 1_000_000)
         warn = (
             f"⚠️ 显存放不下:maxlen={maxlen} 需要 KV {kv_gib:.1f} GiB/卡,"
@@ -277,7 +326,9 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     return {"kv_gib": kv_gib, "budget_gib": budget, "kv_ok": True, "steps": steps,
             "gpu_prefill": pref_ok, "spec_on_gpu": spec_ok,
             "resident_layers": taken, "resident_spec": spec,
-            "kv_bytes": kv_bytes, "kv_free_gib": free_for_kv, "warning": warn}
+            "kv_bytes": kv_bytes, "kv_free_gib": free_for_kv, "warning": warn,
+            "max_num_seqs": _seqs, "gpu_mem_util": _util,
+            "guard_free_gib": _guard_free, "prefill_need_gib": pref_need}
 
 
 def _ranges(xs: list[int]) -> str:
@@ -337,6 +388,12 @@ def main() -> int:
     ap.add_argument("--maxlen", type=int, default=int(os.environ.get("MAXLEN", 1048576)))
     ap.add_argument("--free-gib", type=float, default=None,
                     help="KV 之后**实测**的剩余显存(给了就用它,否则用解析口径)")
+    ap.add_argument("--max-num-seqs", type=int,
+                    default=int(os.environ.get("MAXSEQS") or os.environ.get("MAX_NUM_SEQS") or 1),
+                    help="KV 需要装下 maxlen × 该并发数(默认取 MAXSEQS/MAX_NUM_SEQS,否则 1)")
+    ap.add_argument("--gpu-mem-util", type=float,
+                    default=float(os.environ.get("GPU_UTIL") or 0.90),
+                    help="用于算「vLLM 填池后还剩多少净空」=(1-util)×39.49 GiB")
     ap.add_argument("--emit-env", action="store_true")
     ap.add_argument("--tp", type=int, default=int(__import__("os").environ.get("TP", 2)),
                     help="张量并行度:每层常驻/draft 的每卡占用按 6.72/TP 与 7.388/TP 缩放(默认 2)")
@@ -344,11 +401,15 @@ def main() -> int:
     _tp = max(1, int(getattr(a, "tp", 2)))
     os.environ["TP"] = str(_tp)   # 让 plan() 内部的 TP 相关上限能读到(§554)
     _scale = 2.0 / _tp
-    p = plan(maxlen=a.maxlen, resident_per_layer_gib=None, gpu_prefill_gib=None, draft_gib=7.388 / _tp, free_gib=a.free_gib)
+    p = plan(maxlen=a.maxlen, resident_per_layer_gib=None, gpu_prefill_gib=None,
+             draft_gib=7.388 / _tp, free_gib=a.free_gib,
+             max_num_seqs=a.max_num_seqs, gpu_mem_util=a.gpu_mem_util)
     if a.emit_env:
         print(emit_env(p))
         return 0
-    print(f"[vram-policy] maxlen={a.maxlen}  1M-KV 需要 {p['kv_gib']:.1f} GiB/卡  "
+    print(f"[vram-policy] maxlen={a.maxlen} × {p['max_num_seqs']} 并发  util={p['gpu_mem_util']:.2f}"
+          f"  ⇒ 填池后净空 {p['guard_free_gib']:.1f} GiB(预填充 preflight 要 {p['prefill_need_gib']:.1f})")
+    print(f"[vram-policy] maxlen={a.maxlen}  KV 需要 {p['kv_gib']:.1f} GiB/卡  "
           f"{'OK' if p['kv_ok'] else '**不满足(不可降级)**'}")
     if p.get("warning"):
         print(p["warning"])

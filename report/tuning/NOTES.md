@@ -21407,3 +21407,68 @@ Iteration(288): 1 context request, 1764 context tokens, iteration elapsed time: 
 ### (d) 副产品:**prefix cache 是长 prompt 场景的真实大收益**
 缓存命中的 TTFT ~600-700 ms vs 冷 14 s(**20×**)⇒ 对多轮/agent 复用同一上下文的场景,
 这比"预填充算得快"重要得多,值得单独量化与记录。
+
+## §592 ⭐ GPU 预填充:终于真正打开、量出了它的形状;并找到"策略说开、preflight 全拒"的真根因
+### (a) ❗根因:`--gpu-memory-utilization` 会把 GPU 预填充**饿死**
+vLLM 用 **KV 池把显存填到 util 为止**,与 `maxlen` 无关 ⇒ **启动后净空 ≈ (1−util)×39.49 GiB**:
+| 运行 | util | KV 池 | 启动后净空 | preflight(要 8.4 GiB) |
+|---|---|---|---|---|
+| `gpf3` | 0.90 | 25.03 GiB | **3.09 GiB** | ❌ `only 3.1 GiB is free` |
+| `gpf_on` | 0.55 | 11.21 GiB | **17.8 GiB** | ✅ **ACTIVE(TP0 40 层 / TP1 40 层)** |
+⇒ **这就是"策略层说启用、preflight 却逐层拒绝、悄悄退回 CPU"的根因**;`util ≥ ~0.80` 时必然发生。
+⇒ 解法**不是**降 util(那会连带牺牲 KV),而是**显式 `--kv-cache-memory` 把 KV 池按 `maxlen×并发` 封顶**。
+### (b) KV 的"每 token 成本"**随 maxlen 变化**(实测,原因未解释)
+| maxlen | KV 池 | 报告的 token 数 | 每 token |
+|---|---|---|---|
+| 1M | 2.71 GiB | 1,290,154 | 2.20 KiB |
+| 1M | 2.53 GiB | 1,206,255 | 2.25 KiB |
+| 1M | 12.01 GiB | 6,724,586 | 1.79 KiB |
+| **8192** | 25.03 GiB | 1,600,788 | **16.79 KiB** |
+| **8192** | 11.21 GiB | 716,861 | **16.74 KiB** |
+* 1M 档三次互洽(≈2.1 GiB/Mtoken,正好对应 `kv_source_layer_ids=[2,8,14,20]` **4 个独立 KV 组**);
+* 8K 档约 **26 层各自独立**(≈16.8 KiB/token)⇒ 疑似 vLLM 的 hybrid allocator 在短 maxlen 下**没走 KV 共享**。
+* 对策略无影响(maxlen=8192 真正需要 ≤ 8192×16.8 KiB = **0.13 GiB**),但**这是个必须记住的口径陷阱**:
+  把 "35.98 GiB/卡" 当成 KV 会算错 3 倍 —— 那其实是**总占用**(§570 表格已改口径)。
+### (c) ✅ GPU 预填充**真的打开了**,并量出稳态吞吐
+`GP_MIN=1024 / util=0.55 / MAXLEN=8192 / THREADS=60`:
+```
+TP0: GPU prefill ACTIVE: first 1032 tokens >= threshold 1024; weights from engine shards   ×40 层
+TP1: 同上                                                                                  ×40 层
+[cd-timing] qlen=2048 period=498.13ms compute=424.47ms(engine) rest=73.66ms (compute 85%, rest 15%)
+```
+唯一 prompt(UNIQUE=1,`cached_tokens` 不可得但服务端 usage 的 prompt_tokens 与 target 对得上):
+| prompt | TTFT | 吞吐 |
+|---|---|---|
+| 1021 tok(<1024 ⇒ 仍走 CPU) | 8.06 s | 127 |
+| 1900 tok | 11.87 s | 160 |
+| 3644 tok | 23.49 s | **155** |
+⇒ **155 tok/s,比同一服务的 CPU 路径(258~285)还慢**。但这**不是**"GPU 预填充没用",而是
+**chunk 太小**(见 (d)):3644 恰好是 **2 个 ~2048 的 chunk**,TTFT 正好是 1900 那次的 **2.00×**。
+### (d) ⭐机制:GPU 预填充的成本是**"每 chunk 固定搬一遍权重"**,所以吞吐 ∝ chunk 大小
+* 每个 prefill step 都要把该步 40 层的专家权重 H2D 搬一次:TP=2 每 rank
+  `40 × 3.36 GiB ≈ 144 GiB`(≈ host 侧全量专家权重);
+* 实测单 chunk(2048 tok)≈ **11.8 s** ⇒ 有效带宽 ≈ **12 GB/s**(PCIe Gen4 x16 理论 ~25);
+* ⇒ `吞吐 ≈ chunk_tokens / 11.8s`:
+  | chunk | 2048 | 8192 | 16384 | **32768** |
+  |---|---|---|---|---|
+  | 吞吐 | 174 | 694 | 1388 | **2777** |
+* ⇒ **用户期望的 1500+ 是可达的,但必须把 `--max-num-batched-tokens` 开到 ≥16384**;
+  MBT 默认(~2048)下 GPU 预填充**必然比 CPU 慢**,这是算出来的、不是调出来的。
+* 同时它**彻底解释了 §591(b)**:"8K 预热后 ~1 秒"(≈8000 tok/s)在 DMA 模型下需要 144 GB/s,
+  PCIe 上不可能 ⇒ **只能是 prefix-cache 命中**(§591 的结论被独立证实)。
+* 单 chunck 12 GB/s 偏低 ⇒ 下一步可查:是不是逐 expert 小 copy、有没有 ping/pong 重叠、能否用
+  `cudaMemcpyAsync` 大块 + 多流(设计文档 §2.2 的 DMA 预算模型假设 20 GB/s)。
+### (e) `vram_policy` 按实测重写(用户要求"用户不知道填多少,动态算")
+* `WEIGHTS_GIB` 7.4 → **9.78**(= 日志 `consumed memory (weights + non-torch)`,原值漏了 non-torch);
+* KV 需求量改为 **`maxlen × max_num_seqs` × 2.1 GiB/Mtoken**(可验证"优先级 1 不被降级");
+* **新增 util-fill 威胁告警**:算出 `净空=(1−util)×39.49`,不够时给出**可直接粘贴**的
+  `--kv-cache-memory <bytes>` 与两条出路(关预填充 / 缩 maxlen);
+* **TP=1 直接判否** GPU 预填充(staging 不摊薄 6.72→13.45 GiB,preflight 要 16.8);
+* 新增 CLI `--max-num-seqs/--gpu-mem-util`;`emit_env` 仍输出 `XIAOTU_KV_CACHE_BYTES`(serve_v41.sh 已接线)。
+### (f) 工具修正(**R15 尺子**)
+* `scripts/probe_ttft.py`:**默认 `UNIQUE=1`** —— 每次重复都换全新 prompt(随机前缀 + salt,
+  从第一个词就不同 ⇒ 不可能命中前缀缓存),并解析服务端 usage 的 `prompt_tokens/cached_tokens`;
+  旧行为(复用同一 prompt)保留在 `UNIQUE=0`,但会在文档里标注"这量的是缓存命中"。
+* `report/tuning/probes/xtu_own_v41_mem.sh`:新增 `KV_CACHE_BYTES` 旋钮(→ `--kv-cache-memory`)。
+* `docs/RUNBOOK.md`:新增 **§5.8 让 GPU 预填充真的拿到显存(必读)**、§5.6 加两条陷阱
+  (util 饿死预填充 / "预热 1 秒"是缓存命中)、§5.2 换成新口径表。

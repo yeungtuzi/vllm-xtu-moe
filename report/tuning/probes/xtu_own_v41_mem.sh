@@ -43,6 +43,12 @@ LAYER_TIMING="${LAYER_TIMING:-0}"   # 1 = 打开每层分相计时(§515)      #
 ITERDETAIL="${ITERDETAIL:-0}"  # 1 = --enable-logging-iteration-details(每步分解,§587)
 KVSHARE="${KVSHARE:-0}"    # 1 = 传 --kv-sharing-fast-prefill(§574/§575 的 ③ 实验)
 PREFIX_CACHE="${PREFIX_CACHE:-1}"   # 0 = --no-enable-prefix-caching(用于"预填充可复现性"对照实验,§572)
+KV_CACHE_BYTES="${KV_CACHE_BYTES:-}"  # 非空 = 显式 `--kv-cache-memory`(**封顶 KV 池**)。
+                                      # 【§592 必需】vLLM 默认会把 KV 池填到 `--gpu-memory-utilization` 为止,
+                                      # 启动后净空只剩 (1-util)×39.49 GiB ⇒ util=0.90 时只有 3.95 GiB,
+                                      # 而 GPU 预填充的 preflight 要 8.4 GiB ⇒ **逐层被拒、静默退回 CPU**。
+                                      # 显式封顶后,余量才留给预填充/投机。取什么值见
+                                      # `python -m vllm_xiaotu_moe.vram_policy --maxlen M --max-num-seqs N`。
 PROFILE_DIR="${PROFILE_DIR:-}"   # 非空 = 开 torch profiler;
                                  #   服务起来后 `curl -X POST localhost:$PORT/start_profile` / `/stop_profile`,
                                  #   产物是 chrome trace(默认 /tmp/<dir>/<...>.pt.trace.json.gz)。
@@ -120,6 +126,7 @@ RUN_ENV="$RUN_ENV" READY_TIMEOUT="${READY_TIMEOUT:-2400}" \
   $( [ "$PREFIX_CACHE" = "1" ] && echo --enable-prefix-caching || echo --no-enable-prefix-caching ) \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --kernel-config '{"enable_jit_warmup": false}' \
+  $( [ -n "$KV_CACHE_BYTES" ] && printf -- '--kv-cache-memory %s' "$KV_CACHE_BYTES" ) \
   $( [ "$KVSHARE" = "1" ] && echo --kv-sharing-fast-prefill ) \
   $( [ "$ITERDETAIL" = "1" ] && echo --enable-logging-iteration-details ) \
   $( [ -n "$PROFILE_DIR" ] && printf -- "--profiler-config {\"profiler\":\"torch\",\"torch_profiler_dir\":\"%s\",\"torch_profiler_with_stack\":false}" "$PROFILE_DIR" ) \

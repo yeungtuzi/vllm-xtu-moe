@@ -299,13 +299,33 @@ curl -s http://127.0.0.1:8070/metrics | grep -E "num_requests_running|spec_decod
 | GPU 预填充 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` | 由 `vram_policy` 给(**1M 时 1024**) | 实测交点 384;GPU 路径非逐位确定(§572),但更快 |
 | 投机解码 | `--speculative-config dspark` | R-VRAM 优先级 3 |
 
-### 5.2 R-VRAM 策略(权威输出:`python -m vllm_xiaotu_moe.vram_policy --maxlen 1048576 --tp 2`)
+### 5.2 R-VRAM 策略(权威输出)
 
+```bash
+python -m vllm_xiaotu_moe.vram_policy --maxlen 1048576 --max-num-seqs 2 --tp 2 --gpu-mem-util 0.55
 ```
-✅ 1. 1M 上下文(KV)   2.2 GiB/卡      ✅ 3. GPU 投机解码 3.7 GiB
-✅ 2. GPU 预填充      3.0 GiB         ✅ 4. 专家层常驻  2 层(20-21)
+```
+[vram-policy] maxlen=1048576 × 2 并发  util=0.55  ⇒ 填池后净空 17.8 GiB(预填充 preflight 要 8.4)
+✅ 1. 1M 上下文(KV)        4.4 GiB/卡(maxlen=1048576 × 2 并发)
+✅ 2. GPU 预填充          8.4 GiB(staging 6.72 × 1.25)
+✅ 3. GPU 投机解码        3.7 GiB
+❌ 4. 专家层常驻          0 层(§584 实测:常驻收益为负 ⇒ 显存改投 KV)
 ```
 任一项不足即按优先级 fallback;**绝不额外多占系统内存**。
+
+**输入口径(§592 全部改成"用户不用填"或"实测值")**
+| 量 | 值 | 来源 |
+|---|---|---|
+| 卡可用显存 | 39.49 GiB | A100-40G 实测 |
+| 非 KV 常驻 | **9.78 GiB/卡** | 启动日志 `Actual usage is 9.78 GiB for consumed memory (weights + non-torch)` |
+| KV | **2.1 GiB / Mtoken / 卡** | maxlen=1M 三次实测互洽(1.79~2.25)|
+| KV 需求量 | `maxlen × 并发数` | 服务承诺"每请求都能用满 maxlen" |
+| GPU 预填充预留 | **模型维度现算** = `2×(w13+w2+s13+s2) × 1.25` | 与 preflight 的 `staging_bytes()` 同式 |
+| 投机(draft) | 7.388/TP GiB | checkpoint `mtp.0/1/2` |
+| 单层专家权重 | staging/2(TP=2 时 3.36) | — |
+
+⚠️ **GPU 预填充要求 `--tensor-parallel-size >= 2`**:TP=1 时 staging 不摊薄(6.72→13.45 GiB,
+preflight 要 16.8),单卡必然放不下 ⇒ 策略直接判否(用户裁决:不指望 TP=1 跑它)。
 
 ### 5.3 启动与验收命令
 
@@ -361,6 +381,15 @@ python scripts/test_engine_determinism.py 11     # 11 次运行 10/10 逐位相�
    `ImportError: generic_type ... already registered`。
 4. **多进程压测要关自旋**(`XIAOTU_MOE_SPIN_IDLE_US=0`),否则 SPIN=5000 会把 CPU 烧在自旋上。
 5. **`pkill -f` 会命中自己的命令行** ⇒ 用字符类(`port 832[2]`)。
+6. **⭐ `--gpu-memory-utilization` 会把 GPU 预填充"饿死"**(§592,最容易踩的一个):
+   vLLM 用 KV 池把显存**填到 util 为止**,所以启动后净空 ≈ `(1−util)×39.49 GiB`
+   (util=0.90 ⇒ **3.95 GiB**;util=0.55 ⇒ 17.8 GiB)。而预填充 preflight 要 8.4 GiB
+   ⇒ **util ≥ 0.8 时 GPU 预填充必然逐层被拒、静默退回 CPU(且混合模式比纯 CPU 更慢)**。
+   解法见 §5.8:**显式给 `--kv-cache-memory` 把 KV 池封顶**。
+7. **长 prompt 的"预热后只要 ~1 秒"是 prefix-cache 命中,不是预填充吞吐**(§591):
+   用**完全相同的 prompt** 连发,第 2 次起整段 KV 命中,量到的是"缓存命中 + 首步"。
+   凡是报"预填充 tok/s"的行,必须用**每次从头就不同**的 prompt(首 token 就不同)
+   且核对 `cached_tokens=0`。正确尺子:`scripts/probe_ttft.py`(默认 `UNIQUE=1`)。
 
 ### 5.7 ③ CED 预填充捷径状态(实验,默认关)
 
@@ -370,3 +399,41 @@ python scripts/test_engine_determinism.py 11     # 11 次运行 10/10 逐位相�
   窗口改写;③**层循环级隐藏状态切片**;④返回前零填充回全长。判据修正后实测
   `追加 V4.1 eligible 19 层` ✓。
 * **尚未取得验收数据**(§570 式三门禁 + 生成等价性 + 预填充提速)。**未验证前不要开**。
+
+### 5.8 ⭐ 让 GPU 预填充真的拿到显存(必读)
+
+**规则:只要开了 GPU 预填充(`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS>0`),
+就一定要显式传 `--kv-cache-memory`,不要把 KV 池交给 `--gpu-memory-utilization` 去填。**
+
+```bash
+# 1) 先问策略层要那个数(它会按 maxlen×并发 算出**刚好够**的 KV,并把余量留给预填充/投机)
+python -m vllm_xiaotu_moe.vram_policy --maxlen 1048576 --max-num-seqs 2 --tp 2 --gpu-mem-util 0.90
+#   ⚠️ ... 解法:显式传 `--kv-cache-memory 4729960528` ... 剩下的 15.3 GiB 才留给预填充/投机。
+#   ⇒ 直接把这行 emit 出来:eval "$(python -m vllm_xiaotu_moe.vram_policy ... --emit-env)"
+#     (serve_v41.sh 已自动接线:`XIAOTU_KV_CACHE_BYTES` → `--kv-cache-memory`)
+
+# 2) 探针里也可以直接钉:
+TAG=gpf KV_CACHE_BYTES=4729960528 GP_MIN=1024 MAXLEN=1048576 SEQS=2   bash report/tuning/probes/xtu_own_v41_mem.sh
+```
+
+**为什么要这样**:vLLM 的 KV 池是"把 util 填满"来定尺寸的,与 `maxlen` 无关
+⇒ `maxlen=8192` 也会分到 ~11-25 GiB 的池(能装 70 万~160 万 token,**用不到**),
+而 GPU 预填充的 staging 需要 8.4 GiB **空闲**显存。池封顶后:
+| 配置 | KV 池 | 启动后净空 | GPU 预填充 |
+|---|---|---|---|
+| 1M×2 / util=0.90(默认) | 35.5 | **3.9** | ❌ 逐层被拒 |
+| 1M×2 / `--kv-cache-memory 4.4G` | 4.4 | **15.3** | ✅ + 投机 ✅ |
+| 8K×8 / `--kv-cache-memory 0.5G` | 0.5 | **24.3** | ✅ + 投机 ✅ |
+| 1M×8 / 封顶后 | 17.6 | 2.1 | ❌ KV 优先(按 R-VRAM 优先级 1 让路)|
+
+**若封顶后仍 OOM**(显存实在不够同时放 KV + 预填充 + 投机),按 R-VRAM 顺序二选一:
+1. **关掉 GPU 预填充**:`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0`(上下文不变,预填充回 CPU);或
+2. **缩小上下文**:`--max-model-len` 降到策略给出的建议值(策略会直接打印"≤ N")。
+
+**性能量级(§592 实测,必须按 chunk 大小读)**:GPU 预填充每个 chunk 都要把**该步 40 层的专家权重
+H2D 搬一遍**(TP=2 每 rank ≈144 GiB)⇒ 单 chunk 成本**近似固定**:
+```
+吞吐(chunk) ≈ chunk_tokens / 11.8 s        # 2048 → 174 tok/s;8192 → 694;32768 → 2777
+```
+⇒ **chunk 越大越划算**:`--max-num-batched-tokens` 建议 ≥ 8192,要摸到 1500+ tok/s 需 ≥ 16384~32768。
+短 chunk 下 GPU 预填充**比 CPU 还慢**(CPU 约 3.9 ms/token ≈ 258 tok/s),这正是 §592 的实测结论。
