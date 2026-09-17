@@ -492,6 +492,54 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
             }
             return;
         }
+        // 【§536】M==1(解码热路径)的 **N-tile**:每个 k-group 只载入一次激活,块内最多 NJ 行共享。
+        // 依据 §535:原实现把输出行放最外层 ⇒ 每行都重载整条 K 维激活(M=1/K=5120/inter=2304
+        // ⇒ 每专家约 46 MB 激活 vs 11.8 MB 权重,约 4× 放大);而 lk 内层是"激活常驻寄存器、
+        // 流式过权重"(每条 FMA 仅 0.15 条访存,§534a)。数值逐位不变:每个 (行,token) 的累加
+        // 序列仍是"每 group 一次 FMA 进 t[g&3],结尾 ((t0+t1)+(t2+t3))",只是遍历顺序变了。
+        // env:XIAOTU_MOE_NTILE=1 开(默认关,便于 A/B);XIAOTU_MOE_NTILE_NJ 默认 4。
+        static const int _ntile = [] { const char* e = std::getenv("XIAOTU_MOE_NTILE");
+                                       return e ? std::atoi(e) : 0; }();
+        static const int _ntile_nj = [] { const char* e = std::getenv("XIAOTU_MOE_NTILE_NJ");
+                                          const long v = e ? std::atol(e) : 4;
+                                          return (int)((v > 0 && v <= 16) ? v : 4); }();
+        if (_ntile != 0 && M == 1 && (n1 - n0) >= 2) {
+            static bool _once = [](){ fprintf(stderr, "[ntile] BRANCH TAKEN (M=1 N-tile)\n"); return true; }();
+            (void)_once;
+            const int NJ = _ntile_nj;
+            const float* p0 = a32;
+            for (int jb = n0; jb < n1; jb += NJ) {
+                const int jn = (jb + NJ <= n1) ? NJ : (n1 - jb);
+                __m512 acc[16][4];
+                for (int u = 0; u < jn; ++u)
+                    for (int q = 0; q < 4; ++q) acc[u][q] = _mm512_setzero_ps();
+                for (int g = 0; g < group_count; g++) {
+                    const int base = g * 32;
+                    const __m512 xa = _mm512_loadu_ps(p0 + base);
+                    const __m512 xb = _mm512_loadu_ps(p0 + base + 16);
+                    const int pp = g & 3;
+                    for (int u = 0; u < jn; ++u) {
+                        const int j = jb + u;
+                        const uint8_t* brow = W + (size_t)(j - rowshift) * (K / 2);
+                        XIAOTU_DECODE_GROUP_AVX512(brow, g);
+                        const __m512 sv = _mm512_set1_ps(row_scale((j / gn) * kb_stride, g));
+                        __m512 d = _mm512_mul_ps(wlo_, xa);
+                        d = _mm512_fmadd_ps(whi_, xb, d);
+                        acc[u][pp] = _mm512_fmadd_ps(d, sv, acc[u][pp]);
+                    }
+                }
+                for (int u = 0; u < jn; ++u) {
+                    const __m512 sm = _mm512_add_ps(_mm512_add_ps(acc[u][0], acc[u][1]),
+                                                    _mm512_add_ps(acc[u][2], acc[u][3]));
+                    C[(size_t)jb + (size_t)u] = hsum512(sm) * global_scale;
+                }
+            }
+            if (bp_on) {
+                auto bp_t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+                byteprof_accum((size_t)(n1 - n0) * (size_t)(K / 2), (uint64_t)(bp_t1 - bp_t0));
+            }
+            return;
+        }
         for (int j = n0; j < n1; ++j) {
             const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
             const int srow = (j / gn) * kb_stride;            // 每行一次除法
