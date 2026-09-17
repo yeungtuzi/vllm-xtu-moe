@@ -773,6 +773,35 @@ def install_profile_guard() -> list[str]:
     _initialize_kv_caches._xtu_shim = True  # type: ignore[attr-defined]
     EngineCore._initialize_kv_caches = _initialize_kv_caches
     applied.append("EngineCore._initialize_kv_caches")
+
+    # 【§589 修】**必须同时给每个 worker 进程装一个锚点!**
+    # `_IN_STARTUP` 是**进程级**标志,而门控 `_gpu_pf` 是在 **worker 进程**里求值的;
+    # `EngineCore._initialize_kv_caches` 只在 EngineCore 进程执行(实测日志里那行
+    # "startup finished" 只有 EngineCore 打过)⇒ **worker 里 `_IN_STARTUP[0]` 永远是 True**
+    # ⇒ `in_profile_run()` 恒真 ⇒ **GPU 预填充从来没真正生效过**(4K 输入 TTFT 15.6 s,
+    # 40 层 × 382 ms 全是 CPU MoE)。正确的 per-worker 锚点是
+    # `Worker.compile_or_warm_up_model`:它在 KV 定容之后、图捕获完成时返回,正好是
+    # "该 worker 的 startup 结束"(且期间保持禁用,才能不污染 profile 的显存测量与捕获)。
+    try:
+        from vllm.v1.worker.gpu_worker import Worker
+    except Exception:  # noqa: BLE001
+        return applied
+    orig_warm = getattr(Worker, "compile_or_warm_up_model", None)
+    if orig_warm is not None and not getattr(orig_warm, "_xtu_shim", False):
+        @functools.wraps(orig_warm)
+        def compile_or_warm_up_model(self, *a, **kw):
+            try:
+                return orig_warm(self, *a, **kw)
+            finally:
+                if _IN_STARTUP[0]:
+                    _IN_STARTUP[0] = False
+                    print("[vllm-xtu-moe] worker startup finished (KV sized + graphs "
+                          "captured) -> GPU prefill allowed subject to VRAM preflight",
+                          flush=True)
+
+        compile_or_warm_up_model._xtu_shim = True  # type: ignore[attr-defined]
+        Worker.compile_or_warm_up_model = compile_or_warm_up_model
+        applied.append("Worker.compile_or_warm_up_model(per-worker startup anchor)")
     return applied
 
 

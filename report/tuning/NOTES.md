@@ -21353,3 +21353,31 @@ vllm serve … --tensor-parallel-size 2 --max-model-len 65536 \
 ⇒ **要一锤定音**:用**同一条命令、同一台机器**跑两套栈
 (`vllm bench latency --input-len 32 --output-len 128 --batch-size 1`),我们栈 vs `scripts/serve_lk_port.sh` 的 lk 栈。
 这是唯一能消除全部口径歧义的实验(约 2 次启动 ≈ 15 分钟)。**下一轮执行。**
+
+## §589 🐞❗**发现并修复一个 10× 级 bug:GPU 预填充从未真正生效**(用户提问"4K 输入 TTFT 15 s 是不是没走 GPU 预填充"引出)
+### (a) 现象(用户先看出来的)
+§587 的上下文曲线里 `prompt≈4000 token ⇒ TTFT 15633 ms`。用 `--enable-logging-iteration-details`
+对齐到具体一步:
+```
+Iteration(288): 1 context request, 1764 context tokens, iteration elapsed time: 15614 ms
+[cd-timing] qlen=1764  period=381.99 ms/层  compute=348~351 ms(engine)  rest=31 ms   (compute 91-92%)
+```
+⇒ 40 层 × 382 ms ≈ 15.3 s,**其中 351 ms/层是 CPU 引擎** ⇒ **MoE 在 CPU 上算,GPU 预填充没生效**。
+### (b) 根因:`_IN_STARTUP` 是**进程级**标志,却只在 EngineCore 进程被清零
+* `gpu_prefill.in_profile_run() = _IN_PROFILE_RUN or _IN_STARTUP[0]`,而 `_gpu_pf` 的门控里有一条
+  `not in_profile_run()`(它是为防止 profile run 期间做 host 拷贝、污染 KV 定容而加的,§460);
+* `_IN_STARTUP[0]` 只由 `EngineCore._initialize_kv_caches` 的 shim 清零 —— 而该方法**只在
+  EngineCore 进程执行**:实测日志里那行 "startup finished …" **只有 `EngineCore pid=…` 打过,
+  worker(Worker_TP0/TP1)一次都没有**;
+* ⇒ **worker 进程里 `_IN_STARTUP[0]` 永远是 True** ⇒ `in_profile_run()` 恒真 ⇒
+  **`_gpu_pf` 恒为 False ⇒ GPU 预填充从未跑起来**(尽管日志说"now allowed")。
+* 这也解释了两个长期疑惑:①"打开了 GPU 预填充阈值但预填充耗时几乎不变";②日志里从没见过
+  `GPU prefill DISABLED for this layer`(因为根本没走到 preflight)。
+### (c) 修复
+给**每个 worker 进程**装锚点:`Worker.compile_or_warm_up_model` 返回后清 `_IN_STARTUP[0]`
+(它在 KV 定容之后、图捕获完成时返回,正好是"该 worker 的 startup 结束";期间保持禁用,
+才不会污染 profile 的显存测量与捕获)。`gpu_prefill.install_profile_guard()` 里新增这一段。
+### (d) 影响面(重要)
+* R-VRAM 优先级 2 一直在为 GPU 预填充预留 **3.0 GiB/卡**,但**收益从未兑现**;
+* 预填充一直是**纯 CPU MoE**:实测 4K 输入的 TTFT **15.6 s**、2048-token 一步 ~1.0 s(engine 991 ms);
+  修复后预期大幅下降(待 §589e 验证)。
