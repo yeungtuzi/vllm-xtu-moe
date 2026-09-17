@@ -21882,3 +21882,30 @@ slot_mapping must not exceed q row count 出现次数 = 0     ← ✅ 崩溃消�
 ### (d) 当前状态(可安全合入)
 * **崩溃 0 次**;不切片 ⇒ 无收益、**行为与关闭 CED 完全一致**(耗时 ×1.00);
 * 全部由 `XIAOTU_CED_FASTPREFILL=1` 门控,默认关;失败路径 fail-safe(不会崩)。
+
+## §604h CED:slOT_mapping 越界**已彻底解决**,剩余错误前移到 kernel 的 shape 校验
+### (a) 本轮实现(路径 1,不改 vLLM 文件)
+新增 `_install_ced_kvinsert_shim`:包住 `DeepseekV4Attention._fused_qnorm_rope_kv_insert`,
+当"本步确实做过 CED 改写"(`_CED_STATE["win"] > 0`)且 `slot_mapping` 比 `q` 行数长时,
+**把 `slot_mapping` 切到最后 `q.shape[0]` 项**(浅拷贝 metadata,不动共享对象);
+同时把 §604e 的"SWA 长度不等就不切"门控放宽(改由本 shim 兜住)。
+### (b) 实测(c5):机制✅
+```
+[ced-diag] 层**切片** layer_idx=21 t=301 -> 255                ×2
+[ced-diag] KV-insert:slot_mapping 301 → 255(按 q 行数对齐)     ×4
+slot_mapping must not exceed q row count = 0                   ← ✅ 老错误彻底消失
+```
+### (c) 新错误(前移了一步)
+```
+fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+  fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu:1005,
+  **q/kv/position_ids row counts must match**
+```
+崩溃帧:`attention.py:871`(`_fused_qnorm_rope_kv_insert`)← `project_query_and_cache_kv`(680)
+← `_prepare_and_attn_fn`(699)← `attention.py:567` ← `model.py:1173/432/710` ← `vl_model.py:309`。
+### (d) 下一步(一处 print 即可定位)
+在 `_install_ced_kvinsert_shim` 里**同时打印 `q.shape[0] / kv.shape[0] / positions.shape[0] /
+slot_mapping.numel()`**,即可知道三者里哪个还是全长;最可能是 `positions`
+(它由调用方传入,可能与 `hidden_states` 不是同一个被切的视图)或 `kv`
+(它经 `_run_parallel_input_projections` 产生,若该处读了**未切**的 buffer 就会是 301)。
+**修法**同样是把不匹配的那个按 `q` 行数对齐(与 slot_mapping 同一思路),仍不需要改 vLLM 文件。
