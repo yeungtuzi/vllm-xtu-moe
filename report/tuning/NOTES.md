@@ -20801,3 +20801,17 @@ compress_ratios = [0,0, 2,2,2,2,2,2, 2,2,2,2,2,2, 2,2,2,2,2,2, 1,1,1,1,1,1,1,1,1
    相 B 的 **slot mapping** 必须把 255 个位置写到各自 SWA 缓存的正确槽位。
 3. 末位 logits 由相 B 产出;此后正常解码。
 ⇒ 本轮先交付**口径确认 + 收益 + 验收口径**(上面四节);实现留待后续轮次。
+
+### (f) 实现路径(已核实可行,边界清楚)
+* **已有的基础**:`DeepseekV4Model.forward` 本身就是
+  `for layer in islice(self.layers, self.start_layer, self.end_layer)`(`model.py:707`)
+  ⇒ **层范围前向的骨架已经存在**(PP 机制);层间状态是 6 元组
+  `hidden_states, residual, post_mix, res_mix, pre_mix, previous_aux`(`model.py:710`,`698` 处初始化为 None)。
+* **缺的一块(唯一的真难点)**:**跨"相"的状态交接** —— PP 只搬 `hidden_states`,搬不了这套 mHC 状态。
+  所以相 A(层 0..20,全 T)结束时要把这 6 元组按**最后 255 个位置**切片,交给相 B 作为初始状态。
+* **相 B 的 attention metadata 不用新造**:它就是"序列末尾 255 个 token 的一个 chunk"
+  (`positions`/`slot_mapping`/`block_table` 都落在既有 chunked-prefill 的表达能力内),
+  于是 255 个位置会写进各层 SWA 缓存的正确槽位。
+* **层 21..39 自动不跑压缩器**(`compress_ratios=1` 且 `is_kv_source=False`)⇒ 与 §571a 的实测一致。
+* 末位 logits 由相 B 产出;此后进入正常解码。
+* ⇒ 结论:**可做,工程量集中在"状态交接 + 相 B 的调用编排"**,而不是重写注意力。
