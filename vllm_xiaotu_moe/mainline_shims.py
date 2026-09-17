@@ -1431,6 +1431,50 @@ def _ced_window_indices(cam, w: int):
     return t, n
 
 
+def _install_ced_attn_align_shim() -> list[str]:
+    """【§604n】**在 attention 入口把它自己收到的 `positions`/`hidden_states` 也对齐。**
+
+    为什么必须在这一层做(§604m 实测):层 22..39 的**隐藏态**已被上游链条切短(255),
+    但 attention 拿到的 `positions` **仍是全长 301** —— 说明它并非来自层入参切片
+    (而是 runner 的全局 positions 缓冲)。后果:rotary/compressor 用错位置 ⇒
+    `CUDA error: an illegal memory access`(≥1024 token 的 prompt 必现)。
+    这里按 `min(窗口, hidden_states 行数)` 对齐,**与调用方传什么无关**。
+    """
+    if os.environ.get("XIAOTU_CED_FASTPREFILL") != "1":
+        return []
+    try:
+        from vllm.models.deepseek_v41.attention import DeepseekV4Attention as _A
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip ced attn align shim: {type(exc).__name__}: {exc}")
+        return []
+    orig = getattr(_A, "forward", None)
+    if orig is None or getattr(orig, "_xtu_ced_align", False):
+        return []
+
+    @functools.wraps(orig)
+    def forward(self, positions, hidden_states, *a, **kw):
+        try:
+            w = int(_CED_STATE.get("win", 0))
+            if w > 0 and hasattr(hidden_states, "shape") and hidden_states.shape:
+                need = min(w, int(hidden_states.shape[0]))
+                if hasattr(positions, "shape") and int(positions.shape[0]) > need:
+                    positions = positions[-need:].contiguous()
+                if int(hidden_states.shape[0]) > need:
+                    hidden_states = hidden_states[-need:]
+                if os.environ.get("XIAOTU_CED_DIAG") == "1" and _CED_STATE["log"] < 40:
+                    _CED_STATE["log"] += 1
+                    _log(f"[ced-diag] attn 入口对齐:need={need} "
+                         f"hidden={int(hidden_states.shape[0])} "
+                         f"pos={int(positions.shape[0]) if hasattr(positions, 'shape') else 'NA'}")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"ced attn 入口对齐失败(走原路径): {type(exc).__name__}: {exc}")
+        return orig(self, positions, hidden_states, *a, **kw)
+
+    forward._xtu_ced_align = True  # type: ignore
+    _A.forward = forward
+    return ["DeepseekV4Attention.forward(CED positions/hidden 对齐)"]
+
+
 def _install_ced_kvinsert_shim() -> list[str]:
     """【§604h】CED 切片后 **KV-insert 的 `slot_mapping` 仍是全长** ⇒ `slot_mapping must not exceed q row count`。
 
@@ -1743,6 +1787,7 @@ def apply_mainline_shims() -> list[str]:
         _install_ced_fastprefill_shim,
         _install_ced_slice_shim,
         _install_ced_kvinsert_shim,
+        _install_ced_attn_align_shim,
         _install_oracle_shims,
         _install_prepack_shims,
         _install_mxfp4_cpu_convert_shim,
