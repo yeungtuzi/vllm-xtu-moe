@@ -20741,7 +20741,7 @@ worker 的 `fetch_add` 落在"新调用已开始、但奇数代尚未对它可�
 | 每 node 最低余量 | **≥35.0 GB** | NPS4 无单 node 耗尽 |
 | **KV 容量** | **6,724,586 tokens**;1M 请求并发 **6.41×** | ⇒ **1M 上下文完整支持** |
 | Engram 表内容校验 | **8/8 PASS**(两 rank × 2 层 × weight/scale) | §564 |
-| 显存占用 | **35.98 GiB/卡** | 40 GB 卡内 |
+| 显存占用 | **35.98 GiB/卡(总占用,不是 KV!)** | KV 只有 12.01 GiB;详见 §592(b) |
 | **服务级 greedy 两次自比** | **5/5 逐字节相同** | — |
 | **带载 0 丢票** | `WATCHDOG/abandoned/SLOW parallel_for` **各 0 次**;0 error;52 请求全 200 | §569 修复的直接验证 |
 | ShareGPT 16 题 C=1 | **agg 16.64 tok/s,TPOT 36.75 ms**,TTFT 2178 ms,16/16 | 记录 33.41-40.68 ms 区间内 |
@@ -21472,3 +21472,57 @@ TP1: 同上                                                                     
 * `report/tuning/probes/xtu_own_v41_mem.sh`:新增 `KV_CACHE_BYTES` 旋钮(→ `--kv-cache-memory`)。
 * `docs/RUNBOOK.md`:新增 **§5.8 让 GPU 预填充真的拿到显存(必读)**、§5.6 加两条陷阱
   (util 饿死预填充 / "预热 1 秒"是缓存命中)、§5.2 换成新口径表。
+
+## §593 ⭐ 那 11.6 s/chunk 到底花在哪:**分解到 ms**,并证明"门槛高"= 模型变大 + 我们只跑出 50% 带宽
+### (a) 硬件无辜(用户提议查 PCIe ⇒ 查了,排除)
+| 检查 | 结果 |
+|---|---|
+| `nvidia-smi --query-gpu=pcie.link.gen.*` | `current=4, gpumax=4, hostmax=**5**`, `width=16/16`,三卡一致 |
+| **实测 pinned H2D** | `torch.empty(1GiB).pin_memory().to(cuda,non_blocking)` = **26.85 GB/s**;pageable 25.0;就地 `cudaHostRegister` 26.79 |
+| `dmesg` | 无 PCIe/AER/降级告警 |
+⇒ A100-PCIE 的 `gpumax=Gen4`,链路**跑在自己的上限**(host 侧甚至支持 Gen5);
+⇒ **26.8 GB/s ≈ Gen4 x16 线速(31.5 理论)** ⇒ **不是 BIOS/主板/链路降级**。
+### (b) 每 chunk 要搬多少:143.6 GiB/rank
+日志实测的每 rank 每层形状(w13/w2/scales):
+```
+w13 (384,2304,2560)=2.109 GiB + w2 (384,5120,576)=1.055 GiB + s13/s2=0.425 GiB = 3.589 GiB/层
+× 40 层 = **143.6 GiB / rank / 每个 prefill chunk**(与 chunk 大小无关)
+```
+### (c) ⭐分解:11.6 s → 5.74(线速拷贝) + 1.66(转置) + **4.2(未解释)**
+| 路径 | ms/层 | 40 层 | 有效带宽 |
+|---|---|---|---|
+| 纯 4 个 pinned `.to(dev, non_blocking)` | 143.5 | **5.74 s** | **26.85 GB/s(=线速)** |
+| 上者 + `permute(0,2,1).contiguous()`(GPU K-major) | 185.0 | **7.40 s** | 20.83 GB/s |
+| **服务实测**(`cd-timing`,qlen=2048) | **290** | **11.6 s** | 13.3 GB/s |
+⇒ 结论:
+1. **拷贝本身是线速的**(和 §(a) 的微基准一致)⇒ 瓶颈不是驱动/锁页;
+2. GPU 侧 K-major 转置**多花 1.66 s/chunk**(+29%);
+3. **另有 4.2 s/chunk(105 ms/层)既不是拷贝也不是转置** —— 最可疑的是**没有重叠**:
+   整层 MoE 挂在 `cudaLaunchHostFunc` 回调里,host 是"上一层回调回来才发下一层的拷",
+   所以 H2D 无法与上一层 GPU 计算重叠;`ping/pong 2 槽` 的设计意图(预取)在服务里似乎没生效。
+   (次要嫌疑:每层 `cudaMalloc`/释放 3.5 GiB×2 的分配器抖动。)
+### (d) 对"收益门槛"的完整回答(用户两问)
+* **不是"最多 1 秒传输"**:那个直觉只对**一层**(3.589 GiB ÷ 26.8 GB/s = 143 ms)成立;
+  一个 chunk 要搬 **40 层**。
+* **V4 为什么 7-8 s**:同一份代码、同一带宽,搬的权重更少 ⇒ **门槛上升纯粹是"模型变大"**;
+* **CPU 侧参照**:≈3.9 ms/token(qlen=2048 实测 compute 且整体 ~258-285 tok/s);
+* **盈亏平衡**:`11.6 s = chunk × 3.9 ms` ⇒ **chunk ≈ 3000 token**;之后 GPU 越大越快,因为 11.6 s 是**固定**的:
+  | chunk | 当前(11.6 s) | 转置修好(7.40 s) | 线速+流水(5.74 s) |
+  |---|---|---|---|
+  | 2048 | 174 | 277 | 357 |
+  | 8192 | 694 | 1107 | 1427 |
+  | **11000** | 948 | **1486** | 1916 |
+  | **17400** | **1500** | 2351 | 3031 |
+  ⇒ **1500 tok/s 所需的 chunk:当前 17.4K;去掉多余 4.2 s 后 11.1K;做到线速+重叠后 8.6K**。
+  ⇒ 所以"32K 才有巨大收益"是"固定成本 11.6 s"的算术结果,**修掉 (c) 的第 2、3 项就能把门槛砍半**。
+### (e) 后续可做的三条(按性价比)
+1. **【最贵但最对】把 H2D 从回调里挪出去**:为下一层预取(ping/pong 真正生效)+ 独立拷贝流,
+   目标 = `max(总DMA, 总计算)` ⇒ 5.74 s/chunk;
+2. **消掉 GPU 侧转置 1.66 s**:让 GEMM 直接读 `[E,N,K]` 跨步(或把转置融进反量化 kernel);
+3. **选择性地只搬"本 chunk 命中的专家"**(CPU 引擎已有 expert grouping 的结果可用):
+   qlen=1 时只需 6 个专家(现在也搬 384 个!)—— 对**解码/短 chunk** 是数量级收益,对满 chunk 无收益。
+### (f) ⚠️ 新问题:`MBT=32768` 启动后**卡死**(待查)
+`TAG=gpf_long MAXLEN=65536 MBT=32768 GPU_UTIL=0.55` 起来后 `nvidia-smi` 显示 **GPU 利用率 0%**,
+日志每 60 s 重复 `shm_broadcast.py:801 No available shared memory broadcast block found in 60 seconds`
+(连续 3 次,不恢复)⇒ **不是编译慢,是 hang**;已 kill。要拿到 §(d) 表格里的高 chunk 实测,
+必须先定位这个 hang(嫌疑:MBT≥32768 的某个形状/工作区,或 chunked-prefill 与我们的 host 回调互锁)。

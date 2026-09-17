@@ -335,7 +335,7 @@ TAG=acc1m PORT=8315 MAXLEN=1048576 SEQS=8 GPUS=0,1 SPEC=1 RESIDENT=20-21 GP_MIN=
   bash report/tuning/probes/xtu_own_v41_mem.sh        # 自带内存峰值采样
 
 # 1M 配置的实测(§570):READY 388 s;峰值 629.4 GiB;KV 6,724,586 tokens(1M 并发 6.41×);
-# 显存 35.98 GiB/卡;greedy 两次自比 5/5;带载 0 次 WATCHDOG。
+# 显存 35.98 GiB/卡(**总占用**;其中 KV 池 12.01 GiB —— 别把总占用当 KV,§592(b));greedy 5/5。
 
 # 三门禁(引擎)
 bash scripts/check_engine_aligned.sh
