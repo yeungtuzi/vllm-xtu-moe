@@ -685,6 +685,45 @@ public:
             }
             if (jobs.empty()) return;
 
+            // 【§528】XIAOTU_MOE_FUSE_A2B=1:把 Phase1(gate/up+SiLU)与 Phase2(bf16+down)
+            // **合成一轮并行**。依据:两相用**完全相同**的 job 划分(jobs 按 eid+[ab,ae) 切),
+            // 且每个 assignment 在 Phase2 只读自己在 Phase1 写出的 act_scratch_[ai] —— 
+            // **assignment 之间没有任何跨依赖**,所以合成后每个 assignment 的算子顺序逐字不变
+            // ⇒ 结果应当**逐位相同**(无归约重排)。动机:§527 实测每层固定开销 ~0.6-0.8 ms
+            // 来自"A/B 两轮 per-phase 派发 + 等齐 120 线程"(ovh=0、A:B=2:1 与字节比吻合),
+            // 而每层要付 2 轮;合成后只剩 1 轮,且同一专家的 w13/w2 变成背靠背读取(局部性更好)。
+            static const bool fuse_a2b = std::getenv("XIAOTU_MOE_FUSE_A2B") != nullptr;
+            if (fuse_a2b) {
+                pool_.parallel_for(jobs.size(), [&](size_t ji) {
+                    const Job& job = jobs[ji];
+                    const auto& lst = per_expert[job.eid];
+                    std::vector<float> gate_buf(inter), up_buf(inter);
+                    std::vector<uint16_t> act_bf16(inter);
+                    std::vector<float> down_buf(hidden);
+                    float* act_base = act_scratch_.data();
+                    float* down_base = down_scratch_.data();
+                    for (size_t it = job.ab; it < job.ae; ++it) {
+                        size_t ai = lst[it];
+                        size_t t = ai / (size_t)k;
+                        const uint16_t* xt = input + t * (size_t)hidden;
+                        wt::gate_up(xt, w13_, w13_g_, w13_gs_, gate_buf.data(), up_buf.data(),
+                                    inter, hidden, job.eid, groupN, groupK);
+                        float* act_dst = act_base + ai * (size_t)inter;
+                        if (clamped_)
+                            ::xiaotu_moe::act::silu_gate_clamped(gate_buf.data(),
+                                up_buf.data(), act_dst, inter,
+                                swiglu_limit_, swiglu_alpha_, swiglu_beta_);
+                        else
+                            ::xiaotu_moe::act::silu_gate(gate_buf.data(), up_buf.data(),
+                                                         act_dst, inter);
+                        bf16::convert_f32_to_bf16(act_dst, act_bf16.data(), (size_t)inter);
+                        wt::down(act_bf16.data(), w2_, w2_g_, w2_gs_, down_buf.data(),
+                                 hidden, inter, job.eid, groupN, groupK);
+                        std::memcpy(down_base + ai * (size_t)hidden, down_buf.data(),
+                                    (size_t)hidden * sizeof(float));
+                    }
+                });
+            } else {
             // Phase 1 (parallel over jobs): gate/up + SiLU -> act_scratch_.
             pool_.parallel_for(jobs.size(), [&](size_t ji) {
                 const Job& job = jobs[ji];
@@ -728,6 +767,8 @@ public:
                     std::memcpy(dst, down_buf.data(), (size_t)hidden * sizeof(float));
                 }
             });
+
+            }
 
             // Phase 3 (parallel over tokens): weighted reduce, per token, in rank
             // order — one thread per token, so no output contention.
