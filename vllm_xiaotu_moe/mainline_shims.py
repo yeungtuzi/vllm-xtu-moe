@@ -1462,6 +1462,30 @@ def _install_ced_slice_shim() -> list[str]:
         w = st["win"]
         if t <= w:
             return orig_layer(self, *a, **kw)
+        # 【§604e】**真正决定切片长度的不是"我们改写的那个 metadata",而是
+        # `swa_metadata.slot_mapping`** —— `attention.py:869` 的 fused KV-insert 用的是
+        # `attn_metadata[self.swa_cache_layer.prefix].slot_mapping`,它与 query 侧是
+        # **两个不同的 metadata 对象**。所以这里直接从 forward context 里把 SWA 侧的
+        # slot_mapping 长度读出来,并以它为准;读不到或与窗口不一致就**不切**(安全)。
+        _swa_len = -1
+        try:
+            from vllm.forward_context import get_forward_context as _gfc
+            _md = _gfc().attn_metadata
+            _attn = getattr(self, "attn", None)
+            _swa = getattr(_attn, "swa_cache_layer", None)
+            _pfx = getattr(_swa, "prefix", None)
+            if isinstance(_md, dict) and _pfx is not None and _pfx in _md:
+                _sm = getattr(_md[_pfx], "slot_mapping", None)
+                if _sm is not None:
+                    _swa_len = int(_sm.numel())
+        except Exception:  # noqa: BLE001
+            _swa_len = -1
+        if _swa_len != int(w):
+            if os.environ.get("XIAOTU_CED_DIAG") == "1" and _CED_STATE["log"] < 8:
+                _CED_STATE["log"] += 1
+                _log(f"[ced-diag] 不切片:SWA slot_mapping 长度={_swa_len} ≠ 窗口 {w} "
+                     f"(t={t})⇒ 以 SWA 侧为准(它才是 KV-insert 的约束)")
+            return orig_layer(self, *a, **kw)
         if not (int(_CED_STATE.get("win", 0)) > 0
                 and int(_CED_STATE.get("toks", -1)) == int(t)):
             # 【§604c fail-safe】metadata 侧本步**没有**改写 ⇒ 绝不能切,否则
