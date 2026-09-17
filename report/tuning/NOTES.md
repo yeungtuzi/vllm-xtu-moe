@@ -19470,3 +19470,39 @@ worker 在读别的 node 的页。这既不是 socket 分组、也不是 node �
 读 lk 的内层 lane 映射(§119 已记:lk 的 lane 走**输出列**,我们走 **K 维**),对我们
 `gate_up`/`down_slice_batched` 做同方向向量化改造;验收:§529(a) 的 3 次重复协议(丢首跑)
 + 同日 lk 比值门(≤1.20)+ 数值对拍 + 确定性门。**这是解码侧最后一块拼图。**
+
+## §530 按用户指示**反汇编 lk_moe**(不再猜):已排除两个假设 + 找到结构性差异 + 下一步定位手段
+
+用户指令(2026-09-17):"如果确定是引擎问题,直接反编译 lk-moe 来找到区别,别猜了。" 先确认是引擎问题:
+* **分片不是限制**:M=1 解码形状下 baseline(分片 nshard=8)0.33/0.35 vs `XIAOTU_MOE_NSHARD=1`(socket 副本)0.35/0.33
+  ⇒ **无差别**;结合 §529(0.353 vs lk 0.243 = 1.45×,与服务级 TPOT 比值一致)⇒ 问题在**内核**。
+
+### (a) 排除:ISA 变体不是原因
+lk 的变体阶梯是 `avx2 / avx512_base / avx512_vnni / avx512_amx`(**没有 bf16**),我们是
+`scalar/avx2/avx512_base/avx512_vnni/avx512_bf16`。临时移走 bf16 .so 强制走 vnni 实测(V4.1,M=1,DEDUP=6,丢首跑+2 次):
+**bf16 0.41/0.40 vs vnni 0.40/0.40 ⇒ 无差别**(`xiaotu_moe/loader.py` 有 `choose_variant(force=...)` 可强制)。
+
+### (b) 找到的**结构性**差异(同一 ISA 档,objdump 统计整个 .so 的指令数)
+| .so | `vdpbf16ps` | `vpermi2` | `prefetcht0` |
+|---|---|---|---|
+| 我们 avx512_**vnni** | 0 | **0** | 24 |
+| 我们 avx512_**bf16** | **20** | 0 | 24 |
+| lk avx512_**vnni** | 0 | **176** | 0 |
+| lk avx512_base | 0 | 176 | 0 |
+
+* **lk 的 MXFP4 路线 = 查表(LUT)解量化**:`vpermi2*` 双源字节/字置换把 4-bit 码展开,再走**整数**算术
+  (`vpaddd/vpsrad/vpmulld/vpcmpgtd/vpand`,dumped 区域 0x12b1c5 起可见);
+* **我们**在 vnni 档下 `vpdpbusd/vpermi2/vpmaddwd/vpdpwssd` **全为 0** ⇒ 那条路径根本没用整数点积,
+  而是标量/浮点(bf16 档才有 20 处 `vdpbf16ps`);
+* 我们还有 24 处 `prefetcht0`(**源码级 `__builtin_prefetch`**),lk 一处都没有。
+⇒ **不是"同一算法不同参数",而是两条不同的内核路线**;这解释了为什么 §119 那句"lane=K vs 输出列"
+只是表象 —— 真正的区别在**解量化方式(LUT+整数 vs 浮点展开)**与**数据流结构**。
+
+### (c) ⚠️ 本轮没做到的:还没拿到 lk 的**热循环本身**
+lk 的 .so **静态符号表被 strip**(`nm` 无输出,只有 `.dynsym`),我按 `vpermi2` 地址窗口 dump 到的
+是**解量化辅助段**,不是 GEMV 主循环;我们自己那侧 dump 到的也是 group-scale 段。**所以还不足以动手改。**
+* 下一步的**定位手段**(不再猜地址):①我们的 .so **未 strip**,直接
+  `objdump -d --disassemble=<mangled gate_up_slice_batch_impl<MXFP4>>` 精确取内层循环;
+  ②lk 侧用 **gdb 采样**(`kernel.yama.ptrace_scope=1` 允许附加自己的子进程)在 bench 跑动时反复中断、
+  统计 PC 热点 ⇒ 用热点地址反推函数边界,再 dump 该窗口;③对照维度:每个 dot 指令对应的
+  **权重字节数**、循环展开因子、每迭代的 load 数、是否有横向归约。
