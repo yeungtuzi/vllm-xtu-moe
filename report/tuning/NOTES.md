@@ -19713,3 +19713,17 @@ lk 内层 **58 条指令里 20 条 `vfmadd231ps`,访存只有 3 条(每条 FMA 0
    batched/sharded 变体),跑一次 M=1 bench ⇒ 看哪条亮;
 2. 用该入口的**符号**圈定内层循环,再统计"每条 FMA 配多少访存"(与 §534a 的 lk 0.15 条/ FMA 对齐口径);
 3. 在那之后才谈"填满指令周期 / 减少访存 / 利用 L3"。
+
+### §536(e) 定位 M=1 入口的插桩尝试:构建失败,但失败信息给出了关键线索
+* 我按 §536(d) 想在候选入口插打印,结果 3 个编译错误:
+  `moe_v2_packed4.hpp:705: ‘M’ is not captured / ‘n0’ is not captured / ‘n1’ is not captured`。
+* **线索**:文件里 `const bool bp_on = byteprof_on();` 出现在**两处**(255 与 704),而第二处
+  **位于一个 lambda 体内**(所以 `M/n0/n1` 没被捕获)⇒ **M=1 走的那个内核很可能是以 lambda 形式
+  实现的**,而不是一个具名函数;并且 `forward_many_nsliced` 的定义在 **`moe_v2.hpp`**(不在
+  `moe_v2_packed4.hpp`),我最初的 grep 找错了文件。
+* 已回退插桩并重建:**BUILD_EXIT=0 / 0 错误 / .so 无残留 probe 字符串 / M=1 正常(0.48 ms/层)**。
+  (R55:不允许把构建失败的引擎改动留在树里。)
+* ⇒ 下一轮的定位动作改为:①在 **`moe_v2.hpp` 的 `forward_many_nsliced`** 入口插桩;
+  ②找到 704 那处 `bp_on` 的**外层 lambda 的调用点**(在 `forward_many_nsliced` 里搜
+  `pfor(`/lambda 名),把打印插在**调用点**而不是 lambda 体内(那一层能拿到 M/n0/n1)。
+* **不再对"是哪条内核"做任何推理**,以插桩输出为准。
