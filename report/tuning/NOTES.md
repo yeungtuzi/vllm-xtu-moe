@@ -19727,3 +19727,16 @@ lk 内层 **58 条指令里 20 条 `vfmadd231ps`,访存只有 3 条(每条 FMA 0
   ②找到 704 那处 `bp_on` 的**外层 lambda 的调用点**(在 `forward_many_nsliced` 里搜
   `pfor(`/lambda 名),把打印插在**调用点**而不是 lambda 体内(那一层能拿到 M/n0/n1)。
 * **不再对"是哪条内核"做任何推理**,以插桩输出为准。
+
+### §536(f) 用**插桩**排除:`moe_v2_packed4.hpp` 的两个 FAST_FP4 块在 M=1 下**都不执行**
+* 第二个 FAST_FP4 块(`moe_v2_packed4.hpp:704`,同样条件 `if (FAST_FP4 && gk==32 && (K&31)==0 && M*K<=4<<20)`)
+  插入**无捕获**打印后,构建成功(`BUILD_EXIT=0`),实跑 M=1:**`[probe2]` 一行都没打印**。
+* 加上 §536(b) 的第一个块(插桩也未打印)⇒ **两个 FAST_FP4 实现都不是 M=1 解码执行的内核**。
+* 相关静态事实:`kFastFP4 = FastFP4`(`moe_v2_packed4.hpp:963`)是 traits 模板参数;调用点共 8 处
+  (998/1025/1058/1060/1086/1178/1181/1222)都传 `kFastFP4`。⇒ 说明 M=1 的解码 GEMV
+  **很可能根本不经过 `matmul_packed4_group`**,而走 `moe_v2.hpp` 里的另一条路
+  (`forward_many_nsliced` 的 lambda / sharded / batched 变体)。
+* **不再推理**。下一步只做一件事:**在 `moe_v2.hpp` 的 `forward_many_nsliced` 入口与其内部
+  各 `pfor(...)` 调用点插一次无捕获打印**,跑一次 M=1 bench,看哪条亮 —— 拿到真正入口后再谈优化。
+* 状态:插桩已全部撤回,**BUILD_EXIT=0 / 0 错误 / .so 无 probe 字符串 / M=1 正常**;`XIAOTU_MOE_NTILE`
+  惰性补丁保留(默认关,已记为惰性)。
