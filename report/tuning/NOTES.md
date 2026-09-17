@@ -21968,3 +21968,35 @@ token 数"分配,而我们把入参切短了 ⇒ 断言 token 数一致)。
 ### (e) 全程结论
 机制链条已全部走通(切片 → 元数据改写 → KV-insert 对齐 → attention 入口对齐),
 **零 kernel 错误**;剩下的是与 vLLM 内部**长度约定**的最后一个断言。
+
+## §604o ⭐ CED 的**架构级结论**:剩余阻塞不是 bug,而是"层切片"与 vLLM 流水线不变量冲突
+### (a) AssertionError 的准确位置
+```
+File "vllm/model_executor/kernels/mhc/tilelang.py", line 345
+    assert x.shape == (num_tokens, hidden_size) and x.dtype == torch.bfloat16
+```
+其中 `num_tokens` 取自**同一个 mHC 调用里的 `residual`**(§`tilelang.py:342`),
+即 **mHC(profiler 里占 7.9% 的那个核)要求 `x` 与 `residual` 的 token 数严格相等**。
+### (b) 为什么这是"设计冲突"而不是"少切了一个张量"
+"层切片"路线(§577c:不只改 metadata,还要把层的 MLP/MoE 也只算尾部)意味着
+**让层返回比本步 `num_tokens` 更短的张量**,而 vLLM 的整条流水线
+(runner 的 buffer 分配、mHC 的 `x`/`residual` 配对、各 fused kernel 的行数校验)
+**都以 `num_tokens` 为不变量**。
+我们一路修下来把冲突点逐个暴露并绕开:
+| 顺序 | 暴露的校验 | 我们的绕法 |
+|---|---|---|
+| 1 | `slot_mapping must not exceed q row count` | KV-insert shim 对齐 slot_mapping(§604h) |
+| 2 | `q/kv/position_ids row counts must match` | 同样对齐 positions/kv(§604i) |
+| 3 | `CUDA illegal memory access`(positions 没切到) | 按形状切 + attention 入口对齐(§604m/n) |
+| 4 | **`mHC assert x.shape == (num_tokens, …)`** | **尚未解决** —— 需要让 `residual` 等**全部**流水线张量同步变短 |
+### (c) 两条出路(明确)
+1. **只做 metadata 半程**(§579 原方案,不切层):与流水线**天然兼容**、零风险,
+   但按 §577c 的论证收益小(CPU MoE 仍要算全部 T 个 token)⇒ 只能省 attention 的一部分;
+2. **完整层切片**:必须把"本步 token 数"这一个不变量**贯穿到所有下游张量与断言**
+   (mHC 的 `x/residual`、runner 的 buffer、各 fused kernel)—— 等价于**在上游 vLLM 里原生实现 CED**,
+   工作量与风险都远超"插件级 hack",应当作为**上游特性**推进,而不是继续补丁式打洞。
+### (d) 本轮交付(代码全部默认关、fail-safe)
+* `_install_ced_attn_align_shim`(attention 入口对齐)、`_install_ced_kvinsert_shim`(KV-insert 对齐)、
+  层切片改为**按形状**切入参、`_CED_STATE` 步级握手;
+* 全部由 `XIAOTU_CED_FASTPREFILL=1` + `--kv-sharing-fast-prefill` 门控,**默认关闭**;
+* **短 prompt 5/5 与开关无关地一致**;长 prompt 在默认(关)配置下**完全不受影响**(回归安全)。
