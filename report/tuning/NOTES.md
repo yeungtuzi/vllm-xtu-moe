@@ -21000,3 +21000,55 @@ for layer_name, attn_module in attn_layers.items():
 ① 日志出现 `[ced-fastprefill] 追加 V4.1 eligible N 层: ...`(N 应为 19);② 服务能起、无 assert;
 ③ `T ≤ 255` 的请求与关闭 CED 时**逐位一致**;④ 长 prompt 下 **greedy 生成文本逐字节一致**;
 ⑤ 预填充耗时下降(2048-token 目标 ~35%)。**本节只到"代码就位 + 默认零影响",效果未证。**
+
+## §577 🔎 **上游调研:有人做过 CED**(用户 2026-09-18 要求)→ 结论**直接修正了我们 §576 的实现方向**
+### (a) vLLM:只有**通用**机制,没有为 V4.1 接线
+* 通用机制 = `kv_sharing_fast_prefill`(默认关;CLI `--kv-sharing-fast-prefill`),来历:
+  `[V1] Enable prefill optimization for Gemma3n`(vllm-project/vllm **#22628**)、
+  `[Gemma4] Enable Fast Prefill Optimization`(**#38879**)、文档修正 **#47044**、
+  以及较新的 `[Core] MRV2 support for fast-prefill`(**#56145**,本机 mainline 里可见)。
+* **对 DeepSeek V4.1 没有任何接线**:`grep kv_sharing_target_layer_name vllm/models/deepseek_v41/` 零命中;
+  且 §576 已查明**类型级**原因(`Attention` vs `AttentionLayerBase`)⇒ 上游对该模型必然空集。
+* ⇒ 结论:**vLLM 上游目前没有人做 V4.1 的 CED 接线**(我们的判定与 §574-576 一致)。
+
+### (b) **omlx(Apple Silicon / MLX)已经做了,而且就是同一个方案**
+* PR **jundot/omlx#3607** `feat(deepseek_v41): CED prefill skip with SWA bounded replay`
+  (作者 williamxie1989,合并为 commit `991b891`),带一个 UI 开关 `deepseek_v41_ced_prefill_enabled`。
+* 开关文案自述:*"Improves prefill speed by **approximately 74–79%** in tested configurations.
+  **Long-context accuracy is still being evaluated.**"*
+* 社区部署实例:`drowzeys/keys-Mac-oMLX-0.7.0.dev2-DeepSeek-V4.1-Flash-...-CED-MTP`
+  (256 GB Mac Studio M3 Ultra,单机跑 763B,**551 tok/s prefill**)。
+* 它的 **layout 门禁与我们 §571/§574 独立推导的完全一致**:
+  `n_layers 偶数` + `window_size>0` + `mid = n//2 ∈ kv_source 且 ∈ index_source` +
+  `compress_ratios[mid]==1` + **mid 之后全是 ratio-1** + **mid 之后没有源层** + `engram 层都在 mid 之前`。
+
+### (c) ⚠️ **它直接暴露了我们 §576 实现的方向性错误**(两个)
+1. **判据范围错**:我把"`compress_ratio>0` 且非源"的层全算作 eligible,**实测 38 层**
+   (`[ced-fastprefill] 追加 V4.1 eligible 38 层`,日志已存 `cedon.memfoot.log`)—— 但**编码器半区
+   (2..19)必须在预填充时跑满**(它们要产出 `h_mid` 和自身的 KV)。omlx 的门禁只允许
+   **ratio-1 的连续尾段 + 中点层是源** ⇒ V4.1 应是 **19 层(21..39)+ 中点层 20 的特殊处理**。
+   我这次启动了那个错配的服务(它没崩,但结果必然错)⇒ 该 A/B **无效**,已作废。
+2. **更根本:只改 attention metadata 不够**。omlx 的做法是**在层循环里把隐藏状态切成尾部**:
+   `ced_tail = window_size`,`for i >= mid: layer(...)` 只对**尾部 token** 跑(连 MoE/MLP 都只跑尾部),
+   并把 `cache[1] = None` 丢掉不连续的 SWA 窗口;中点是"**query 走尾部、global KV 仍投影完整
+   编码器隐状态**"的分离处理(`kv_x = x if ced_kv is None else ced_kv`)。
+   而我们的 metadata-only 改写**只限制注意力 query**,MLP/MoE 仍会对全部 T 个 token 跑
+   ⇒ **在我们这台机器上(预填充由 CPU MoE 主导)几乎拿不到收益**。
+   ⇒ **必须做"隐藏状态切片"(模型层循环级),而不是只改 attention metadata。**
+
+### (d) 它给的另一个关键信息:**窗口取 128(≈近似),不是 255(精确)**
+* omlx 取 `ced_tail = window_size`(=128),并把"drop 掉不连续的窗口"当成 by design;
+  它自己的测试**明确断言**长序列下末位 logits 与完整计算**不相等**
+  (`assert not np.allclose(lo[:, -1], ln[:, -1])`),只有"短于窗口"的情形才逐位一致。
+* 这与 §573b 的因果分析对上了:**要精确需 `2·w_win−1 = 255`**;取 128 就是**用精度换速度**,
+  也解释了它文案里"长上下文精度仍在评估"。
+* 它声称的 **74–79%** 远高于我们按层数的估算(35–47%)——**这是它的测量口径**,不宜直接搬用;
+  我们若做,必须在**本机同口径**下自己量。
+
+### (e) 对我们 ③ 的修正结论
+* 上游(vLLM)**没有**可复用的 V4.1 CED 实现;omlx 有,但是 **MLX 的模型层**实现,不能直接搬到 vLLM;
+* **方案确认**:§573 的设计与 omlx 独立一致(结构门禁、切尾、SWA 窗口处理、末位采样),**方案本身是对的**;
+* **实现位置纠正**:不能停在 attention-metadata 改写,必须做**层循环级的隐藏状态切片**
+  (含中点层的 query/KV 分离、`cache[1]` 丢弃、logits 零填充且只采末位);
+* **精度档位**:128(近似,omlx 选择)vs 255(我们论证的精确档)——建议**先做 255 精确档**,
+  用 §572 的"首 token/贪心文本一致"验收;要更快要精度就再切 128 并**明确标注精度代价**。
