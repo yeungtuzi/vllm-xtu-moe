@@ -53,7 +53,69 @@ VRAM_RESERVE_GIB = 4.0
 # 若线性外推到 1M 会得出 ~160 GiB 的荒谬值)。两个数都可用 env 覆盖以便实测标定。
 LONG_SEQ_WORKSPACE_GIB_PER_32K = 5.0
 LONG_SEQ_WORKSPACE_CAP_GIB = 6.0
-GPU_PREFILL_GIB = 3.0           # MBT=8192 的激活/工作区 + ping/pong 双槽的额外部分(待精确测,先保守按 3.0)
+# 【§589 修】**按实测口径**改为 6.7 GiB:实际 staging 是 `ns=4`(TP=2+node 分片)下的 6.7 GiB,
+# 加 25% 余量需 8.4 GiB 空闲显存;原值 3.0 只有真实需求的一半 ⇒ 优先级 2 预留了显存
+# 却永远过不了 preflight(且'部分层 GPU/部分层 CPU'的混合模式比纯 CPU 更慢)。
+# 【§590,用户要求"按模型动态算,别写死"】**GPU 预填充的预留由模型维度现算**:
+#   staging = 2 × (w13 + w2 + s13 + s2)   ← 开头的 2 就是 **ping/pong 双槽**
+#   (与 `gpu_prefill.staging_bytes()` 同一公式,即 preflight 实际用的那个;单槽 = 3.36 GiB,
+#    正是 RESIDENT_GIB_PER_LAYER,可见口径自洽。)
+#   ⇒ 预留 = staging × 1.25(preflight 的 margin,默认 1.25)
+# 维度来源:env `XIAOTU_VRAM_{EXPERTS,HIDDEN,INTER,GROUP_K}`;缺省用 V4.1 的值,
+# 且 **inter 取每 rank 分片**(I_full/tp)。找不到维度时才回落到写死的 6.72 GiB。
+GPU_PREFILL_GIB_FALLBACK = 6.72
+GPU_PREFILL_MARGIN = 1.25     # preflight 的口径:fits_device() 要求 free ≥ staging × 1.25
+
+
+def gpu_prefill_gib(n_experts: int, hidden: int, inter: int, group_k: int = 32) -> float:
+    """与 `gpu_prefill.staging_bytes()` 同式的 staging 估算(GiB),不依赖 torch。"""
+    E, H, I, gk = int(n_experts), int(hidden), int(inter), max(1, int(group_k))
+    w13d = E * (2 * I) * (H // 2)
+    w2d = E * H * (I // 2)
+    s13d = E * (2 * I) * (H // gk)
+    s2d = E * H * (I // gk)
+    return 2 * (w13d + w2d + s13d + s2d) / 2**30
+
+
+def _dims_from_ckpt() -> tuple[int, int, int] | None:
+    """从 checkpoint 的 config.json 读 (n_routed_experts, hidden_size, moe_intermediate_size)。
+
+    路径:`XIAOTU_VRAM_MODEL`(默认用 V4.1 的 model scope 快照)。读不到返回 None。
+    **目的是让用户什么都不用填** —— 策略按当前模型自己算预留。
+    """
+    import json
+    p = os.environ.get("XIAOTU_VRAM_MODEL") or (
+        "/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master")
+    try:
+        with open(os.path.join(p, "config.json")) as fh:
+            c = json.load(fh)
+        t = c.get("text_config", c)
+        E = int(t.get("n_routed_experts", 0))
+        H = int(t.get("hidden_size", 0))
+        I = int(t.get("moe_intermediate_size", 0))
+        return (E, H, I) if (E and H and I) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _prefill_staging_gib(tp: int = 2) -> float:
+    """按模型维度算 staging;dim 不可得时回落到实测值。"""
+    def _e(k, dflt):
+        try:
+            return int(os.environ.get(k, dflt))
+        except (TypeError, ValueError):
+            return int(dflt)
+    E = _e("XIAOTU_VRAM_EXPERTS", 0)
+    H = _e("XIAOTU_VRAM_HIDDEN", 0)
+    I = _e("XIAOTU_VRAM_INTER", 0)
+    GK = _e("XIAOTU_VRAM_GROUP_K", 32)
+    if not (E > 0 and H > 0 and I > 0):
+        dims = _dims_from_ckpt()          # ← 用户不填:从 checkpoint config 自取
+        if dims:
+            E, H, I = dims
+    if E > 0 and H > 0 and I > 0:
+        return gpu_prefill_gib(E, H, I // max(1, int(tp)), GK)
+    return GPU_PREFILL_GIB_FALLBACK           # MBT=8192 的激活/工作区 + ping/pong 双槽的额外部分(待精确测,先保守按 3.0)
                                 # 注:双槽本身 ≈ 2×一层 K-major(TP=2 每层 ~1.7 GB)≈ 3.4 GB,已含在此数内
 DRAFT_GIB_PER_RANK = 7.388 / 2  # **草稿 = DSpark 投机解码**(算法名);其权重在 checkpoint 里
                                 # 存为 `mtp.0/1/2`(config `num_nextn_predict_layers=3`),
@@ -87,9 +149,18 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     `CARD_TOTAL − WEIGHTS − KV(maxlen)`。
     """
     kv_per_m = kv_gib_per_mtoken if kv_gib_per_mtoken is not None else _env_gib("XIAOTU_KV_GIB_PER_MTOKEN", KV_GIB_PER_MTOKEN)
-    pref = gpu_prefill_gib if gpu_prefill_gib is not None else _env_gib("XIAOTU_GPUPREFILL_GIB", GPU_PREFILL_GIB)
+    # 【§590】**先解析 tp**,后面所有"按模型现算"的量都依赖它(原先 _tp_eff 在下面才定义,
+    # 导致这里 UnboundLocalError)。
+    _tp_eff = max(1, int(_env_gib("XIAOTU_T_VRAM_TP", os.environ.get("TP", 2))))
+    # GPU 预填充 staging(含 ping/pong 双槽)与"单层专家权重"(= staging/2)都按模型维度现算;
+    # 显式传参或 env 仍可覆盖(调试用)。
+    _dyn_pref = _env_gib("XIAOTU_GPUPREFILL_GIB", _prefill_staging_gib(_tp_eff))
+    pref = gpu_prefill_gib if gpu_prefill_gib is not None else _dyn_pref
     draft = draft_gib if draft_gib is not None else _env_gib("XIAOTU_DRAFT_GIB_PER_RANK", DRAFT_GIB_PER_RANK)
-    per_layer = resident_per_layer_gib if resident_per_layer_gib is not None else _env_gib("XIAOTU_RESIDENT_GIB_PER_LAYER", RESIDENT_GIB_PER_LAYER)
+    # 【§590】单层专家权重(每 rank)= staging/2(那一半就是单槽;实测 3.36 GiB @TP=2),
+    # 同样**按模型现算**,不再让用户填 RESIDENT_GIB_PER_LAYER。
+    per_layer = (resident_per_layer_gib if resident_per_layer_gib is not None
+                 else _env_gib("XIAOTU_RESIDENT_GIB_PER_LAYER", _dyn_pref / 2.0))
     if allow_host_cost is None:
         allow_host_cost = os.environ.get("XIAOTU_VRAM_ALLOW_HOST_COST") == "1"
     host_cost = _env_gib("XIAOTU_GPUPREFILL_HOST_GIB", GPU_PREFILL_HOST_GIB)
@@ -108,7 +179,6 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     # 【§554 实测,TP 相关】1M 档:TP=2 实测 2 层通过(峰值 38.25/38.28 GiB,余 ~2.2 GiB)、3 层 OOM;
     # TP=1 实测 **0 层**时峰值 35.4 GiB(余 ~5 GiB)⇒ 再加 1 层(+6.72)必超 ⇒ TP=1 上限 0。
     # 根因:maxlen 很长时 vLLM 自身的非 KV 占用(~20 GiB)不在解析式里,只能靠实测标定。
-    _tp_eff = max(1, int(_env_gib("XIAOTU_T_VRAM_TP", os.environ.get("TP", 2))))
     resident_cap = None
     if maxlen >= 1_000_000:
         resident_cap = 2 if _tp_eff <= 2 else 0
@@ -135,16 +205,19 @@ def plan(*, maxlen: int, free_gib: float | None = None,
 
     # 优先级 2:GPU 预填充(受"不得额外占系统内存"约束)
     host_ok = allow_host_cost or host_cost <= 0.0
-    pref_ok = (budget >= pref) and host_ok
-    why = f"剩余 {budget:.1f} GiB,需要 {pref:.1f} GiB"
+    # 【§589 修】必须按"实测 staging × 1.25"判(preflight 就是按这个口径卡的),
+    # 否则会出现"策略说启用、preflight 全拒、退化成混合模式(比纯 CPU 还慢)"。
+    pref_need = pref * GPU_PREFILL_MARGIN
+    pref_ok = (budget >= pref_need) and host_ok
+    why = f"剩余 {budget:.1f} GiB,需要 {pref_need:.1f} GiB(staging {pref:.2f}×{GPU_PREFILL_MARGIN})"
     if not host_ok:
         why += (f"; **额外占主机内存 {host_cost:.0f} GiB/rank ⇒ 按总约束判为不可用**"
                 f"(除非 XIAOTU_VRAM_ALLOW_HOST_COST=1)")
-    elif not (budget >= pref):
+    elif not (budget >= pref_need):
         why += " ⇒ 不够"
     steps.append(("2. GPU 预填充", pref_ok, why + ("(启用)" if pref_ok else " ⇒ fallback: CPU 预填充")))
     if pref_ok:
-        budget -= pref
+        budget -= pref_need
 
     # 优先级 3:GPU 投机解码
     spec_ok = budget >= draft
@@ -178,9 +251,33 @@ def plan(*, maxlen: int, free_gib: float | None = None,
                   n > 0,
                   f"剩余 {budget:.1f} GiB / 每层 {per_layer:.2f} GiB ⇒ 可放 {n} 层:{spec or '(0)'}"
                   + ("" if n > 0 else " ⇒ fallback: 全部放主机内存")))
+    # ---- 【§590,用户要求】**容量自检 + 可执行提示** ----------------------------
+    # 只要启用了 GPU 预填充,它的安全预留必须**在 KV 之外**留出来;留不出来时:
+    #   ①显式给出该留的 KV 预算(供 `--kv-cache-memory`,否则 vLLM 会把空闲显存全吃进 KV,
+    #     预填充的 staging 就过不了 preflight,退化成"部分层 GPU/部分层 CPU"的混合模式 —— 更慢);
+    #   ②告诉用户两条可执行出路:关掉 GPU 预填充,或缩小 `--max-model-len`。
+    held = (pref_need if pref_ok else 0.0) + (draft if spec_ok else 0.0)
+    free_for_kv = max(0.0, CARD_TOTAL_GIB - WEIGHTS_GIB - reserve - held)
+    kv_bytes = int(max(0.5, min(kv_gib, free_for_kv)) * 2**30)
+    warn = None
+    if pref_ok and kv_gib > free_for_kv + 1e-9:
+        maxlen_ok = int(free_for_kv / max(1e-9, kv_per_m) * 1_000_000)
+        warn = (
+            f"⚠️ 显存放不下:maxlen={maxlen} 需要 KV {kv_gib:.1f} GiB/卡,"
+            f"但 GPU 预填充安全预留 {pref_need:.1f} GiB(单层 staging {pref:.2f}×{GPU_PREFILL_MARGIN})"
+            + (f" + 投机 {draft:.1f} GiB" if spec_ok else "")
+            + f" 之后只剩 {free_for_kv:.1f} GiB ⇒ 请二选一:\n"
+            f"      (a) 关掉 GPU 预填充:VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0"
+            f"(上下文仍可 {maxlen},预填充回 CPU);或\n"
+            f"      (b) 缩小上下文:--max-model-len ≤ {maxlen_ok}(KV ≤ {free_for_kv:.1f} GiB),"
+            f"保留 GPU 预填充。\n"
+            f"      另:务必把 KV 预算显式传进去(--kv-cache-memory {kv_bytes}),"
+            f"否则 vLLM 会把空闲显存吃进 KV、预填充 staging 过不了 preflight。"
+            f"(详见 docs/RUNBOOK.md §5.8)")
     return {"kv_gib": kv_gib, "budget_gib": budget, "kv_ok": True, "steps": steps,
             "gpu_prefill": pref_ok, "spec_on_gpu": spec_ok,
-            "resident_layers": taken, "resident_spec": spec}
+            "resident_layers": taken, "resident_spec": spec,
+            "kv_bytes": kv_bytes, "kv_free_gib": free_for_kv, "warning": warn}
 
 
 def _ranges(xs: list[int]) -> str:
@@ -231,7 +328,7 @@ def emit_env(p: dict) -> str:
     _kv_bytes = int(p.get("kv_gib", 0.0) * _slack * (1 << 30))
     if _kv_bytes < (1 << 29):          # 至少 0.5 GiB,避免极端 maxlen 下把 KV 压到不可用
         _kv_bytes = 1 << 29
-    lines.append(f"XIAOTU_KV_CACHE_BYTES={_kv_bytes}")
+    lines.append(f"XIAOTU_KV_CACHE_BYTES={p.get('kv_bytes', 0)}")
     return "\n".join(lines)
 
 
@@ -247,12 +344,14 @@ def main() -> int:
     _tp = max(1, int(getattr(a, "tp", 2)))
     os.environ["TP"] = str(_tp)   # 让 plan() 内部的 TP 相关上限能读到(§554)
     _scale = 2.0 / _tp
-    p = plan(maxlen=a.maxlen, resident_per_layer_gib=6.72 / _tp, gpu_prefill_gib=None, draft_gib=7.388 / _tp, free_gib=a.free_gib)
+    p = plan(maxlen=a.maxlen, resident_per_layer_gib=None, gpu_prefill_gib=None, draft_gib=7.388 / _tp, free_gib=a.free_gib)
     if a.emit_env:
         print(emit_env(p))
         return 0
     print(f"[vram-policy] maxlen={a.maxlen}  1M-KV 需要 {p['kv_gib']:.1f} GiB/卡  "
           f"{'OK' if p['kv_ok'] else '**不满足(不可降级)**'}")
+    if p.get("warning"):
+        print(p["warning"])
     for name, ok, why in p["steps"]:
         print(f"  {'✅' if ok else '❌'} {name:28s} {why}")
     print(f"  ⇒ 结论: gpu_prefill={p['gpu_prefill']}  spec_on_gpu={p['spec_on_gpu']}  "
