@@ -19740,3 +19740,24 @@ lk 内层 **58 条指令里 20 条 `vfmadd231ps`,访存只有 3 条(每条 FMA 0
   各 `pfor(...)` 调用点插一次无捕获打印**,跑一次 M=1 bench,看哪条亮 —— 拿到真正入口后再谈优化。
 * 状态:插桩已全部撤回,**BUILD_EXIT=0 / 0 错误 / .so 无 probe 字符串 / M=1 正常**;`XIAOTU_MOE_NTILE`
   惰性补丁保留(默认关,已记为惰性)。
+
+### §536(g) ✅ 插桩定位成功:M=1 解码走 `forward_many_nsliced`,但**不是** `pfor(active*nc_gu)`/`pfor(active*nc_d)` 那两支
+在 `moe_v2.hpp` 的 `forward_many_nsliced` 入口与三个 `pfor` 调用点插 env 门控探针
+(`XIAOTU_MOE_TRACE=1`,默认完全静默;宏 `XTU_PROBE`),M=1 实跑结果:
+
+| 探针 | 是否触发 |
+|---|---|
+| `nsliced-ENTER` | ✅ **执行** |
+| `PHASE-A(gu)`(`pfor(active_.size()*nc_gu)`) | ❌ 不执行 |
+| `PHASE-B(sock)`(`pfor(active_.size()*nc_d)`) | ❌ 不执行 |
+| `PHASE-C(reduce)`(`pfor(M)`) | ✅ 执行 |
+
+⇒ **确定结论**:M=1 的 GEMV 走的是 `nshard_ >= 2` 时的**分片版 A/B**(源码 §988 注释
+"Sub-split for the SHARDED weight-read phases (A and B)" 那一族),即 subA/subB 的循环体;
+我此前改的 `matmul_packed4_group`(两个 FAST_FP4 块)**确实与解码无关**。
+这也解释了 §536(b) 的"NJ 无效果":改的根本不是执行路径。
+
+* **固化了诊断开关**:`XTU_PROBE(tag)` + `XIAOTU_MOE_TRACE=1`(默认静默),以后定位"某形状走哪条路"
+  一条命令即可,不必再靠推理 —— 本 session 四次同类错误(§527/§531/§533/§536b)都源于缺它。
+* 下一步(唯一):读 `moe_v2.hpp` 的分片 A/B 段(约 1150-1250 行)找到 subA/subB 的 `pfor` 与内核调用,
+  在**那里**插探针确认,然后按 lk 的口径(每条 FMA 配几次访存)做对照与优化。

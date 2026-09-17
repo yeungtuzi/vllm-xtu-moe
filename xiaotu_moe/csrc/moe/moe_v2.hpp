@@ -854,10 +854,20 @@ public:
         return lim;
     }
 
+// 【§536g】阶段探针:`XIAOTU_MOE_TRACE=1` 时每个 trace 点打印一次(默认完全静默)。
+// 用途:定位"某形状到底走哪条路径/哪一支 pfor"—— 本 session 因缺它而连错四次(§527/§531/§533/§536),
+// 现在把它固化成常驻诊断开关(与 SHARD_DIAG / GROUP_DIAG / BYTEPROF 同类)。
+#define XTU_PROBE(tag) do { \
+    static const bool _po = [](){ \
+        const bool on = (std::getenv("XIAOTU_MOE_TRACE") != nullptr); \
+        if (on) fprintf(stderr, "[trace] " tag "\n"); \
+        return true; }(); (void)_po; } while (0)
     void forward_many_nsliced(int M, int k,
                               const uint32_t* expert_ids, const float* weights,
                               const uint16_t* input, float* output,
                               int chunk_hint = 0, size_t wlimit = 0) {
+        XTU_PROBE("nsliced-ENTER");
+
         const int hidden = cfg_.hidden_size;
         const int inter = cfg_.intermediate_size;
         const int nel = cfg_.expert_num;
@@ -1171,6 +1181,7 @@ public:
                 }
             });
         } else {
+            XTU_PROBE("PHASE-A(gu)");
             pfor(active_.size() * (size_t)nc_gu, [&](size_t ji) {
                 size_t e_idx = ji / (size_t)nc_gu;
                 int c = (int)(ji % (size_t)nc_gu);
@@ -1250,6 +1261,7 @@ public:
                                        /*row0=*/(long)((size_t)n * d_crows));
             });
         } else {
+            XTU_PROBE("PHASE-B(sock)");
             pfor(active_.size() * (size_t)nc_d, [&](size_t ji) {
                 size_t e_idx = ji / (size_t)nc_d;
                 int c = (int)(ji % (size_t)nc_d);
@@ -1267,6 +1279,7 @@ public:
         auto pB1 = clk::now();
 
         // Phase C: weighted reduce per token (rank order) - no output contention.
+            XTU_PROBE("PHASE-C(reduce)");
         pfor((size_t)M, [&](size_t t) {
             float* out_t = output + t * (size_t)hidden;
             for (int r = 0; r < k; ++r) {
