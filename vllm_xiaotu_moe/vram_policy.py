@@ -46,6 +46,13 @@ KV_GIB_PER_MTOKEN = 2.71 / 1.290154      # ≈2.1 GiB / 1M tokens
 # 预填充/激活/CUDA graph 之外的**保守余量**:§509 实测"解析式说 6 层常驻、6 层直接 OOM(34.8/40GB);
 # 2 层稳过(27.1GB)" ⇒ 解析式必须留安全垫,否则会把用户推到 OOM。
 VRAM_RESERVE_GIB = 4.0
+# 【§551 修 §513c 的 32K 预填充 OOM】**序列长度相关的工作区**必须进预算,否则 KV 会把卡占满、
+# 长预填充的 attention/indexer 工作区无处可放。实测锚点(§513c):maxlen≥32768 的那次请求
+# 在 reserve=4 GiB + GPU_PREFILL=3 GiB 下 OOM,报错时**只差 508 MiB** ⇒ 32K 档至少要多留 ~5 GiB。
+# 做法:按 32K 线性、但**封顶**(分块预填充下每个 chunk 的工作区有界,不能随 maxlen 无界增长;
+# 若线性外推到 1M 会得出 ~160 GiB 的荒谬值)。两个数都可用 env 覆盖以便实测标定。
+LONG_SEQ_WORKSPACE_GIB_PER_32K = 5.0
+LONG_SEQ_WORKSPACE_CAP_GIB = 6.0
 GPU_PREFILL_GIB = 3.0           # MBT=8192 的激活/工作区 + ping/pong 双槽的额外部分(待精确测,先保守按 3.0)
                                 # 注:双槽本身 ≈ 2×一层 K-major(TP=2 每层 ~1.7 GB)≈ 3.4 GB,已含在此数内
 DRAFT_GIB_PER_RANK = 7.388 / 2  # mtp 全量 7.388 GiB,TP=2 ⇒ 每 rank 一半
@@ -87,7 +94,12 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     kv_gib = kv_per_m * (maxlen / 1_000_000.0)
     budget = free_gib if free_gib is not None else (CARD_TOTAL_GIB - WEIGHTS_GIB - kv_gib)
     # 留出保守余量(激活/cudagraph/碎片);§509 的实测证据见 VRAM_RESERVE_GIB 注释
-    budget = max(0.0, budget - VRAM_RESERVE_GIB)
+    # 【§551】基础安全垫 + 序列长度相关工作区(按 32K 锚点线性、封顶;§513c 的 32K OOM 处方)
+    per32k = _env_gib("XIAOTU_VRAM_RESERVE_WORKSPACE_GIB_PER_32K", LONG_SEQ_WORKSPACE_GIB_PER_32K)
+    cap_ws = _env_gib("XIAOTU_VRAM_RESERVE_WORKSPACE_CAP_GIB", LONG_SEQ_WORKSPACE_CAP_GIB)
+    long_ws = min(cap_ws, per32k * (maxlen / 32768.0))
+    reserve = VRAM_RESERVE_GIB + long_ws
+    budget = max(0.0, budget - reserve)
 
     steps: list[tuple[str, bool, str]] = []
 
@@ -179,6 +191,16 @@ def emit_env(p: dict) -> str:
     # 所以这里把"优先级 1/2/3 之后剩下的 GiB"显式交给引擎的预算旋钮,
     # 让常驻层**只能在这个额度内**贪心放置(引擎会逐层试、超了就跳过)。
     lines.append(f"XIAOTU_MOE_RESIDENT_BUDGET_GB={max(0.0, p.get('budget_gib', 0.0)):.1f}")
+    # 【§551 新增,修 §513c 的 32K 预填充 OOM】**显式给 KV cache 设上限**。
+    # 为什么必须这样做:vLLM 按 `--gpu-memory-utilization` 把卡填到 95%,留给激活的只有它自己
+    # 剖析出的那点余量;而**长序列预填充的 attention/indexer 工作区随序列长度增长**(§513c:
+    # 32K 输入 OOM 时只差 508 MiB)⇒ KV 必须让出一块。这里按"maxlen 真正需要多少 KV"再给 15% 余量
+    # 作为上限,超出的显存全部留给工作区/激活。上限可用 XIAOTU_KV_CACHE_BYTES 覆盖(便于实测标定)。
+    _slack = _env_gib("XIAOTU_KV_CACHE_SLACK", 1.15)
+    _kv_bytes = int(p.get("kv_gib", 0.0) * _slack * (1 << 30))
+    if _kv_bytes < (1 << 29):          # 至少 0.5 GiB,避免极端 maxlen 下把 KV 压到不可用
+        _kv_bytes = 1 << 29
+    lines.append(f"XIAOTU_KV_CACHE_BYTES={_kv_bytes}")
     return "\n".join(lines)
 
 

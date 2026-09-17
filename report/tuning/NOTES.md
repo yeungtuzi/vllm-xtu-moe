@@ -20153,3 +20153,36 @@ for (m0 += MR) for (j0 = n0; j0 < n1; j0 += NR) {     // 8 个输出行一块
   或先把 me=2 那一档的误差来源查清。
 * **教训(第 6 次同类,已入库)**:比较精度**必须逐用例对齐**;把两边"各自最差的那一格"拿来比,
   等于换了坐标系 —— 与 §543(探针污染)、§547(猜语义)同族:**先把尺子对齐,再读数**。
+
+## §552 【32K 预填充 OOM 追到底】它**不是**我们的工作区,而是 **vLLM 自己的融合算子分配 padded-q 张量**;KV 上限已生效但还需常驻层让位
+### (a) 本轮做的修复:给 KV 设显式上限(规划器 + 启动脚本)
+`vram_policy.py` 现在输出 `XIAOTU_KV_CACHE_BYTES`(= maxlen 所需 KV × 1.15,下限 0.5 GiB),
+`serve_v41.sh` 据此传 `--kv-cache-memory`。**实测生效**:
+```
+reserved 2.53 GiB memory for KV Cache as specified by kv_cache_memory_bytes config
+GPU KV cache size: 1,206,255 tokens, Maximum concurrency for 1,048,576 tokens per request: 1.15x
+```
+⇒ **1M 上下文(优先级 1)保住了**,而且把原本被 `gpu_util=0.95` 填掉的 ~25 GiB 显存让了出来。
+配套:`VRAM_RESERVE` 从常数改成 `基础 4 GiB + 序列长度相关工作区(按 32K 锚点线性、封顶 6 GiB)`。
+
+### (b) 32K 请求**仍然**打死 EngineCore —— 但失败点被定位到 vLLM 自己
+```
+vllm/models/deepseek_v41/attention.py:680 project_query_and_cache_kv
+  → :871 _fused_qnorm_rope_kv_insert
+  → torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+  → RuntimeError: torch_call_dispatcher("aten::new_empty", …)  API call failed at stable/ops.h:939
+```
+* 该算子是 **stable-ABI C++**(`csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu`),
+  Python 侧注释写明 "**the kernel allocates and returns the padded q tensor**"。
+* 尺寸核算:**8192 token(chunk)× 64 head × 512 × 2 B = 512 MiB** —— 与 §513c 记录的
+  **"Tried to allocate 508.00 MiB" 精确吻合** ⇒ **所谓"长序列工作区"就是这个注意力输出张量**,
+  它随 **chunk(MBT)** 线性、每个 chunk 都要一块。
+* stable-ABI 把 CUDA OOM 包成了不透明的那句 "API call failed"(所以日志里没有 "Tried to allocate" 文本,
+  这也是 §513c 之后我没能立刻认出它的原因)。
+
+### (c) 我的决策(按 R-VRAM 优先级,记录在案)
+R-VRAM 的次序是 **1) 1M 上下文 > 2) GPU 预填充 > 3) 投机 > 4) 专家常驻层**。
+既然长序列工作区属于"优先级 1 能不能用"的前提,**必须由优先级 4 让位** ⇒ 正在做对照实验:
+同样的 1M 服务 + KV 上限,但**关掉常驻层**(`XIAOTU_MOE_GPU_RESIDENT_LAYERS=`),再打 32K 预填充。
+* 若通过 ⇒ 结论成立:**长上下文下常驻层必须让位**(并写进规划器:maxlen 大时 resident 直接给 0);
+* 若仍失败 ⇒ 说明还有别的常驻占用(vLLM 的 graph/activation 池),需要进一步降 util 或减 max_num_seqs。
