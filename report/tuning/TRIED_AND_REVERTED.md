@@ -953,7 +953,7 @@ TP=2 省下的 PCIe 权重流式时间,被每层 attention 的跨卡归约吃掉
 | 根因(为什么必挂) | `counter_` 在这套协议里是**一身二职**:(a) worker 领票的来源 `fetch_add(1)`;(b) 调用方判断"下一次调用从哪张票开始"的**观察点**。`start_ = counter_.load()` 之所以对,正是因为它**只观察、不消费**。改成 `fetch_add(n)` 后,这次调用**把这 n 张票自己吃掉了** ⇒ worker 之后 `fetch_add(1)` 拿到的必然是 `t >= start_ + n` ⇒ 全部越界 ⇒ (持锁复核时活代未变)被丢弃 ⇒ `break` ⇒ park。于是 `remaining_ = n` 永远不减,调用方永久等待。 |
 | 结论 | **§196 的"原子预留"不是一处 `load→fetch_add` 的替换,而是一次协议重设计**:必须同时把 worker 的**领票方式**改掉(每次调用的局部 job 索引 + 领票动作本身不可被"代数推进"孤立),否则要么吃掉票(本次)、要么回到"重置计数器导致陈旧票别名"的轮 68 事故。 |
 | 什么条件下才允许再试 | ①先**只加无损账**(flat 路径照抄分片的 `issued_/inrange_/abandoned_/underflow_`),拿到"领票即记账"的不变式,能指出故障时**哪一张票**消失;②新协议必须给出**构造性论证**并写进代码注释(领票与代数归属如何原子);③验收 = 数值门禁 7/7 **且** `bench_engine_ab.py` 连跑 + 一次零埋点 120 请求长跑无看门狗(见 §501)。**只靠推理不许再改这段代码。** |
-| 当前状态 | 已 `git checkout` 还原 `numa_pool.hpp` 并重新编译;门禁恢复 `OK=7 BAD=1` + `DEDUP=12 0.95 PASS / DEDUP=23 1.07 PASS`。**丢票的竞态本身依然存在**(§501 两次复现),只是没修。 |
+| 当前状态 | 已 `git checkout` 还原 `numa_pool.hpp` 并重新编译;门禁恢复 `OK=7 BAD=1` + `DEDUP=12 0.95 PASS / DEDUP=23 1.07 PASS`。**丢票的竞态当时依然存在**(§501 两次复现)。**→ 已于 2026-09-18 修复,见本节末尾「后续(§569)」**。 |
 
 ### 附:引擎重编译的正确姿势(本轮踩到)
 `scripts/build_engine_variants.sh` 在本环境**找不到 pybind11**(`vllm-xiaotu-moe` env 里没有
@@ -965,3 +965,21 @@ PYBIND11_INC=/home/user/anaconda3/envs/vllm-xiaotu-moe/lib/python3.12/site-packa
 ```
 注意 `-I` 要给到 **`torch/include`**,不是 `torch/include/pybind11`(头文件路径是
 `pybind11/pybind11.h`)。CUDA 侧脚本能自动探测到 `/usr/local/cuda`。
+
+
+---
+
+## R113 后续(2026-09-18):**已复现 + 已构造性修复**(NOTES §567/§569)
+
+* **复现**(§567 造的检测器 + `XIAOTU_MOE_POOL_DEADLINE_MS` 把 300 s 的慢信号降到秒级):
+  `report/tuning/probes/stress_pool.sh 4 900 1 2`(`THREADS=48 SPIN=0`)⇒ **4/4 进程 SIGABRT(20~105 s)**,
+  证据 `WATCHDOG(sharded) total=64 rem=1 exec=63 abandoned=48`、`node*: jobs=8 pulled=14`、
+  **`snap_retry=0 snap_mismatch=0`** ⇒ seqlock 复读**检不出**"自洽但陈旧"的快照(旧 gen + 旧 base/nj 完全匹配)。
+* **本文件上一版方案为何失败**(已记录在案):`start_ = counter_.fetch_add(n)` 让调用方**吃掉票**⇒必挂;
+  根因是 `counter_` 一身二职(worker 领票来源 + 调用方观察点)。**这次没有走那条路。**
+* **本次修复**:把两处发布的**奇数 store 从 `release` 改 `seq_cst`**(x86 = `xchg` 全屏障)⇒
+  保证"奇数代全局可见"**先于**票快照 load ⇒ 快照之后领票的 worker 必然看到新代 ⇒ 走既有 re-anchor 分支。
+  成本:每次池调用一次 locked op(在调用方路径,**不在领票热循环**)。
+* **验证**:同参数压力 **4/4 SIGABRT → 0/4**;长跑 **4×600 s(≈960 万次池调用)零丢票**;
+  数值门 `OK=7 BAD=1`、性能门 `0.70 / 0.85 ms/层`、同日 lk 比值 `1.17 / 1.23` **全部不变**。
+* **待补**:flat 路径的同型分支由同一修复覆盖,但**未单独复现**(8 NUMA node 下压力器走 sharded)。

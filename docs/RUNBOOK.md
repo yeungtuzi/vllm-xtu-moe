@@ -282,3 +282,91 @@ curl -s http://127.0.0.1:8070/metrics | grep -E "num_requests_running|spec_decod
 | 内存占用翻倍 / 某个 NUMA 节点被占满 | 检查是否有残留进程占着分片内存;分片布局不可关闭(单拷贝模式已删除) |
 | 输出不连贯 | 用 `XIAOTU_VERIFY_LAYER=1` 查看每层 `rel_rms`,并用 `XIAOTU_MOE_PROFILE=1` 看耗时分布 |
 | 想加速长 prefill | `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384` |
+
+---
+
+## 5. DeepSeek-V4.1-Flash 运行手册(v2026-09-18;数据出处见 `report/tuning/NOTES.md` §564-§578)
+
+### 5.1 出货默认(不要凭记忆改,以下为实测过的组合)
+
+| 项 | 默认 | 依据 |
+|---|---|---|
+| TP | **2** | 单卡放不下;TP=1 需显式说明差异(§507) |
+| 分片单位 | **自适应 node**(NPS4 上 = 8 片) | socket 分片在 NPS4 上慢 +29%(§505/§518/§519) |
+| `XIAOTU_MOE_SPIN_IDLE_US` | **300** | 5000 = 正反馈灾难;0 更慢(§356/R14;本机 1.84 vs 1.14 ms/层) |
+| `XIAOTU_ENGRAM_LAST` | **1**(2026-09-17 起) | 峰值 **1087.6 → 642 GiB(−41%)**;正确性已闭环(§563-565) |
+| `XIAOTU_ENGRAM_VERIFY` | **1** | 表内容逐 chunk 抽验、失败 fail-closed(§564) |
+| GPU 预填充 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` | 由 `vram_policy` 给(**1M 时 1024**) | 实测交点 384;GPU 路径非逐位确定(§572),但更快 |
+| 投机解码 | `--speculative-config dspark` | R-VRAM 优先级 3 |
+
+### 5.2 R-VRAM 策略(权威输出:`python -m vllm_xiaotu_moe.vram_policy --maxlen 1048576 --tp 2`)
+
+```
+✅ 1. 1M 上下文(KV)   2.2 GiB/卡      ✅ 3. GPU 投机解码 3.7 GiB
+✅ 2. GPU 预填充      3.0 GiB         ✅ 4. 专家层常驻  2 层(20-21)
+```
+任一项不足即按优先级 fallback;**绝不额外多占系统内存**。
+
+### 5.3 启动与验收命令
+
+```bash
+# 启动(TP=2/1M/投机/常驻层,真实权重)
+TAG=acc1m PORT=8315 MAXLEN=1048576 SEQS=8 GPUS=0,1 SPEC=1 RESIDENT=20-21 GP_MIN=1024 THREADS=60 \
+  bash report/tuning/probes/xtu_own_v41_mem.sh        # 自带内存峰值采样
+
+# 1M 配置的实测(§570):READY 388 s;峰值 629.4 GiB;KV 6,724,586 tokens(1M 并发 6.41×);
+# 显存 35.98 GiB/卡;greedy 两次自比 5/5;带载 0 次 WATCHDOG。
+
+# 三门禁(引擎)
+bash scripts/check_engine_aligned.sh
+#   数值门:OK=7 BAD=1(max_rel=1.873e-02,me=1 既有偏差)
+#   性能门:DEDUP=12 0.70 ms/层(216 GB/s);DEDUP=23 0.85 ms/层(296 GB/s、2.47 GB/s·线程)
+#   同日 lk 比值:1.17 / 1.23(阈值 1.30/1.40)
+python scripts/test_engine_determinism.py 11     # 11 次运行 10/10 逐位相同
+```
+
+### 5.4 环境变量速查(本会话新增/变更)
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `XIAOTU_ENGRAM_LAST` | **1** | Engram 大表最后加载(峰值 −41%) |
+| `XIAOTU_ENGRAM_VERIFY` | 1 | 表内容抽验(fail-closed) |
+| `XIAOTU_ENGRAM_ABLATE_FILE` | 未设 | 设了才装"禁注入"消融开关;`touch/rm` 运行时切换(§565) |
+| `XIAOTU_MOE_POOL_DEADLINE_MS` | 300000 | flat 路径看门狗截止(调试用毫秒级) |
+| `XIAOTU_MOE_SHARD_WD` | 300 | **sharded** 路径看门狗截止(秒) |
+| `XIAOTU_MOE_PUB_WINDOW_US` | 0 | 发布窗口放大器(诊断;§567) |
+| `PREFIX_CACHE`(探针) | 1 | 0 = `--no-enable-prefix-caching` |
+| `KVSHARE`(探针) | 0 | 1 = `--kv-sharing-fast-prefill` |
+| `XIAOTU_CED_FASTPREFILL` | **0(未验证完,勿开)** | ③ CED 预填充捷径(§571-578) |
+| `XIAOTU_CED_WINDOW` | 255 | CED 尾部长度(255=精确档论证,128=omlx 近似档) |
+| `XIAOTU_MOE_VARIANT` | 未设 | 强制 ISA 变体(变体是 pybind11 全局注册,**一变体一进程**) |
+
+### 5.5 验收/诊断工具(都在 `report/tuning/probes/`)
+
+| 工具 | 用途 |
+|---|---|
+| `capture_prefill_golden.py` | 抓/比对 **prefill logits 黄金基线**(8 例,含 3 条长 prompt) |
+| `ced_ab.py` | ③ CED 的**生成口径** A/B(文本 + 耗时) |
+| `prof_capture.py` + `trace_kernels.py` | torch profiler 抓取 + 按 kernel 归因 |
+| `engram_ablation.py` | Engram 运行时消融(困惑度 ×5.15 @ 知识密集文本;×1.4 @ 普通文本) |
+| `stress_pool.py` / `.sh` | 线程池丢票竞态复现器(修复前 4/4 挂;修后 4×600 s 0 挂) |
+
+### 5.6 已知陷阱(踩过的)
+
+1. **长 prompt 的 prefill logits 本就不逐位可复现**(native 噪声:1K→0.12、4K→0.38 nats;
+   首 token 稳定)。**不是**引擎问题,也**不是** prefix cache(§572 两次否证)。⇒ 长序列验收用
+   "首 token/贪心文本一致"而不是逐位 logprob。
+2. **`--kv-sharing-fast-prefill` 开着会声明 prompt logprobs 不正确**(runner 有硬 assert)。
+3. **`XIAOTU_MOE_VARIANT` 只能进程级**:同进程加载两个变体会
+   `ImportError: generic_type ... already registered`。
+4. **多进程压测要关自旋**(`XIAOTU_MOE_SPIN_IDLE_US=0`),否则 SPIN=5000 会把 CPU 烧在自旋上。
+5. **`pkill -f` 会命中自己的命令行** ⇒ 用字符类(`port 832[2]`)。
+
+### 5.7 ③ CED 预填充捷径状态(实验,默认关)
+
+* 上游 vLLM **只有通用机制**(`kv_sharing_fast_prefill`),对 V4.1 **零接线**;omlx PR#3607 做了
+  "CED prefill skip with SWA bounded replay"(声称 prefill 快 74-79%,长上下文精度仍在评估)。
+* 我们已实现(§576/§578,全部 env 门控):①eligible=**19 层(21..39)**;②attention metadata
+  窗口改写;③**层循环级隐藏状态切片**;④返回前零填充回全长。判据修正后实测
+  `追加 V4.1 eligible 19 层` ✓。
+* **尚未取得验收数据**(§570 式三门禁 + 生成等价性 + 预填充提速)。**未验证前不要开**。

@@ -1217,9 +1217,30 @@ def _install_ced_fastprefill_shim() -> list[str]:
             out = set(orig_elig(vllm_config, *a, **kw))    # 上游结果(对 V4.1 为空)
             try:
                 d = _gl(vllm_config, _ALB)
-                mine = {n for n, m in d.items()
-                        if getattr(m, "compress_ratio", 0)
-                        and not getattr(m, "is_kv_source", False)}
+                # 【§577/§578/§579 修】只取 **decoder 半区**(V4.1 = 层 21..39,共 19 层)。
+                #
+                # ⚠️ **必须按"名字里的层号"判定,不能用注意力模块名去比对**:`init_attn_backend`
+                # 比对的键是 **`kv_cache_group_spec.layer_names`**(缓存子模块名,如
+                # `...layers.21.attn.<cache>`),而 `get_layers_from_vllm_config(AttentionLayerBase)`
+                # 给出的既有注意力模块名、也有各缓存子模块名 ⇒ 用模块名做 `in` 判定的结果
+                # **命名空间不一致**、FastPrefill 后端套不上 ⇒ 元数据没被改写而层被切了 ⇒ 实测崩在
+                # `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert: slot_mapping must not exceed q row count`。
+                # 按层号判定对两种命名都成立(多余的名字无害:循环只遍历缓存组里的名字)。
+                import re as _re
+                try:
+                    n_layers = int(getattr(vllm_config.model_config.hf_text_config,
+                                           "num_hidden_layers", 0) or 0)
+                except Exception:  # noqa: BLE001
+                    n_layers = 0
+                mid = n_layers // 2 if n_layers else 0
+                mine = set()
+                for n in d:
+                    mo = _re.search(r"layers\.(\d+)\.", n)
+                    if not mo:
+                        continue
+                    idx = int(mo.group(1))
+                    if mid and mid < idx < n_layers:
+                        mine.add(n)
                 if mine:
                     print(f"[ced-fastprefill] 追加 V4.1 eligible {len(mine)} 层: "
                           f"{sorted(mine)[:3]} … {sorted(mine)[-1:]}", flush=True)
@@ -1288,6 +1309,128 @@ def _ced_window_indices(cam, w: int):
     return t, n
 
 
+def _install_ced_slice_shim() -> list[str]:
+    """③ CED **层循环级切片**(§578):让 decoder 半区的层(21..39)只处理**尾部 token**。
+
+    为什么必须做在"层"上而不是只改 attention metadata(§577c):本机预填充由 **CPU MoE 主导**,
+    只限制注意力 query 的话 MLP/MoE 仍会对全部 T 个 token 跑 ⇒ 几乎拿不到收益。
+
+    做法(纯插件,不改主线文件):
+    * 层循环 `model.py:706-721` 把每层返回值**串下去**,所以某一层返回尾部尺寸后,
+      后续层自然只处理尾部 ✓;
+    * 本 shim 包住 `DeepseekV4DecoderLayer.forward`:**该层的 attn 属于 eligible 集合**时,
+      把逐 token 入参切到**最后 `window` 行**(`window = XIAOTU_CED_WINDOW`,默认 255 = §573b 的**精确**档);
+    * 包住 `DeepseekV4Model.forward`:返回前把隐藏状态**零填充回全长 T**
+      (runner 用 `hidden_states[logits_indices]` 取采样位,返回短张量会索引错位)。
+
+    门控(§578b,全部 fail-open:任一不满足就完全走原路径):
+    * `XIAOTU_CED_FASTPREFILL=1` 且 非投机解码(aux/DSpark 预热会缺上下文);
+    * 本批是**单个连续** prefill(`positions` 连续)—— 多请求 flat batch 不能切"最后 N 行";
+    * `T > window`;非 CUDA graph 捕获期;非 profile run。
+    """
+    if os.environ.get("XIAOTU_CED_FASTPREFILL") != "1":
+        return []
+    try:
+        from vllm.models.deepseek_v41.nvidia import model as _m
+        from vllm.model_executor.layers.attention_layer_base import (
+            AttentionLayerBase as _ALB,
+        )
+        from vllm.config.vllm import get_layers_from_vllm_config as _gl
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip ced slice shim: {type(exc).__name__}: {exc}")
+        return []
+    Layer = getattr(_m, "DeepseekV4DecoderLayer", None)
+    Model = getattr(_m, "DeepseekV4Model", None)
+    if Layer is None or Model is None:
+        return []
+    if getattr(Layer.forward, "_xtu_ced_slice", False):
+        return []
+    try:
+        from vllm_xiaotu_moe.gpu_prefill import in_profile_run as _in_prof
+    except Exception:  # noqa: BLE001
+        def _in_prof():
+            return False
+
+    st = {"win": int(os.environ.get("XIAOTU_CED_WINDOW", "0") or 0) or 255,
+          "armed": False, "full_t": 0, "hits": 0}
+    orig_layer = Layer.forward
+    orig_model = Model.forward
+    # 逐 token 的入参名(见 model.py:315 的签名)
+    TOK = ("x", "positions", "input_ids", "pre_mix", "post_mix", "res_mix",
+           "residual", "engram_hashes", "engram_mask")
+
+    def _eligible(layer) -> bool:
+        attn = getattr(layer, "attn", None)
+        if attn is None:
+            return False
+        src = getattr(attn, "kv_source_layer_id", None)
+        srcs = getattr(attn, "kv_source_layers", ()) or ()
+        return (src is not None and bool(srcs)
+                and not getattr(attn, "is_kv_source", False)
+                and int(src) == int(max(srcs)))
+
+    @functools.wraps(orig_layer)
+    def forward(self, *a, **kw):
+        if not st["armed"] or not _eligible(self):
+            return orig_layer(self, *a, **kw)
+        import inspect
+        ba = inspect.signature(orig_layer).bind(self, *a, **kw)
+        x = ba.arguments.get("x")
+        t = int(x.shape[0]) if hasattr(x, "shape") else 0
+        w = st["win"]
+        if t <= w:
+            return orig_layer(self, *a, **kw)
+        for name in TOK:
+            v = ba.arguments.get(name)
+            if hasattr(v, "shape") and v is not None and v.shape and int(v.shape[0]) == t:
+                ba.arguments[name] = v[-w:]
+        st["hits"] += 1
+        return orig_layer(*ba.args, **ba.kwargs)
+
+    forward._xtu_ced_slice = True  # type: ignore[attr-defined]
+    Layer.forward = forward
+    Model.forward = _wrap_model_forward(orig_model, st)
+    return [f"DeepseekV4DecoderLayer.forward(CED 切片, window={st['win']})",
+            "DeepseekV4Model.forward(CED 零填充)"]
+
+
+def _wrap_model_forward(orig_model, st):
+    import functools as _ft
+    import torch
+
+    @_ft.wraps(orig_model)
+    def forward(self, input_ids=None, *a, **kw):
+        T = int(input_ids.shape[0]) if hasattr(input_ids, "shape") else 0
+        positions = a[0] if a else kw.get("positions")
+        armed = False
+        if T > st["win"] and 0 < st["win"]:
+            try:
+                p = positions
+                if p is not None and int(p.shape[0]) == T:
+                    armed = (int(p[-1].item()) - int(p[0].item()) == T - 1)
+            except Exception:  # noqa: BLE001
+                armed = False
+        if not armed:
+            return orig_model(self, input_ids, *a, **kw)
+        st["armed"], st["full_t"] = True, T
+        try:
+            out = orig_model(self, input_ids, *a, **kw)
+        finally:
+            st["armed"] = False
+
+        def _pad(h):
+            n = int(h.shape[0])
+            if n >= T:
+                return h
+            return torch.nn.functional.pad(h, (0, 0) * (h.dim() - 1) + (T - n, 0))
+
+        if isinstance(out, tuple):
+            return tuple(_pad(o) if hasattr(o, "shape") else o for o in out)
+        return _pad(out) if hasattr(out, "shape") else out
+
+    return forward
+
+
 def apply_mainline_shims() -> list[str]:
     """Idempotently install all shims; returns the list of things applied."""
     if not mixed_mode_enabled():
@@ -1307,6 +1450,7 @@ def apply_mainline_shims() -> list[str]:
         _install_engram_ablate_shim,
         _install_ced_diag_shim,
         _install_ced_fastprefill_shim,
+        _install_ced_slice_shim,
         _install_oracle_shims,
         _install_prepack_shims,
         _install_mxfp4_cpu_convert_shim,

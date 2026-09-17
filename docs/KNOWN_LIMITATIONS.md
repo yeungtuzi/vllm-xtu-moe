@@ -95,3 +95,31 @@ XIAOTU_MOE_PROFILE=1 <你的启动命令>      # 打印引擎相位耗时
 python scripts/probe_oracle.py           # 确认后端选择
 python scripts/tiny_moe_equiv.py         # CPU/GPU 专家端到端等价性
 ```
+
+---
+
+## 7. 更新(2026-09-18)
+
+### 7.1 已修复:**线程池丢票竞态(R113)** —— 见 `report/tuning/NOTES.md` §569
+* 复现:专用压力器(`report/tuning/probes/stress_pool.{py,sh}`)**4/4 进程在 20~105 s 内 SIGABRT**,
+  证据 `WATCHDOG(sharded) total=64 rem=1 exec=63 abandoned=48 node*: jobs=8 pulled=14`,
+  **`snap_retry=0 snap_mismatch=0`**(seqlock 复读检不出"自洽但陈旧"的快照)。
+* 根因:调用方"奇数发布 store(release)"在 x86 上只进 store buffer,紧随其后的票快照 load 可以先执行
+  ⇒ worker 领到**本代**的票却按**旧**快照判越界 ⇒ `abandoned` 丢弃且不递减 ⇒ `remaining_` 永挂。
+* 修复:两处发布的奇数 store 改 `memory_order_seq_cst`(x86 = `xchg` 全屏障)⇒ 快照之后领票者必看到新代。
+* 验证:**4/4 SIGABRT → 0/4**;长跑 4×600 s(≈960 万次池调用)零 WATCHDOG;数值门/性能门**不变**。
+* ⚠️ flat 路径同型分支被同一修复覆盖,但**未单独复现**(8 node 下压力器走 sharded)⇒ 记为待补验证。
+
+### 7.2 新增已知**非缺陷**特性:长 prompt 的 prefill logits 不逐位可复现(§572)
+* 无任何改动、同一请求重发:短 prompt(n≤300)**逐位相同**;`long_1024` Δlogprob 0.12~0.25;
+  `long_4096` 0.13~0.38;**首个生成 token/贪心文本始终相同**。
+* **两次独立否证**:①关 prefix cache 无效;②`GP_MIN=0`(MoE 全在逐位确定的 CPU 引擎)仍无效。
+* 归因:vLLM 长序列 CSA2 稀疏注意力的原子累加(块数越多归约顺序越多)。
+  ⇒ 长上下文验收请用"首 token/贪心文本一致",**不要**用逐位 logprob 门槛。
+
+### 7.3 实验特性:**③ CED 预填充捷径**(默认关,未验收)
+* 上游 vLLM 只有通用 `kv_sharing_fast_prefill`,对 V4.1 零接线;omlx PR#3607 已做同类功能
+  (声称 prefill 快 74-79%,**长上下文精度仍在评估**)。
+* 我们已实现,全部 env 门控(`XIAOTU_CED_FASTPREFILL=1`):eligible=19 层(21..39)、
+  attention metadata 窗口改写、**层循环级隐藏状态切片**、返回前零填充回全长。
+* **⚠️ 未取得验收数据(生成等价性 + 预填充提速)之前不要开启。**
