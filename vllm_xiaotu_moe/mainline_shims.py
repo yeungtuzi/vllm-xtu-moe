@@ -1467,6 +1467,19 @@ def _install_ced_kvinsert_shim() -> list[str]:
                 md = attn_metadata.get(pfx) if pfx is not None else None
                 sm = getattr(md, "slot_mapping", None)
                 qn = int(q.shape[0])
+                # 【§604i】**四者行数必须一致**(kernel:1005 `q/kv/position_ids row counts
+                # must match`)。层切片只切了"模型的逐 token 入参",而这几个是**在
+                # attention 内部**由入参派生/由调用方单独传入的 ⇒ 可能仍是全长。
+                # 语义与层切片相同(保留最后 q 行),所以在这里统一按 q 行数对齐。
+                if os.environ.get("XIAOTU_CED_DIAG") == "1" and _CED_STATE["log"] < 30:
+                    _CED_STATE["log"] += 1
+                    _log(f"[ced-diag] 行数 q={qn} kv={int(kv.shape[0])} "
+                         f"pos={int(positions.shape[0]) if hasattr(positions, 'shape') else 'NA'} "
+                         f"sm={int(sm.numel()) if sm is not None else 'NA'}")
+                if hasattr(positions, "shape") and int(positions.shape[0]) > qn > 0:
+                    positions = positions[-qn:]
+                if hasattr(kv, "shape") and int(kv.shape[0]) > qn > 0:
+                    kv = kv[-qn:]
                 if sm is not None and int(sm.numel()) > qn > 0:
                     import copy as _cp
                     nmd = _cp.copy(md)
