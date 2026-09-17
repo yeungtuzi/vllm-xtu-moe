@@ -852,7 +852,14 @@ def staging_bytes(n_experts: int, hidden: int, inter: int, group_k: int = 32,
     w2d = E * H * (I // 2)
     s13d = E * (2 * I) * (H // gk)
     s2d = E * H * (I // gk)
-    return 2 * (w13d + w2d + s13d + s2d)
+    # 【§600 修口径】不是只有 ping/pong 两槽!一次 staging 的**真实峰值**是:
+    #   槽 2×(w13+w2+s13+s2) + raw(w13+w2,组装目标) + DMA 暂存(N 张量各一份)
+    # 原式只算第一项(6.72 GiB),于是 preflight 说 8.4 GiB 够、实际要 ~11 GiB ⇒
+    # "预检通过但跑起来 OOM"。这里把三项都算上(暂存已改为每张量一份)。
+    slots = 2 * (w13d + w2d + s13d + s2d)
+    raw = w13d + w2d
+    tmp = w13d + w2d + s13d + s2d
+    return slots + raw + tmp
 
 
 def fits_device(need_bytes: int, device, margin: float = 1.25):
@@ -885,7 +892,10 @@ def _dma_hostbuf(engine, which: int, node: int, nbytes: int, device) -> torch.Te
     """DMA one of the ENGINE's own host buffers to a fresh device tensor."""
     if nbytes <= 0:
         raise RuntimeError(f"gpu-prefill: engine buffer which={which} node={node} is empty")
-    t = _reuse(("dma", int(which), int(node)), (int(nbytes),), device)
+    # 【§600】暂存缓冲**每张量一份**(不再每 node 一份)。同一条 stream 上
+    # "DMA n → copy n → DMA n+1" 是严格有序的 ⇒ 复用安全;而每 node 一份会让
+    # ns 份暂存同时常驻(TP=2 共 3.59 GiB),把真正的 staging 峰值从 ~11 GiB 抬到 ~14 GiB。
+    t = _reuse(("dma", int(which)), (int(nbytes),), device)
     stream = torch.cuda.current_stream(device).cuda_stream
     got = engine.copy_hostbuf_to_device(int(which), int(node), t.data_ptr(), stream)
     if int(got) != int(nbytes):

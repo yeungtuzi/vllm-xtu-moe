@@ -32,6 +32,9 @@ RESIDENT="${RESIDENT:-}"  # XIAOTU_MOE_GPU_RESIDENT_LAYERS,如 0-3,20-22
 RESIDENT_BUDGET_GB="${RESIDENT_BUDGET_GB:-}"   # 常驻额度(§509:必须在 KV 之后预算,否则会挤掉 1M 上下文)
 SPEC="${SPEC:-0}"
 COMPILE="${COMPILE:-0}"
+EAGER="${EAGER:-0}"      # 1 = --enforce-eager(关 CUDA graph)。【§600】我们实测 CUDA graph
+                          #     **没有收益**(§584:43.19→44.73ms),但它会给每个形状建**持久池**
+                          #     (实测首请求 +7.7 GiB 常驻)⇒ 大 chunk 的 GPU 预填充应该关掉它换显存。
 SHARD_BY_NODE="${SHARD_BY_NODE:-}"   # 非空 = 设 XIAOTU_MOE_SHARD_BY_NODE ⇒ **按 NUMA node 分片**(nshard=NPS 的 node 数)
                                      # 留空 = 代码默认 **按 socket 分片**(nshard=2)。
                                      # 【2026-09-17 实测】B=8 时 node 分片比 socket 分片快 **4.7×**
@@ -138,5 +141,6 @@ RUN_ENV="$RUN_ENV" READY_TIMEOUT="${READY_TIMEOUT:-2400}" \
   $( [ "$KVSHARE" = "1" ] && echo --kv-sharing-fast-prefill ) \
   $( [ "$ITERDETAIL" = "1" ] && echo --enable-logging-iteration-details ) \
   $( [ -n "$PROFILE_DIR" ] && printf -- "--profiler-config {\"profiler\":\"torch\",\"torch_profiler_dir\":\"%s\",\"torch_profiler_with_stack\":false}" "$PROFILE_DIR" ) \
+  $( [ "$EAGER" = "1" ] && echo --enforce-eager ) \
   $( [ "$COMPILE" = "1" ] && echo --compilation-config "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"mode\":\"VLLM_COMPILE\"${JITCACHE_CC_EXTRA}}" ) \
   $( [ "$SPEC" = "1" ] && echo --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' ) \
