@@ -21526,3 +21526,37 @@ w13 (384,2304,2560)=2.109 GiB + w2 (384,5120,576)=1.055 GiB + s13/s2=0.425 GiB =
 日志每 60 s 重复 `shm_broadcast.py:801 No available shared memory broadcast block found in 60 seconds`
 (连续 3 次,不恢复)⇒ **不是编译慢,是 hang**;已 kill。要拿到 §(d) 表格里的高 chunk 实测,
 必须先定位这个 hang(嫌疑:MBT≥32768 的某个形状/工作区,或 chunked-prefill 与我们的 host 回调互锁)。
+
+## §594 分相定位:**GPU 预填充的 80% 花在 staging(DMA+组装+转置),GEMM 只占 20%**
+用 `XIAOTU_GP_SPLIT=1`(probe 旋钮 `GP_SPLIT=1`)在服务里逐层打点(`util=0.55 / MBT 默认 / qlen=1891`):
+```
+[layer 0] asm=282.6ms free=12.21GiB alloc=25.56GiB reserved=26.10GiB   ← staging
+[layer 0] kernels=54.9ms                                              ← MoE GEMM
+[layer 1] asm=219.8ms ...
+```
+| 项 | 每层 | 40 层/chunk | 占比 |
+|---|---|---|---|
+| **`asm`** = `kmajor_from_engine_shards`(DMA + 跨步组装 + K-major 转置) | **220~283 ms** | **≈9.2 s** | **~80%** |
+| `kernels` = `gpu_moe_layer`(Triton 反量化 + grouped GEMM) | **54.9 ms** | 2.2 s | ~20% |
+| 合计 | ~290 ms | **11.6 s** | 100% ✓ 与 TTFT 实测吻合 |
+
+### staging 内部的账(离线复现同模式,GPU2)
+| 阶段 | ns=4 | ns=8 | 说明 |
+|---|---|---|---|
+| A) 主机→设备 DMA(`cudaMemcpyAsync`,**pageable `mmap`**) | 166 ms/层 | 168 ms | **20.5 GB/s** |
+| A′) 同样但**锁页** | — | — | 线速 **26.8 GB/s**(§593) |
+| B) 跨步 `copy_` 组装进 raw | ~0(measurement artifact) | | 量级 ≤ 数 ms |
+| C) 4 个 K-major 转置 | ~1 ms | | 设备侧,便宜 |
+⇒ **DMA 是 staging 的主体**;服务实测 asm 220~283 ms 比离线的 166 ms 还多 **55~115 ms/层**,
+差额与 `alloc=25.6 / reserved=26.1 GiB` 的**分配器抖动**同时出现 ⇒ 第二嫌疑是每层的
+`_reuse` 缓冲 + `_kmajor_bytes` 新分配引起的 `cudaMalloc/free` 与碎片。
+
+### 结论(修法,按收益排序)
+1. **让 H2D 与上一层计算重叠**(把 staging 从 `cudaLaunchHostFunc` 回调里挪出来 / 真正用起
+   已有的 `PrefetchSlot`):理论收益 = 把 `period` 从 `compute + rest` 压到 `max(DMA, 计算)`
+   ⇒ 11.6 s → ~6-7 s/chunk;
+2. **锁页引擎的自有分片缓冲**(`mmap` 现在是 pageable):20.5 → 26.8 GB/s ⇒ 约 −1.2 s/chunk;
+   *注:锁页 143.6 GiB/rank 成本不低,需要 `cudaHostRegister` 一次性做完并计入内存账*;
+3. **消除 B+C 的中间张量**(让引擎按 `E` 段做 `cudaMemcpy2DAsync` 直接写进 K-major 目标;
+   或把转置融进反量化 kernel):省掉约 1 个 read+write pass + 分配器抖动;
+4. 只搬"本 chunk 命中的专家"(qlen=1 时 384 个里只用 6 个)——对**解码/短 chunk** 是数量级收益。
