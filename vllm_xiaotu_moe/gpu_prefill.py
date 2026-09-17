@@ -866,6 +866,114 @@ def _dma_hostbuf(engine, which: int, node: int, nbytes: int, device) -> torch.Te
     return t
 
 
+_STAGE_ACC = {"n": 0, "dma": 0.0, "asm": 0.0, "tr": 0.0}
+
+
+def _stage_mark(t0: float, key: str) -> float:
+    """[§594 诊断] 把 `kmajor_from_engine_shards` 的三个子相累加起来。
+
+    `XIAOTU_GPF_STAGE=1` 时,每 40 次(一层一次)打印一次平均,用来回答
+    "asm 的 220~283 ms/层 里,DMA / 跨步组装 / K-major 转置 各占多少"。
+    **每个子相后面都要 sync**,否则测到的是"发射耗时"而不是"完成耗时";
+    诊断模式下多 2 次 sync 可以接受(它只在 env 打开时生效)。
+    """
+    import time as _t
+    import torch as _torch
+    if os.environ.get("XIAOTU_GPF_STAGE") != "1":
+        return t0
+    _torch.cuda.synchronize()
+    now = _t.perf_counter()
+    _STAGE_ACC[key] += (now - t0) * 1e3
+    _STAGE_ACC["n"] += 1 if key == "tr" else 0
+    if key == "tr" and _STAGE_ACC["n"] % 40 == 0:
+        n = _STAGE_ACC["n"]
+        d, a, r = _STAGE_ACC["dma"], _STAGE_ACC["asm"], _STAGE_ACC["tr"]
+        print(f"[gpf-stage] n={n} dma={d/40:.1f}ms asm={a/40:.1f}ms tr={r/40:.1f}ms "
+              f"total={(d+a+r)/40:.1f}ms/层", flush=True)
+        _STAGE_ACC.update({"dma": 0.0, "asm": 0.0, "tr": 0.0})
+    return now
+
+
+def kmajor_from_engine_shards_v2(engine, device, hidden: int, inter: int,
+                                 n_experts: int, group_k: int):
+    """【§595 A/B】同 `kmajor_from_engine_shards`,但把三个阶段**分批**做:
+
+        D) 先把所有节点的 DMA **一次性全发出去**(同一 stream,背靠背) → sync
+        B) 再做全部跨步组装(纯 D2D)                                          → sync
+        C) 最后做 4 个 K-major 转置                                            → sync
+
+    为什么要这样:原实现是 **per-node `DMA → copy_` 交替**,每个 `copy_` 都排在
+    自己那次 DMA 之后,于是 **PCIe 在每次 D2D 期间空转**,而且三段耗时混在一起、
+    无法归因(§594 只能量到 asm 总量)。分批后既能让 DMA 连续占满链路,也能把
+    "DMA = 多少 / 组装 = 多少 / 转置 = 多少" 分开报出来。
+    """
+    import time as _time
+    import torch as _torch
+
+    geo = engine.shard_geometry()
+    ns = int(geo["ns"])
+    if ns < 2 or not geo["w13_node_bytes"] or not geo["w2_node_bytes"]:
+        return None
+    H, I, E = int(hidden), int(inter), int(n_experts)
+    rb13 = H // 2
+    rb2 = I // 2
+    gk = int(group_k) if int(group_k) > 0 else 1
+    dbg = os.environ.get("XIAOTU_GPF_STAGE") == "1"
+
+    # ---- D) 所有 DMA 背靠背发出(不夹 D2D)----------------------------------
+    t0 = _time.perf_counter()
+    b13 = [_dma_hostbuf(engine, 0, n, int(geo["w13_node_bytes"]), device) for n in range(ns)]
+    b2 = [_dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device) for n in range(ns)]
+    bs13 = _dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device)
+    bs2 = _dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device)
+    if dbg:
+        _torch.cuda.synchronize()
+    t_d = _time.perf_counter() - t0
+
+    # ---- B) 组装(纯 D2D,源是连续的 node 缓冲,目标是跨步行区间)----------
+    t1 = _time.perf_counter()
+    w13_raw = _reuse(("raw13",), (E, 2 * I, rb13), device)
+    c13 = int(geo["w13_cbytes"])
+    cr13 = int(geo["w13_crows"])
+    for n in range(ns):
+        blk = b13[n].view(E, 2, c13)
+        c0 = n * cr13
+        w13_raw[:, c0:c0 + cr13, :].copy_(blk[:, 0, :].reshape(E, cr13, rb13))
+        w13_raw[:, I + c0:I + c0 + cr13, :].copy_(blk[:, 1, :].reshape(E, cr13, rb13))
+    w2_raw = _reuse(("raw2",), (E, H, rb2), device)
+    c2 = int(geo["w2_cbytes"])
+    cr2 = int(geo["w2_crows"])
+    for n in range(ns):
+        c0 = n * cr2
+        w2_raw[:, c0:c0 + cr2, :].copy_(b2[n].view(E, cr2, rb2))
+    s13_raw = bs13.view(E, 2 * I, H // gk)
+    s2_raw = bs2.view(E, H, I // gk)
+    if dbg:
+        _torch.cuda.synchronize()
+    t_b = _time.perf_counter() - t1
+
+    # ---- C) K-major 转置 ---------------------------------------------------
+    t2 = _time.perf_counter()
+    out = (_kmajor_bytes(w13_raw), _kmajor_bytes(s13_raw),
+           _kmajor_bytes(w2_raw), _kmajor_bytes(s2_raw))
+    if dbg:
+        _torch.cuda.synchronize()
+    t_c = _time.perf_counter() - t2
+
+    if dbg:
+        a = _STAGE_ACC
+        a["n"] += 1
+        a["dma"] += t_d * 1e3
+        a["asm"] += t_b * 1e3
+        a["tr"] += t_c * 1e3
+        if a["n"] % 40 == 0:
+            print(f"[gpf-v2] n={a['n']} dma={a['dma']/40:.1f}ms 组装={a['asm']/40:.1f}ms "
+                  f"转置={a['tr']/40:.1f}ms total={(a['dma']+a['asm']+a['tr'])/40:.1f}ms/层",
+                  flush=True)
+            a.update({"dma": 0.0, "asm": 0.0, "tr": 0.0})
+    return out
+
+
 def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
                               n_experts: int, group_k: int):
     """K-major device weights built from the engine's OWN host buffers.
@@ -903,6 +1011,8 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
     # (Measured: `view`+`cat` of the strided gate/up views then one transpose cost
     # **894 ms/layer**, because cat of strided views falls back to a slow kernel;
     # this form keeps the copies contiguous. See NOTES §466.)
+    import time as _time
+    _t_dma = _time.perf_counter()
     w13_raw = _reuse(("raw13",), (E, 2 * I, rb13), device)
     c13 = int(geo["w13_cbytes"])
     cr13 = int(geo["w13_crows"])
@@ -927,12 +1037,17 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
         .view(E, 2 * I, H // gk)
     s2_raw = _dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device) \
         .view(E, H, I // gk)
+    # [§594] 到此为止 = "DMA 发射 + 跨步组装" 都排在同一条流上;下面 sync 一次把它们
+    # 一起结掉,所以先记 dma,再单独量转置(转置只在 GPU 上,不含 DMA)。
+    _t_dma_end = _stage_mark(_t_dma, "dma")
     # K-major outputs are returned FRESH: `_kmajor_bytes` is a fast contiguous
     # transpose (73 ms total), whereas `reused.copy_(t.transpose(1,2))` is a
     # strided read and cost ~126 ms extra (NOTES §466). Reuse is worth it for the
     # big INTERMEDIATES (node DMA buffers + raw, ~13 GB of churn); not here.
-    return (_kmajor_bytes(w13_raw), _kmajor_bytes(s13_raw),
-            _kmajor_bytes(w2_raw), _kmajor_bytes(s2_raw))
+    out = (_kmajor_bytes(w13_raw), _kmajor_bytes(s13_raw),
+           _kmajor_bytes(w2_raw), _kmajor_bytes(s2_raw))
+    _stage_mark(_t_dma_end, "tr")
+    return out
 
 
 

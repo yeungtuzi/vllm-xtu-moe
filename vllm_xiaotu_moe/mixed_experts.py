@@ -1258,6 +1258,7 @@ class _XiaotuExpertsMixin:
                 PrefetchSlot,
                 gpu_moe_layer,
                 kmajor_from_engine_shards,
+                kmajor_from_engine_shards_v2 as _v2,
             )
 
             # 需要的只有形状:E/H/I。源张量可能已被释放,所以优先用释放时记下的形状。
@@ -1308,7 +1309,11 @@ class _XiaotuExpertsMixin:
 
                     _t_split = os.environ.get("XIAOTU_GP_SPLIT") == "1"
                     _t0 = _time.perf_counter() if _t_split else 0.0
-                    _km = kmajor_from_engine_shards(
+                    # 【§595 A/B】`XIAOTU_GPF_V2=1` 用"分批 DMA"版本(见 gpu_prefill 的
+                    # 同名函数 docstring):DMA 全发完再组装、再转置,既能干净分相,也让
+                    # PCIe 不被夹在中间的 D2D 打断。默认仍是老实现(逐字不变)。
+                    _km = (_v2 if os.environ.get("XIAOTU_GPF_V2") == "1"
+                           else kmajor_from_engine_shards)(
                         engine, _dev, hidden_size, _I, _E, int(self._group_k)
                     )
                     if _t_split:

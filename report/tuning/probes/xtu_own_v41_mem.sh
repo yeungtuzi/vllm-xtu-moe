@@ -41,6 +41,8 @@ CD_TIMING="${CD_TIMING:-0}"       # 1 = 打开**引擎侧**每层分相计时([c
                                    #   (Python 的 apply() 在 replay 时不执行 ⇒ LAYER_TIMING 量不到稳态解码)。
 LAYER_TIMING="${LAYER_TIMING:-0}"   # 1 = 打开每层分相计时(§515)      # 1 = 参考脚本的 --compilation-config {"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_DECODE_ONLY"}          # 1 = 开 DSpark 投机(draft=mtp,默认常驻 GPU)
 ITERDETAIL="${ITERDETAIL:-0}"  # 1 = --enable-logging-iteration-details(每步分解,§587)
+GPF_V2="${GPF_V2:-0}"        # 1 = XIAOTU_GPF_V2=1:staging 分批版(DMA 全发完再组装/转置,§595)
+GPF_STAGE="${GPF_STAGE:-0}"  # 1 = XIAOTU_GPF_STAGE=1:staging **子相**计时(§594 dma/asm/tr)
 GP_SPLIT="${GP_SPLIT:-0}"    # 1 = XIAOTU_GP_SPLIT=1:每层打印 GPU 预填充的 **staging(asm)**
                              #     与 **kernels** 分相耗时(§594;用来定位 11.6s/chunk 的构成)
 KVSHARE="${KVSHARE:-0}"    # 1 = 传 --kv-sharing-fast-prefill(§574/§575 的 ③ 实验)
@@ -95,6 +97,8 @@ XV="$ROOT/report/tuning/logs/$TAG.envfile"
   echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=$GP_MIN"
   [ "$LAYER_TIMING" = "1" ] && echo "XIAOTU_LAYER_TIMING=1"
   [ -n "$SHARD_BY_NODE" ] && echo "XIAOTU_MOE_SHARD_BY_NODE=$SHARD_BY_NODE"
+  [ "$GPF_V2" = "1" ] && echo "XIAOTU_GPF_V2=1"
+  [ "$GPF_STAGE" = "1" ] && echo "XIAOTU_GPF_STAGE=1"
   [ "$GP_SPLIT" = "1" ] && echo "XIAOTU_GP_SPLIT=1"
   [ "$CD_TIMING" = "1" ] && echo "XIAOTU_CD_TIMING=1"
   [ "$CD_TIMING" = "1" ] && echo "XIAOTU_CD_TIMING_EVERY=40"
@@ -110,7 +114,7 @@ XIAOTU_MOE_RESIDENT_BUDGET_GB=0 XIAOTU_RELEASE_SOURCE=$RELEASE_SOURCE \
 XIAOTU_ENGRAM_LAST=${XIAOTU_ENGRAM_LAST:-1} \
 ${WCOPY:+XIAOTU_GPUPREFILL_WCOPY=$WCOPY} ${RANK_SPLIT:+XIAOTU_MOE_RANK_SPLIT=$RANK_SPLIT} VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=$GP_MIN \
 XIAOTU_LAYER_TIMING=$LAYER_TIMING XIAOTU_LAYER_TIMING_EVERY=40 \
-${GP_SPLIT:+XIAOTU_GP_SPLIT=$GP_SPLIT} \
+${GPF_V2:+XIAOTU_GPF_V2=$GPF_V2} ${GPF_STAGE:+XIAOTU_GPF_STAGE=$GPF_STAGE} ${GP_SPLIT:+XIAOTU_GP_SPLIT=$GP_SPLIT} \
 ${CD_TIMING:+XIAOTU_CD_TIMING=$CD_TIMING} ${CD_TIMING:+XIAOTU_CD_TIMING_EVERY=40} \
 ${SHARD_BY_NODE:+XIAOTU_MOE_SHARD_BY_NODE=$SHARD_BY_NODE} \
 ${RESIDENT_BUDGET_GB:+XIAOTU_MOE_RESIDENT_BUDGET_GB=$RESIDENT_BUDGET_GB} \
