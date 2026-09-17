@@ -1257,6 +1257,27 @@ def _install_ced_fastprefill_shim() -> list[str]:
             return out
 
         get_kv_sharing_fast_prefill_eligible_layers._xtu_ced = True  # type: ignore
+
+        # 【§604d 诊断】**真正决定元数据会不会被改写的是"这个层有没有换上 FastPrefill 后端"**。
+        # `attn_utils.py:225` 用**模块全局名**调用它 ⇒ 必须打在 `_au` 的命名空间上才生效。
+        # 计数为 0 就说明"eligible 集合与 `kv_cache_group_spec.layer_names` 一个都没匹配上"。
+        try:
+            _orig_cfb = getattr(_au, "create_fast_prefill_custom_backend", None)
+            if _orig_cfb is not None and not getattr(_orig_cfb, "_xtu_ced_cnt", False):
+                _cfb_n = [0]
+
+                @functools.wraps(_orig_cfb)
+                def create_fast_prefill_custom_backend(prefix, backend, *a, **kw):
+                    _cfb_n[0] += 1
+                    if os.environ.get("XIAOTU_CED_DIAG") == "1" and _cfb_n[0] <= 25:
+                        _log(f"[ced-diag] 换上 FastPrefill 后端 #{_cfb_n[0]} prefix={prefix} "
+                             f"backend={getattr(backend, '__name__', backend)}")
+                    return _orig_cfb(prefix, backend, *a, **kw)
+
+                create_fast_prefill_custom_backend._xtu_ced_cnt = True  # type: ignore
+                _au.create_fast_prefill_custom_backend = create_fast_prefill_custom_backend
+        except Exception as exc:  # noqa: BLE001
+            _log(f"ced cfb 计数探针装不上: {type(exc).__name__}: {exc}")
         _au.get_kv_sharing_fast_prefill_eligible_layers = (
             get_kv_sharing_fast_prefill_eligible_layers)
         applied.append("get_kv_sharing_fast_prefill_eligible_layers(V4.1 判据)")
