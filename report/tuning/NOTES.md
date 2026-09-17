@@ -21757,3 +21757,33 @@ RuntimeError: torch_call_dispatcher("aten::new_empty", ...) API call failed
 5. staging 真实峰值口径 + 同步路径单槽(10.3 → 7.2 GiB)。
 ### (d) 未解决:**16K chunk 仍会 OOM**(在 attention 的 `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`)
 40 GB 卡上 `MBT=16384 + GPU 预填充` 的激活+staging 放不下 ⇒ **当前 GPU 预填充的可用上限是 MBT=8192**。
+
+## §604 ③ CED 进展:A/B 工具跑通、短 prompt 全 PASS;**长 prompt 仍崩**(附精确位置与下一步)
+### (a) 基线(CED 关,`GP_MIN=0/PREFIX_CACHE=0/MAXLEN=8192/MBT=2048`)
+| case | 耗时 | 说明 |
+|---|---|---|
+| corr_* (5 条短) | 0.83-1.24 s | — |
+| long_300 | 3.97 s | — |
+| long_1024 | 10.75 s | — |
+| long_4096 | **34.33 s** | CED 要打的正是这一档 |
+原始:`/tmp/ced_off.json`(用 `report/tuning/probes/ced_ab.py --port 8393 --out /tmp/ced_off.json`)。
+### (b) CED 开(`XIAOTU_CED_FASTPREFILL=1 XIAOTU_CED_WINDOW=255` + `--kv-sharing-fast-prefill`)
+* **短 prompt(≤255 token)5/5 PASS** —— 文本逐字相同、耗时不变(此时窗口不触发,两侧都走原路径);
+* **长 prompt 3/3 FAIL**:请求 **500**,实验侧文本为空。
+  服务端错误(3 次)正是老问题:
+```
+fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert ... slot_mapping must not exceed q row count
+```
+### (c) 定位(已缩小到一处):**两套判据必须逐层一致**
+| 侧 | 判据 | 位置 |
+|---|---|---|
+| attention **metadata** 改写 | **按层号**:`mid(=20) < idx < n_layers(=40)` ⇒ 21..39 | `_install_ced_fastprefill_shim`(§579 改过) |
+| **层切片**(+零填充) | **按 attn 属性**:`kv_source_layer_id == max(kv_source_layers)` 且非 `is_kv_source` | `_install_ced_slice_shim` 的 `_eligible`(**仍是旧判据**) |
+* `slot_mapping must not exceed q row count` 的语义正是"**元数据说 query 有 T 行,但实际 q 只有 w 行**"(或反之)
+  ⇒ 只要一层上两侧结论不同就会崩;而只有 `T > w` 时才走到这条路径 —— **与"短 prompt PASS、长 prompt FAIL"完全吻合**。
+### (d) 下一步(已就绪的工具)
+1. 加好**逐层诊断**(`XIAOTU_CED_DIAG=1` 时切片侧打印 `layer/eligible/src/max_srcs/is_kv_source`);
+2. 起一个 `CED=1 + XIAOTU_CED_DIAG=1` 的服务跑一条长 prompt,把**切片侧集合**打出来,
+   与 metadata 侧的 21..39 对照,找出差集;
+3. 把两侧统一到**同一判据**(建议统一为**按层号**,因为 §579 已证明名字空间不可靠),再跑 `ced_ab.py --check`;
+4. 预期收益:预填充跳过 19 个 decoder 层的 MLP/MoE(本机预填充由 CPU MoE 主导 ⇒ 理论上接近减半)。

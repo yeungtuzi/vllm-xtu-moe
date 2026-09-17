@@ -1367,7 +1367,7 @@ def _install_ced_slice_shim() -> list[str]:
             return False
 
     st = {"win": int(os.environ.get("XIAOTU_CED_WINDOW", "0") or 0) or 255,
-          "armed": False, "full_t": 0, "hits": 0}
+          "armed": False, "full_t": 0, "hits": 0, "_logged": set()}
     orig_layer = Layer.forward
     orig_model = Model.forward
     # 逐 token 的入参名(见 model.py:315 的签名)
@@ -1380,9 +1380,21 @@ def _install_ced_slice_shim() -> list[str]:
             return False
         src = getattr(attn, "kv_source_layer_id", None)
         srcs = getattr(attn, "kv_source_layers", ()) or ()
-        return (src is not None and bool(srcs)
-                and not getattr(attn, "is_kv_source", False)
-                and int(src) == int(max(srcs)))
+        ok = (src is not None and bool(srcs)
+              and not getattr(attn, "is_kv_source", False)
+              and int(src) == int(max(srcs)))
+        # 【§604 诊断】`XIAOTU_CED_DIAG=1` 时逐层打印**切片侧**的判据结果。
+        # 必须与 metadata 侧(§579:按层号 `mid < idx < n_layers` ⇒ 21..39)**逐层一致**,
+        # 否则会出现"元数据被改写、层没切"(或反之)⇒
+        # `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert: slot_mapping must not exceed q row count`。
+        if os.environ.get("XIAOTU_CED_DIAG") == "1":
+            _nm = getattr(layer, "layer_name", "?")
+            if _nm not in st.setdefault("_logged", set()):
+                st["_logged"].add(_nm)
+                _log(f"[ced-diag] slice-side layer={_nm} eligible={ok} "
+                     f"src={src} max_srcs={max(srcs) if srcs else None} "
+                     f"is_kv_source={getattr(attn, 'is_kv_source', None)}")
+        return ok
 
     @functools.wraps(orig_layer)
     def forward(self, *a, **kw):
