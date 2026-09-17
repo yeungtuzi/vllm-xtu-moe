@@ -546,6 +546,7 @@ public:
             // 原有的"先掀 gen 再读 counter_ 以保证陈旧票落在 start_ 之前"不变。
             gen = current_gen_.load(std::memory_order_relaxed) + 2;   // 下一个偶数代
             current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
+            pub_window_delay_();   // 【R113 诊断】默认 0,仅在复现竞态时非 0
             start_ = counter_.load();
             n_ = n;
             worker_limit_.store(limit >= nt_ ? 0 : limit, std::memory_order_relaxed);
@@ -567,7 +568,16 @@ public:
         {
             std::unique_lock<std::mutex> lk(done_mtx_);
             auto t0 = std::chrono::steady_clock::now();
-            const auto deadline = t0 + std::chrono::seconds(300);
+            // 【R113 复现器】截止时间可调(默认 300s = 原行为)。
+            // 为什么需要:丢票的表现是"`remaining_` 永不归零 ⇒ 卡满 300s 才 abort",
+            // 这个信号**太慢**,没法在压力测试里反复触发。把它降到秒级/毫秒级,
+            // 就能用"跑 N 次短调用、数 aborts"来**快速判定竞态是否被触发**。
+            // ⚠️ 只影响"检测速度",不改协议本身;生产仍用默认 300s。
+            long deadline_ms = 300000;
+            if (const char* e = std::getenv("XIAOTU_MOE_POOL_DEADLINE_MS")) {
+                long v = std::atol(e); if (v > 0) deadline_ms = v;
+            }
+            const auto deadline = t0 + std::chrono::milliseconds(deadline_ms);
             const char* tre = std::getenv("XIAOTU_MOE_POOL_TRACE");
             long rstep_s = (tre && std::atoi(tre) > 0) ? (long)std::atoi(tre) : 0;
             bool late = false;
@@ -804,6 +814,7 @@ public:
             }
             uint64_t gen = current_gen_.load(std::memory_order_relaxed) + 2;
             current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
+            pub_window_delay_();   // 【R113 诊断】默认 0,仅在复现竞态时非 0
             total = 0;
             for (int n = 0; n < nnodes; ++n) {
                 node_nj_[n] = job_counts[n];
@@ -1370,6 +1381,27 @@ private:
                 }
             }
         }
+    }
+
+    // 【R113 复现工具】**放大"发布奇数 → 读票计数器"这段窗口**(µs)。
+    //
+    // 为什么是这个区间:调用方 `current_gen_.store(gen-1)` 是释放store,但它进的是
+    // **store buffer**;随后读票计数器(counter_/node_base_)在 x86 TSO 下**可以先于**
+    // 那条 store 对其他核可见。于是 worker 可能出现:
+    //     fetch_add 落在新调用区间内(票属于新一代)
+    //   但随后读 current_gen_ 仍得到**旧的偶数代**(因为奇数 store 还没可见)
+    //   ⇒ 它按旧 start/n 算 i 越界 ⇒ 走 "future-gap" 分支**无条件丢弃**这张票
+    //   ⇒ 新一代 remaining_ 永不归零 ⇒ 看门狗 abort(§501 实测)。
+    // 这个旋钮把那几纳秒的窗口拉到可观测尺度,使竞态**可复现/可验证**;
+    // 默认 0 = 与生产行为逐位相同(仅在调用方路径上,每层一次,不在领票热循环里)。
+    void pub_window_delay_() {
+        static const long us = [] {
+            const char* e = std::getenv("XIAOTU_MOE_PUB_WINDOW_US");
+            return e ? std::atol(e) : 0L;
+        }();
+        if (us <= 0) return;
+        auto dl = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+        while (std::chrono::steady_clock::now() < dl) { }
     }
 
     void stop() {

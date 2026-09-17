@@ -20588,3 +20588,51 @@ DEDUP=23  na=20  0.84 ms/层(门限 0.95) 300 GB/s 2.50 GB/s·线程  同日 lk 
   **为什么必须是环境变量而不是进程内切换**:变体的 pybind11 类型是全局注册的,同进程加载两个变体直接
   `ImportError: generic_type: type "MOEConfigV2" is already registered!` ⇒ **一变体一进程**。
 * `scripts/bench_engine_ab.py` 新增 **`WARMUP`**(默认 1,验收用 200);`check_engine_aligned.sh` 两臂都传它。
+
+## §567 ⏳ R113 丢票:先造"可复现的检测器"(部分成功)+ 一个**否定结果**(窗口放大方向搞反了)
+### (a) 为什么必须先造检测器
+TRIED_AND_REVERTED R113 明确写着:**"只靠推理不许再改这段代码"**,且前置条件①(flat 无损账)已满足。
+丢票的唯一信号是"`remaining_` 永不归零 ⇒ **卡满 300s** 才 `abort()`" —— 这个信号太慢,
+压力测试里没法反复触发。所以先做两件事:
+1. **截止时间可调**:`XIAOTU_MOE_POOL_DEADLINE_MS`(flat 路径,默认 300000 = 原行为)。
+   分片路径**本来就有** `XIAOTU_MOE_SHARD_WD`(秒,默认 300)。
+2. **压力复现器** `scripts/stress_pool.py` + `scripts/stress_pool.sh`:
+   合成小权重(E=64/H=1024/I=512)在**毫秒级**完成一次 `cpu_prefill`,于是每秒能冲
+   **~1.5 万次池调用**(实测 0.068 ms/call);批量跑 N 进程 × T 秒,数 `WATCHDOG` 出现次数。
+
+### (b) 机制分析(为什么它罕见但真实)—— 供下一步用
+flat worker 快路径(`numa_pool.hpp:1296-1320`):
+```cpp
+size_t t = counter_.fetch_add(1);      // 领票(RMW,全屏障)
+size_t i = t - start;                  // 用**快照**的 start
+uint64_t g = current_gen_.load(acquire);
+if (g == gen) { if (i >= n) { dropped_f_++; break; } ... }   // ← future-gap:无条件丢弃
+```
+调用方发布:`current_gen_.store(gen-1, release)`(奇数) **然后** `start_ = counter_.load()`。
+x86 TSO 下**那条 release store 进的是 store buffer,后续 load 可以先执行** ⇒ 存在如下交错:
+```
+1) worker 读到旧的偶数 gen=g0(快照 start=s0/n=n0)
+2) 调用方 store 奇数(仍在 store buffer),读 counter_ 得到 s2(≥ s0+n0)
+3) worker fetch_add 拿到 t ≥ s2  ← 这张票**属于新一代**
+4) worker 随后读 current_gen_ 仍得到**旧偶数 g0**(奇数 store 还没对它可见)
+5) 于是按旧 start 算 i = t-s0 ≥ n0 ⇒ 走 future-gap **无条件丢弃**这张票
+6) 新调用 remaining_ 永不归零 ⇒ 看门狗
+```
+⇒ 要害是第 4 步:worker 的"复读 gen"在 TSO 下**不能**证明快照不过期;真正权威的是**票本身**。
+(注:sharded 路径还有 per-node 的 `node_base_` 快照,同一机制。)
+
+### (c) 否定结果:窗口放大器方向搞反了
+新增 `XIAOTU_MOE_PUB_WINDOW_US`(默认 0,在生产路径上是**零影响**):在"奇数 store"与
+"读票计数器快照"之间插入可配延迟。**实测:它让竞态更不可能,而不是更容易**:
+* flat/分片各 20,000 次调用(`PUB_WINDOW_US=200` + `SHARD_WD=1`)**零 WATCHDOG**;
+* 调用率从 **0.068 → 1.083 ms/call**(延迟本身),而 worker 在这 200 µs 里读到的是**奇数**,
+  于是**不领票**,等偶数出现后才重新领 ⇒ 陈旧快照窗口反而被"抹平"。
+⇒ **正确的放大器必须作用于"store 的传播"或"读快照前的间隔",而不是 store 之后**。若继续做 ④,
+下一步应:①把该延迟插在**奇数 store 之前**(制造"worker 刚过 gen 检查"的密集期),或
+②做一个**确定性交错**的 litmus 级复现器(把协议原语抽出来,用 sleep 固定 1→5 步),而非靠运气撞硬件窗口。
+* 现状:**不改变协议**(遵守"不许只靠推理改"),只留下检测器与这个方向性结论。
+
+### (d) 顺带:比值门余量按实测噪声带重标
+同日 6 次观测:`x 0.69-0.85 / lk 0.56-0.66` ⇒ 比值带 **1.14-1.35**(lk 自身 run-to-run 漂移就有 12%)。
+原门限 1.25/1.35 会让比值**正好压在线上**(实测 1.25/1.25、1.35/1.35 各一次)⇒ 会随机翻红。
+现取 **1.30/1.40**(留 ~5% 余量),**仍能抓住 §505 那种 1.43× 的分片回归**(那是比值门存在的唯一理由)。
