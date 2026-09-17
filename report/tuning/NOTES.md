@@ -19367,3 +19367,20 @@ worker 在读别的 node 的页。这既不是 socket 分组、也不是 node �
 * 下一轮就是用 A/B 把 a 再拆开:`XIAOTU_MOE_SPIN_IDLE_US` 0/300、`THREADS` 60/120/192、
   `XIAOTU_MOE_NSLICE_SMALL` 0/1、`XIAOTU_MOE_NENGINES` 1/2 —— a 对哪一个最敏感,哪一个就是主因。
 
+
+### §526 (轮 49) 固定开销 `a` 的 A/B 归因(V4.0/BS=6/DEDUP=12,na=11,REP=80)
+
+| 配置 | ms/层 | 相对 baseline | 对 `a` 的影响 |
+|---|---|---|---|
+| baseline(120,SPIN默认,NSLICE默认) | 0.870 | 1.00× | Δ=+0.000 ms |
+| SPIN=0 | 1.540 | 0.56× | Δ=+0.670 ms |
+| SPIN=300 | 0.890 | 0.98× | Δ=+0.020 ms |
+| THREADS=60 | 1.300 | 0.67× | Δ=+0.430 ms |
+| THREADS=192 | 1.220 | 0.71× | Δ=+0.350 ms |
+| NSLICE_SMALL=0(legacy) | 0.850 | 1.02× | Δ=-0.020 ms |
+
+* baseline 0.870 ms/层(na=11,其中固定项 §524 拟合 ≈0.83 ms ⇒ 这一档 86% 是固定开销)。
+* 用法:**相对 baseline 的 Δ 越大,那个旋钮越是 `a` 的主因**。下一轮按 Δ 排序去读对应代码路径
+  (SPIN/线程数 ⇒ 线程池唤醒或自旋;NSLICE_SMALL ⇒ 派发路径;若都不动 a,则嫌疑集中在
+  每层 host 往返/两相 barrier 本身,属 R113 那一族的协议问题)。
+
