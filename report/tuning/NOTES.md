@@ -21706,3 +21706,26 @@ out=140355456507904 inter=140234945200128 alloc=28920.8MiB res=30116.0   ← L2
 非KV 10 GiB + staging 10.3 + KV 4 + 首请求增长 7.7 + 激活(MBT) ≈ 39 GiB  ⇒ 很紧
 ⇒ KV 封顶 2-4 GiB(--kv-cache-memory),不要用 util 去填;启动时 free 要 ≥17 GiB
 ```
+
+## §601 ⭐ 同步路径只需**单槽**:staging 峰值 10.3 → 6.72 GiB;并定位 16K-chunk 的真正 OOM 点是 **attention**
+### (a) 16K-chunk 的 OOM 不在我们的 MoE
+`big10`(KV=2 GiB/MBT=16384/单槽前)在 13824-token 请求上崩,栈是:
+```
+File "vllm/models/deepseek_v4/...": return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+RuntimeError: torch_call_dispatcher("aten::new_empty", ...) API call failed
+```
+⇒ **是 attention 的 KV-insert 要再分配显存时失败**,不是 GPU 预填充本身。
+根因:我们的 staging(当时 10.3 GiB)把显存预算挤掉,attention 没有余量。
+### (b) 关键优化:**同步路径用单槽**
+* `prefetch_layer` 的"槽数 ≥2"下限是为了**侧流预取**(单槽会覆盖正在用的权重 —— 真正确性 bug);
+* 但 **engine-shards 的同步路径** staging 与 GEMM 都在**同一条 compute stream** 上严格有序
+  ⇒ 覆盖必然发生在上一层 GEMM 完成之后 ⇒ **单槽安全**;
+* `slot_for_shapes(..., nslots=1)` ⇒ staging 峰值 `3.59(槽) + 3.16(raw) + 0.45(暂存)` = **7.2 GiB**
+  (原 10.3;`prefetch_layer` 那条路径仍保持 ≥2)。
+### (c) 16K-chunk 的实测吞吐(修好前的 big10,GPU 预填充全 40 层 ACTIVE)
+| prompt | TTFT | tok/s | 对照 CPU(big9) |
+|---|---|---|---|
+| 3658 | 12.106 s | 302 | 24.17 s(151) |
+| 6977 | 15.202 s | 459 | 42.17 s(165) |
+⇒ **2.0× / 2.8×**;16000-token 那条因 attention OOM 未完成(已在 (b) 修)。
+⇒ 也量出成本结构:`~8.9 s 固定 + 0.79 ms/token`(固定项 = 权重搬运,斜率项 = GEMM 随 qlen 增长)。
