@@ -79,7 +79,7 @@ vllm serve <模型目录> \
   --gpu-memory-utilization 0.85
 
 # 4)(可选,推荐)把**长 prefill 也交给 GPU** —— DeepSeek-V4.1-Flash 实测快 2.0-2.8×
-#    两个前提:①阈值要 ≥3072(低于此 CPU 更划算);②**必须显式封顶 KV 池**,
+#    两个前提:①阈值要 ≥4096(低于此 CPU 更划算);②**必须显式封顶 KV 池**,
 #    否则 vLLM 会把显存填满、GPU 预填充会被逐层静默拒绝(退回 CPU)。
 vllm serve <模型目录> \
   --tensor-parallel-size 2 \

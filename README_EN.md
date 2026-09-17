@@ -101,7 +101,7 @@ vllm serve <MODEL_DIR> \
 
 # 4) (optional, recommended) also put **long prefill on the GPU** — measured
 #    2.0-2.8x faster on DeepSeek-V4.1-Flash. Two prerequisites:
-#    ① threshold >= 3072 tokens (below that the CPU path is cheaper);
+#    ① threshold >= 4096 tokens (below that the CPU path is cheaper);
 #    ② you MUST cap the KV pool explicitly, otherwise vLLM fills VRAM and GPU
 #       prefill is silently rejected layer-by-layer (falls back to CPU).
 vllm serve <MODEL_DIR> \

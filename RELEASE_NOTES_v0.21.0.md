@@ -1,21 +1,46 @@
-# vllm-xtu-moe v0.21.0 — GPU 预填充真正可用 + 显存口径修正
+# vllm-xtu-moe v0.21.0 — 支持 DeepSeek-V4.1-Flash(748B)
 
-**主题:把 GPU 预填充从"能开、但更慢还会 OOM"修成"能开、快 2-2.8×、显存算得准";
-并在过程中撤回了我们自己一个假的性能数字。**
+**本次最大的变化:把 DeepSeek-V4.1-Flash 跑成可用的生产配置** ——
+**1M 上下文 + GPU 预填充 + 投机解码**全链路端到端验收通过;
+其中 GPU 预填充从"能开但更慢、还会 OOM"修成"**能开、快 2.0-2.8×、显存算得准**"。
 
 `v0.21.0` 里程碑(commit `c7ab954`)当时的标注是"**功能完成,性能待优化(不发 release)**"。
-本次把那个"待优化"做掉了:让**长 prompt 走 GPU 预填充**这条路真正可用,
-并把这一路上踩到的**显存口径错误**修掉 —— 因此 0.21 现在可以发行。
+本次把那个"待优化"做掉了 —— 因此 0.21 现在可以发行。
 
 ---
 
-## 1. 为什么值得做
+## 1. 新增:DeepSeek-V4.1-Flash(748B)全链路支持
 
-长 prompt 的预填充在本项目里一直由 **CPU 引擎**承担(约 **258-285 tok/s**),GPU 预填充的路径
+它是本项目迄今遇到的最"对我们路子"的模型:38.5% 的权重是**纯查找表**(Engram,183 GiB,
+每 token 只需 ~12 KB 主机流量),官方生产栈自己就把这张表放在**主机内存**里;
+其余部分(CED / CSA2 / FP4 KV / DSpark 投机)由 vLLM 主线的 `deepseek_v41` 提供,
+本插件负责 **MoE 层**(把 routed experts 放 CPU)。
+
+**验收结果**(TP=2 / 1M 上下文 / 投机 / 真实权重;完整证据见 `report/tuning/NOTES.md` §570):
+
+| 项 | 结果 |
+|---|---|
+| 启动 | **388.3 s**(Engram 189 GiB 流式 + 逐层释放) |
+| **主机内存峰值** | **629.4 GiB**(ENGRAM_LAST=0 基线 1087.6 GiB,**−42%**) |
+| **KV 容量** | **6,724,586 tokens**;1M 请求并发 **6.41×** ⇒ 1M 上下文完整支持 |
+| 显存占用 | 35.98 GiB/卡(A100-40GB 内) |
+| **服务级 greedy 两次自比** | **5/5 逐字节相同** |
+| 单流解码(ShareGPT 16 题 C=1) | **16.64 tok/s,TPOT 36.75 ms** |
+| 并发(C=4) | 30.47 tok/s,TPOT 111.19 ms |
+| 数值门禁 | `OK=7 BAD=1,max_rel=1.873e-02`(与既有记录逐位一致) |
+| 性能门禁 | DEDUP=12 **0.70 ms/层(216 GB/s)**;DEDUP=23 **0.85 ms/层(296 GB/s)** |
+| 引擎逐位确定性 | 11 次运行 **10/10** |
+| 带载 0 丢票 | `WATCHDOG / abandoned / SLOW parallel_for` 各 **0** 次 |
+
+启动用 `docs/RUNBOOK.md` §5.9 的配置即可(见本文件 §6)。
+
+## 2. GPU 预填充:从"能开但更慢/OOM"到"快 2.0-2.8×"
+
+长 prompt 的预填充一直由 **CPU 引擎**承担(约 **258-285 tok/s**),而
 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` **默认关闭**,因为历史上它要么更慢、要么 OOM。
-本次把它修到"可开"。
+本节把这条路修到"可开且更快"。
 
-## 2. 关键修复(全部有实测证据;详见 `report/tuning/NOTES.md` §594-§602)
+## 3. 关键修复(全部有实测证据;详见 `report/tuning/NOTES.md` §594-§602)
 
 | # | 问题 | 修复 | 证据 |
 |---|---|---|---|
@@ -26,7 +51,7 @@
 | 5 | **`--enforce-eager` 反而更吃显存** | 明确记录:**不要开**(实测 free 12.95→**1.4** GiB,预填充被拒) | §600(c) |
 | 6 | 我们自己发布的 **"1725 tok/s"是无效数据** | **撤回**:该次响应 `chunks=1` 且无 `usage` ⇒ 是错误/截断响应;探针增加校验 | §602 |
 
-## 3. 真实收益(同一服务、同一批唯一 prompt、客户端 TTFT)
+## 4. 真实收益(同一服务、同一批唯一 prompt、客户端 TTFT)
 
 | prompt | CPU 预填充(基线) | **GPU 预填充** | 加速 |
 |---|---|---|---|
@@ -37,7 +62,7 @@
 固定项 = 每个 chunk 都要把 **143.6 GiB/rank** 的专家权重搬一遍(TP=2,40 层 × 3.589 GiB)——
 所以 **chunk(MBT)越大越划算**,这也是"预填充吞吐随 prompt 变长而提高"的原因。
 
-## 4. 端到端性能(官方 `vllm bench serve`)
+## 5. 端到端性能(官方 `vllm bench serve`)
 
 > 口径:`--backend openai-chat`,`--dataset-name random`,`--ignore-eos`,`--random-output-len 128`,
 > 预热轮与正式轮**不同 seed**(同 seed 会整段命中前缀缓存,TTFT 假快 —— §603),
@@ -78,20 +103,20 @@
 * **短 prompt(L=32/256)TTFT 亚秒级**(474 ms / 1.98 s),走 CPU 路径;
 * **L=1024 的 TTFT 10.0 s 偏高**:该组数据是用**旧阈值 1024** 跑的,1K prompt 刚好越过阈值
   而白付了 ~9 s 固定成本。按实测成本模型(`8.9 s/chunk + 0.79 ms/token` vs CPU `3.9 ms/token`)
-  **盈亏平衡 ≈2860 token**,所以**推荐阈值已改为 3072**(`vram_policy` 现在直接输出 3072)。
+  **盈亏平衡 ≈2860 token**,所以**推荐阈值已改为 4096**(`vram_policy` 现在直接输出 4096)。
 
 
-## 5. 推荐配置(详见 `docs/RUNBOOK.md` §5.9)
+## 6. 推荐配置(详见 `docs/RUNBOOK.md` §5.9)
 
 ```bash
 TAG=harness PORT=8700 GPUS=0,1 TP=2 MAXLEN=1048576 SEQS=8 MBT=8192 LOAD=auto GPU_UTIL=0.55 \
 SPEC=1 COMPILE=0 THREADS=60 SPIN=300 KV_CACHE_BYTES=4294967296 \
-VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=3072 \
+VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=4096 \
   bash scripts/serve_v41.sh
 ```
 显存配方(TP=2/MBT=8192):非KV 10 + KV 4 + staging 7.2 + 首请求一次性增长 7.7 + 激活 ≈ **33 GiB**。
 
-## 6. 已知限制(必须知道)
+## 7. 已知限制(必须知道)
 
 * **`MBT` 上限 8192**:`16384` 会 OOM,且 OOM 点是 **attention** 的
   `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`(不是 MoE)——40 GB 卡上
@@ -102,7 +127,7 @@ VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=3072 \
 * 剩余优化(未做):把 H2D 从 `cudaLaunchHostFunc` 回调里挪出以与上一层计算重叠;
   让 GEMM 直接读非 K-major 布局以彻底省掉转置与 `raw` 那 3.16 GiB。
 
-## 7. 复现
+## 8. 复现
 
 ```bash
 # 引擎三门禁(数值 / 性能 / 确定性)

@@ -353,8 +353,8 @@ def emit_env(p: dict) -> str:
     # 总约束:GPU 预填充要么用"零主机代价"的实现,要么不开
     # 【§603】**阈值 1024 偏低**:实测 GPU 预填充是"每 chunk ≈8.9 s 固定 + 0.79 ms/token",
     # 而 CPU 是 ≈3.9 ms/token ⇒ 盈亏平衡在 **~2860 token**。用 1024 会让 1-3K 的 prompt
-    # 白付 ~9 s(实测 L=1024 的 TTFT 从 CPU 的 ~4 s 变成 10.03 s)。这里取 **3072**。
-    _gpm = _env_gib("XIAOTU_GPU_PREFILL_SWITCH_TOKENS", 3072)
+    # 白付 ~9 s(实测 L=1024 的 TTFT 从 CPU 的 ~4 s 变成 10.03 s)。这里取 **4096**。
+    _gpm = _env_gib("XIAOTU_GPU_PREFILL_SWITCH_TOKENS", 4096)
     lines.append(f"VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS={int(_gpm) if p['gpu_prefill'] else 0}")
     lines.append(f"XIAOTU_GPU_RESIDENT_LAYERS={p.get('resident_spec','')}")
     # 【§508 更正】draft 上不上 GPU **不需要新旋钮**:hybrid_model.py:669-686 里
