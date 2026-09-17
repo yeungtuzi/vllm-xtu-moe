@@ -21316,3 +21316,40 @@ CPU 路径每层只让**几百 KB 的隐状态**过 PCIe —— 这正是它与�
 ### (d) 真正剩下的、与 lk 无关的技术问题
 **TPOT 随上下文从 30.6 ms(50 token)涨到 67.2 ms(4K token)** —— 这是**注意力/CSA2 随上下文增长的成本**,
 两边同模型同样存在,不是我们的差异点,但它决定了"真实长 prompt 场景下的体验",值得单独优化(CSA2/稀疏索引在长上下文下的 kernel 成本)。
+
+## §588 🎯 **找到公布值的测量口径** —— 它是**短上下文**数;同口径下我们已经超过 27 t/s
+### (a) lk 的真实启动命令(`/home/user/lvllm/Lvllm/commands/dsv41_serve_tp2_3090_dspark.sh`)
+```
+CUDA_VISIBLE_DEVICES=0,3  LK_THREADS=48  LK_THREAD_BINDING=CPU_CORE
+LVLLM_MOE_NUMA_ENABLED=1  LVLLM_ENABLE_NUMA_INTERLEAVE=1  LK_POWER_SAVING=1
+VLLM_USE_V2_MODEL_RUNNER=1  LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024
+vllm serve … --tensor-parallel-size 2 --max-model-len 65536 \
+  --max-num-batched-tokens 8192 --max-num-seqs 2 --gpu-memory-utilization 0.95 \
+  --kv-cache-dtype fp8_ds_mla \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","mode":"VLLM_COMPILE"}' \
+  --enable-prefix-caching --enable-chunked-prefill \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
+```
+要点:①**`--max-model-len 65536`**(不是 1M)②**它就是用 `FULL_DECODE_ONLY`+`VLLM_COMPILE`**(我们 §581 测过,
+在我们这套里无收益)③`LK_THREADS=48`(我们是 60/rank = 120)④`--max-num-seqs 2`。
+### (b) 测量口径(`vllm/benchmarks/latency.py`,`vllm bench latency` 的实现)
+* **默认 `--input-len 32` / `--output-len 128`**;"single request" ⇒ `--batch-size 1`;
+* 走**离线 `LLM.generate`**(**不过 HTTP**)、**输入是随机 token**(`np.random.randint(10000)`)、`temperature=1.0`
+  (⇒ release notes 里写 "greedy" 是宽松说法);
+* ⇒ **"2×3090:27 t/s" 是"~32 token 上下文、单请求、解码吞吐"的数**。
+### (c) 同口径比较(我们的短上下文实测)
+| | 上下文 | 单流 |
+|---|---|---|
+| **lk 公布值** | **~32 token**(默认 input-len) | **27 t/s** |
+| 我们(§587 实测,同机同模型) | 7 token | 26.4 t/s |
+| 我们 | **50 token** | **32.7 t/s** |
+| 我们 | 250 token | 24.4 t/s |
+⇒ 在公布值的口径上,我们落在 **~29-33 t/s** 区间 ⇒ **已经达到并略超过 27 t/s**;
+而 §583/§586 说的"落后 15%"是**拿我们 250-1000 token 的 42.9 ms 去比它 32 token 的 37 ms**(第三次 R15 口径错)。
+### (d) 仍存的不确定性(必须写明)
+1. 它没写**具体命令行**(可能显式传了 input/output len);温度是 1.0 而非贪心;
+2. 它用的是 **offline API**,我们目前是 HTTP(但 §587 已证:两者在我们的服务上都 ≈33 ms,差异可忽略);
+3. 配置不同(它有 COMPILE=1/65536/seqs=2/gpu-util .95,我们是 COMPILE=0/8192/seqs=8/.90)。
+⇒ **要一锤定音**:用**同一条命令、同一台机器**跑两套栈
+(`vllm bench latency --input-len 32 --output-len 128 --batch-size 1`),我们栈 vs `scripts/serve_lk_port.sh` 的 lk 栈。
+这是唯一能消除全部口径歧义的实验(约 2 次启动 ≈ 15 分钟)。**下一轮执行。**
