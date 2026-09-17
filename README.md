@@ -6,10 +6,14 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 里程碑(2026-09-13)**:除了本插件路径,仓库里还有一条**把 lvllm 的编排链移植进 vLLM fork**
-> 的路线(同样是我们的 CPU 引擎,但由 lvllm 自己决定专家怎么分/怎么调度)。
-> 两条路线都已实测:**移植路线在两卡 A100-40GB 上跑到解码 C=1 20.29 t/s、预填充 1287 t/s、1M 上下文**。
-> 见 [`docs/MILESTONE_lk_port.md`](docs/MILESTONE_lk_port.md) 与 `report/tuning/NOTES.md` §290-§299。
+> **📌 当前版本:v0.21.0**(2026-09-17)——
+> **GPU 预填充从"能开但更慢还会 OOM"修成"能开、快 2.0-2.8×、显存算得准"**,
+> 并补齐官方 `vllm bench serve` 的完整验收数据(6 种 prompt 长度 × C=1/2/4/8)。
+> 发行说明:[`RELEASE_NOTES_v0.21.0.md`](RELEASE_NOTES_v0.21.0.md) ·
+> Releases: <https://github.com/yeungtuzi/vllm-xtu-moe/releases/tag/v0.21.0>
+>
+> 历史:另一条**把 lvllm 编排链移植进 vLLM fork** 的路线(两卡 A100-40GB 上解码 C=1 20.29 t/s、
+> 预填充 1287 t/s、1M 上下文)见 [`docs/MILESTONE_lk_port.md`](docs/MILESTONE_lk_port.md)。
 
 ---
 
@@ -72,8 +76,20 @@ export VLLM_EXPERTS_LOAD_DEVICE=cpu     # 专家权重放 CPU
 vllm serve <模型目录> \
   --tensor-parallel-size 1 \
   --max-model-len 8192 \
-  --gpu-memory-utilization 0.85 \
-  --enforce-eager
+  --gpu-memory-utilization 0.85
+
+# 4)(可选,推荐)把**长 prefill 也交给 GPU** —— DeepSeek-V4.1-Flash 实测快 2.0-2.8×
+#    两个前提:①阈值要 ≥3072(低于此 CPU 更划算);②**必须显式封顶 KV 池**,
+#    否则 vLLM 会把显存填满、GPU 预填充会被逐层静默拒绝(退回 CPU)。
+vllm serve <模型目录> \
+  --tensor-parallel-size 2 \
+  --max-model-len 1048576 \
+  --max-num-batched-tokens 8192 \
+  --kv-cache-memory 4294967296 \
+  --gpu-memory-utilization 0.55 \
+  --speculative-config dspark
+# 显存配方(TP=2/MBT=8192):非KV 10 + KV 4 + staging 7.2 + 首请求一次性增长 7.7 + 激活 ≈ 33 GiB
+# 完整参数表与依据见 docs/RUNBOOK.md §5.9;判定是否真走了 GPU:日志出现 `GPU prefill ACTIVE`
 ```
 
 自检(打印引擎 ISA 变体、生效的集成补丁、后端注册情况):
@@ -99,6 +115,7 @@ DeepSeek-V4-Flash 的**推荐参数与实测数据**见
 > | 结论 | 验证于 | 在 v0.2.0 代码上复验? |
 > |---|---|---|
 > | **DeepSeek-V4-Flash 主线端到端**(服务、`bench_lat` C=1/2/4、数值门禁 `OK=7 BAD=1`、启动自检) | **v0.2.0**(2026-09-14) | ✅ **是** |
+> | **DeepSeek-V4.1-Flash 全链路**(1M 上下文 / GPU 预填充 / 投机解码;`vllm bench serve` 6 长度 × 4 并发) | **v0.21.0**(2026-09-17) | ✅ **是** |
 >
 > 原因:v0.2 改动了**所有模型都会走的路径**(执行模型 `XIAOTU_MOE_ASYNC=0`、
 > 小 batch 路径 `NSLICE_SMALL=0`、**EP 存储分片**)。**除 DeepSeek-V4-Flash 外均需复验**,
@@ -109,6 +126,40 @@ DeepSeek-V4-Flash 的**推荐参数与实测数据**见
 > (Engram,183 GiB,每 token 只需 ~12 KB 主机流量),官方生产栈也把这张表放在**主机内存**里
 > 用 RDMA 预取 —— 与本项目的 `XIAOTU_PLE_CPU=1` 思路一致;但整条模型(CED/CSA2/FP4 KV/DSpark)
 > 需要 vLLM 主线先支持 `deepseek_v41`,本插件只覆盖 MoE 层,无法独自提供。
+
+## 性能实测(v0.21.0)
+
+> 机器:2×AMD EPYC 9654(192 核)/ 3×A100-40GB / DDR5-4800 24 通道。
+> 口径:**TP=2**、充分预热、唯一 prompt(不命中前缀缓存)、官方 `vllm bench serve`。
+> 原始数据在 [`report/tuning/logs/bench_serve_acc2/`](report/tuning/logs/bench_serve_acc2/),
+> 完整表见 [`report/tuning/BENCH_REFERENCE.md`](report/tuning/BENCH_REFERENCE.md) §7。
+
+### GPU 预填充 vs CPU 预填充(DeepSeek-V4.1-Flash,客户端 TTFT)
+
+| prompt | CPU 预填充 | **GPU 预填充** | 加速 |
+|---|---|---|---|
+| ~3.7K | 24.17 s(151 tok/s) | **12.11 s(302 tok/s)** | **2.0×** |
+| ~7.0K | 42.17 s(165 tok/s) | **15.19 s(460 tok/s)** | **2.8×** |
+
+成本模型(实测):**每个 chunk ≈ 8.9 s 固定 + 0.79 ms/token**。固定项 = 每个 chunk 都要把
+**143.6 GiB/rank** 的专家权重搬一遍(TP=2,40 层 × 3.589 GiB)⇒ **chunk(`--max-num-batched-tokens`)越大越划算**。
+
+### 端到端(官方 `vllm bench serve`,TP=2 / MBT=8192 / GPU 预填充 / KV 封顶 4 GiB / 关前缀缓存)
+
+| prompt | TTFT C=1 | TTFT C=8 | 总吞吐 C=1 | 总吞吐 C=8 | TPOT C=1 |
+|---|---|---|---|---|---|
+| 32 | 0.47 s | 3.49 s | 37 tok/s | 95 tok/s | 36.2 ms |
+| 256 | 1.98 s | 10.9 s | 55 | 134 | 43.6 ms |
+| 1024 | 10.0 s | 23.6 s | 65 | 242 | 64.6 ms |
+| 4096 | 12.8 s | 46.4 s | 200 | 379 | 66.3 ms |
+| 16384 | 34.5 s | 170 s | 399 | 455 | 54.4 ms |
+| 32768 | 70.9 s | 333 s | 420 | 454 | 58.4 ms |
+
+**怎么读**:①长 prompt 的总吞吐**饱和在 ~420-455 tok/s**(上界由 GPU 预填充的固定成本决定);
+②**TTFT 与长度线性、与并发强相关** —— 预填充是串行共享资源,并发只增加排队;
+③短 prompt(32/256)走 CPU,TTFT 亚秒级。
+
+---
 
 ## 工作原理(一句话版)
 
@@ -169,6 +220,17 @@ vllm-xtu-moe/
 - **FP8 CPU 内核性能待优化**:当前是"先正确、后提速"的阶段。
 - **不支持专家并行(expert_map)**:TP>1 走权重分片,EP 尚未支持。
 - **不支持 gate/up 交错布局**(`SWIGLUOAI`,gpt-oss 系)。
+- **GPU 预填充的 chunk 上限是 `--max-num-batched-tokens 8192`**(DeepSeek-V4.1-Flash / A100-40GB):
+  `16384` 会 OOM,且 OOM 点是 **attention** 的 `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`
+  (不是 MoE)——16K chunk 的激活 + staging 放不下。想再往上需要更大显存或把激活压下来。
+- **开了 GPU 预填充就必须显式封顶 KV 池**(`--kv-cache-memory`):vLLM 默认把显存填到
+  `--gpu-memory-utilization` 为止,预填充的 staging 会**逐层被拒并静默退回 CPU**。见 `docs/RUNBOOK.md` §5.8。
+- **③ CED 预填充捷径:已实现机制链但默认关闭,当前拿不到收益**。
+  实测把冲突逐个定位到**两个上游不变量**:`mhc/tilelang.py:345` 断言
+  `x.shape == (num_tokens, hidden_size)`(层不能返回比本步 `num_tokens` 更短的张量),
+  以及 `positions` 来自 runner 全局缓冲、插件层够不到。
+  ⇒ 要真正拿到收益应把"本步有效 token 数"作为一等量在**上游 vLLM** 里下传。
+  全过程与证据见 [`report/tuning/NOTES.md`](report/tuning/NOTES.md) §571-§604。
 
 ## 许可与第三方
 
