@@ -20931,3 +20931,42 @@ token_ids、首个生成 token 及其 logprob),存成 `report/tuning/ced_prefill
 先做最小可验证实验:只做第 1+2 步(登记 + 开标志),看 eligible 集合是否非空、
 `FastPrefill` 后端能否在 V4.1 的稀疏注意力后端上正常工作、以及"只算 1 token"是否如预期
 **破坏** SWA(预期破坏 ⇒ 正好反证第 3 步的必要性),再用 greedy 生成口径验收。
+
+## §575 ③ 路线再修正:**不能复用上游的 `kv_sharing_target_layer_name` 属性**(会丢 SWA),但插桩点反而更精确(2 个函数)
+### (a) 硬否决点(读代码即定,不必试)
+`v1/worker/gpu/attn_utils.py:130 get_kv_cache_spec()`:
+```python
+for layer_name, attn_module in attn_layers.items():
+    if getattr(attn_module, "kv_sharing_target_layer_name", None):
+        # This layer will use KV cache of the sharing target layer.
+        continue          # ← 该层不再生成自己的 KV cache spec
+```
+⇒ 该机制的前提是"eligible 层**自己没有 KV cache**"(YOCO/Gemma3n 那种纯共享层)。
+而 V4.1 的 decoder 层(21..39)**各自必须有自己的 SWA 缓存**(报告 §2.2:SWA 逐层计算)
+⇒ **登记这个属性 = 丢掉 SWA 缓存 = 直接坏掉**。所以 §574 里"照搬上游捷径"的路线**不成立**。
+(V4.1 的 global 压缩 KV 本来就是靠 `k_cache.prefix` 指向源层实现的**共享**,不重复占缓存;
+  它的"共享"与这套属性的语义不同。)
+
+### (b) 但插桩点因此变得**非常精确**(仍是 §573 的窗口方案,只是落在上游已有的改写点上)
+上游真正可复用的不是"属性",而是**这两个函数的机制**:
+1. `v1/worker/gpu/attn_utils.py:156 get_kv_sharing_fast_prefill_eligible_layers()` —— 决定**哪些层**走 fast-prefill;
+2. `v1/attention/backends/utils.py:631 make_kv_sharing_fast_prefill_common_attn_metadata()` —— 决定这些层**保留哪些 query 位置**
+   (上游只保留 `logits_indices` = 每请求 1 个位置)。
+外加 `create_fast_prefill_custom_backend()`(已存在)会把 (2) 的改写挂到 eligible 层上。
+⇒ V4.1 需要的改动**只需**:
+* 在 (1) 里加一条 **V4.1 专属判据**(而不是用那个属性):
+  `compress_ratio > 0 and not is_kv_source`(即"读共享压缩 KV、但自己仍有 SWA"的消费者层 = 21..39)
+  —— 这样**完全不动 `get_kv_cache_spec`**,SWA 缓存照旧分配 ✓;
+* 在 (2) 里把这批层的 query 集合从"logits 位置"改成**最后 `2·w_win−1 = 255` 个位置**(§573 的窗口,§574 已独立印证)。
+* 仍受上游那条硬约束:该模式下 **prompt logprobs 不正确** ⇒ 验收走 **greedy 生成口径**。
+
+### (c) 为什么这是"更小"而不是"更大"
+* **不动**模型 forward、**不动** runner 的采样/调度、**不动**缓存规格;
+* 只改**两个函数**,且第二个函数的改写框架(包装后端、覆写 metadata)上游已经写好;
+* 跳过的层仍会写 global 压缩 KV(由层 20 的压缩器负责)与窗口内 SWA KV ✓。
+
+### (d) 下一步(可直接开工)
+按 (b) 实现,全部 **env 门控、默认关**;验收:
+①服务能起 + 日志确认 eligible 集合 = 层 21..39;②`T ≤ 255` 的请求与今天**逐位一致**;
+③长 prompt 下 **greedy 生成文本与关闭时逐字节一致**(§572 已证"首 token 在 native 噪声下稳定");
+④预填充耗时相对关闭时下降(2048-token 目标 ~35%,8192 ~44%,见 §573c)。
