@@ -1232,7 +1232,7 @@ def _install_ced_group_name_probe() -> list[str]:
 # metadata 侧每被调用一次就把 `win` 写成"本步实际改写成的窗口长度"(改写=窗口长,未改写=0);
 # 切片侧**必须**看到 `win > 0` 才允许切。这样即使某一层没被换上 FastPrefill 后端
 # (⇒ 元数据整步没改写),切片也会**自动停用** —— 从"崩"降级为"不生效"。
-_CED_STATE: dict = {"win": 0, "toks": -1, "log": 0}
+_CED_STATE: dict = {"win": 0, "toks": -1, "log": 0, "sliced_attn": None}
 
 
 def _install_ced_fastprefill_shim() -> list[str]:
@@ -1461,7 +1461,9 @@ def _install_ced_kvinsert_shim() -> list[str]:
     @functools.wraps(orig)
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
         try:
-            if int(_CED_STATE.get("win", 0)) > 0 and isinstance(attn_metadata, dict):
+            if (int(_CED_STATE.get("win", 0)) > 0
+                    and _CED_STATE.get("sliced_attn") == id(self)
+                    and isinstance(attn_metadata, dict)):
                 swa = getattr(self, "swa_cache_layer", None)
                 pfx = getattr(swa, "prefix", None)
                 md = attn_metadata.get(pfx) if pfx is not None else None
@@ -1477,16 +1479,16 @@ def _install_ced_kvinsert_shim() -> list[str]:
                          f"pos={int(positions.shape[0]) if hasattr(positions, 'shape') else 'NA'} "
                          f"sm={int(sm.numel()) if sm is not None else 'NA'}")
                 if hasattr(positions, "shape") and int(positions.shape[0]) > qn > 0:
-                    positions = positions[-qn:]
+                    positions = positions[-qn:].contiguous()
                 if hasattr(kv, "shape") and int(kv.shape[0]) > qn > 0:
-                    kv = kv[-qn:]
+                    kv = kv[-qn:].contiguous()
                 if sm is not None and int(sm.numel()) > qn > 0:
                     import copy as _cp
                     nmd = _cp.copy(md)
                     try:
-                        object.__setattr__(nmd, "slot_mapping", sm[-qn:])
+                        object.__setattr__(nmd, "slot_mapping", sm[-qn:].contiguous())
                     except Exception:  # noqa: BLE001
-                        setattr(nmd, "slot_mapping", sm[-qn:])
+                        setattr(nmd, "slot_mapping", sm[-qn:].contiguous())
                     _nd = dict(attn_metadata)
                     _nd[pfx] = nmd
                     attn_metadata = _nd
@@ -1638,7 +1640,14 @@ def _install_ced_slice_shim() -> list[str]:
             _log(f"[ced-diag] 层**切片** layer_idx={st.get('idx', {}).get(id(self))} "
                  f"t={t} -> {w}")
         st["hits"] += 1
-        return orig_layer(*ba.args, **ba.kwargs)
+        # 【§604j】把"本层被切片"这件事**只对本层的 attn 模块**生效:
+        # 之前用的是**步级** `_CED_STATE["win"]>0`,于是对没被切片的层(22..39,t 已是 w)
+        # 也会触发 KV-insert 的对齐 ⇒ 索引到不该动的 SWA 槽位 ⇒ CUDA 非法访存。
+        _CED_STATE["sliced_attn"] = id(getattr(self, "attn", None))
+        try:
+            return orig_layer(*ba.args, **ba.kwargs)
+        finally:
+            _CED_STATE["sliced_attn"] = None
 
     forward._xtu_ced_slice = True  # type: ignore[attr-defined]
     Layer.forward = forward
