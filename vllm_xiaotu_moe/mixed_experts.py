@@ -154,6 +154,9 @@ def _host_mib() -> dict:
 
 
 _LAYER_IDX_RE = __import__("re").compile(r"layers\.(\d+)\.")
+
+# 【§597】设备级 GPU 预填充判定(第一个模块的决定即为全局,防混合模式)
+_GPF_OK: dict = {}
 _RELEASE_MISSES = 0   # 见 _release_source_weights:静默失败的可观测性
 _RELEASE_FILE = "/tmp/xiaotu_release_source"
 
@@ -1258,7 +1261,7 @@ class _XiaotuExpertsMixin:
                 PrefetchSlot,
                 gpu_moe_layer,
                 kmajor_from_engine_shards,
-                kmajor_from_engine_shards_v2 as _v2,
+                slot_for_shapes,
             )
 
             # 需要的只有形状:E/H/I。源张量可能已被释放,所以优先用释放时记下的形状。
@@ -1281,10 +1284,15 @@ class _XiaotuExpertsMixin:
             # 判定**每个模块只做一次**:预检看的是瞬时空闲显存,逐次判定会让同一层
             # 在 GPU/CPU 之间来回跳(实测一次 forward 内 24 层走分片、16 层退回源张量,
             # 另一半 forward 全部 SKIPPED,NOTES §464),行为不可复现。
-            _ok = getattr(self, "_gpu_pf_ok", None)
+            # 【§597】**判定必须进程级**(不是"每个模块一次")。原先用 self._gpu_pf_ok 是
+            # **每层模块各判一次**,于是出现最坏的形态:前 8 层 free 够 ⇒ 走 GPU,
+            # 第 9 层起 free 掉到阈值下 ⇒ 逐层退回 CPU ⇒ **一次 forward 里 GPU/CPU 混合**,
+            # 实测 13.8K prompt 要 76.5 s(纯 CPU 只要 ~54 s、纯 GPU 应 ~13 s)。
+            # 现在第一个做出判定的模块把结论钉在**设备级**,后续所有层沿用。
+            _ok = _GPF_OK.get(_dev.index if hasattr(_dev, "index") else None)
             if _ok is None:
                 _ok, _free = fits_device(_need, _dev)
-                self._gpu_pf_ok = bool(_ok)
+                _GPF_OK[_dev.index if hasattr(_dev, "index") else None] = bool(_ok)
                 if not _ok:
                     print(
                         f"[vllm-xtu-moe] GPU prefill DISABLED for this layer -> staying "
@@ -1309,12 +1317,18 @@ class _XiaotuExpertsMixin:
 
                     _t_split = os.environ.get("XIAOTU_GP_SPLIT") == "1"
                     _t0 = _time.perf_counter() if _t_split else 0.0
-                    # 【§595 A/B】`XIAOTU_GPF_V2=1` 用"分批 DMA"版本(见 gpu_prefill 的
-                    # 同名函数 docstring):DMA 全发完再组装、再转置,既能干净分相,也让
-                    # PCIe 不被夹在中间的 D2D 打断。默认仍是老实现(逐字不变)。
-                    _km = (_v2 if os.environ.get("XIAOTU_GPF_V2") == "1"
-                           else kmajor_from_engine_shards)(
-                        engine, _dev, hidden_size, _I, _E, int(self._group_k)
+                    # 【§597】**复用环形槽缓冲**(与 prefetch_layer 共用 `_SLOTS`)。
+                    # 每层新分配 3.589 GiB 会造成不可回收的碎片(`reserved` 单调上涨),
+                    # 直接导致上面的混合模式;改成写进复用的 slot.bufs 后,驻留量恒定。
+                    _gk = int(self._group_k)
+                    _slot = slot_for_shapes((
+                        (_E, hidden_size // 2, 2 * _I),
+                        (_E, hidden_size // _gk, 2 * _I),
+                        (_E, _I // 2, hidden_size),
+                        (_E, _I // _gk, hidden_size),
+                    ), _dev)
+                    _km = kmajor_from_engine_shards(
+                        engine, _dev, hidden_size, _I, _E, _gk, dst=_slot.bufs
                     )
                     if _t_split:
                         torch.cuda.synchronize()
@@ -1333,8 +1347,9 @@ class _XiaotuExpertsMixin:
                     torch.cuda.empty_cache()
                     _gpu_pf = False
                     _km = None
-                    if getattr(self, "_gpu_pf_ok", None) is not False:
-                        self._gpu_pf_ok = False
+                    _di = _dev.index if hasattr(_dev, "index") else None
+                    if _GPF_OK.get(_di) is not False:
+                        _GPF_OK[_di] = False
                         print(
                             "[vllm-xtu-moe] GPU prefill OOM while staging a layer -> "
                             "falling back to CPU prefill for this layer and disabling "
@@ -1344,8 +1359,7 @@ class _XiaotuExpertsMixin:
                             flush=True,
                         )
             if _km is not None:
-                _slot = PrefetchSlot()
-                _slot.bufs = _km
+                # 槽来自 `slot_for_shapes`(环形复用);这里只补 ready 事件。
                 _slot.ready = torch.cuda.Event()
                 _slot.ready.record(torch.cuda.current_stream(_dev))
                 _t1 = _time.perf_counter() if _t_split else 0.0

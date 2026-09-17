@@ -656,8 +656,8 @@ def _pinned(t: torch.Tensor) -> torch.Tensor:
 _PIN_CACHE: dict[tuple, tuple] = {}
 
 
-def _kmajor_bytes(t):
-    """[E, A, B] u8 -> [E, B, A] u8(字节转置;nibble 仍留在字节内)。
+def _kmajor_bytes(t, dst=None):
+    """[E, A, B] u8 -> [E, B, A] u8(字节转置;nibble 仍留在字节内)。`dst` 给了就写进去。
 
     【§596】**默认改用分块 Triton kernel**:实测 `transpose(1,2).contiguous()`
     对这种 uint8 逐字节转置只有 **~90 GB/s**(4 个张量合计 42.8 ms/层),
@@ -666,9 +666,13 @@ def _kmajor_bytes(t):
     """
     try:
         from vllm_xiaotu_moe.byte_transpose import ktranspose_bytes
-        return ktranspose_bytes(t)
+        return ktranspose_bytes(t, dst)
     except Exception:  # noqa: BLE001
-        return t.transpose(1, 2).contiguous()
+        r = t.transpose(1, 2).contiguous()
+        if dst is not None:
+            dst.copy_(r)
+            return dst
+        return r
 
 
 def _kmajor_cached(t: torch.Tensor):
@@ -985,7 +989,7 @@ def kmajor_from_engine_shards_v2(engine, device, hidden: int, inter: int,
 
 
 def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
-                              n_experts: int, group_k: int):
+                              n_experts: int, group_k: int, dst=None):
     """K-major device weights built from the engine's OWN host buffers.
 
     WHY (report/tuning/NOTES.md §459): the GPU prefill path used to stream the
@@ -1054,10 +1058,20 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
     # transpose (73 ms total), whereas `reused.copy_(t.transpose(1,2))` is a
     # strided read and cost ~126 ms extra (NOTES §466). Reuse is worth it for the
     # big INTERMEDIATES (node DMA buffers + raw, ~13 GB of churn); not here.
-    out = (_kmajor_bytes(w13_raw), _kmajor_bytes(s13_raw),
+    if dst is not None:
+        # 【§597】写进调用方给的**复用缓冲**(环形槽),避免每层新分配 3.589 GiB ——
+        # 实测每层新分配会让 `reserved` 单调上涨、free 跌破预填充阈值,
+        # 于是第 8 层起逐层 DISABLED、退化成比纯 CPU 还慢的混合模式(76.5 s/13.8K)。
+        _kmajor_bytes(w13_raw, dst[0])
+        _kmajor_bytes(s13_raw, dst[1])
+        _kmajor_bytes(w2_raw, dst[2])
+        _kmajor_bytes(s2_raw, dst[3])
+        _stage_mark(_t_dma_end, "tr")
+        return tuple(dst)
+    res = (_kmajor_bytes(w13_raw), _kmajor_bytes(s13_raw),
            _kmajor_bytes(w2_raw), _kmajor_bytes(s2_raw))
     _stage_mark(_t_dma_end, "tr")
-    return out
+    return res
 
 
 
@@ -1120,13 +1134,35 @@ class PrefetchSlot:
         self.t1 = None
 
     def alloc(self, tensors, device):
-        shapes = tuple(tuple(t.shape) for t in tensors)
-        if self.bufs is None or self.bufs[0].shape != shapes[0] or \
-                self.bufs[1].shape != shapes[1] or self.bufs[2].shape != shapes[2] or \
-                self.bufs[3].shape != shapes[3]:
+        self.alloc_shapes(tuple(tuple(t.shape) for t in tensors), device)
+
+    def alloc_shapes(self, shapes, device):
+        shapes = tuple(tuple(int(v) for v in sh) for sh in shapes)
+        if self.bufs is None or tuple(tuple(b.shape) for b in self.bufs) != shapes:
             self.bufs = tuple(
                 torch.empty(s, dtype=torch.uint8, device=device) for s in shapes
             )
+
+
+def slot_for_shapes(tensors, device):
+    """按**形状**取/建全局环形槽(所有层共享同一 key),并 alloc 出复用缓冲。
+
+    与 `prefetch_layer` 共用 `_SLOTS`,深度/下限语义一致(≥2;单槽是正确性 bug)。
+    返回的 `slot.bufs` 可直接当 `kmajor_from_engine_shards(..., dst=slot.bufs)` 的目标。
+    """
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    shapes = tuple(tuple(t.shape) if hasattr(t, "shape") else tuple(t) for t in tensors)
+    key = (dev.index,) + shapes
+    slots = _SLOTS.get(key)
+    if slots is None:
+        nslots = max(2, int(os.environ.get("XIAOTU_MOE_PREFETCH_SLOTS", "2") or 2))
+        slots = [PrefetchSlot() for _ in range(nslots)]
+        _SLOTS[key] = slots
+    i = _RING.get(key, 0)
+    _RING[key] = i + 1
+    slot = slots[i % len(slots)]
+    slot.alloc_shapes(shapes, dev)
+    return slot
 
 
 _SLOTS: dict[tuple, list] = {}

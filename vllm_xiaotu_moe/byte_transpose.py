@@ -47,17 +47,24 @@ def _enabled() -> bool:
     return os.environ.get("XIAOTU_GPF_TT", "1") != "0"
 
 
-def ktranspose_bytes(t: torch.Tensor) -> torch.Tensor:
+def ktranspose_bytes(t: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """[E, A, B] uint8 -> [E, B, A] uint8(K-major 字节转置)。
 
+    `out` 给了就**写进去**(不分配)——staging 路径靠这个复用环形缓冲、消除每层分配。
     只在 3 维、uint8/byte、CUDA、且开着 `XIAOTU_GPF_TT` 时走分块 kernel;
-    其余情况(含 triton 不可用)逐字退回 `transpose(1,2).contiguous()`。
+    其余情况(含 triton 不可用、或 out 给了但没法原地转置)退回 torch。
     """
     if (not _HAVE_TRITON or not _enabled() or t.dim() != 3
-            or t.dtype != torch.uint8 or not t.is_cuda or not t.is_contiguous()):
-        return t.transpose(1, 2).contiguous()
+            or t.dtype != torch.uint8 or not t.is_cuda or not t.is_contiguous()
+            or (out is not None and (not out.is_contiguous()
+                                     or tuple(out.shape) != (t.shape[0], t.shape[2], t.shape[1])))):
+        r = t.transpose(1, 2).contiguous()
+        if out is not None:
+            out.copy_(r)
+            return out
+        return r
     E, A, B = (int(v) for v in t.shape)
-    y = torch.empty((E, B, A), dtype=t.dtype, device=t.device)
+    y = out if out is not None else torch.empty((E, B, A), dtype=t.dtype, device=t.device)
     BM = 128 if A % 128 == 0 else 64
     BN = 128 if B % 128 == 0 else (64 if B % 64 == 0 else 32)
     grid = (E, triton.cdiv(A, BM), triton.cdiv(B, BN))
