@@ -21823,3 +21823,32 @@ fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert ... slot_mapping must not exce
 ### (d) 保底:fail-safe 已就位
 `_CED_STATE` 握手(win>0 且 toks 与当前 T 完全相等)保证**最坏情况只是"不生效",不会崩**;
 一旦 (c) 对齐,收益按 §573b 的论证接近"预填充少算 19 个 decoder 层"。
+
+## §604f ✅ CED 崩溃**已消除**,并定位到"缺失的那一块":**SWA 那个 metadata 没有被改写**
+### (a) 机制(读代码得到,`vllm/models/deepseek_v41/attention.py:843-880`)
+```python
+swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)     # ← 另一个 metadata 对象
+return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    q, kv, swa_kv_cache_2d, swa_metadata.slot_mapping, ...)
+```
+**fused KV-insert 的约束来自 `swa_metadata.slot_mapping`,而不是 query 侧那个 metadata。**
+我们只改写了 query 侧 ⇒ `slot_mapping`(全长 T)对 q(窗口 255)⇒ `slot_mapping must not exceed q row count`。
+### (b) 修法:切片长度**由 SWA 侧实测长度决定**(`§604e`)
+在层 forward 里从 `get_forward_context().attn_metadata[self.attn.swa_cache_layer.prefix]`
+读出 `slot_mapping.numel()`,**只有它等于窗口 `w` 时才切**,否则不切。
+### (c) 实测(c2)
+```
+[ced-diag] 不切片:SWA slot_mapping 长度=301 ≠ 窗口 255 (t=301)⇒ 以 SWA 侧为准   ×16
+slot_mapping must not exceed q row count 出现次数 = 0     ← ✅ 崩溃消除
+```
+耗时与基线 **×1.00**(不切片 ⇒ 没有收益,符合预期)。
+### (d) 结论 / 下一步(唯一剩下的一块)
+**要让 CED 真正生效,必须让 SWA 那一组 metadata 也被窗口化** —— 即
+`kv_cache_group_spec.layer_names` 里代表 SWA 缓存的那个名字,也要落进
+`get_kv_sharing_fast_prefill_eligible_layers()` 的返回集合(它才会被换上 FastPrefill 后端、
+`build()` 才会走我们的改写)。当前我们的 override 加的是
+`get_layers_from_vllm_config(AttentionLayerBase)` 里含 `layers.N.` 的名字(38 个),
+**实测 SWA 那组没被覆盖**。
+⇒ 下一步:在 override 里把 **SWA 组的名字** 也补进去(可从 `vllm_config` 的
+`kv_cache_groups` / `KVCacheSpec.has_layer_views` 枚举),或直接把 `create_fast_prefill_custom_backend`
+的调用按"层号 21..39 的全部组"接管;补齐后再跑 `ced_ab.py --check`,预期文本一致且耗时可观测下降。
