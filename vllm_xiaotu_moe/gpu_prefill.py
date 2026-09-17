@@ -858,12 +858,18 @@ def staging_bytes(n_experts: int, hidden: int, inter: int, group_k: int = 32,
     # "预检通过但跑起来 OOM"。这里把三项都算上(暂存已改为每张量一份)。
     slots = 2 * (w13d + w2d + s13d + s2d)
     raw = w13d + w2d
-    tmp = w13d + w2d + s13d + s2d
+    # 暂存现在**每张量一份**(见 `_dma_hostbuf`),所以是"一个 node 的量"而不是全部 node 之和
+    tmp = (w13d + w2d + s13d + s2d) / n
     return slots + raw + tmp
 
 
-def fits_device(need_bytes: int, device, margin: float = 1.25):
-    """(ok, free_bytes). Compare the staging need against FREE device memory."""
+def fits_device(need_bytes: int, device, margin: float = 1.10):
+    """(ok, free_bytes). 把 staging 的**真实峰值**与**空闲**显存比。
+
+    【§600】margin 从 1.25 收到 **1.10**:`need_bytes` 现在是诚实口径
+    (槽 + raw + 单份暂存 = ~10.8 GiB,原来只有槽的 6.72),再乘 1.25 会把
+    "实测能跑"的配置(如 free=12.95)误判为不够。1.10 覆盖碎片/激活抖动。
+    """
     try:
         free, _total = torch.cuda.mem_get_info(torch.device(device))
     except Exception:  # noqa: BLE001
