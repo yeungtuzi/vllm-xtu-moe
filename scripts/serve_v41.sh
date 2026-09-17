@@ -275,7 +275,13 @@ echo "[v41] pid=$(cat "$OUTDIR/$TAG.pid")"
 DEADLINE=$(( SECONDS + ${READY_TIMEOUT:-3600} ))
 while [ "$SECONDS" -lt "$DEADLINE" ]; do
   if grep -q "Application startup complete" "$LOG" 2>/dev/null; then
-    echo "[v41] READY tag=$TAG"; exit 0
+    echo "[v41] READY tag=$TAG"
+  # 【§555】形状预热:把"首个长上下文请求付 ~237 s JIT"的成本挪到启动阶段
+  if [ "${WARMUP:-1}" = "1" ]; then
+    PORT="$PORT" LENS="${WARMUP_LENS:-8192 32768}" CKPT="$CKPT" MODEL=dsv41 \
+      bash "$ROOT/scripts/warmup_shapes.sh" || echo "[v41] ⚠️ 预热失败(不致命,继续启动)"
+  fi
+  exit 0
   fi
   if ! kill -0 "$(cat "$OUTDIR/$TAG.pid")" 2>/dev/null; then
     echo "[v41] server exited early; tail:"; tail -25 "$LOG"; exit 1

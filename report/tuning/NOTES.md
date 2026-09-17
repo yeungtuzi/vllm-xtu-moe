@@ -20206,3 +20206,26 @@ R-VRAM 的次序是 **1) 1M 上下文 > 2) GPU 预填充 > 3) 投机 > 4) 专家
 * 剩余余量 **~2.2 GiB**;3 层会多要 3.36 GiB ⇒ 必 OOM(与实测一致)⇒ **边界 2 层是实测的上限**。
 * 顺带回答"设了 1M 会不会截断 32K 输入":**不会** —— maxlen 是上限;两次测试的
   `total_input_tokens` 都等于输入总长,完整处理。
+
+## §555 【冷启动量化】"首个长上下文请求付 237 s"= 逐形状 JIT;**同形状第二次只要 1.15 s(206×)** ⇒ 已加"启动预热"
+### (a) 实测(同机同日,TP=2 / maxlen=1M / 常驻 2 层 / GPU 预填充已启用)
+同一服务内连打三次**同形状** 32K 输入请求:
+| 次数 | TTFT |
+|---|---|
+| 第 1 次(冷) | **237,405 ms** |
+| 第 2 次 | **1,150 ms** |
+| 第 3 次 | **1,128 ms** |
+
+* ⇒ **稳态 32K 预填充 TTFT ≈ 1.15 s(≈28,500 t/s)** —— 我们的 GPU 预填充其实非常快;
+  首个请求那 237 s **全部**是**逐形状 JIT(Triton + TileLang)+ graph 捕获**。
+* 日志时间线佐证:冷请求期间连续出现
+  `Triton JIT: BuildPrefillChunkMetadataKernel / _ring_slot_mapping_kernel / _block_scores_kernel / _mask_candidates_kernel`
+  与 `TileLang JIT: hc_prenorm_gemm_tilelang`(后者在请求开始 10 分钟后还在编)。
+* ⚠️ **跨服务没有命中磁盘缓存**:新起的服务打第一个 32K 仍付 237 s
+  ⇒ 光靠 Triton/TileLang 缓存不够,**必须在启动阶段主动预热形状**。
+
+### (b) 修复:启动时形状预热(已实现并接入)
+* 新增 `scripts/warmup_shapes.sh`:READY 之后对每个长度发 1 条 `--random-output-len 1` 的请求
+  (只付预填充),默认 `WARMUP=1`、`WARMUP_LENS="8192 32768"`,失败不致命;
+* `serve_v41.sh` 在 `[v41] READY` 之后自动调用(`WARMUP=0` 可关)。
+* 效果预期:把 237 s 的 JIT 成本从**用户可见的首个请求**挪到**启动阶段**,真实请求回到 ~1.15 s 量级。
