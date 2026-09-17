@@ -64,6 +64,43 @@
 
 ## 5. 端到端性能(官方 `vllm bench serve`)
 
+### 5.1 硬件配置(数字必须与它同页,否则无意义)
+
+| 项 | 本机 |
+|---|---|
+| **GPU** | **2× NVIDIA A100-PCIE-40GB(SM80)**,TP=2,PCIe Gen4 ×16 |
+| **CPU** | **2× AMD EPYC 9654 96-Core**(192 核 / 384 线程,SMT 关;NPS4 ⇒ **8 NUMA node**) |
+| **内存** | **1538 GiB**;实测聚合带宽 **~740 GB/s** |
+| 线程 | `XIAOTU_MOE_THREADS=60`/rank;`SPIN_IDLE_US=300` |
+| 软件 | vLLM 主线 `6b5ef34f7b` + 本插件 **v0.21.0**;TP=2 / `--max-model-len 1048576` |
+
+### 5.2 性能摘要(ShareGPT 真实对话;**output tok/s,TTFT 单列**)
+
+口径:`scripts/bench_sharegpt.sh`(`--dataset-name sharegpt`,`--sharegpt-output-len 128`,
+`--num-prompts 16`,**前缀缓存开**)。**不用 `random`** —— 随机 token 会让投机解码失效、
+前缀缓存无从体现(详见 `report/tuning/BENCH_REFERENCE.md` §8.1)。
+
+| Setup | Plain decode | dspark(投机) |
+|---|---|---|
+| **C=1 agg output tok/s** | 13.79 | **18.38** |
+| **C=1 TPOT**(单列) | 43.22 ms ⇒ 23.1 tok/s | **29.45 ms ⇒ 33.9 tok/s** |
+| **C=1 TTFT**(单列) | 2222 ms | 2262 ms |
+| **C=4 agg output tok/s** | **41.62** | 31.03 |
+| **C=8 agg output tok/s**(最好) | **48.56** | 41.26 |
+
+**怎么读**
+* **简报数字 = output tok/s**:单流 **18.38(dspark)/ 13.79(Plain)**;曲线最好 **48.56(Plain C=8)**;
+* **TTFT 单列**(C=1 ≈2.2 s),不摊进吞吐;
+* **投机解码单流收益显著**(逐 token 23.1 → **33.9 tok/s**,**+47%**),但**并发下反而不如 Plain**
+  (C=8:41.26 vs 48.56)—— draft 的开销与显存占用在高并发时变成负担,这是本次实测的新结论;
+* 与参考实现(2×RTX 3090 TP2,dspark 26-40 t/s)相比,**我们的单流解码速率 33.9 t/s 落在其区间内**;
+  但**参考机三轴更弱**(GPU/CPU/内存带宽),所以这个"打平"并不值得骄傲 —— 差距在每层 0.2-0.3 ms 的编排延迟。
+
+![bench](docs/figures/v0210_bench_serve.png)
+
+### 5.3 裸预填充口径(随机 token,仅用于量预填充本身)
+
+
 > 口径:`--backend openai-chat`,`--dataset-name random`,`--ignore-eos`,`--random-output-len 128`,
 > 预热轮与正式轮**不同 seed**(同 seed 会整段命中前缀缓存,TTFT 假快 —— §603),
 > 服务端**关前缀缓存**以量到真实预填充。原始结果:`report/tuning/logs/bench_serve_acc2/`。
