@@ -20382,3 +20382,31 @@ t= 436s  RSS  590.8 GiB   ← READY 稳态
   改为同时包 `load_weights` 并把 iterator 换成计数式包装;
 * 注意保留两条既有约束:①常驻层不建引擎不释放;②数值/确定性门必须不变。
 * 中途产物:`$TAG.memfoot` 的曲线就是**唯一的验收尺子**(峰值相位 + 峰值幅度一起看)。
+
+## §562 🎯 又一个**配置级**大胜:默认开启 `XIAOTU_ENGRAM_LAST` ⇒ 装载峰值 1087.6 → **642.1 GiB(−41%)**
+### (a) 起因:我把"曲线 + 日志时间轴"对齐后,发现 Engram 压在峰值上
+```
+t= 62s  Engram table offloaded                                  ← 很早
+t=308s  RSS 峰值 1087.6 GiB
+t=329s  RSS 释放 546 GiB
+t=388s  "Model loading took … 368.23 s"
+t=436s  READY(稳态 590 GiB)
+```
+* R11 本来就规定"**Engram 一律最后加载**",但 `_engram_last_on()` **默认关闭**(要显式 `XIAOTU_ENGRAM_LAST=1`)
+  ⇒ 我们一直把 **94.4 GiB/rank 的 Engram 物化**压在专家装载期上。
+
+### (b) 实测(同旗标 TP=2/maxlen=1024/util=0.60/SEQS=8/COMPILE=0/THREADS=60,只改这一个开关)
+| | 服务树峰值 | 启动到 READY |
+|---|---|---|
+| `ENGRAM_LAST=0`(此前默认) | **1087.6 GiB** | 436 s |
+| **`ENGRAM_LAST=1`** | **642.1 GiB(−445 GiB, −41%)** | **352 s(更快)** |
+* 曲线也变健康:`峰值 642 @126s → 专家阶段释放到 286 → Engram 后置物化 → 591(READY)`。
+* **正确性证据(日志)**:`streamed layers.14.engram.embed.weight -> (192009666, 256) (45.8 GiB)`、
+  `streamed …scale -> (…, 8) (1.4 GiB)`、`re-loaded 4 real Engram tensor(s) from the checkpoint into the
+  pinned tables (**no extra peak**)`、`materialized 2 Engram table(s) AFTER the expert phase (IRON_RULES R11)`,
+  **0 错误**。⇒ 走的正是 R11 设计的"分块流式读进已物化的 pinned 缓冲",峰值只多一个 chunk。
+
+### (c) 已设默认
+`serve_v41.sh` 与 `xtu_own_v41_mem.sh` 都改为 `${XIAOTU_ENGRAM_LAST:-1}`(env 桥 + nohup env 双写),
+注释里带上本节数据。**正确性 A/B(greedy 5 条逐字节)正在进行**:ENGRAM_LAST=1 臂已存
+`/tmp/greedy_englast1.json`,=0 臂服务起来后对拍。
