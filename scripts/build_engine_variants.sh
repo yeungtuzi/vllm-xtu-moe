@@ -108,6 +108,7 @@ VARIANTS=(
   "avx512_base|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma"
   "avx512_vnni|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mfma"
   "avx512_bf16|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mfma"
+  "avx512_bf16_vbmi|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mfma"
 )
 
 for entry in "${VARIANTS[@]}"; do

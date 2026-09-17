@@ -421,6 +421,29 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         const __m128i nib_mask = _mm_set1_epi8(0x0F);
         // Decode one 32-value K-group (16 packed bytes at b_row+g*16) into
         // 32 bf16(u16) in NATURAL column order [W0..W31] (nibble c%2 of byte c/2).
+#if defined(__AVX512VBMI__)
+// 【§548】VBMI 一次解 4 组(64 字节)。映射经 /tmp/vbmi_idx4.cpp 逐位验证(§547):
+//   multishift(control,data);控制 = 4*(i%8) 与 32+4*(i%8)(所有 qword 相同);
+//   输出字节位置决定读哪个 qword;每 lane(=1 组)自然列序 = [n1_lo8, n2_lo8, n1_hi8, n2_hi8]。
+#define XIAOTU_DECODE_QUAD_VBMI(b_row, g0, WLO, WHI)                                        \
+    do {                                                                                    \
+        const __m512i _raw = _mm512_loadu_si512((const void*)((b_row) + (size_t)(g0) * 16)); \
+        const __m512i _m   = _mm512_set1_epi8(0x0F);                                        \
+        const __m512i _n1  = _mm512_and_si512(_mm512_multishift_epi64_epi8(                  \
+                                 _mm512_set1_epi64((long long)0x1C1814100C080400ULL), _raw), _m); \
+        const __m512i _n2  = _mm512_and_si512(_mm512_multishift_epi64_epi8(                  \
+                                 _mm512_set1_epi64((long long)0x3C3834302C282420ULL), _raw), _m); \
+        for (int _s = 0; _s < 4; ++_s) {                                                     \
+            const __m128i _l = _mm512_extracti32x4_epi32(_n1, _s);                           \
+            const __m128i _r = _mm512_extracti32x4_epi32(_n2, _s);                           \
+            (WLO)[_s] = _mm512_permutexvar_ps(                                               \
+                _mm512_cvtepu8_epi32(_mm_unpacklo_epi64(_l, _r)), permv_tbl_);               \
+            (WHI)[_s] = _mm512_permutexvar_ps(                                               \
+                _mm512_cvtepu8_epi32(_mm_unpackhi_epi64(_l, _r)), permv_tbl_);               \
+        }                                                                                    \
+    } while (0)
+#endif
+
 #define XIAOTU_DECODE_GROUP_AVX512(b_row, g_in)                                        \
         /* 【第 215 轮·PERMV 解码】把 4bit 码经 fp32 LUT 直接 permute 成 fp32 权重:        \
            load(1)+and(1)+srli(1)+and(1)+unpack(2)+cvt(2)+permutexvar(2) = 10 条/32 权重,   \
@@ -453,6 +476,57 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         if (gemm_nr > 0) {
             constexpr int MR = 4;
             const int NR = std::min(gemm_nr, 8);
+#if defined(__AVX512VBMI__)
+            // 【§548】XIAOTU_MOE_VBMI_DECODE=1 时用 VBMI 版解码路径(4 组一次);
+            // 累加顺序与下方完全一致(每 (行,token) 按 g 递增、组内 s 递增)⇒ 数值应逐位相同。
+            static const bool _vbmi_on = [] {
+                const char* e2 = std::getenv("XIAOTU_MOE_VBMI_DECODE");
+                return e2 && std::atoi(e2) != 0;
+            }();
+            if (_vbmi_on && (group_count % 4) == 0) {
+                for (int m0 = 0; m0 < M; m0 += MR) {
+                    const int mr = std::min(MR, M - m0);
+                    for (int j0 = n0; j0 < n1; j0 += NR) {
+                        const int nj = std::min(NR, n1 - j0);
+                        __m512 acc[MR][8];
+                        for (int r = 0; r < mr; ++r)
+                            for (int jj = 0; jj < nj; ++jj) acc[r][jj] = _mm512_setzero_ps();
+                        for (int g0 = 0; g0 < group_count; g0 += 4) {
+                            __m512 av[MR][2][4];
+                            for (int r = 0; r < mr; ++r)
+                                for (int s = 0; s < 4; ++s) {
+                                    const float* ap = a32 + (size_t)(m0 + r) * K + (g0 + s) * 32;
+                                    av[r][0][s] = _mm512_loadu_ps(ap);
+                                    av[r][1][s] = _mm512_loadu_ps(ap + 16);
+                                }
+                            for (int jj = 0; jj < nj; ++jj) {
+                                const int j = j0 + jj;
+                                const uint8_t* brow = W + (size_t)(j - rowshift) * (K / 2);
+                                __m512 wlo[4], whi[4];
+                                XIAOTU_DECODE_QUAD_VBMI(brow, g0, wlo, whi);
+                                for (int s = 0; s < 4; ++s) {
+                                    const __m512 sv =
+                                        _mm512_set1_ps(row_scale((j / gn) * kb_stride, g0 + s));
+                                    for (int r = 0; r < mr; ++r) {
+                                        __m512 d = _mm512_mul_ps(wlo[s], av[r][0][s]);
+                                        d = _mm512_fmadd_ps(whi[s], av[r][1][s], d);
+                                        acc[r][jj] = _mm512_fmadd_ps(d, sv, acc[r][jj]);
+                                    }
+                                }
+                            }
+                        }
+                        for (int r = 0; r < mr; ++r)
+                            for (int jj = 0; jj < nj; ++jj)
+                                C[(size_t)(m0 + r) * N + j0 + jj] = hsum512(acc[r][jj]) * global_scale;
+                    }
+                }
+                if (bp_on) {
+                    auto bp_t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+                    byteprof_accum((size_t)(n1 - n0) * (size_t)(K / 2), (uint64_t)(bp_t1 - bp_t0));
+                }
+                return;
+            }
+#endif
             for (int m0 = 0; m0 < M; m0 += MR) {
                 const int mr = std::min(MR, M - m0);
                 for (int j0 = n0; j0 < n1; j0 += NR) {

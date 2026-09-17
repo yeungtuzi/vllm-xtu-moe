@@ -18,6 +18,7 @@ import sys
 # NOTE: `avx512_bf16` implies avx512_base + vnni; modern EPYC (e.g. 9654) has
 # avx512_bf16. AMX (avx512_amx) is Intel-only and skipped here.
 _LADDER = [
+    ("avx512_bf16_vbmi", "_avx512_bf16_vbmi", {"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512_bf16", "avx512vbmi"}),
     ("avx512_bf16", "_avx512_bf16", {"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512_bf16"}),
     ("avx512_vnni", "_avx512_vnni", {"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512_vnni"}),
     ("avx512_base", "_avx512_base", {"avx512f", "avx512bw", "avx512vl", "avx512dq"}),
