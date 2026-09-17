@@ -21796,3 +21796,30 @@ fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert ... slot_mapping must not exce
    与 metadata 侧的 21..39 对照,找出差集;
 3. 把两侧统一到**同一判据**(建议统一为**按层号**,因为 §579 已证明名字空间不可靠),再跑 `ced_ab.py --check`;
 4. 预期收益:预填充跳过 19 个 decoder 层的 MLP/MoE(本机预填充由 CPU MoE 主导 ⇒ 理论上接近减半)。
+
+## §604c/final ③ CED 本轮收敛到的**精确**状态(下一轮从这里继续)
+### (a) 已修好并**验证生效**的
+1. **切片侧判据**:原来是 `layer.attn.kv_source_layer_id` 属性判据,**实测该属性恒为 `None`**
+   ⇒ 从不切片;改成**层号**判据(模型 forward 武装时建 `id(layer)->层号`),日志确认
+   `[ced-diag] 层**切片** layer_idx=21 t=301 -> 255` ✅
+2. `_install_ced_diag_shim` 引用了**已不存在**的 `vllm.attention`(4 次 `ModuleNotFoundError`)。
+### (b) 逐步排除掉的假设(都有日志)
+| 假设 | 实测 | 结论 |
+|---|---|---|
+| "eligible 集合是空的" | `[ced-fastprefill] 追加 V4.1 eligible **38** 层`(19 层 × 2 名字) | ❌ 不是 |
+| "FastPrefill 后端没装" | `create_fast_prefill_custom_backend` 被调用 **50 次**(≥25 层/rank) | ❌ 不是 |
+| "元数据没被改写" | 握手 `win>0 且 toks==T` **成立**(fail-safe 0 次触发) | ❌ 不是(预填充步确实改写了) |
+| "层没被切" | `layer_idx=21 t=301 -> 255` | ❌ 不是 |
+⇒ **两侧都在动、握手也对,却仍崩** ⇒ 剩下的不一致在**窗口语义**(不是"谁没做",而是"做的量不同")。
+错误位置固定:`deepseek_v41/attention.py:567`(fused KV-insert),由 `model.py:432` 调起。
+### (c) 下一步(唯一没排除的方向)
+在崩溃点打印 **`q 行数` 与 `slot_mapping 长度`**(包一层 `DeepseekV4Attention.forward` 或
+在 `_ced_window_indices` 里也记录"改写后上游实际用掉的 query 长度"),确认:
+* 上游 `make_kv_sharing_fast_prefill_common_attn_metadata` 在拿到我们扩展后的
+  `logits_indices_padded` 后,**最终**把 query 限成多少行(可能不是 255,而是
+  `2·w_win−1` 派生的另一个值,或按 block 对齐到别处);
+* 以及 KV-insert 里 `slot_mapping` 是按"本步 chunk 的全部 token"还是按"query 行数"生成的。
+两者对齐后才能拿到 CED 的收益。
+### (d) 保底:fail-safe 已就位
+`_CED_STATE` 握手(win>0 且 toks 与当前 T 完全相等)保证**最坏情况只是"不生效",不会崩**;
+一旦 (c) 对齐,收益按 §573b 的论证接近"预填充少算 19 个 decoder 层"。
