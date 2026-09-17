@@ -71,6 +71,26 @@ for D in 12 23; do
          "$D" "$NA" "$MS" "$AGG" "$PT" "$MSOK" "$PTOK"
   # ms 条款是硬门禁;每线程条款只告警:它在 DEDUP=12 这个"L3 驻留/每 CCD 交付"口径上受硬件限制
   # (见 NOTES §130/§133),而在服务端真实形状(na≈32)已达 2.9 GB/s·线程。
+  # 【§525/§526 新增】**同日 lk 对照 + 比值门**(RATIO=0 可关,RATIO_MAX 默认 1.20)。
+  # 为什么必须加:绝对阈值 0.70 在机器状态漂移时会把环境变化算在我们头上(2026-09-17 实测
+  # 同日 lk 也慢了 1.14×);而 2026-09-16 把阈值放宽到 1.15 又**放过了 §505 的分片回归**
+  # (同日比值 1.43×,绝对 ms 1.16 却"低于放宽后的阈值")。⇒ 判据改成**同日、同参、
+  # 同机的 xiaotu/lk 比值**;绝对 ms 仍然打印并保留原阈值告警(便于和 §119 的历史数字比)。
+  if [ "${RATIO:-1}" = "1" ] && [ -x "${LK_PY:-/home/user/anaconda3/envs/lvllmds4-x/bin/python}" ]; then
+    LKMS="$(ENG=lk LK_THREADS="${LK_THREADS:-120}" CUDA_VISIBLE_DEVICES="${LK_GPU:-0}" \
+            XIAOTU_LAYER1_NPZ="$NPZ" BS=6 DEDUP="$D" REP="$REP" timeout 600 \
+            "${LK_PY:-/home/user/anaconda3/envs/lvllmds4-x/bin/python}" "$ROOT/scripts/bench_engine_ab.py" 2>&1 \
+            | grep -E "^ +6 " | awk '{print $2}' | head -1)"
+    if [ -n "${LKMS:-}" ]; then
+      RAT=$(awk -v a="$MS" -v b="$LKMS" 'BEGIN{printf "%.2f", a/b}')
+      ROK=$(awk -v r="$RAT" -v m="${RATIO_MAX:-1.20}" 'BEGIN{print (r<=m)?"PASS":"FAIL"}')
+      printf '   â³ 同日 lk 对照 %s ms/层 ⇒ 比值 %s× (门限 ≤%s) %s\n' \
+             "$LKMS" "$RAT" "${RATIO_MAX:-1.20}" "$ROK"
+      [ "$ROK" = "PASS" ] || FAIL=1
+    else
+      echo "   ↳ 同日 lk 对照未取到结果(跳过比值门)"
+    fi
+  fi
   [ "$MSOK" = "PASS" ] || FAIL=1
 done
 
