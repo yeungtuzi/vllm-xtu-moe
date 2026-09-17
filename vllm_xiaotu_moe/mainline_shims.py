@@ -1442,6 +1442,8 @@ def _install_ced_attn_align_shim() -> list[str]:
     """
     if os.environ.get("XIAOTU_CED_FASTPREFILL") != "1":
         return []
+    if os.environ.get("XIAOTU_CED_ATTN_ALIGN", "0") != "1":
+        return []          # 【§604p】默认关:它单方面切 attention 输入会破坏 x/residual 配对
     try:
         from vllm.models.deepseek_v41.attention import DeepseekV4Attention as _A
     except Exception as exc:  # noqa: BLE001
@@ -1694,7 +1696,7 @@ def _install_ced_slice_shim() -> list[str]:
                     and int(v.shape[0]) > need:
                 ba.arguments[_name] = v[-need:]
                 _sliced.append(f"{_name}:{int(v.shape[0])}->{need}")
-        if os.environ.get("XIAOTU_CED_DIAG") == "1" and st["hits"] < 30:
+        if os.environ.get("XIAOTU_CED_DIAG") == "1" and st["hits"] < 60:
             _log(f"[ced-diag] 层切片(按形状)layer_idx={st.get('idx', {}).get(id(self))} "
                  f"t={t} need={need} 切了={_sliced}")
         if os.environ.get("XIAOTU_CED_DIAG") == "1" and st["hits"] < 30:
@@ -1787,7 +1789,9 @@ def apply_mainline_shims() -> list[str]:
         _install_ced_fastprefill_shim,
         _install_ced_slice_shim,
         _install_ced_kvinsert_shim,
-        _install_ced_attn_align_shim,
+        # 【§604p】`_install_ced_attn_align_shim` **故意不注册**:它让 attention 只算尾窗,
+        # 而层的 residual 仍是全长 ⇒ mHC 的 `assert x.shape == (num_tokens, …)` 立刻失败
+        # (c11 实测:long_300 从可用退回失败)。要开必须显式 `XIAOTU_CED_ATTN_ALIGN=1`。
         _install_oracle_shims,
         _install_prepack_shims,
         _install_mxfp4_cpu_convert_shim,
