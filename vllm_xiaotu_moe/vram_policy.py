@@ -155,9 +155,18 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     if spec_ok:
         budget -= draft
 
-    # 优先级 4:专家层常驻(收益最高 = 解码器靠前的层)
-    n = int(budget // per_layer) if per_layer > 0 else 0
-    n = max(0, min(n, len(RESIDENT_PRIORITY)))
+    # 优先级 4:专家层常驻。
+    # 【§584 实测】**默认改为 0 层** —— "常驻收益最高"这个前提被推翻:
+    #   * 服务级(TP=2/8K/5 层常驻):TPOT 43.19 vs 无常驻 42.86 ms ⇒ **+0.33 ms(中性偏负)**;
+    #     聚合更明显:C=4 41.42 vs **46.92 t/s(−12%)**;
+    #   * 原因:GPU 小 M MoE 比 CPU 引擎**慢 3-5×**(M=1:1.272 vs 0.38 ms/层,随 M 线性),
+    #     常驻是把"0.38 ms 的 CPU 计算"换成"1.27 ms 的 GPU 计算";
+    #   * ⇒ 这块显存**改投 KV** 收益确定且单调(每层 3.36 GiB/rank ≈ 1.5M token KV)。
+    # 想恢复旧行为:显式给 RESIDENT_LAYERS(或 `XIAOTU_RESIDENT_POLICY=1`)。
+    n = 0
+    if os.environ.get("XIAOTU_RESIDENT_POLICY") == "1":
+        n = int(budget // per_layer) if per_layer > 0 else 0
+        n = max(0, min(n, len(RESIDENT_PRIORITY)))
     # 【§552 实测硬上限】maxlen 很长时 vLLM 自己的"非 KV"占用很大(1M 实测峰值 30.7 GiB),
     # 解析式会高估可用空间 ⇒ 用实测标定的阶跃上限兜住(3 层常驻时 32K 预填充 OOM,0 层通过,边界 2-3)。
     if resident_cap is not None and n > resident_cap:
