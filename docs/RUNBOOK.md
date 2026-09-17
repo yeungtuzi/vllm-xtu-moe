@@ -455,6 +455,25 @@ TAG=gpf KV_CACHE_BYTES=4729960528 GP_MIN=1024 MAXLEN=1048576 SEQS=2   bash repor
 ⚠️ **`--max-num-batched-tokens=32768` 目前会 hang**(§593(f),启动后 GPU 0%、日志刷
 `shm_broadcast...60 seconds`)⇒ 先别用,修好再上。
 
+### 5.8b ⚠️ 发行流程(踩过:只 push tag ≠ 发布 Release)
+
+**"发行一个版本" = 版本号 + git tag + `gh release create` 三件事,缺一不可。**
+2026-09-17 的 v0.21.0 只做了前两件 ⇒ GitHub 的 Releases 页面仍显示旧的 v0.2.0(Latest),
+用户"看不到新版本"。正确流程:
+
+```bash
+# 1) 版本号
+sed -i 's/^version = .*/version = "0.21.0"/' pyproject.toml
+# 2) 写发行说明 RELEASE_NOTES_v0.21.0.md,然后 commit + push + 打 tag
+git add -A && git commit -m "release: v0.21.0"
+git push origin main
+git tag -a v0.21.0 -m "..." && git push origin v0.21.0
+# 3) **关键一步:创建 GitHub Release**(否则页面上看不到)
+gh release create v0.21.0 --title "vllm-xtu-moe v0.21.0 — <主题>" \
+  --notes-file RELEASE_NOTES_v0.21.0.md
+gh release list --limit 5        # 复核 Latest 是否已切到新版本
+```
+
 ### 5.9 ⭐ 推荐的生产/挂 harness 配置(最稳定且高效;2026-09-17 定稿)
 
 **一句话:TP=2 / 1M 上下文 / 显式 12 GiB KV / 投机开 / **GPU 预填充关** / 常驻层 0 / 编译关。**
