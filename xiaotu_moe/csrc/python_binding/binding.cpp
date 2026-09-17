@@ -65,14 +65,19 @@ using namespace xiaotu_moe;
 //
 // Requires only host-side CUDA runtime API (no device kernels), so the whole
 // module still builds with a plain host compiler once -lcudart is linked.
-// 【第 221 轮】异步握手**默认开启**(可用 `XIAOTU_MOE_ASYNC=0` 关闭)。
-// 理由:它是本项目最大的单点收益(V 6.53→1.80 ms/token,C=4 聚合 71.8→107.3 t/s),
-// 且已验证「与 host-func 逐位相同」+「服务级 greedy 文本 5/5 相同」+ 长跑无 hang。
-// 关闭后自动回落到 `cudaLaunchHostFunc` 路径(功能等价、更慢)。
+// 【§582】**默认改为 sync(即 `XIAOTU_MOE_ASYNC` 未设时不走 async)**;要 async 请显式 `=1`。
+//
+// 为什么翻默认:第 221 轮时 async 确实是最大单点收益(V 6.53→1.80 ms/token、
+// C=4 聚合 71.8→107.3 t/s),但**后续实测推翻了它作为默认的资格**(NOTES §517b/§517c):
+//   * qlen=1 / TP=1 每层:sync **1.05 ms** vs async **2.05 ms**(引擎段 0.44 vs 1.31)⇒ **async 慢 2×**;
+//   * 且 async 跑里观察到"每步把整段 prompt 重算一遍"的病态(qlen=26 而非 1,ShareGPT 掉到 2.27 tok/s)。
+// 我们的 `serve_v41.sh` / probe 一直显式钉 `ASYNC=0`,所以**生产路径从未被打中**;
+// 但"默认 true"对任何不设该 env 的启动者都是颗地雷 ⇒ 现在把默认值改成与实测最优一致(fail-safe)。
+// async 路径保留(高并发下曾显示收益),作为显式 opt-in 继续存在。
 static bool xiaotu_async_enabled() {
     static const bool e = [] {
         const char* v = std::getenv("XIAOTU_MOE_ASYNC");
-        return !(v && std::atoi(v) == 0);
+        return v && std::atoi(v) != 0;      // 只有显式 =1 才走 async
     }();
     return e;
 }
