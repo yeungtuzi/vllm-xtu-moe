@@ -21560,3 +21560,27 @@ w13 (384,2304,2560)=2.109 GiB + w2 (384,5120,576)=1.055 GiB + s13/s2=0.425 GiB =
 3. **消除 B+C 的中间张量**(让引擎按 `E` 段做 `cudaMemcpy2DAsync` 直接写进 K-major 目标;
    或把转置融进反量化 kernel):省掉约 1 个 read+write pass + 分配器抖动;
 4. 只搬"本 chunk 命中的专家"(qlen=1 时 384 个里只用 6 个)——对**解码/短 chunk** 是数量级收益。
+
+## §595 ⭐ 更正 §593(f):`MBT=32768` 不是 hang,是 **GPU 激活显存 OOM**;`--kv-cache-memory` 跳过 profiling 但**不解决它**
+### (a) 死因(实测,`big1` = TP=2/MAXLEN=65536/MBT=32768/KV 封顶 8 GiB/util 0.55)
+```
+RuntimeError: Worker failed with error 'CUDA out of memory. Tried to allocate 2.00 GiB.
+  GPU 0 has a total capacity of 39.49 GiB of which 1.50 GiB is free.
+  Including non-PyTorch memory, this process has 37.69 GiB memory in use.'
+```
+时间线:15:32:23 启动 → 15:39:09 marlin/warmup → **15:40:09 起 `shm_broadcast` 每 60 s 报警**(引擎在忙)
+→ 15:41:32 OOM → 15:42:08 worker 死亡。
+### (b) 用户的算式成立,但归宿是"显存"不是"卡死"
+* CPU 预填充 ≈ **3.9 ms/token** ⇒ MBT=32768 的一次 dummy/捕获前向 ≈ **128 s**(这就是那 2 分钟"卡死"的真身);
+* 但**更硬的墙是显存**:那次前向的**激活**就要 ~20 GiB(37.69 已用 − 10 非 KV − 8 KV),
+  ⇒ `Tried to allocate 2.00 GiB` 时只剩 1.50 GiB ⇒ **OOM**。
+* `--kv-cache-memory` 确实跳过了 memory profiling(否则还要更慢),但**跳不过按 MBT 尺寸的 dummy/图捕获前向**。
+### (c) 结论 / 下一步
+* **chunk 上限由"激活显存"决定,不是 KV**:粗算
+  | MBT | 激活(约) | 非KV 10 + KV 8 + 激活 | 是否可行 |
+  |---|---|---|---|
+  | 8192 | ~5 GiB | 23 GiB | ✅(已实测可用) |
+  | **16384** | **~10 GiB** | 28 GiB(+staging 8.4 = 36.4) | ✅ 待实测 |
+  | 32768 | ~20 GiB | 38 GiB(+staging 8.4 = 46) | ❌ 实测 OOM |
+* ⇒ 想上 32K-chunk,必须**先把激活压下来**(降 KV 到最小 + 保证 staging 之后仍有 ≥20 GiB),
+  或者接受"MBT=16384 封顶"。**§593(f) 的"hang"标注作废**(已更正为 OOM)。
