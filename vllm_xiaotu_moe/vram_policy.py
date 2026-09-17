@@ -233,6 +233,7 @@ def main() -> int:
                     help="张量并行度:每层常驻/draft 的每卡占用按 6.72/TP 与 7.388/TP 缩放(默认 2)")
     a = ap.parse_args()
     _tp = max(1, int(getattr(a, "tp", 2)))
+    os.environ["TP"] = str(_tp)   # 让 plan() 内部的 TP 相关上限能读到(§554)
     _scale = 2.0 / _tp
     p = plan(maxlen=a.maxlen, resident_per_layer_gib=6.72 / _tp, gpu_prefill_gib=None, draft_gib=7.388 / _tp, free_gib=a.free_gib)
     if a.emit_env:
