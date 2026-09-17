@@ -1367,7 +1367,7 @@ def _install_ced_slice_shim() -> list[str]:
             return False
 
     st = {"win": int(os.environ.get("XIAOTU_CED_WINDOW", "0") or 0) or 255,
-          "armed": False, "full_t": 0, "hits": 0, "_logged": set()}
+          "armed": False, "full_t": 0, "hits": 0, "idx": {}, "n": 0}
     orig_layer = Layer.forward
     orig_model = Model.forward
     # 逐 token 的入参名(见 model.py:315 的签名)
@@ -1375,6 +1375,19 @@ def _install_ced_slice_shim() -> list[str]:
            "residual", "engram_hashes", "engram_mask")
 
     def _eligible(layer) -> bool:
+        # 【§604 修】**第一判据 = 层号**,必须与 metadata 侧 §579 的
+        # `mid < idx < n_layers` 逐字一致(两侧不一致正是长 prompt 崩的根因)。
+        _ix = st.get("idx") or {}
+        _i = _ix.get(id(layer))
+        if _i is not None and st.get("n"):
+            _n = int(st["n"])
+            ok = (_n // 2) < _i < _n
+            if os.environ.get("XIAOTU_CED_DIAG") == "1" and not ok:
+                _log(f"[ced-diag] slice-side layer_idx={_i} eligible=False(层号判据)")
+            return ok
+        # 兜底(拿不到层号时):旧的属性判据。**注意它实测恒 False**
+        # (`layer.attn.kv_source_layer_id` 为 None)⇒ 只在极端情况下才会走到这里,
+        # 一旦走到就**必须告警**,因为它会让两侧判据再次不一致。
         attn = getattr(layer, "attn", None)
         if attn is None:
             return False
@@ -1383,17 +1396,9 @@ def _install_ced_slice_shim() -> list[str]:
         ok = (src is not None and bool(srcs)
               and not getattr(attn, "is_kv_source", False)
               and int(src) == int(max(srcs)))
-        # 【§604 诊断】`XIAOTU_CED_DIAG=1` 时逐层打印**切片侧**的判据结果。
-        # 必须与 metadata 侧(§579:按层号 `mid < idx < n_layers` ⇒ 21..39)**逐层一致**,
-        # 否则会出现"元数据被改写、层没切"(或反之)⇒
-        # `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert: slot_mapping must not exceed q row count`。
-        if os.environ.get("XIAOTU_CED_DIAG") == "1":
-            _nm = getattr(layer, "layer_name", "?")
-            if _nm not in st.setdefault("_logged", set()):
-                st["_logged"].add(_nm)
-                _log(f"[ced-diag] slice-side layer={_nm} eligible={ok} "
-                     f"src={src} max_srcs={max(srcs) if srcs else None} "
-                     f"is_kv_source={getattr(attn, 'is_kv_source', None)}")
+        if ok is False:
+            _log("[ced-diag] ⚠️ 层号判据不可用且属性判据为假 ⇒ 本层不切片;"
+                 "若 metadata 侧已改写就会崩(应尽快修)")
         return ok
 
     @functools.wraps(orig_layer)
@@ -1440,6 +1445,18 @@ def _wrap_model_forward(orig_model, st):
         if not armed:
             return orig_model(self, input_ids, *a, **kw)
         st["armed"], st["full_t"] = True, T
+        # 【§604 修】**两侧判据必须同源**:metadata 侧(§579)用**层号** `mid<idx<n_layers`,
+        # 而切片侧的旧 `_eligible` 读 `layer.attn.kv_source_layer_id` —— 实测该属性是 `None`
+        # ⇒ 切片侧**从未切片过任何层**,而 metadata 已被改写 ⇒
+        # `slot_mapping must not exceed q row count`(短 prompt 不触发窗口所以看不出来)。
+        # 这里在武装时按模型自己的层列表建 `id(layer) -> 层号`,切片侧据此判断。
+        try:
+            _ls = getattr(self, "layers", None)
+            if _ls is not None:
+                st["idx"] = {id(l): i for i, l in enumerate(_ls)}
+                st["n"] = len(_ls)
+        except Exception:  # noqa: BLE001
+            st["idx"] = {}
         try:
             out = orig_model(self, input_ids, *a, **kw)
         finally:

@@ -21781,6 +21781,15 @@ fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert ... slot_mapping must not exce
 | **层切片**(+零填充) | **按 attn 属性**:`kv_source_layer_id == max(kv_source_layers)` 且非 `is_kv_source` | `_install_ced_slice_shim` 的 `_eligible`(**仍是旧判据**) |
 * `slot_mapping must not exceed q row count` 的语义正是"**元数据说 query 有 T 行,但实际 q 只有 w 行**"(或反之)
   ⇒ 只要一层上两侧结论不同就会崩;而只有 `T > w` 时才走到这条路径 —— **与"短 prompt PASS、长 prompt FAIL"完全吻合**。
+### (c2) 【§604b】切片侧判据已修好并**确认生效**,但仍崩 ⇒ 不一致现在在 metadata 侧
+* 修法:模型 forward 武装时建 `id(layer) -> 层号`,切片侧改用**与 metadata 侧同一条规则**
+  (`n//2 < idx < n`),旧的属性判据降为兜底并告警;
+* 效果证据(日志):`[ced-diag] slice-side layer_idx=0/10/11/12/13 ... eligible=False(层号判据)`
+  ⇒ 层号判据**真的在跑**(0-13 正确判 False);
+* 但 long_300/1024/4096 **仍然 500**,错误仍是
+  `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert ... slot_mapping must not exceed q row count`;
+* 另一个发现:`[ced-diag] dump 失败 ModuleNotFoundError: No module named 'vllm.attention'`
+  ⇒ 老的 diag 探针引用了已不存在的模块,**它自己坏了**(4 次),修 diag 才能看到 metadata 侧的真实集合。
 ### (d) 下一步(已就绪的工具)
 1. 加好**逐层诊断**(`XIAOTU_CED_DIAG=1` 时切片侧打印 `layer/eligible/src/max_srcs/is_kv_source`);
 2. 起一个 `CED=1 + XIAOTU_CED_DIAG=1` 的服务跑一条长 prompt,把**切片侧集合**打出来,
