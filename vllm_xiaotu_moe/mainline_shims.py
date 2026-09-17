@@ -1595,8 +1595,6 @@ def _install_ced_slice_shim() -> list[str]:
         x = ba.arguments.get("x")
         t = int(x.shape[0]) if hasattr(x, "shape") else 0
         w = st["win"]
-        if t <= w:
-            return orig_layer(self, *a, **kw)
         # 【§604e】**真正决定切片长度的不是"我们改写的那个 metadata",而是
         # `swa_metadata.slot_mapping`** —— `attention.py:869` 的 fused KV-insert 用的是
         # `attn_metadata[self.swa_cache_layer.prefix].slot_mapping`,它与 query 侧是
@@ -1636,10 +1634,16 @@ def _install_ced_slice_shim() -> list[str]:
                 _log(f"[ced-diag] 切片被 fail-safe 拦住(metadata 本步未改写或令牌数不匹配:"
                      f"win={_CED_STATE.get('win')} toks={_CED_STATE.get('toks')} t={t})⇒ 本步不切片")
             return orig_layer(self, *a, **kw)
+        # 【§604l】**关键修复**:本层应处理的长度 `need = w`(本层首次切片)或 `t`
+        # (上游已把隐藏态切短了 ⇒ 保持 t)。判据必须是"**比 need 长的都切**",
+        # 而不是"等于 t 的才切" —— 实测层 22..39 的 `t` 已是 255 而 `positions` 仍是 301,
+        # 用 `== t` 就漏掉了它 ⇒ rotary/compressor 拿错位置 ⇒ **CUDA 非法访存**。
+        need = w if t > w else t
         for name in TOK:
             v = ba.arguments.get(name)
-            if hasattr(v, "shape") and v is not None and v.shape and int(v.shape[0]) == t:
-                ba.arguments[name] = v[-w:]
+            if hasattr(v, "shape") and v is not None and len(getattr(v, "shape", ())) \
+                    and int(v.shape[0]) > need:
+                ba.arguments[name] = v[-need:]
         if os.environ.get("XIAOTU_CED_DIAG") == "1" and st["hits"] < 30:
             _log(f"[ced-diag] 层**切片** layer_idx={st.get('idx', {}).get(id(self))} "
                  f"t={t} -> {w}")
