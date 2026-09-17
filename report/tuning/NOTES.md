@@ -21852,3 +21852,33 @@ slot_mapping must not exceed q row count 出现次数 = 0     ← ✅ 崩溃消�
 ⇒ 下一步:在 override 里把 **SWA 组的名字** 也补进去(可从 `vllm_config` 的
 `kv_cache_groups` / `KVCacheSpec.has_layer_views` 枚举),或直接把 `create_fast_prefill_custom_backend`
 的调用按"层号 21..39 的全部组"接管;补齐后再跑 `ced_ab.py --check`,预期文本一致且耗时可观测下降。
+
+## §604g CED:再缩小一圈 —— SWA 组名**已在** eligible 里,但它的 metadata 仍未被改写
+### (a) 本轮新增的两个事实(都有日志)
+1. **SWA 的取用键就是缓存前缀名**:`swa_cache_layer.prefix =`
+   `'language_model.model.layers.21.attn.swa_cache'`,而 `attn_metadata` 共 **51 个键**,
+   形如 `language_model.model.layers.{0,4,8,12,16,…}.attn.swa_cache` ⇒ "元数据按缓存前缀取用"实锤;
+2. 我加了 `init_attn_backend` **组名探针**(打在 `model_runner` 与 `speculator` 各自的命名空间上,
+   因为它们是**直接 import**,改 `attn_utils` 无效),把 `kv_cache_config` 里每个组的
+   真实 `layer_names` 收集起来并并进 eligible 集合 —— **结果 eligible 仍是 38 个名字(并集新增 0)**
+   ⇒ **SWA 那一组的名字本来就已经在 eligible 集合里了**。
+### (b) 但 SWA 的 metadata 依然没被窗口化
+```
+不切片:SWA slot_mapping 长度=301 ≠ 窗口 255        ×12      ← 仍是全长
+层**切片** 次数 = 0 ;  slot_mapping 越界 = 0                 ← 安全、但不生效
+```
+⇒ 排除了"名字没匹配"这一支。剩下的唯一解释:**SWA 那个 metadata 不是经由
+`FastPrefillAttentionBuilder.build()` 产生的**,所以我们的
+`make_kv_sharing_fast_prefill_common_attn_metadata` 改写对它**从不发生**
+(而 query 侧那个 metadata 确实被改写了 —— 握手能通过就是证据)。
+### (c) 下一步(两个方向,按代价排序)
+1. **【小】直接改 KV-insert 的入口**:包一层
+   `DeepseekV4Attention._fused_qnorm_rope_kv_insert`,`当本层已切片到 `w` 时,
+   把 `swa_metadata.slot_mapping`(与 `positions`)同样切到**最后 `w` 项**`
+   —— 语义正确(decoder 层只依赖最后 `2·w_win−1` 个位置,§573b),且**不改 vLLM 文件**;
+2. **【大】查清 `attn_metadata[...swa_cache]` 到底由哪个 builder 生成**
+   (在 `create_fast_prefill_custom_backend` 的 wrapper 里记 `prefix` 与组名对应关系),
+   再决定是补 eligible 还是补该 builder。
+### (d) 当前状态(可安全合入)
+* **崩溃 0 次**;不切片 ⇒ 无收益、**行为与关闭 CED 完全一致**(耗时 ×1.00);
+* 全部由 `XIAOTU_CED_FASTPREFILL=1` 门控,默认关;失败路径 fail-safe(不会崩)。
