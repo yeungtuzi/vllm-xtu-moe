@@ -1634,8 +1634,14 @@ def _install_ced_slice_shim() -> list[str]:
 
     @functools.wraps(orig_layer)
     def forward(self, *a, **kw):
-        if not st["armed"] or not _eligible(self):
+        if not st["armed"]:
             return orig_layer(self, *a, **kw)
+        # 【§604q】**入参归一化与"是否切片"解耦**:只要本步武装,就无条件把
+        # "比本层隐藏态更长的入参"切齐 —— 这是纯一致性操作(对 0..20 层 `need==t`
+        # ⇒ 什么都不会切),但它能保证**链条下游的层**(22..39:隐藏态已被切短、
+        # 而 `positions` 等仍是全长)也被正确处理。之前把归一化放在 `_eligible` 之后,
+        # 导致这些层拿不到 normalization,`positions` 一直是 301 ⇒ CUDA 非法访存。
+        _elig = _eligible(self)
         import inspect
         ba = inspect.signature(orig_layer).bind(self, *a, **kw)
         x = ba.arguments.get("x")
@@ -1684,7 +1690,7 @@ def _install_ced_slice_shim() -> list[str]:
         # (上游已把隐藏态切短了 ⇒ 保持 t)。判据必须是"**比 need 长的都切**",
         # 而不是"等于 t 的才切" —— 实测层 22..39 的 `t` 已是 255 而 `positions` 仍是 301,
         # 用 `== t` 就漏掉了它 ⇒ rotary/compressor 拿错位置 ⇒ **CUDA 非法访存**。
-        need = w if t > w else t
+        need = w if (t > w and _elig) else t
         # 【§604m】**不再依赖固定入参名**:`TOK` 那张表是按 `nvidia/model.py` 的签名写的,
         # 而实际跑的是 `nvidia/vl_model.py`(traceback 里是 vl_model.py:309)⇒ 名字对不上,
         # `positions` 永远切不到(诊断里 `q=255 kv=255 **pos=301**` 出现 14 次)。
@@ -1696,9 +1702,9 @@ def _install_ced_slice_shim() -> list[str]:
                     and int(v.shape[0]) > need:
                 ba.arguments[_name] = v[-need:]
                 _sliced.append(f"{_name}:{int(v.shape[0])}->{need}")
-        if os.environ.get("XIAOTU_CED_DIAG") == "1" and st["hits"] < 60:
-            _log(f"[ced-diag] 层切片(按形状)layer_idx={st.get('idx', {}).get(id(self))} "
-                 f"t={t} need={need} 切了={_sliced}")
+        if os.environ.get("XIAOTU_CED_DIAG") == "1" and st["hits"] < 60 and _sliced:
+            _log(f"[ced-diag] 层归一化 layer_idx={st.get('idx', {}).get(id(self))} "
+                 f"elig={_elig} t={t} need={need} 切了={_sliced}")
         if os.environ.get("XIAOTU_CED_DIAG") == "1" and st["hits"] < 30:
             _log(f"[ced-diag] 层**切片** layer_idx={st.get('idx', {}).get(id(self))} "
                  f"t={t} -> {w}")
