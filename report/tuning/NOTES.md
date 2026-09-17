@@ -20460,3 +20460,50 @@ dst[a:b].copy_(src)
   `engram_vocab_start` 语义**(不是我们自己推的公式);③服务级 greedy 逐字节对拍(当前 5/5);
   ④**尚缺**一条更强的"表内容级"校验 —— 建议补:装载后对**每张表的若干随机行**做 CRC,
   与 `safe_open` 直接读 checkpoint 同位置比对(几秒,能覆盖全 384M 行分布)。
+
+## §564 ✅ 补齐 §563(d)④ 的**表内容级校验**,并用 torch profiler 把 **Engram 的真实开销**测出来了
+### (a) 内容级校验(落地 + 结果)
+`_stream_engram_from_ckpt` 现在**逐 chunk 抽验边界行**(`XIAOTU_ENGRAM_VERIFY`,默认开):
+把刚拷进 pinned 缓冲的第 `a+r` 行与**再用 `safe_open` 直接读 checkpoint 同一绝对行**逐字节比;
+`a=0` 时抽首行(抓全局偏移错),每个 chunk 抽末行(抓 chunk 循环 off-by-one)。
+失败**fail-closed**(抛异常),因为表错但服务能起来 ⇒ 静默错输出比启动失败危险得多。
+* 实测(TP=2,真实权重):**8/8 PASS**,`checked=98 chunks=97` 每张表;两个 rank 的 `vocab_start` 分别为
+  `0` / `192001740`(layer1)、`0` / `192007016`(layer14)✓。峰值 **650.3 GiB**(=ENGRAM_LAST 路径,复现 −41%)。
+
+### (b) 怎么取证(工具新增)
+* `xtu_own_v41_mem.sh` 新增 `PROFILE_DIR=` 旋钮。**坑**:本版 vLLM 光设 `VLLM_TORCH_PROFILER_DIR`
+  **不够**,`/start_profile` 会 404 —— HTTP 路由只在 `profiler_config.profiler is not None` 时挂载
+  (`entrypoints/serve/profile/api_router.py:36`)⇒ 必须同时传
+  `--profiler-config '{"profiler":"torch","torch_profiler_dir":...}'`。
+* `probes/prof_capture.py`:对已运行的服务抓"一次长 prefill + 一次批量 decode"。
+* `probes/trace_kernels.py`:按 kernel 名聚合 chrome trace。
+* **一步解码有 ~1353 个 GPU 事件**,所以**不能用小窗口归因**(我第一次用 1300 µs 窗口只截到 4.9%);
+  正确做法是**用 `_hash_ids_kernel`(每 pass 恰好 1 次)作步界**,对整步聚合。
+
+### (c) 实测:Engram 每个解码步(batch=4,64 个 pass 平均)
+| 操作 | 每步 |
+|---|---|
+| `_hash_ids_kernel`(n-gram 哈希,GPU Triton) | 11 µs |
+| `_engram_lookup_kernel` ×2(UVA 直读 pinned 表 + FP8 反量化) | 36 µs |
+| AllGather ×2(head 12→24,NCCL) | ~39 µs |
+| **`wkv` GEMM ×2(FP8 Marlin)** | **268 µs(占 71%)** |
+| `_fused_engram_post_wkv_kernel` ×2(门控 + 注入) | 21 µs |
+| **合计** | **≈375 µs** |
+* 同窗口 GPU kernel 忙 = **26 018 µs/步** ⇒ Engram 占 **1.4%**;步周期(带 profiler)67.6 ms。
+* **关键发现**:`wkv` 单层单次 **134.2 µs**;其权重 `6144×25600` FP8 = **157.3 MB** ⇒
+  `157.3 MB / 134.2 µs = 1.17 TB/s` ≈ A100 HBM 的 75%。**它是权重带宽受限的**,与 batch 无关
+  (batch=1 也是这个数)⇒ 解码时 Engram 的代价**几乎全部是"每步把 315 MB 的 wkv 权重读一遍"**,不是查表。
+* 查表本身确实是**延迟受限**:prefill 每 chunk ~875 token × 12 头 × 264 B ≈ 2.8 MB 却要 **570 µs**
+  ⇒ **4.9 GB/s 有效带宽**,证实是随机访存/TLB 受限(呼应上游注释 "the table dwarfs TLB reach")。
+* prefill 代价:8 个 chunk × (570 + 217) µs ≈ **6.3 ms / 7K token**,相对 prefill 总时长可忽略。
+
+### (d) 结论(回答"Engram 怎么用/什么好处/性能影响")
+1. **它不生成 token**,不做任何计算捷径:第 1/14 层往残差流**加**一个门控项
+   (`hidden + gate*value`,`engram.py:852`),token 仍走满 40 层。
+2. **存储与计算分离**:表在 **pinned host 内存**(189 GiB),由 **GPU 通过 UVA 直接读**(`engram.py:614`);
+   **CPU 一个字节都不参与**,所以"交给某个 CPU 核组查表"既非现状也非更优 —— 结果必须回到 GPU 残差流,
+   让 CPU 查反而要多一次 H2D。
+3. **分片是必须的**:按 **head** 切(每 rank 12 头),查完 `all_gather` 拼回 24 头;不分片则每 rank 要存整表(内存翻倍,
+   违反"不额外多占系统内存")。
+4. **性能影响:解码 ≈1.4% 的 GPU 时间**(且被 CPU MoE 掩盖),**prefill ≈0.1~0.2%**;
+   换来的容量是 196B 参数级别的条件记忆 ⇒ **代价极小、收益是参数量效率**(报告:1/3 总参数追平 V4-Pro-Base 知识类评测)。

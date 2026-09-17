@@ -237,6 +237,16 @@ def _stream_engram_from_ckpt(model, model_path, pending, chunk_rows: int = 2_000
                     n_full = int(sl.get_shape()[0])
                     assert off + n <= n_full, (
                         f"engram shard overrun: off={off} n={n} full={n_full}")
+                    # 【§564】**内容级校验**(默认开;`XIAOTU_ENGRAM_VERIFY=0` 可关)。
+                    # 为什么需要:§563 的 bug 就是"拷了 [0:part] 而不是 [off:off+part]"——
+                    # 形状对、不报错、能起服务,只有查表结果错。所以光看日志"streamed ..."
+                    # 不足以证明表内容对。这里**逐 chunk 抽验边界行**:把刚拷进 pinned 缓冲的
+                    # 第 (a+r) 行与再用 safe_open 直接读 checkpoint 的同一绝对行逐字节比。
+                    # 抽"最后一个行"能抓住 chunk 循环的 off-by-one;抽首批的"第一行"能抓住
+                    # 全局偏移错。成本:每 chunk 1~2 次小随机读(共 ~100 次/tensor)。
+                    verify = os.environ.get("XIAOTU_ENGRAM_VERIFY", "1") == "1"
+                    n_checked = n_bad = 0
+                    n_chunks = 0
                     for a in range(0, n, chunk_rows):
                         b = min(n, a + chunk_rows)
                         src = sl[off + a:off + b]
@@ -244,11 +254,37 @@ def _stream_engram_from_ckpt(model, model_path, pending, chunk_rows: int = 2_000
                         if src.dtype == torch.float8_e8m0fnu:
                             src = src.view(torch.uint8)
                         dst[a:b].copy_(src)
+                        if verify:
+                            rows = [b - a - 1] if a else [0, b - a - 1]
+                            for r in rows:
+                                s2 = sl[off + a + r]
+                                if s2.dtype == torch.float8_e8m0fnu:
+                                    s2 = s2.view(torch.uint8)
+                                n_checked += 1
+                                if not torch.equal(dst[a + r], s2):
+                                    n_bad += 1
+                                    if n_bad <= 3:
+                                        print(f"[xtu-engram-verify] MISMATCH {ck} "
+                                              f"local_row={a + r} global_row={off + a + r}",
+                                              flush=True)
+                        n_chunks += 1
+                    if verify:
+                        verdict = "PASS" if n_bad == 0 else f"FAIL({n_bad})"
+                        print(f"[xtu-engram-verify] {ck}: {verdict} "
+                              f"checked={n_checked} chunks={n_chunks} "
+                              f"vocab_start={off} rows={n}", flush=True)
+                        if n_bad:
+                            raise RuntimeError(
+                                f"engram content mismatch: {n_bad}/{n_checked} rows of {ck}")
                 n_ok += 1
                 print(f"[xtu-engram-last] streamed {ck} -> {tuple(dst.shape)} "
                       f"(vocab_start={off} of {n_full} rows, "
                       f"{dst.numel() * dst.element_size() / 2**30:.1f} GiB)", flush=True)
             except Exception as exc:  # noqa: BLE001
+                # 表内容校验失败**必须炸掉**(fail-closed):表错了服务还能起来,但输出是错的,
+                # 静默继续比启动失败危险得多。
+                if "engram content mismatch" in str(exc):
+                    raise
                 print(f"[xtu-engram-last] FAILED to stream {ck}: "
                       f"{type(exc).__name__}: {exc}", flush=True)
     return n_ok

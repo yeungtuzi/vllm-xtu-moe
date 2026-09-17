@@ -40,6 +40,13 @@ CD_TIMING="${CD_TIMING:-0}"       # 1 = 打开**引擎侧**每层分相计时([c
                                    #   比 LAYER_TIMING 更有用:它写在引擎回调里,所以 **cudagraph replay 时也会打**
                                    #   (Python 的 apply() 在 replay 时不执行 ⇒ LAYER_TIMING 量不到稳态解码)。
 LAYER_TIMING="${LAYER_TIMING:-0}"   # 1 = 打开每层分相计时(§515)      # 1 = 参考脚本的 --compilation-config {"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_DECODE_ONLY"}          # 1 = 开 DSpark 投机(draft=mtp,默认常驻 GPU)
+PROFILE_DIR="${PROFILE_DIR:-}"   # 非空 = 开 torch profiler;
+                                 #   服务起来后 `curl -X POST localhost:$PORT/start_profile` / `/stop_profile`,
+                                 #   产物是 chrome trace(默认 /tmp/<dir>/<...>.pt.trace.json.gz)。
+                                 #   用途:把一步解码拆到 kernel 粒度(engram 查表 / MoE / 编排空档),见 §564。
+                                 #   ⚠️ 本版 vLLM 的光有 `VLLM_TORCH_PROFILER_DIR` **不够**:HTTP 路由只在
+                                 #   `profiler_config.profiler is not None` 时挂载(serve/profile/api_router.py:36),
+                                 #   所以必须同时传 `--profiler-config '{"profiler":"torch",...}'`(否则 /start_profile 404)。
 MBT="${MBT:-}"            # --max-num-batched-tokens(留空 = 不传)   # serve_v41.sh 的默认;0 = 完全不自旋(serve_mainline.sh 的默认,§355 证明 5000 是正反馈灾难)
 RANK_SPLIT="${RANK_SPLIT:-}"   # **留空 = 交给引擎的自适应判据**(§519:node 数/world>=2 ⇒ node 分片 + 核按 node 子集切)。
                               # 【为什么改掉默认的 2】脚本原来硬写 `=2`(§505 的 socket+CCD 交错),那会**覆盖**掉引擎的
@@ -95,6 +102,7 @@ XIAOTU_LAYER_TIMING=$LAYER_TIMING XIAOTU_LAYER_TIMING_EVERY=40 \
 ${CD_TIMING:+XIAOTU_CD_TIMING=$CD_TIMING} ${CD_TIMING:+XIAOTU_CD_TIMING_EVERY=40} \
 ${SHARD_BY_NODE:+XIAOTU_MOE_SHARD_BY_NODE=$SHARD_BY_NODE} \
 ${RESIDENT_BUDGET_GB:+XIAOTU_MOE_RESIDENT_BUDGET_GB=$RESIDENT_BUDGET_GB} \
+${PROFILE_DIR:+VLLM_TORCH_PROFILER_DIR=$PROFILE_DIR} \
 $JIT_ENV \
 FLASHINFER_DISABLE_VERSION_CHECK=1 VLLM_USE_FLASHINFER_SAMPLER=0 \
 VLLM_ENGINE_READY_TIMEOUT_S=3600"
@@ -109,5 +117,6 @@ RUN_ENV="$RUN_ENV" READY_TIMEOUT="${READY_TIMEOUT:-2400}" \
   --trust-remote-code --enable-prefix-caching --enable-chunked-prefill \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --kernel-config '{"enable_jit_warmup": false}' \
+  $( [ -n "$PROFILE_DIR" ] && printf -- "--profiler-config {\"profiler\":\"torch\",\"torch_profiler_dir\":\"%s\",\"torch_profiler_with_stack\":false}" "$PROFILE_DIR" ) \
   $( [ "$COMPILE" = "1" ] && echo --compilation-config "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"mode\":\"VLLM_COMPILE\"${JITCACHE_CC_EXTRA}}" ) \
   $( [ "$SPEC" = "1" ] && echo --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' ) \
