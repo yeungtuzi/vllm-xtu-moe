@@ -360,7 +360,12 @@ def emit_env(p: dict) -> str:
     if p["spec_on_gpu"]:
         lines.append("XIAOTU_MOE_RESIDENT_DRAFT=1")   # 默认值,显式写出便于审计
     else:
-        lines.append("XIAOTU_MOE_RESIDENT_DRAFT=0")   # 显存真不够时:关掉投机(优先级 3 的 fallback)
+        # 【§594 修】**绝不能输出 DRAFT=0**:那表示"draft 层不进 GPU",会走 CPU 引擎,
+        # 而 §508 实测 draft 走 CPU 时投机是**净负**(7.11 vs 10.76 t/s)。
+        # 正确做法是**根本不传 `--speculative-config`**(整块关掉投机),而不是把 draft 放 CPU。
+        lines.append("# ⚠️ 优先级 3 不足:请**不要**传 --speculative-config(整块关掉投机);"
+                     "把 draft 放 CPU 是净负(§508:7.11 vs 10.76 t/s)")
+        lines.append("XIAOTU_MOE_RESIDENT_DRAFT=1")
     # 【§508】**恒 0**:GPU 预填充的活跃路径从引擎分片直接填 K-major,不需要 Python 副本;
     # 只有"引擎没有分片"的兜底路径才建副本(那时会打告警)。
     lines.append("XIAOTU_GPUPREFILL_WCOPY=0")
