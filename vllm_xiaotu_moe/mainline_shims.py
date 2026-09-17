@@ -1181,6 +1181,53 @@ def _install_ced_diag_shim() -> list[str]:
     return ["init_attn_backend(ced diag)"]
 
 
+# 【§604f】**真正要匹配的是"KV 缓存组的真实 layer_names"**,而这个集合只有
+# `init_attn_backend(kv_cache_config, ...)` 拿得到。所以在这里接管它,把组名收集下来,
+# 供 eligible 判据使用 —— 这样不依赖"名字空间猜测"(实测 SWA 那组就没被覆盖到)。
+_CED_GROUP_NAMES: set = set()
+
+
+def _install_ced_group_name_probe() -> list[str]:
+    """接管 `init_attn_backend`,把 `kv_cache_config` 里每个组的真实组名记下来。
+
+    ⚠️ `model_runner`/`speculator` 都是 **`from ... import init_attn_backend`**(直接导入),
+    所以必须打在**它们各自的命名空间**上,改 `attn_utils.init_attn_backend` 是无效的。
+    """
+    if os.environ.get("XIAOTU_CED_FASTPREFILL") != "1":
+        return []
+    out: list[str] = []
+    for modname in ("vllm.v1.worker.gpu.model_runner",
+                    "vllm.v1.worker.gpu.spec_decode.speculator"):
+        try:
+            mod = __import__(modname, fromlist=["init_attn_backend"])
+            orig = getattr(mod, "init_attn_backend", None)
+            if orig is None or getattr(orig, "_xtu_ced_grp", False):
+                continue
+
+            @functools.wraps(orig)
+            def init_attn_backend(kv_cache_config, vllm_config, device, *a, **kw):
+                try:
+                    names = set()
+                    for g in kv_cache_config.kv_cache_groups:
+                        names.update(getattr(g, "layer_names", ()) or ())
+                    if names:
+                        _CED_GROUP_NAMES.clear()
+                        _CED_GROUP_NAMES.update(names)
+                        if os.environ.get("XIAOTU_CED_DIAG") == "1":
+                            _log(f"[ced-diag] KV 缓存组真实组名 {len(names)} 个,样例="
+                                 f"{sorted(names)[:4]}")
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"ced 组名收集失败: {type(exc).__name__}: {exc}")
+                return orig(kv_cache_config, vllm_config, device, *a, **kw)
+
+            init_attn_backend._xtu_ced_grp = True  # type: ignore
+            setattr(mod, "init_attn_backend", init_attn_backend)
+            out.append(f"{modname}.init_attn_backend(组名探针)")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"ced 组名探针 {modname} 装不上: {type(exc).__name__}: {exc}")
+    return out
+
+
 # 【§604c fail-safe】metadata 侧与切片侧之间的**唯一握手**。
 # metadata 侧每被调用一次就把 `win` 写成"本步实际改写成的窗口长度"(改写=窗口长,未改写=0);
 # 切片侧**必须**看到 `win > 0` 才允许切。这样即使某一层没被换上 FastPrefill 后端
@@ -1248,9 +1295,18 @@ def _install_ced_fastprefill_shim() -> list[str]:
                     idx = int(mo.group(1))
                     if mid and mid < idx < n_layers:
                         mine.add(n)
+                # 【§604f】**再并上"KV 缓存组的真实组名"**(由 init_attn_backend 探针收集)。
+                # 这是关键:元数据是按**缓存前缀名**(如 `...layers.21.attn.swa_cache`)取用的,
+                # 而 `AttentionLayerBase` 那套名字**覆盖不到 SWA 那一组**(实测 SWA 元数据
+                # 仍是全长 ⇒ 切片被正确地拦下、CED 不生效)。
+                for n in list(_CED_GROUP_NAMES):
+                    mo = _re.search(r"layers\.(\d+)\.", n)
+                    if mo and mid and mid < int(mo.group(1)) < n_layers:
+                        mine.add(n)
                 if mine:
-                    print(f"[ced-fastprefill] 追加 V4.1 eligible {len(mine)} 层: "
-                          f"{sorted(mine)[:3]} … {sorted(mine)[-1:]}", flush=True)
+                    print(f"[ced-fastprefill] 追加 V4.1 eligible {len(mine)} 个名字"
+                          f"(含 KV 缓存组真实组名): {sorted(mine)[:3]} … {sorted(mine)[-1:]}",
+                          flush=True)
                 out |= mine
             except Exception as exc:  # noqa: BLE001
                 _log(f"ced eligible 追加失败: {type(exc).__name__}: {exc}")
@@ -1335,6 +1391,7 @@ def _install_ced_fastprefill_shim() -> list[str]:
         _bu.make_kv_sharing_fast_prefill_common_attn_metadata = (
             make_kv_sharing_fast_prefill_common_attn_metadata)
         applied.append(f"make_kv_sharing_fast_prefill_common_attn_metadata(窗口={win or '默认'})")
+    applied.extend(_install_ced_group_name_probe())
     return applied
 
 
