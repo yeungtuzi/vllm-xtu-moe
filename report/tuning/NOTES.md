@@ -20507,3 +20507,35 @@ dst[a:b].copy_(src)
    违反"不额外多占系统内存")。
 4. **性能影响:解码 ≈1.4% 的 GPU 时间**(且被 CPU MoE 掩盖),**prefill ≈0.1~0.2%**;
    换来的容量是 196B 参数级别的条件记忆 ⇒ **代价极小、收益是参数量效率**(报告:1/3 总参数追平 V4-Pro-Base 知识类评测)。
+
+## §565 ✅ `XIAOTU_ENGRAM_LAST` **默认翻到 1**(§563/§564 已闭环);`--load-format dummy` 不再读真表;并首次用**运行时消融**量出 Engram 的知识价值
+### (a) 默认翻转(依据)
+§562d 的"greedy 跨臂 1/5"已查明是**我们的 shard 偏移 bug**(§563),修复后 greedy **5/5 逐字节相同**,
+且新增**表内容级校验**(§564,默认开、fail-closed、实测 8/8 PASS)。⇒ 收益大、风险闭环,故:
+* `scripts/serve_v41.sh`:`XIAOTU_ENGRAM_LAST` 默认 **0 → 1**(env 文件两处);
+* `report/tuning/probes/xtu_own_v41_mem.sh`:同上;
+* 要用旧行为:`XIAOTU_ENGRAM_LAST=0`。
+* **默认路径实测**(不传任何 ENGRAM 环境变量,TP=2/maxlen=8192/util=0.90,`LOAD=auto`):
+  envfile 里 `XIAOTU_ENGRAM_LAST=1` ✓、内容校验 PASS ✓、**峰值 637.9 GiB**(基线 1087.6,−41%)、
+  `min node free` 最低 **38.7 GB**(NPS4 不再逼近单 node OOM ✓)。
+
+### (b) `--load-format dummy` 时不再读真表(§565 新增的约束)
+原实现的注释写"dummy 才退回占位填充",但代码只看"checkpoint 里有没有表" ⇒ `LOAD=dummy`
+(serve 脚本的默认)也会**真读 189 GiB**。dummy 下所有权重都是占位、输出本就无意义,这纯属浪费
+启动时间与磁盘。新增 `_load_format_is_dummy()`(读 `get_current_vllm_config().load_config.load_format`),
+dummy 时保留占位填充并打一行说明。
+
+### (c) **运行时消融**实测 Engram 的知识价值(新工具 `probes/engram_ablation.py`)
+做法:启动时给 `XIAOTU_ENGRAM_ABLATE_FILE=<path>`,插件把 `Engram.forward` 换成
+"文件存在 ⇒ 恒等返回(不注入)"⇒ **同一进程、同一份权重、同一套 kernel,只差一个开关**,
+`touch`/`rm` 即可 A/B。指标:给一段文本量每 token 的 `prompt_logprobs`,算平均 NLL(配对比较;
+每次请求带唯一 nonce 并跳过前 16 个位置,避开 prefix cache 把 `prompt_logprobs` 打空)。
+* **知识密集型(10 段长尾事实:Antikythera / Tsar Bomba / CKM 矩阵 / Voynich …)**:
+  **10/10 全部变差**,ΔNLL **+0.41 ~ +3.03 nats**,**困惑度 ×2.7 ~ ×20.8(均值 ×5.15、中位 ×3.96)**。
+* **普通自然文本(4 段,nat1024)**:ΔNLL **+0.12 ~ +0.78**,**×1.13 ~ ×2.19(均值 ≈×1.4)**。
+⇒ **Engram 买到的正是"长尾事实/稀有实体"这类知识**,普通文本上几乎不影响 —— 与"条件记忆"的设计意图一致。
+* ⚠️ **不可用的那个指标**:裸问答 prompt 上的贪心生成对照(4 个问题里 3 个两臂不同,但**两臂都出现
+  退化模板输出**,如 `#solved\nimport math…`、`- 🎯 Used 1 tool call`)。该 prompt 风格会把模型驱动到
+  退化续写,不能当质量指标 ⇒ 下一步要用 **chat template + 正式评测集**重做。
+* 重要限定:消融**只去掉注入效果**;`prepare_embeddings` 的查表仍会发生(它在层外预取),
+  所以 (c) 量的是"注入带来了什么",不是"省掉 Engram 能省多少时间"(后者见 §564:解码 1.4%)。

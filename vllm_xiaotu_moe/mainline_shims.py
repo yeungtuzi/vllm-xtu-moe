@@ -290,16 +290,33 @@ def _stream_engram_from_ckpt(model, model_path, pending, chunk_rows: int = 2_000
     return n_ok
 
 
+def _load_format_is_dummy() -> bool:
+    """当前是否 `--load-format dummy`(§565)。
+
+    `dummy` 下**所有**权重都是 1.0/127 的占位,输出本来就无意义,再去 checkpoint
+    读 189 GiB 真表纯属浪费启动时间与磁盘。所以此时保留 dummy 填充。
+    """
+    try:
+        from vllm.config.vllm import get_current_vllm_config_or_none
+
+        vc = get_current_vllm_config_or_none()
+        lf = getattr(getattr(vc, "load_config", None), "load_format", None)
+        return str(lf).lower() == "dummy"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _materialize_engram_tables(model=None, model_path=None) -> int:
     """把延后的 Engram pinned 大表真正建出来(专家阶段全部结束之后调用)。
 
     **真实权重支持**(NOTES §474/§476):分配好 pinned 缓冲后,若 checkpoint 里确实有
     Engram 张量,就**分块流式**读进这些缓冲(`_stream_engram_from_ckpt`);只有
-    `--load-format dummy`(checkpoint 找不到表)才退回 dummy 填充。
+    `--load-format dummy`(或 checkpoint 找不到表)才保留 dummy 填充。
     这样 `XIAOTU_ENGRAM_LAST=1` 在真实权重下可用:189 GiB pinned 表**不再与专家阶段叠加**。
     """
     n = 0
     _real = []
+    dummy = _load_format_is_dummy()
     for m in list(_ENGRAM_LAST_PENDING):
         try:
             w = torch.empty(
@@ -332,13 +349,16 @@ def _materialize_engram_tables(model=None, model_path=None) -> int:
             print(f"[xtu-engram-last] materialize FAILED: {type(exc).__name__}: {exc}",
                   flush=True)
     # 真实权重:把 checkpoint 的真表分块流式灌进刚物化的 pinned 缓冲。
-    # 找不到表(如 --load-format dummy)就保留 dummy 填充(见 §474/§476)。
-    if _real and model is not None:
+    # 找不到表(或 --load-format dummy)就保留 dummy 填充(见 §474/§476/§565)。
+    if _real and model is not None and not dummy:
         _m = [mm for (mm, _w, _s) in _real]
         _ok = _stream_engram_from_ckpt(model, model_path, _m)
         if _ok:
             print(f"[xtu-engram-last] re-loaded {_ok} real Engram tensor(s) from the "
                   f"checkpoint into the pinned tables (no extra peak)", flush=True)
+    elif _real and dummy:
+        print("[xtu-engram-last] --load-format dummy ⇒ 保留占位填充,"
+              "不从 checkpoint 读真表(省 ~189 GiB 磁盘读;§565)", flush=True)
     del _real
     _ENGRAM_LAST_PENDING.clear()
     if n:
@@ -1042,6 +1062,43 @@ def _install_lvllm_engine_substitution() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+def _install_engram_ablate_shim() -> list[str]:
+    """**诊断用**运行时消融:把 Engram 的注入变成"恒等"(§565)。
+
+    为什么需要:要知道"那 196B 条件记忆到底买到了什么",唯一可信的办法是**消融后实测**
+    (困惑度/生成质量),而不是断言。消融必须是"同一进程、只差一个开关",否则模型/编译/
+    缓存差异都会混进来。
+
+    做法:把 `Engram.forward` 换成"开关文件存在 ⇒ 直接返回输入(不注入)"。
+    * **默认不安装**(`XIAOTU_ENGRAM_ABLATE_FILE` 未设时零开销、零行为变化);
+    * 给了路径就安装,之后**运行时 `touch`/`rm` 该文件即可切换**,可在同一次服务里 A/B;
+    * 每 pass 只有 2 次 `Engram.forward` 调用,`os.path.exists` 的开销可忽略。
+    """
+    path = os.environ.get("XIAOTU_ENGRAM_ABLATE_FILE")
+    if not path:
+        return []
+    try:
+        from vllm.models.deepseek_v41.common.engram import Engram
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip engram ablate shim: {type(exc).__name__}: {exc}")
+        return []
+    if getattr(Engram.forward, "_xtu_ablate", False):
+        return []
+    orig = Engram.forward
+
+    @functools.wraps(orig)
+    def forward(self, hidden_states, hash_ids, token_mask=None):
+        if os.path.exists(path):
+            # 恒等:等价于"该层不做任何 Engram 注入"。返回输入本身即可,
+            # 调用方是 `residual = self.engram(previous_post, ...)`。
+            return hidden_states
+        return orig(self, hidden_states, hash_ids, token_mask)
+
+    forward._xtu_ablate = True  # type: ignore[attr-defined]
+    Engram.forward = forward
+    return [f"Engram.forward(ablate via {path})"]
+
+
 def apply_mainline_shims() -> list[str]:
     """Idempotently install all shims; returns the list of things applied."""
     if not mixed_mode_enabled():
@@ -1058,6 +1115,7 @@ def apply_mainline_shims() -> list[str]:
         _install_upstream_seg_shims,
         _install_build_kernel_probe,
         _install_engram_materialize_shim,
+        _install_engram_ablate_shim,
         _install_oracle_shims,
         _install_prepack_shims,
         _install_mxfp4_cpu_convert_shim,
