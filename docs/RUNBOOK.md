@@ -127,6 +127,37 @@ xiaotu_moe variant = _avx512_bf16
 | `--enforce-eager` | 建议先开 | 避免 CUDA graph 与 CPU 引擎 host 回调的额外变量;稳定后可尝试关闭 |
 | `--kernel-config.enable_jit_warmup=false` | 建议 | 跳过 JIT 预热,加快启动 |
 | `--trust-remote-code` | 通常不需要 | 主流模型配置已进入主线 |
+| `JITCACHE=1`(env,默认) | **保持开启** | 把编译缓存钉到固定目录,见 §3.5 |
+
+### 3.5 JIT 固定缓存目录(`JITCACHE`,用户 2026-09-17 要求)
+
+**症状**:用 `--compilation-config '{"mode":"VLLM_COMPILE",…}'` 时,**每换一个旗标、每改一行我们
+的代码,启动后第一个请求就把逐形状的 Triton 内核从头编一遍**(`jit_monitor` 警告 20-60 s/形状)。
+
+**原因**(安装好的 vLLM 源码里逐行核实):缓存目录名 = 四个 hash 拼出来的
+`$VLLM_CACHE_ROOT/torch_compile_cache/<hash10>`,而其中 `env_hash` 覆盖**每一个 `VLLM_*` 环境变量**、
+`code_hash` 覆盖**被 trace 的源码(含我们插件替换的模型类)**;并且
+`CompilerInterface.initialize_cache()` 会把 `TRITON_CACHE_DIR` **重定向**到那个 hash 目录里,
+所以 `~/.triton/cache` 攒下的内核用不上。
+
+**做法**:三个启动器(`scripts/serve_v41.sh`、`scripts/serve_mainline.sh`、
+`report/tuning/probes/xtu_own_v41_mem.sh`)都 source `scripts/lib_jitcache.sh`:
+
+| 旋钮 | 默认 | 含义 |
+|---|---|---|
+| `JITCACHE` | `1` | `1` = 钉住固定目录;`0` = 回到 vLLM 默认的 hash 行为 |
+| `XIAOTU_JIT_CACHE_DIR` | `~/.cache/vllm/torch_compile_cache` | 固定目录的**根**(默认就是 vLLM 自己的根,即参考实现 lk 的设定) |
+| `JITCACHE_STAMP` | 空 | 追加到目录名,用来**强制重建** |
+| `JITCACHE_COMPILING` | 由 `COMPILE` 决定 | 只有走编译时才真的改 `TRITON_CACHE_DIR` 等 |
+
+目录名形如
+`…/torch_compile_cache/xtu-DeepSeek-V4.1-Flash-tp2-vllm_compile-6b5ef34f7b-82747171`,
+即 **模型 + TP + 编译模式 + vLLM commit + 我们源码的 sha1**。所以
+* 重复启动 / 换旗标扫描 ⇒ **命中同一目录**;
+* 我们自己改了插件或引擎源码、上游 vLLM 动了 ⇒ **自动换新目录**(不会读到陈旧计算图)。
+
+日志里会出现 `[jitcache] 固定缓存目录 = …`;若该行显示"本次不编译 ⇒ 不改 Triton 目录",
+说明这一跑是 `mode=NONE`,Triton 用的仍是 `~/.triton/cache`(本来就固定持久)。
 
 ---
 

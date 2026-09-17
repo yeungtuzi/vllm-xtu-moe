@@ -46,8 +46,27 @@ if ENG == "lk":
 MODEL = os.environ.get("XIAOTU_LAYER1_NPZ", "")
 if not MODEL:
     raise SystemExit("set XIAOTU_LAYER1_NPZ=<real layer-1 npz fixture> (see docs/BENCHMARKS.md)")
-H, I, GK, E, K = 4096, 2048, 32, 256, 6
-N_LAYERS = 43
+# ---- 维度:**从 checkpoint 的 config.json 自动探测**(不再写死 V4 的 4096/2048)
+# 为什么:写死 V4 维度后,指向 V4.1-Flash(H=5120/I=2304/E=384/40 层)会直接
+# `ValueError: could not broadcast input array from shape (2304,2560) into shape (2048,2048)`
+# —— 2026-09-17 做 NPS4 分片 A/B 时又踩一次(bench_cpu_engine.py 早已修过,本文件漏了)。
+# 仍可用 env 覆盖:HID/I/E/K/GK/NLAYERS。
+_tc = {}
+_cfg_path = os.path.join(MODEL, "config.json")
+if os.path.isfile(_cfg_path):
+    try:
+        with open(_cfg_path) as _f:
+            _j = json.load(_f)
+        _tc = _j.get("text_config", _j) or {}
+    except Exception:  # noqa: BLE001
+        _tc = {}
+H = int(os.environ.get("HID", _tc.get("hidden_size", 4096)))
+I = int(os.environ.get("I", _tc.get("moe_intermediate_size", 2048)))
+E = int(os.environ.get("E", _tc.get("n_routed_experts", 256)))
+K = int(os.environ.get("K", _tc.get("num_experts_per_tok", 6)))
+GK = int(os.environ.get("GK", 32))
+N_LAYERS = int(os.environ.get("NLAYERS", _tc.get("num_hidden_layers", 43)))
+print(f"[dims] H={H} I={I} E={E} K={K} GK={GK} layers={N_LAYERS} (auto)")
 
 
 def f32_to_bf16_bits(x):

@@ -32,9 +32,14 @@ PY_EXT="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SU
 
 # pybind11(header-only):优先环境变量,其次常见位置
 if [[ -z "${PYBIND11_INC:-}" ]]; then
+  # 【2026-09-17 修】本 env 里**没有独立的 pybind11 包**,但 **torch 自带一份**头文件
+  # (`site-packages/torch/include/pybind11/`)。原来只试 `import pybind11` 和 /usr/include,
+  # 于是构建立在 `exit 2` 上 —— 而 `BUILD_EXIT` 若被 `| tail` 吞掉,门禁就会**去验旧的 .so**。
+  # 注意 `-I"$PYBIND11_INC"` 要求这里是**包含 `pybind11/` 的那个目录**(不是 pybind11 本身)。
   for cand in \
       "$("$PYTHON" -c 'import pybind11, os; print(os.path.join(pybind11.get_include()))' 2>/dev/null)" \
-      /usr/include/pybind11 /usr/local/include/pybind11 ; do
+      "$("$PYTHON" -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__),"include"))' 2>/dev/null)" \
+      /usr/include /usr/local/include ; do
     [[ -n "$cand" && -d "$cand" ]] && PYBIND11_INC="$cand" && break
   done
 fi

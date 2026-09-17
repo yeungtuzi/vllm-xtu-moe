@@ -450,25 +450,28 @@ public:
                 // 【第 212 轮】多 rank 同机:分片数与 node 基址都按 rank 切开,
                 // 让 rank r 的 1/world 权重落在它自己那 1/world 个 NUMA node 上
                 // (与 numa_pool 的核表切分一致)。world<=1 时行为与以前完全一致。
-                static const int _rank_mode = [] {
-                    const char* e = std::getenv("XIAOTU_MOE_RANK_SPLIT");
-                    return e ? std::atoi(e) : 2;      // 【§505】默认 2(CCD 交错)
-                }();
-                // mode 2(CCD 交错)时每 rank 仍覆盖全部 node ⇒ 分片数**不切**
-                const int _world = (_rank_mode >= 2) ? 1
-                                 : (_rank_mode == 1 ? std::max(1, cfg_.num_processes) : 1);
-                // 【§505】**分片单位 = socket(无视 NPS)**,与 numa_pool 的 shard_by_socket_ 同判据。
-                // 只有在"每个 rank 覆盖全部 socket"(world<=1 或 rank_split==2)时才按 socket 分片;
-                // 否则(rank 只拿到一部分 node)必须退回按 node 分片,不然会有分片没人领 ⇒ 死等。
-                const bool _sock = shard_by_socket_env() && (_world <= 1 || _rank_mode >= 2);
+                // 【§519】核切分与分片单位由**同一个判据**决定 —— 见 numa_pool.hpp 的
+                // resolve_shard_mode() 长注释与实测表。默认:node 数/world >= 2 时
+                // 按 **node** 分片 + 核按 node 子集切(RANK_SPLIT=1);否则(会退化成
+                // 每 rank 一片、等于权重存 2 份)按 socket 分片 + 核按 CCD 交错(=2)。
+                // 显式 RANK_SPLIT 优先,保证"分片单位 == 核切分单位"这个不变量。
+                int _rank_mode = 2; bool _sock = true;
+                resolve_shard_mode(std::max(1, cfg_.num_processes), _rank_mode, _sock);
+                const int _world = (_rank_mode >= 2) ? 1 : std::max(1, cfg_.num_processes);
                 const int _units = _sock ? numa_socket_count() : numa_node_count();
                 rank_node_base_ = std::max(0, cfg_.process_id) * (_units / _world);
                 nshard_ = std::max(1, _units / _world);
                 // 【§505 用户指导】EPYC/Xeon 上**无视 NPS,直接按 socket 分片**(+ 核心 CCD 交错):
                 // 既保住访存局部性(socket 内 node 距离 10/12,跨 socket 32),又天然沿 CCD 均衡,
                 // 而且同一份配置在 NPS1/NPS4 上行为一致(不需要"CPU 型号 ⇒ CCD 分布"配置表)。
-                // NPS=4 且精确知道 CCD 分布时按 node 分片**可能**更快一点,但差异不大 ⇒ 不做默认。
-                // 回到按 node 分片:XIAOTU_MOE_SHARD_BY_NODE=1(或显式 XIAOTU_MOE_NSHARD=<node 数>)。
+                // 【§519 更正 §505】上面"node 分片只快一点、不做默认"的判断**已被实测推翻**
+                // (2026-09-17):socket 分片让整层权重只落在 2 个 NUMA node 上、worker 却铺满
+                // 8 个 node ⇒ 引擎每层 compute 0.44→0.96 ms、单流 24.94→14.17 t/s;
+                // 微基准 B=8 上 node 分片比 socket **快 4.7×**(1.76 vs 8.25 ms/层)。
+                // 现默认 = **node 分片 + 核按 node 子集切**,只有 node 数/world 会退化到 1 时
+                // 才退回 socket(见 resolve_shard_mode 的判据与告警)。
+                // 仍可显式覆盖:`XIAOTU_MOE_RANK_SPLIT=2`(socket)/`=1`(node)/
+                // `XIAOTU_MOE_NSHARD=<n>`(直接钉分片数)。
                 // 注:分片越细 ⇒ 每片的线程数越少(nthreads/NS),片内并行不足。
                 if (const char* _ns = std::getenv("XIAOTU_MOE_NSHARD")) {
                     const int v = std::atoi(_ns);
@@ -1422,7 +1425,23 @@ private:
         //   oom-kill: constraint=CONSTRAINT_MEMORY_POLICY, nodemask=7,
         //             task=VLLM::EngineCor, anon-rss 603GB
         // 整个 EngineCore 被杀(2026-09-11 实测)。mbind 只作用于这段映射,不会泄漏。
-        long rc = syscall(SYS_mbind, p, total, MPOL_BIND, &mask, sizeof(mask) * 8, 0);
+        // 【§520 实验,env 门控,默认关】把"按 socket 分组"**真正实现出来**再量一次:
+        // 上面这条 `mask = 1UL << node` + MPOL_BIND 意味着"一个分片 = 一个**单 node**",
+        // 所以 §505 的 socket 分片(nshard=2)实际上让**整层权重只落在 2 个 node 上**(§518)。
+        // 本开关:每个分片改为 **MPOL_INTERLEAVE 到它所属 socket 的全部 node** ⇒ 保留 socket
+        // 粒度,同时把该 socket 的 4 个内存域都用上、且同 socket 内线程距离 ≤12。
+        // 用途:回答"是'无视 NPS、只按 socket 分组'这个方向错了,还是我们把它做砸了"。
+        int mpol = MPOL_BIND;
+        if (std::getenv("XIAOTU_MOE_SHARD_INTERLEAVE_SOCKET") != nullptr) {
+            NumaTopology _t = discover_numa_topology();
+            const int sock = (node >= 0 && node < (int)_t.node_socket.size())
+                             ? _t.node_socket[(size_t)node] : 0;
+            unsigned long m2 = 0;
+            for (size_t j = 0; j < _t.node_socket.size(); ++j)
+                if (_t.node_socket[j] == sock) m2 |= (1UL << j);
+            if (m2) { mask = m2; mpol = MPOL_INTERLEAVE; }
+        }
+        long rc = syscall(SYS_mbind, p, total, mpol, &mask, sizeof(mask) * 8, 0);
         uint8_t* d = static_cast<uint8_t*>(p);
         copier(d, src, total);
         if (std::getenv("XIAOTU_MOE_SHARD_DIAG") != nullptr)

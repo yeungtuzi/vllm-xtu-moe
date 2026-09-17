@@ -129,6 +129,25 @@ RESIDENT="${RESIDENT-0-11}"
 OOT="${XIAOTU_OOT_OVERRIDE:-1}"
 EXTRA_ENV="${EXTRA_ENV:-}"
 
+# COMPILE(默认 0 = 现状:不加 --compilation-config)。=1 时用参考实现的
+# `{"cudagraph_mode":"FULL_DECODE_ONLY","mode":"VLLM_COMPILE"}`;此时 vLLM 会把
+# TRITON_CACHE_DIR 重定向进 hash 目录 ⇒ 必须靠 lib_jitcache.sh 钉住(见该文件)。
+COMPILE="${COMPILE:-0}"
+JITCACHE_MODEL="$(basename "$CKPT")"
+JITCACHE_TP="$TP"
+JITCACHE_MODE="$([ "$COMPILE" = "1" ] && echo vllm_compile || echo none)"
+JITCACHE_COMPILING="$COMPILE"
+. "$ROOT/scripts/lib_jitcache.sh"
+JIT_ENV=""
+if [ -n "${TRITON_CACHE_DIR:-}" ]; then
+  JIT_ENV="TRITON_CACHE_DIR=$TRITON_CACHE_DIR TORCHINDUCTOR_CACHE_DIR=$TORCHINDUCTOR_CACHE_DIR"
+  [ -n "${TILELANG_CACHE_DIR:-}" ] && JIT_ENV="$JIT_ENV TILELANG_CACHE_DIR=$TILELANG_CACHE_DIR"
+fi
+CC_JSON=""
+if [ "$COMPILE" = "1" ]; then
+  CC_JSON="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"mode\":\"VLLM_COMPILE\"${JITCACHE_CC_EXTRA}}"
+fi
+
 # ---- 启动前自检:把"宿主节奏决定引擎行为"的隐式契约变成显式断言 ----
 # 这些开关缺失时**不报错、只静默变慢**(实测可达 30×),所以必须在起服务前拦住。
 # CHECK=0 可跳过(仅供诊断);CHECK_STRICT=1 时自检不通过直接拒绝启动。
@@ -165,6 +184,8 @@ if [ "$EAGER" = "1" ]; then ARGS+=(--enforce-eager); fi
 # 注意:`--cudagraph-capture-sizes` 是 nargs='+'(**空格分隔**,不是逗号)
 if [ -n "$CUDAGRAPH_SIZES" ]; then ARGS+=(--cudagraph-capture-sizes $CUDAGRAPH_SIZES); fi
 if [ -n "$LOAD_STRATEGY" ]; then ARGS+=(--safetensors-load-strategy "$LOAD_STRATEGY"); fi
+# JIT 固定缓存目录(COMPILE=1 时才有意义;见 scripts/lib_jitcache.sh)
+if [ -n "$CC_JSON" ]; then ARGS+=(--compilation-config "$CC_JSON"); fi
 if [ "$KERNEL_WARMUP" = "0" ]; then
   ARGS+=(--kernel-config '{"enable_jit_warmup": false}')
 fi
@@ -260,6 +281,7 @@ nohup env \
   XIAOTU_MOE_RANK_SPLIT="${XIAOTU_MOE_RANK_SPLIT:-2}" \
   XIAOTU_MOE_GPU_RESIDENT_LAYERS="$RESIDENT" \
   OMP_NUM_THREADS=1 \
+  $JIT_ENV \
   $EXTRA_ENV \
   "${NCTL[@]}" "$PY" -m vllm.entrypoints.openai.api_server "${ARGS[@]}" > "$LOG" 2>&1 &
 echo $! > "$OUTDIR/$TAG.pid"

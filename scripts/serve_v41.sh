@@ -87,6 +87,31 @@ LOAD="${LOAD:-dummy}"          # dummy = no disk read, exercises the kernels
 GPU_UTIL="${GPU_UTIL:-0.85}"
 EXTRA_ENV="${EXTRA_ENV:-}"
 
+# COMPILE(默认 0 = 与 cellV/参考实现一致的 vLLM 默认:mode=NONE + cudagraph
+#   FULL_AND_PIECEWISE)。=1 时用参考实现 lk 的那组旗标
+#   `{"cudagraph_mode":"FULL_DECODE_ONLY","mode":"VLLM_COMPILE"}`(probe 里一直是这个)。
+#   注意:一旦走 VLLM_COMPILE,vLLM 就会把 TRITON_CACHE_DIR 重定向进它自己按 hash
+#   算出来的目录 ⇒ 换旗标/改我们一行代码都要**逐形状重新 JIT**。下面 source 的
+#   lib_jitcache.sh 就是把那个目录钉死(JITCACHE=1,默认)。见 docs/RUNBOOK.md。
+COMPILE="${COMPILE:-0}"
+
+# ---- JIT 固定缓存目录(scripts/lib_jitcache.sh 有完整原理)--------------------
+JITCACHE_MODEL="$(basename "$CKPT")"
+JITCACHE_TP="$TP"
+JITCACHE_MODE="$([ "$COMPILE" = "1" ] && echo vllm_compile || echo none)"
+JITCACHE_COMPILING="$COMPILE"          # 只在编译路径上钉 Triton 目录(见 lib_jitcache.sh)
+. "$ROOT/scripts/lib_jitcache.sh"
+# 只有非空才往子进程传:`TRITON_CACHE_DIR=""` 与"未设"语义不同(Triton 会把空串当路径)。
+JIT_ENV=""
+if [ -n "${TRITON_CACHE_DIR:-}" ]; then
+  JIT_ENV="TRITON_CACHE_DIR=$TRITON_CACHE_DIR TORCHINDUCTOR_CACHE_DIR=$TORCHINDUCTOR_CACHE_DIR"
+  [ -n "${TILELANG_CACHE_DIR:-}" ] && JIT_ENV="$JIT_ENV TILELANG_CACHE_DIR=$TILELANG_CACHE_DIR"
+fi
+CC_JSON=""
+if [ "$COMPILE" = "1" ]; then
+  CC_JSON="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"mode\":\"VLLM_COMPILE\"${JITCACHE_CC_EXTRA}}"
+fi
+
 OUTDIR="$ROOT/report/tuning/logs"; mkdir -p "$OUTDIR"
 LOG="$OUTDIR/$TAG.log"
 
@@ -197,13 +222,17 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   echo "XIAOTU_MOE_RESIDENT_BUDGET_GB=${XIAOTU_MOE_RESIDENT_BUDGET_GB:-0}"
   echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-${POLICY_GP_MIN:-0}}"
   echo "XIAOTU_RELEASE_SOURCE=${XIAOTU_RELEASE_SOURCE:-1}"
-  # 【§504】**多 rank 同机必须用 CCD 交错切分**(RANK_SPLIT=2)。原因(改自 moe_v2.hpp 的设计):
-  #   nshard_ = max(1, numa_node_count()/world)。NPS1 本机 numa=2、TP=2 ⇒ **nshard_=1**
-  #   ⇒ 分片路径整个失效,退回"每个 socket 一份副本"⇒ **权重存 2 份**;
-  #   而 RANK_SPLIT=2 让**每个 rank 覆盖全部 node**(CCD 交错),于是 nshard_=2 生效
-  #   ⇒ 每个 node 只存自己那 1/2 行 = **整机 1 份权重**(与 lk_moe 的"每 node 一份分片"同构)。
-  #   实测(TP=2/V4.1 真权重,服务进程树总 RSS):峰值 1121 → 989.5 GiB;稳态 1121 → 859 GiB。
-  echo "XIAOTU_MOE_RANK_SPLIT=${XIAOTU_MOE_RANK_SPLIT:-2}"
+  # 【§504 的结论,§519 更正】**多 rank 同机时"分片单位"与"核切分单位"必须一致**:
+  #   * §504 遇到的问题是真的:NPS1(2 node)+TP=2 时按 node 分片会退化成 nshard_=1 ⇒
+  #     分片路径失效、退回"每 socket 一份副本"⇒ **权重存 2 份**;
+  #   * 但 §505 的解法(默认"按 socket 分片 + 核 CCD 交错")在 **NPS=4 上代价巨大**:整层权重
+  #     只落在 2 个 NUMA node 上、worker 却铺满 8 个 ⇒ 引擎每层 0.44→0.96 ms,
+  #     单流 24.94→14.17 t/s;微基准 B=8 上 node 分片快 **4.7×**(§518);
+  #   * 现在由**引擎自适应**:node 数/world ≥ 2 ⇒ node 分片 + 核按 node 子集切
+  #     (NPS4+TP2 ⇒ 每 rank 4 片,仍是**整机 1 份权重**且 node-local);
+  #     会退化时才退回 socket。该组合实测 **18.22 t/s / 987 GiB**(§518)。
+  #   ⇒ 所以这里**默认不设**这个键,交给 `resolve_shard_mode()`;显式设 2 才回到旧行为。
+  [ -n "${XIAOTU_MOE_RANK_SPLIT:-}" ] && echo "XIAOTU_MOE_RANK_SPLIT=$XIAOTU_MOE_RANK_SPLIT"
   for kv in $EXTRA_ENV; do case "$kv" in *=*) echo "$kv";; esac; done
 } > "$XTU_ENV_FILE"
 export XIAOTU_ENV_FILE
@@ -220,8 +249,9 @@ nohup env \
   XIAOTU_MOE_NSLICE_SMALL="${XIAOTU_MOE_NSLICE_SMALL:-0}" \
   XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
   XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-$SPIN_DEFAULT}" \
-  XIAOTU_MOE_RANK_SPLIT="${XIAOTU_MOE_RANK_SPLIT:-2}" \
+  ${XIAOTU_MOE_RANK_SPLIT:+XIAOTU_MOE_RANK_SPLIT=$XIAOTU_MOE_RANK_SPLIT} \
   OMP_NUM_THREADS=1 \
+  $JIT_ENV \
   $EXTRA_ENV \
   numactl --interleave=all "$PY" -m vllm.entrypoints.openai.api_server \
     --model "$CKPT" --served-model-name dsv41 \
@@ -230,6 +260,7 @@ nohup env \
     $( [ "${MBT:-0}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
     --gpu-memory-utilization "$GPU_UTIL" $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager ) \
     $( [ "${SPEC:-0}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" ) \
+    $( [ -n "$CC_JSON" ] && printf -- '--compilation-config %s' "$CC_JSON" ) \
     $( [ "${PREFIX_CACHE:-1}" = "1" ] || echo --no-enable-prefix-caching ) --trust-remote-code \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --kernel-config '{"enable_jit_warmup": false}' \

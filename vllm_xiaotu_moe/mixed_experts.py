@@ -33,6 +33,7 @@ DS-V4(sqrtsoftplus)都会选错专家。
 from __future__ import annotations
 
 import os
+import time
 
 import torch
 
@@ -56,6 +57,37 @@ except ImportError:  # mainline <= 6c73b08dec
     from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
         select_experts,
     )
+
+
+# ---- 【§515 分相计时】定位"外层调度/编排"的每层开销 -------------------------
+# 用户判断:同机同模型同 prompt 下我们比 lk_moe 慢 ~1.8-2.1×(1.43 vs 0.80 ms/层),
+# 而引擎自身 batch=1 只占 ~0.3-0.5 ms/层 ⇒ 缺口必在编排路径上。这里把**每层**拆成三段:
+#   pre  = 进 apply() 到调用引擎之前(我们的 Python 暂存/分支/常驻判定…)
+#   eng  = `engine.cpu_decode(...)` 本身(binding 内部含 D2H+CPU MoE+H2D)
+#   post = 引擎返回到 apply() 返回(结果 dtype 转换 / output.copy_ / 诊断钩子)
+# 开法:`XIAOTU_LAYER_TIMING=1`(每 40 次调用打一行 = 一次完整模型 pass)。
+_LT_ON = os.environ.get("XIAOTU_LAYER_TIMING") == "1"
+_LT_EVERY = int(os.environ.get("XIAOTU_LAYER_TIMING_EVERY", "40") or 40)
+_LT_ACC = {"n": 0, "pre": 0.0, "eng": 0.0, "post": 0.0}
+import threading as _threading
+_LT_LOCK = _threading.Lock()
+
+
+def _lt_record(pre_ms: float, eng_ms: float, post_ms: float) -> None:
+    if not _LT_ON:
+        return
+    with _LT_LOCK:
+        _LT_ACC["n"] += 1
+        _LT_ACC["pre"] += pre_ms
+        _LT_ACC["eng"] += eng_ms
+        _LT_ACC["post"] += post_ms
+        if _LT_ACC["n"] % max(1, _LT_EVERY) == 0:
+            n = _LT_ACC["n"]
+            tot = _LT_ACC["pre"] + _LT_ACC["eng"] + _LT_ACC["post"]
+            print(f"[layer-timing] n={n} pre={_LT_ACC['pre']/n:.3f}ms "
+                  f"eng={_LT_ACC['eng']/n:.3f}ms post={_LT_ACC['post']/n:.3f}ms "
+                  f"total={tot/n:.3f}ms (每层;越接近 100% 说明开销在哪个相位)",
+                  flush=True)
 
 
 _VERIFY_LAYER = os.environ.get("XIAOTU_VERIFY_LAYER", "") == "1"
@@ -1071,6 +1103,7 @@ class _XiaotuExpertsMixin:
         workspace2: torch.Tensor | None = None,
         expert_tokens_meta: object | None = None,
     ) -> torch.Tensor:
+        _lt_t0 = time.perf_counter() if _LT_ON else 0.0
         if apply_router_weight_on_input:
             raise NotImplementedError(
                 "xiaotu CPU experts backend does not support "
@@ -1362,12 +1395,14 @@ class _XiaotuExpertsMixin:
                     f"threshold {_gp_min}; weights from {_pf_reason}",
                     flush=True,
                 )
+        _lt_t1 = time.perf_counter() if _LT_ON else 0.0
         if not _resident and not _gpu_pf:
             engine.cpu_decode(
                 stream.cuda_stream, qlen, self.moe_config.experts_per_token,
                 h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
                 out.data_ptr(),
             )
+        _lt_t2 = time.perf_counter() if _LT_ON else 0.0
         if _sync == "post":
             torch.cuda.synchronize()
         if _HID_LAYER and _HID_LAYER in getattr(layer, "layer_name", ""):
@@ -1390,6 +1425,10 @@ class _XiaotuExpertsMixin:
                 self._verified_n = getattr(self, "_verified_n", 0) + 1
                 self._verify_once(layer, h_bf16, ids_i32, wts_f32, out)
         result = out.to(hidden_states.dtype)
+        if _LT_ON:
+            _lt_t3 = time.perf_counter()
+            _lt_record((_lt_t1 - _lt_t0) * 1e3, (_lt_t2 - _lt_t1) * 1e3,
+                       (_lt_t3 - _lt_t2) * 1e3)
         if output is not None:
             # Modular upstream API: the caller owns the output buffer and uses it
             # directly, so the result must land in it (upstream ignores our return).

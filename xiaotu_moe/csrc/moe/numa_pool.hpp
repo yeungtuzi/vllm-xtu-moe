@@ -339,6 +339,60 @@ inline bool shard_by_socket_env() {
     return true;
 }
 
+// ============================================================================
+// 【§519 2026-09-17】**分片单位必须等于内存分配单位(NUMA node),且必须与核切分同单位**
+//
+// 依据(moe_v2.hpp:1296-1305 的布局注释):每个 node 一个 COMPACT region 并 `mbind` 到该
+// node,并明写 "**Every weight read is from node-local pages (no cross-node traffic)**"。
+// ⇒ 这个不变量**只在 `nshard_ == node 数` 时成立**。§505 为了修 NPS1+TP2 的"权重存 2 份"
+// 把单位改成 socket(nshard=2)⇒ 整层权重**只落在 2 个 NUMA node 上**,而 worker 铺满 8 个
+// node ⇒ 大部分读跨 node、内存并行度 8→2。
+//
+// 实测(同机/同模型 V4.1/同旗标,TP=2,maxlen=1024、util=0.60、seqs=8、ASYNC=0、qlen=1):
+//   核切分       | 分片   | 引擎 compute/层 | 单流 t/s | 峰值 RSS
+//   RANK_SPLIT=2 | socket | 0.96 ms         | 14.17   | 1088 GiB
+//   RANK_SPLIT=2 | node   | 9.02 ms(✗ 单位不配对)| 2.14 | 1083 GiB
+//   RANK_SPLIT=1 | node   | 0.66 ms         | 18.22   |  987 GiB
+// 引擎微基准(world=1、真实 V4.1 层、THREADS=120、B=8):socket 8.25 vs node 1.76 ms/层 ⇒ 4.7×。
+//
+// 判据(**rank_split 显式给定时以它为准**,从而两者永远同单位;不自洽的组合会被修正并告警):
+//   * `XIAOTU_MOE_RANK_SPLIT=1` ⇒ node 分片;`=2` ⇒ socket 分片;
+//   * 未给 RANK_SPLIT 时:`node 数 / world >= 2` ⇒ node(不会退化,并行度最高);
+//     否则(如 NPS=1 + TP=2 ⇒ 2/2 = 1,node 分片等于"权重存 2 份",见 §504)⇒ socket;
+//   * `XIAOTU_MOE_SHARD_BY_NODE` / `XIAOTU_MOE_SHARD_BY_SOCKET` 仅在 RANK_SPLIT 未给时生效。
+inline void resolve_shard_mode(int world, int& rank_split_mode, bool& shard_by_socket) {
+    const char* rs = std::getenv("XIAOTU_MOE_RANK_SPLIT");
+    const bool force_node = std::getenv("XIAOTU_MOE_SHARD_BY_NODE") != nullptr;
+    const bool force_socket = std::getenv("XIAOTU_MOE_SHARD_BY_SOCKET") != nullptr;
+    const int w = std::max(1, world);
+    const int nodes = numa_node_count();
+    const bool node_ok = (nodes / w) >= 2;      // node 分片不会退化成"每 rank 一片"
+    const bool rs_given = (rs != nullptr && *rs != '\0');
+    bool node_mode;
+    if (rs_given) {
+        const int v = std::atoi(rs);
+        if (v == 1)      node_mode = true;
+        else if (v == 2) node_mode = false;
+        else             node_mode = node_ok;   // 0/其它:不当作核切分指令,走自适应
+    } else if (force_node)        node_mode = true;
+    else if (force_socket)        node_mode = false;
+    else                          node_mode = node_ok;
+    rank_split_mode = node_mode ? 1 : 2;
+    shard_by_socket = !node_mode;
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        if (rs_given && ((std::atoi(rs) == 1 && !node_mode) || (std::atoi(rs) == 2 && node_mode)))
+            std::fprintf(stderr, "[xiaotu/shard] 显式 RANK_SPLIT=%s 与分片单位冲突,已按核切分修正\n", rs);
+        std::fprintf(stderr,
+                     "[xiaotu/shard] unit=%s rank_split=%d (world=%d nodes=%d rs_env=%s%s%s%s)\n",
+                     node_mode ? "node" : "socket", rank_split_mode, w, nodes,
+                     rs_given ? rs : "-", force_node ? " +BY_NODE" : "",
+                     force_socket ? " +BY_SOCKET" : "", node_ok ? "" : " [node->degenerate->socket]");
+        std::fflush(stderr);
+    }
+}
+
 // NUMA node of the calling worker thread (sched_getcpu -> node). Builds the
 // cpu->node map once; the worker is pinned stably so this is a single lookup.
 inline int current_node() {
@@ -936,17 +990,8 @@ private:
         //   XIAOTU_MOE_RANK_SPLIT=2(interleave,推荐)→ 按 **CCD 交错**切:rank r 拿
         //        {ccd | ccd_slot % world == r},核互不重叠 **且每个 rank 覆盖全部 8 个 node**
         //        ⇒ 可以继续用 nshard=8(最快),两个 rank 也不抢核。
-        static const int rank_split_mode = [] {
-            const char* e = std::getenv("XIAOTU_MOE_RANK_SPLIT");
-            // 【§505】**默认改成 2(CCD 交错)**。理由:
-            //   * mode 1 按"NUMA node 子集"切 ⇒ 每个 rank 只覆盖一半 node ⇒ 引擎只能
-            //     nshard = node/world。NPS1+TP=2 时那等于 **1** ⇒ 分片路径整体失效,
-            //     退回"每 socket 一份副本" ⇒ **权重存 2 份**(§504 实测 1121 vs 589 GiB);
-            //   * mode 2 按 CCD 交错切:核互不重叠 **且每个 rank 覆盖全部 socket** ⇒
-            //     nshard = socket 数 ⇒ 整机 1 份权重,且天然沿 CCD 均衡。
-            // 想要旧行为:XIAOTU_MOE_RANK_SPLIT=1。
-            return e ? std::atoi(e) : 2;
-        }();
+        int rank_split_mode = 2; bool _shard_sock = true;
+        resolve_shard_mode((int)world_, rank_split_mode, _shard_sock);
         if (rank_split_mode != 0 && world_ > 1 && cores_.size() >= (size_t)world_ * 2) {
             std::vector<int> mine;
             mine.reserve(cores_.size() / (size_t)world_);
@@ -997,11 +1042,9 @@ private:
         // 取 socket 分片的票 ⇒ 有的分片没人领 ⇒ 死等/看门狗。
         // 分片单位必须与 moe_v2.hpp 的 nshard_ 完全一致(见那里的同款判据)。
         {
-            static const int _rs = [] {
-                const char* e = std::getenv("XIAOTU_MOE_RANK_SPLIT");
-                return e ? std::atoi(e) : 2;
-            }();
-            shard_by_socket_ = shard_by_socket_env() && (world_ <= 1 || _rs >= 2);
+            int _rs = 2; bool _sock = true;
+            resolve_shard_mode((int)world_, _rs, _sock);
+            shard_by_socket_ = _sock;
         }
         auto shard_of_node = [&](int abs_node) -> int {
             if (!shard_by_socket_) return abs_node - rank_node0_;

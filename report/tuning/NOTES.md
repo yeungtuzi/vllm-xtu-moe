@@ -19047,3 +19047,251 @@ ERROR [async_llm.py:829] EngineDeadError: EngineCore encountered an issue
 * **预填充侧已经没有大问题**(剩下的只有冷启动 JIT 预热,§513);
 * **解码侧是唯一的主战场**:①每线程交付带宽(1.32→2.21 GB/s·线程)②常驻层数(受优先级 1 约束,§513c)
   ③spec 参数 ④R113 丢票修复后放开线程/并发。
+
+## §516 【重要更正 + 归零基线】cellV 的 24.94 t/s 就是 V4.1(40 层);`layers=43` 是个**印错了的标签**;并记下 JIT 缓存机制
+
+### (a) 我这一轮犯的错(用户当场纠正:"你把 4.1 和 4.0 搞混了")
+我看到 `cellV.log` 里 `[cd-timing] layers=43 …`,立刻把它读成"这是 V4.0(43 层)⇒ 与
+env 文件里写的 V4.1 矛盾",并据此怀疑 24.94 t/s 这个数字不可比。**这是错的**,两条独立证据:
+* `grep -o "model\.layers\.[0-9]*" cellV.log | sort -u -t. -k3 -n | tail` ⇒ 最大是 **39**
+  ⇒ **40 层 = V4.1**(config.json 里 `/text_config/num_hidden_layers = 40`,同一次核实);
+* `binding.cpp:292-296`:那个字段根本不是层数,而是**采样间隔**
+  `every = getenv("XIAOTU_CD_TIMING_EVERY") ?: 43`,printf 的标签却写成 `layers=%d`
+  (`binding.cpp:873-876`)。`43` 是 V4.0 时代留下的**默认常数**,模型是什么都不影响它。
+  ⇒ **cellV 全程是 V4.1、TP=1、40 层,`period=1.05 ms/层` 的分解成立**
+  (40 × 1.05 ≈ 42 ms/token ≈ 24 t/s,与截图 24.94 一致)。
+* **待办**:把 `layers=` 这个标签改成 `every=`(还要重建 .so ⇒ 与其它引擎改动一起做,别单独重建)。
+
+### (b) cellV 的启动配置(全部来自它自己的日志,不是推测)
+`cellV.env`: `tp=1 maxlen=1024 load=auto util=0.60`;日志 `non-default args` 与 engine config:
+`tensor_parallel_size=1`、`max_model_len=1024`、`gpu_memory_utilization=0.6`、`max_num_seqs=8`、
+`enforce_eager=False`、`speculative_config=None`、`compilation_config={'mode': NONE,
+cudagraph_mode: FULL_AND_PIECEWISE, cudagraph_capture_sizes=[1,2,4,8,16]}`、`enable_jit_warmup=False`。
+⇒ **一个 `--compilation-config` 都没传**(那两个是当时的默认值),`gpu_worker` 报的装载后占用是
+**15.44 GiB(weights + non-torch)**。
+* 我今天第一次复刻时**漏了 `VLLM_EXPERTS_LOAD_DEVICE=cpu`** ⇒ 专家权重建在 GPU 上 ⇒
+  装载期 `torch.OutOfMemoryError: Tried to allocate 4.22 GiB`(与"代码退化"无关,是我漏 env)。
+  补上后日志立刻出现 `[vllm-xtu-moe] GPU/CPU Mixed …` + `mainline shims applied (30)`
+  + `Using 'CPU' Mxfp4 MoE backend`,装载正常。
+  ⚠️ 记录一个可核对的漂移:`shims applied` 从 cellV 的 **27** 条涨到今天的 **30** 条。
+
+### (c) 上游与代码在 cellV 之后**没有动**(所以"代码回归"这个假设被压缩到我们仓库内部)
+* `vllm-mainline` checkout:`git log -1` = `6b5ef34f7b`(2026-09-15 00:41,是我们自己的
+  Engram SM80 补丁),**9/15 14:00 之后零提交、工作树干净**;`dabc4362b`(cellV 版本串
+  `v0.29.1rc1.dev95+gdabc4362b` 里的那个)是 HEAD 的**祖先** ⇒ cellV 之后上游一行没变。
+* 我们仓库 9/15 14:00 之后有 20+ 个提交,其中**会碰性能路径的**主要是:
+  `34e50f5`(nshard_ 改成 socket 数 + `RANK_SPLIT=2` 默认)、`9db554a`(WCOPY 默认)、
+  `b6e0659`(serve_v41.sh 的 TP 默认 1→2)、`d380119`(flat 路径无损账)。
+  ⇒ 单变量对照必须把**旗标**和**env**分开测,见 §517。
+
+### (d) 引擎微基准:线程数**不是**那 0.6 ms/层 的来源(实测,真实 V4.1 层权重)
+`XIAOTU_LAYER1_NPZ=<ckpt> BS=1,8 REP=200 LAYER=3 scripts/bench_engine_ab.py`:
+
+| THREADS | B=1 ms/层 | 40 层 ≈ ms/token | B=8 ms/层 |
+|---|---|---|---|
+| 60 | 0.68 | 27.3 | 8.84 |
+| **120** | **0.58** | **23.3** | 8.25 |
+| 192 | 0.82 | 32.7 | 8.23 |
+
+* B=1 时 120 最优(比 60 快 17%、比 192 快 41%);B=8 时 60/120/192 几乎一样(8.2-8.8)。
+* ⇒ **我们的启动器钉的 `THREADS=60` 在 TP=1 单流下确实亏 ~17%(≈4 ms/token)**,但
+  cellV→LT 的差距是 **0.59 ms/层 ≈ 24 ms/token**,量级对不上 ⇒ **线程数不是主因**。
+* ⚠️ 这条 bench 走的是 `cpu_prefill`,与服务解码路径 `cpu_decode(forward_many)` 不是同一条,
+  绝对值不可直接与 `[cd-timing] compute=` 比(后者 0.44 ms/层)。
+
+### (e) 新发现:JIT 编译缓存**按"旗标 + 我们源码"分目录** ⇒ 每次扫描都要重编(已修,见 R12/JIT)
+`vllm/compilation/backends.py:1028-1067` + `compiler_interface.py:470-481`:缓存目录 =
+`$VLLM_CACHE_ROOT/torch_compile_cache/sha256([env_hash, config_hash, code_hash, compiler_hash])[:10]`,
+`env_hash` 覆盖**每一个 `VLLM_*` 环境变量**,`code_hash` 覆盖**被 trace 的源码(含我们插件替换的
+模型类)**;而且它把 `TRITON_CACHE_DIR` **重定向**进这个 hash 目录 ⇒ 本机 `~/.triton/cache` 里
+2814 个内核(1.3 GB)**一个都用不上**。已实现 `scripts/lib_jitcache.sh`(JITCACHE=1 默认),
+详见 IRON_RULES R12/JIT 与 docs/RUNBOOK.md §3.5。
+
+## §517 TP=1 复刻(逐字 cellV 旗标)第一轮:**同时踩到两件事** —— 引擎默认的 async 路径比 sync 慢 2×,以及一次"重复预填充"病态
+
+### (a) 第一次复刻:漏 `VLLM_EXPERTS_LOAD_DEVICE=cpu` ⇒ 装载期 OOM(我的错,不是代码)
+`torch.OutOfMemoryError: Tried to allocate 4.22 GiB … 37.06 GiB memory in use` 发生在
+`initialize_model → make_layers`,即**专家权重建在 GPU 上**。补上该 env 后日志立刻出现
+`GPU/CPU Mixed` + `mainline shims applied (30)` + `Using 'CPU' Mxfp4 MoE backend`,装载正常(540 s READY)。
+⇒ 教训:复刻必须连 env 一起复刻;**"日志里没有 env 回显"只说明没用 env 文件,不说明没设 env**
+(插件只回显它从 `XIAOTU_ENV_FILE` 补进来的键)。
+
+### (b) cellV 走的是 **sync** 路径,复刻里我漏了 ASYNC ⇒ 2× 差距被暴露出来
+`binding.cpp:291-333` 是 async 路径(打印 `[cd-timing/async]`),`836-877` 是 sync 路径(打印 `[cd-timing]`)。
+`xiaotu_async_enabled()`(`:69-75`)**未设 `XIAOTU_MOE_ASYNC` 时为 true** ⇒ 引擎默认走 async。
+* cellV(9/15)的日志是 `[cd-timing]` ⇒ 它那次的 `XIAOTU_MOE_ASYNC=0`(sync);
+* 我的复刻没设 ⇒ 走了 async,于是同一份代码、同一批旗标下量到:
+
+| 运行 | 路径 | qlen=1 period | compute(engine) | rest | 40 层 ⇒ ms/token |
+|---|---|---|---|---|---|
+| **cellV(9/15)** | sync | **1.05 ms** | **0.44 ms** | 0.62 | 42 ⇒ 24 t/s |
+| cellV1(今天) | **async** | **2.05 ms** | **1.31 ms** | 0.74 | 82 ⇒ 12 t/s |
+
+⇒ **在 qlen=1、TP=1 下,async 路径的每层成本是 sync 的 2×(引擎段 3×)**;
+而 `binding.cpp:68-72` 的注释仍写着"async 是最大单点收益(V 6.53→1.80 ms/token)" ⇒ **注释已过时,
+必须按当前实测改掉,或把默认改成 sync**。(我们的 `serve_v41.sh`/probe 一直显式钉 `ASYNC=0`,
+所以**生产路径没被这条打中**;但引擎默认值是颗地雷。)
+
+### (c) 同一跑里还观察到"重复预填充"病态(未解决,单独立项)
+cellV1 那跑:`total_input_tokens=74`(4 条 prompt 合计),`out=64`,`C=1`,但 `qlen` 序列是
+**192 个 `qlen=26` 的 pass + 68 个 `qlen=1` 的 pass**(≈ 4×64 = 256 次生成步 + ~20 次捕获热身)。
+`Engine 000` 行同期报 `Avg prompt throughput: 0.0`、`generation 1.8 tokens/s`、`Running: 1 reqs`,
+即**每一步只生成 1 个 token,却喂了 26 个 token 进 MoE**,单步 ~550 ms ⇒ ShareGPT 基准掉到 **2.27 tok/s / TPOT 438 ms**。
+* 26 ≠ 任何 cudagraph 捕获尺寸(1/2/4/8/16),而 prompt 恰好 26 token ⇒ 像是**每步都把整段 prompt 重算一遍**;
+* 该现象**只出现在 async 这跑**;sync 跑(cellV)的 qlen 分布是 `1`(433)/`8`/`4`/`2`,正常;
+* 结论:先按"async 路径问题"处理(改默认 + 修),**不要**在这个状态下评价 ShareGPT 吞吐。
+  ⚠️ 不要引用 cellV1 的 2.27 tok/s 作为"我们的解码性能"。
+
+### (d) 引擎微基准:线程数(见 §516d)与上游漂移都排除;剩下 TP=2 的 EP —— §518 在测
+
+## §518 【本轮根因】§505 把"分片单位"从 **NUMA node** 改成 **socket** ⇒ 解码引擎慢 2.2×;把分片单位与核切分**配对**回来后 **+29%(14.17 → 18.22 t/s)**
+
+### (a) 线索:cellV 的 `compute=0.44` vs 今天 TP=2 的 `compute=0.96`,而 **EP 是免费的**
+`XIAOTU_CD_TIMING=1` 在服务里量到的每层分解(**同一批 cellV 旗标**:TP / maxlen=1024 / util=0.60 / seqs=8 / mode=NONE / `ASYNC=0`,`qlen=1`):
+
+| 运行 | 核切分 | 分片单位 | period | **compute(engine)** | ep | rest | 单流 t/s | 峰值 RSS |
+|---|---|---|---|---|---|---|---|---|
+| cellV(9/15,**早于 §505**)| (未知) | **node**(TP=1 ⇒ nshard=**8**) | **1.05** | **0.44** | 0.00 | 0.62 | **24.94** | — |
+| cellT2(今天的默认)| `RANK_SPLIT=2` | socket(nshard=2) | 1.67 | 0.96 | **0.00** | 0.71 | 14.17 | 1087.6 GiB |
+| cellT2n(单位不配对)| `RANK_SPLIT=2` | node | 9.81 | **9.02** | 0.00 | 0.79 | 2.14 | 1083.1 GiB |
+| **cellT2n1(配对)** | **`RANK_SPLIT=1`** | **node** | **1.24** | **0.66** | **0.00** | **0.58** | **18.22** | **986.8 GiB** |
+
+* **`ep=0.00` 全部为 0** ⇒ EP 的 shm 交换(两次 barrier + memcpy + 求和)不是瓶颈,§511 里"TP=2 要付 EP 代价"的猜测**被推翻**;
+* 差距**全在 `compute`(引擎内部)**;`rest`(GPU 侧)我们甚至比 cellV **更好**(0.58 vs 0.62)。
+
+### (b) 机制:`shard` 必须等于**内存分配单位**,而分配单位是 **NUMA node**(代码明写)
+`moe_v2.hpp:1296-1305` 原文:
+> node n owns gate rows [n*I/NS,(n+1)*I/NS) … Each node maps a COMPACT region … **mmap'd and
+> MPOL_BIND to that node**. … **Every weight read is from node-local pages (no cross-node traffic)**.
+
+⇒ 权重是按 **node** 布好且 `mbind` 到该 node 的,**"每次读都是 node-local"这个不变量只在 `nshard=node 数` 时成立**。
+§504/§505 为了修 NPS=1 下 TP=2 的"权重存 2 份"问题,把分片单位改成 socket(`nshard=2`)⇒
+**`node n` 只剩 2 个区域,整层权重实际只落在 2 个 node 上**,而 worker 铺满 8 个 node
+⇒ 大部分读变成**跨 node**,且内存并行度从 8 node 掉到 2 node(**≈4×**,与实测 4.7× 吻合)。
+**而 cellV(9/15)跑在 §505 之前 ⇒ 它当时是 `nshard=8`** —— 这就是"24.94 → 13.98"的真正来源。
+
+* **引擎微基准(真实 V4.1 层,world=1,THREADS=120)独立复现**:
+  | 分片单位 | B=1 ms/层 | B=8 ms/层 |
+  |---|---|---|
+  | socket(默认) | 0.57 | **8.25** |
+  | node(`XIAOTU_MOE_SHARD_BY_NODE=1`) | **0.37** | **1.76** |
+  ⇒ **B=1 快 1.54×、B=8 快 4.7×**(B=8 正是解码批的形态)。
+* **为什么 §505 的门禁没抓到**:`check_engine_aligned.sh` 的负载用 `DEDUP=12` 把 12 个 batch 压到
+  同一小撮专家上 ⇒ 工作集小到基本命中缓存,**分片铺在 2 个 node 还是 8 个 node 量不出来**。
+  ⇒ **门禁缺一个"大工作集 / 非去重"用例**(待补,见 (e))。
+
+### (c) 第二个必须同时满足的条件:**分片单位与核切分必须用同一个单位**
+cellT2n 那一行(9.02 ms/层,比错的默认还慢 9×)就是故意只改一半的结果:
+`RANK_SPLIT=2` 按 CCD 交错把核铺满 8 个 node,而 node 分片把 rank0 的权重钉在 node 0-3
+⇒ 一半 worker 读的是**别的 node 的内存**,引擎内部的一致性也随之被破坏。
+代码里本来就写了这条("与 numa_pool 的核表切分保持同一套划分"),两种**自洽**组合:
+
+| 模式 | 核切分 | 分片 | 每 rank 分片数 | 内存 | 实测 |
+|---|---|---|---|---|---|
+| socket 模式(§505 默认) | `RANK_SPLIT=2` | socket | 2 | 1 份但只落在 2 node | 1.67 ms/层 |
+| **node 模式(推荐)** | **`RANK_SPLIT=1`** | **node** | **4**(NPS4/TP2) | **1 份且 node-local** | **1.24 ms/层** |
+
+### (d) 结论与口径
+> 解码慢的主因**不是** EP、不是带宽、不是 Python/编排,而是**我们自己引擎的分片单位选错**:
+> §505 把分片从 node 改成 socket 之后,权重只落在 2 个 NUMA node 上、worker 却铺满 8 个
+> ⇒ 引擎内部每层从 0.44 ms 退化到 0.96 ms。把分片单位与核切分配回 node 之后:
+> **C=1 单流 14.17 → 18.22 t/s(+29%)、TPOT 64.6 → 49.5 ms、峰值 RSS 还少 100 GiB**。
+
+* 本次只动了两个 env(`XIAOTU_MOE_RANK_SPLIT=1` + `XIAOTU_MOE_SHARD_BY_NODE=1`,**未改代码**);
+* 下一步(见 §519):把这条**做成自适应默认**(node 数/world ≥ 2 时用 node,否则退回 socket),
+  并补门禁用例;然后重跑数值/确定性/性能三关。
+
+## §520 回答"'无视 NPS、只按 socket 分组'这个方向错了,还是我们把它做砸了" —— **两半都对,但"做砸了"是大头(2.2×),粒度错是小头(2.1×)**
+
+### (a) 事实:所谓"按 socket 分片"从来没真的按 socket 分过
+`moe_v2.hpp` 的 `shard_region()` 里是 `unsigned long mask = 1UL << node;` + `MPOL_BIND`
+—— **一个分片 = 一个单 node**。所以 §505 的 socket 分片(`nshard=2`)实际效果是
+**整层权重只落在 2 个 node 上**(§518),而 worker 铺满 8 个:两个 socket 里各有 3/4 的
+worker 在读别的 node 的页。这既不是 socket 分组、也不是 node 分组,是"两不像"。
+
+### (b) 把"按 socket 分组"**正确地实现出来**再量一次(§520 新开关,默认关)
+新 env `XIAOTU_MOE_SHARD_INTERLEAVE_SOCKET=1`:每个分片改为
+**`MPOL_INTERLEAVE` 到它所属 socket 的全部 node**(保留 socket 粒度,但把该 socket 的
+4 个内存域都用上、同 socket 内距离 ≤12)。真实 V4.1 层、THREADS=120、REP=60、world=1:
+
+| 配置 | B=6 ms/层 | **B=8 ms/层** |
+|---|---|---|
+| A `RANK_SPLIT=2`(现行 socket 分片:单 node 绑定) | 5.85 | **8.63** |
+| B 自适应默认(node 分片,nshard=8) | **1.62** | **1.83** |
+| **C socket 粒度 + 分片内交织到整个 socket** | 2.52 | **3.88** |
+
+### (c) 结论(直接回答问题)
+* **"按 socket 分组搞砸了"= 主要矛盾**:C vs A = **8.63 → 3.88(2.22×)**,B=6 上
+  5.85 → 2.52(2.32×)。**同一台机、同一份代码、只把"绑单个 node"换成"交织到整个 socket",
+  就拿回了一半以上的差距** ⇒ 你原话里的"是我们按 socket 分组的时候搞砸了"**成立**。
+* **"无视 NPS / 粒度只到 socket"= 次要但真实**:C vs B = 3.88 vs 1.83(**还差 2.12×**),
+  B=6 上 2.52 vs 1.62(1.56×)。差在 ①域数 2 vs 8 ②距离 12 vs 10 ⇒
+  "只按 socket 分组"这个**方向**在 NPS=4 上确实仍然吃亏,**不能"无视 NPS"**。
+* 所以两半都有份,但**先修的是实现**(2.2×),**默认取 node**(再 2.1×):
+  默认 = node 分片 + 核按 node 子集切(§519 的自适应),C 只作为诊断开关保留。
+* 注意 C 在**服务 TP=2** 上还会再吃亏一层:核若按 CCD 交错(`RANK_SPLIT=2`),rank0 的
+  权重在 socket 0 的 4 个 node 上,而它一半 worker 在 socket 1(距离 32)⇒ 再次印证
+  §519 的不变量:**分片单位与核切分必须同一个单位**。
+
+### (d) 副产品:大页假设被干净排除
+`XIAOTU_MOE_SHARD_HUGEPAGE` A/B(V4.0/DEDUP=12/B=6):关 0.93 vs 开 0.95 ms/层 ⇒ 无关;
+与 `moe_v2.hpp:1408-1418` 的注释一致(稀疏跨度开大页会让 3.2GB/层 → 15-19GB/层,
+且实测速度不升反降)。
+
+## §521 服务级验收新默认(+31%),但**并发(C=8)暴露出下一个主战场**:14.52 t/s vs cellV 的 78 t/s
+
+### (a) 新默认(纯自适应,零 env 旋钮)服务级通过
+`TAG=defT2 TP=2 maxlen=1024 util=0.60 seqs=8 COMPILE=0 THREADS=60 SPIN=0 CD_TIMING=1`
+(probe 已不再硬写 RANK_SPLIT)。日志出现 **`[xiaotu/shard] unit=node rank_split=1 (world=2 nodes=8 rs_env=-)`**
+⇒ 自适应默认在**真实 vLLM 服务路径**上生效(不只是微基准)。
+
+| | 旧默认 socket | **新默认 node** |
+|---|---|---|
+| C=1 聚合 / TPOT | 14.17 t/s / 64.60 ms | **18.62 t/s / 48.32 ms(+31%)** |
+| 每层 engine / rest | 0.96 / 0.71 ms | **0.67 / 0.55 ms** |
+| 峰值 RSS | 1088 GiB | **1004 GiB** |
+
+新二进制上:**确定性门 11/11 逐位相同**;数值门(上一版)OK=7 BAD=1 同历史。
+
+### (b) ⚠️ C=8 是病态,而且**不是**切片造成的(下一个主战场)
+同一服务:`CS=8 OUT=64 N=24` ⇒ **agg 14.52 t/s、TPOT 485.12 ms、TTFT 6455 ms**
+(比 C=1 的 18.62 **更差**);同期 cd-timing `qlen=4 period=2.98 ms/层 compute=1.73 rest=1.25`。
+* 按 cd-timing 的稳态推算,8 条并发、qlen=8 时每步 40×~3 ms=120 ms ⇒ 应约 60+ t/s,
+  实测只有 14.5 ⇒ **绝大多数时间不在稳态**:要么在等预填充、要么每步被重算(§517 在 async 路径上
+  见过同款"重复预填充"指纹:每步只生成 1 token 却喂进整个 prompt)。
+* **cellV(9/15)的 C=8 = 78.10 t/s**(其日志同期 `Running: 8 reqs`、`generation 51.7`)⇒
+  并发这一档我们落后 **5.4×**,而 C=1 只差 ~1.3×(24.94 vs 18.62)。
+* 由于 C=1 在本次改动后**变好**了,这个病态**不是**切片回归 ⇒ 它正是目标里说的
+  "**外层调度/编排**"那一块,而且现在是最大的一块。下一步:用 nsys/`[cd-timing]` 的
+  `MIN period` + vLLM 的 `Running/Waiting/preempted` 计数把"等预填充 vs 重算"分开。
+
+### (c) 【§521 更正】C=8 那格是**我的测量错误**,不是病态 —— 并发扩展其实是健康的
+上面 (b) 里我拿 `N=24` 的 C=8 去比 C=1 和 cellV,是错的:**两组的 prompt 集不同**
+(`N=24` 那组的 `total_input_tokens=5838` ⇒ **243 token/prompt**,而 C=1 那组只有 ~18 token/prompt
+⇒ 前者是预填充主导的负载)。同一服务、**同一批固定 prompt(sharegpt16.json,16 条)**重测:
+
+| C | 聚合 t/s | TPOT | TTFT |
+|---|---|---|---|
+| 1 | 10.74 | **49.84 ms** | 1436 ms |
+| **8** | **40.57** | 128.53 ms | 1467 ms |
+
+⇒ **C=1 → C=8 扩展 3.78×**(cellV 自己那组是 24.94→78.10 = 3.13×)⇒ **并发是健康的**,
+"concurrency hurts" 是我的 prompt 集混淆造成的假象。**教训与 §511 同一条:跨会话比聚合吞吐必须先比 prompt 集。**
+
+### (d) 目标口径更新:主标题里的"解码慢 1.8-2.1×"已被本轮消掉大半
+解码**只用 TPOT**(聚合吞吐受 prompt 集支配,不可跨组比):
+
+| | TPOT | 每层(40 层) | 备注 |
+|---|---|---|---|
+| cellV 9/15(TP=1,§505 之前) | 40 ms | 1.00 | 24.94 t/s |
+| 本轮前的服务(socket 分片) | 57-71 ms | 1.43-1.78 | 目标里引用的那段 |
+| **本轮后(纯自适应默认,零 env)** | **48.3-49.8 ms** | **1.21-1.25** | 18.62 t/s(4 条)/ TPOT 稳定 |
+| lk_moe 对照 | 32-34 ms | 0.80-0.85 | |
+
+* 与**目标开头**那段(57-71 ms)相比:TPOT **−25~30%**;与 lk 的差距从 **1.8-2.1× 收到 ~1.5×**。
+* **剩余差距的位置已经很清楚**(每层分解,`qlen=1`):
+  * 我们 **rest = 0.55 ms**(GPU 侧),**比 cellV 的 0.62 还好** ⇒ 编排/GPU 侧不再是短板;
+  * 我们 **engine = 0.67 ms** vs cellV 的 **0.44** ⇒ **剩下的 ~0.23 ms/层全在引擎内部**,
+    正对应待做项 ⑤(每线程交付带宽 1.32 → 2.21 GB/s)与 §519 里那个"vs 轮 73 基线仍差 ~1.4×"的未归因残差。
+  ⇒ **下一轮主攻从"编排"切换到"引擎内层"**(这条与目标里"引擎自身 batch=1 只占 0.3-0.5 ms/层"的旧假设不同:
+    现在的实测是引擎**占了每层的大头 55%**)。
