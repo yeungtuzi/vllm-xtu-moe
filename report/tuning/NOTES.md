@@ -21940,3 +21940,31 @@ must not exceed = 0 ; row counts must match = 0      ← ✅ 两种 kernel 校�
    再试 1024/4096;
 2. 不用切片视图,而是 `sm[-qn:].contiguous()` / `positions[-qn:].contiguous()`(排除视图对齐问题)。
 ### (d) 总结:路径已打通到"能跑",剩下的是**正确性/边界**问题(不是"机制不通")
+
+## §604m/n CED:两处"入参没切到"的真因已找到并修掉;错误继续前移(现为 AssertionError)
+### (a) §604m:层切片**不能按入参名表**
+* 原来的 `TOK` 名字表是按 `nvidia/model.py` 的签名写的,而**实际跑的是 `nvidia/vl_model.py`**
+  (traceback 里是 `vl_model.py:309`)⇒ 名字对不上,**`positions` 永远切不到**;
+* 诊断铁证:`行数 q=255 kv=255 **pos=301** sm=301` 出现 **14 次**(层 22..39);
+* 改成**按形状切**(凡 `shape[0] > need` 的入参一律切),诊断随即显示 layer 21
+  `切了=['x:301->255','positions:301->255','input_ids:301->255','pre_mix:301->255','post_mix:…']` ✅
+### (b) §604n:层 22..39 的 `positions` 根本**不来自层入参**
+切了层入参后,attention 收到的 `positions` **仍是 301** ⇒ 它来自 runner 的全局缓冲,
+与层入参无关。于是在 **`DeepseekV4Attention.forward` 入口**按
+`need = min(窗口, hidden_states 行数)` 对齐 `positions`/`hidden_states`(与调用方传什么无关)。
+### (c) 实测(c11):行数不一致**消失**,换成 AssertionError
+```
+[ced-diag] attn 入口对齐:need=255 hidden=255 pos=255
+行数情形:只剩 q=255 kv=255 pos=255 sm=301        ← 之前 14 次的 pos=301 已消除 ✅
+must not exceed / row counts must match / illegal memory access = 0   ✅
+```
+但 long_300/1024/4096 仍 500(这次是 **AssertionError**,非 kernel 错)。
+### (d) 下一步
+`AssertionError` 无 traceback 细节(需把日志级别/栈打全,或直接在 shim 里 try/except 捕获并打印栈)。
+怀疑方向:切片后 `hidden_states` 与 **MLA/compressor 的 buffer 长度约定**(它们可能按"本步 chunk 的
+token 数"分配,而我们把入参切短了 ⇒ 断言 token 数一致)。
+**注意**:CED 是"近似相等"的优化,本语料(long_* 是同一句话重复 70 次的退化 prompt)
+不适合做等价判据,验证时应换成**有真实语义的长 prompt**。
+### (e) 全程结论
+机制链条已全部走通(切片 → 元数据改写 → KV-insert 对齐 → attention 入口对齐),
+**零 kernel 错误**;剩下的是与 vLLM 内部**长度约定**的最后一个断言。
