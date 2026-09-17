@@ -21729,3 +21729,31 @@ RuntimeError: torch_call_dispatcher("aten::new_empty", ...) API call failed
 | 6977 | 15.202 s | 459 | 42.17 s(165) |
 ⇒ **2.0× / 2.8×**;16000-token 那条因 attention OOM 未完成(已在 (b) 修)。
 ⇒ 也量出成本结构:`~8.9 s 固定 + 0.79 ms/token`(固定项 = 权重搬运,斜率项 = GEMM 随 qlen 增长)。
+
+## §602 ❗**更正 §598**:那条 "1725 tok/s" **无效,撤回**;GPU 预填充的真实收益是 **2.0-2.8×**
+### (a) 怎么发现的(自查尺子,遵守 R15)
+`probe_ttft.py` 对**成功**请求会收到 3 个 SSE 帧(`chunks=3`)且带 `usage`;
+而 `big3`/`big4` 那两条 **`chunks=1` 且 `prompt_tokens=None`** ⇒ **是错误/截断响应**,
+其 `ttft_s`(8.008 / 18.352 s)根本不是一次完成的预填充。
+| 文件 | L | chunks | usage | 结论 |
+|---|---|---|---|---|
+| big3 | 16000 | **1** | 无 | ❌ 无效(已撤回 1725 tok/s) |
+| big4 | 16000 | **1** | 无 | ❌ 无效 |
+| big8 | 1024/4096 | 3 | 有 | ✅ |
+| big10 | 4096/8000 | 3 | 有 | ✅ |
+| big11 | 8000 | 3 | 有 | ✅ |
+### (b) 有效数字(GPU 预填充,全 40 层 ACTIVE,vs 同期 CPU 路径)
+| prompt | GPU TTFT | GPU tok/s | CPU TTFT | CPU tok/s | 加速 |
+|---|---|---|---|---|---|
+| 3655 | **12.11 s** | 302 | 24.17 s | 151 | **2.0×** |
+| 6980 | **15.19 s** | 460 | 42.17 s | 165 | **2.8×** |
+* 成本结构:`≈8.9 s 固定 + 0.79 ms/token`(固定项 = 每 chunk 搬 143.6 GiB/rank;斜率项 = GEMM 随 qlen);
+* `chunks=1` 的教训:**探针必须校验 `chunks>=2 && prompt_tokens`**,否则把错误响应当成"极快"。
+### (c) 仍然成立、且是真正价值的修复(这些有日志/指针级证据)
+1. 环形槽复用(消除每层 3.589 GiB 新分配);
+2. `inter` 复用(消除每层 382 MB);
+3. 设备级 GPU/CPU 判定(消除"前 8 层 GPU、其余 CPU"的混合模式 —— 日志里 40×`DISABLED` 是铁证);
+4. 分块字节转置(42.8 → 6.5 ms/层,`torch.equal` 逐位相同);
+5. staging 真实峰值口径 + 同步路径单槽(10.3 → 7.2 GiB)。
+### (d) 未解决:**16K chunk 仍会 OOM**(在 attention 的 `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`)
+40 GB 卡上 `MBT=16384 + GPU 预填充` 的激活+staging 放不下 ⇒ **当前 GPU 预填充的可用上限是 MBT=8192**。
