@@ -21680,3 +21680,29 @@ out=140355456507904 inter=140234945200128 alloc=28920.8MiB res=30116.0   ← L2
 * 显存预算里要给这次"首请求增长"留 ~8 GiB:**启动时 free ≥ 18 GiB** 才能安全跑完第一个请求;
 * 因此 GPU 预填充的配置要把 `--kv-cache-memory` 压到 **4-8 GiB**(而不是让 util 去填);
 * 之前 big3 末尾的 OOM 是**修复前**的真泄漏(0.42 GiB/层 × 40 + 一次性 7.7)叠加所致,现已闭环。
+
+## §600 ⭐ staging 的**真实峰值**是 ~10.3 GiB(不是 6.72);`--enforce-eager` 反而更吃显存
+### (a) `staging_bytes` 口径 bug(会放过注定 OOM 的配置)
+原式只算 **ping/pong 两槽** = `2×(w13+w2+s13+s2)` = **6.72 GiB** —— 但一次 staging 的**峰值**还包含:
+| 组成 | TP=2 大小 | 说明 |
+|---|---|---|
+| 槽(环形,2 个) | 7.18 GiB | 转置后的 K-major 目标 |
+| `raw13`+`raw2` | 3.16 GiB | 组装目标(转置的输入) |
+| DMA 暂存 | **每张量一份**(~0.45 GiB) | 见 (b) |
+| **合计** | **10.31 GiB** | preflight 需 `×1.10` ≈ **11.34 GiB** 空闲 |
+⇒ 6.72×1.25 = 8.4 GiB 的旧门槛**放过了实际要 10.3 GiB 的配置** ⇒ "预检通过、跑起来 OOM"(big8 就是)。
+### (b) 顺手省 2.7 GiB:DMA 暂存从"每 node 一份"改为"每张量一份"
+`_reuse(("dma", which, node))` → `_reuse(("dma", which))`。同一条 stream 上
+"DMA n → copy n → DMA n+1" **严格有序** ⇒ 复用安全;而每 node 一份会让 ns(=8)份暂存同时常驻。
+### (c) ❗**`--enforce-eager` 会让 free 从 12.95 GiB 掉到 1.4 GiB**(实测,`big9`)
+* 动机本是想省掉"CUDA graph 持久池"(首请求 +7.7 GiB);
+* 实测反效果:同样 KV=4 GiB 下,eager 版**第一个 forward 时只剩 1.4 GiB 空闲**
+  ⇒ preflight 直接拒(prefill 要 11.3 GiB)⇒ **GPU 预填充整段没跑起来**,TTFT 退化成 CPU 的
+  14.5/24.2/42.2 s(2K/4K/8K);
+* ⇒ **结论:保留 CUDA graph(不要 `--enforce-eager`)**,并用 §599 的"首请求一次性增长"去预算;
+  另外注意:第二段 `[cd-timing]` 里 prefill 长度与 TTFT 呈线性 ⇒ 那就是 CPU 路径的特征指纹。
+### (d) 当前推荐的显存配方(TP=2 / MBT=16384 / 有 graph)
+```
+非KV 10 GiB + staging 10.3 + KV 4 + 首请求增长 7.7 + 激活(MBT) ≈ 39 GiB  ⇒ 很紧
+⇒ KV 封顶 2-4 GiB(--kv-cache-memory),不要用 util 去填;启动时 free 要 ≥17 GiB
+```
