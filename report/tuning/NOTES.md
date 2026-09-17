@@ -21089,3 +21089,25 @@ hidden_states, residual, post_mix, res_mix, pre_mix, previous_aux = layer(
 ### (e) 验收(沿用 §572/§576c)
 ①短 prompt(T ≤ 窗口)与关闭时**逐位一致**;②长 prompt **greedy 生成文本逐字节一致**(精确档应当成立);
 ③预填充耗时下降(2048-token 目标 ≥35%);④R-VRAM/数值门/确定性三门不退化。
+
+## §580 ❗**常驻层不减少每步延迟**(今日 5 层复测证实旧结论);短板锁定在"每步启动/同步"
+### (a) 今日对照(TP=2,8K,GP_MIN=1024,THREADS=60·rank⁻¹,COMPILE=0,ShareGPT 16 题 OUT=128)
+| 配置 | C=1 聚合 | C=1 TPOT | C=4 聚合 | C=4 TPOT |
+|---|---|---|---|---|
+| **无常驻**(`conc60`) | 13.85 t/s | 42.86 ms | **46.92 t/s** | 75.98 ms |
+| **常驻 20-24(5 层)**(`res5`) | **14.43 t/s** | **43.19 ms** | 41.42 t/s | 76.74 ms |
+⇒ **TPOT 没改善(反而 +0.33 ms)**;C=4 还略降。聚合好看一点只是因为 TTFT 从 2217→2030 ms。
+* 这与记录 §15809 完全一致:*"`rest`(0.52 ms/层 ≈ 22 ms/token)**不能靠把层搬上 GPU 消除** —— 已用 2 层常驻实测证伪"*。
+* ⇒ **每层 0.45-0.62 ms 的 `rest` 不是"权重的 CPU↔GPU 搬运"**,而是**每步的启动/同步/握手开销** —— 只有
+  "把整步折叠成一次图回放"(CUDA graph)这类手段才能消掉它。
+
+### (b) 因此下一步锁定:**cellV 旗标**(`--compilation-config {"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_DECODE_ONLY"}`)
+* 来历:参考实现 lk 的启动脚本用的那组旗标("cellV" 是首次使用它们的服务 tag);
+* 机理:`FULL_DECODE_ONLY` 把**整个解码步**capture 成一张图 ⇒ 每步一次 replay 代替几百次 kernel launch/同步;
+  `VLLM_COMPILE` 再用 inductor 融合算子、削掉 Python 开销 —— **正好对症**我们的短板;
+* 已知代价:走 `VLLM_COMPILE` 后 vLLM 把 Triton 缓存重定向到按 hash 算出的目录 ⇒ 换旗标/改一行代码要
+  **逐形状重新 JIT**(冷启 237 s);我们已用 `scripts/lib_jitcache.sh` 把目录钉死(见 RUNBOOK §3.5);
+* 待验证(决定它能不能当默认):①数值门/determinism 在 COMPILE=1 下不变;②R-VRAM(1M/投机/常驻)在
+  COMPILE=1 下的显存账是否仍成立;③我们的 CPU MoE 在**图捕获**下的行为(捕获期不能做 host 拷贝;
+  记录 §406 有 `cudaHostRegister` 作废捕获的坑)。
+  ⇒ 今日对照实验:`comp1`(COMPILE=1 + 常驻 20-24,其余同上)。
