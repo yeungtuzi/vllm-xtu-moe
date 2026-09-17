@@ -469,6 +469,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                             av[r][1] = _mm512_loadu_ps(ap + 16);
                         }
                         for (int jj = 0; jj < nj; ++jj) {
+                            { static const bool _pn=[&](){ if(std::getenv("XIAOTU_MOE_TRACE")) fprintf(stderr,"[trace] NR-BRANCH jj-loop (nj=%d mr=%d)\n", nj, mr); return true;}(); (void)_pn; }
                             const int j = j0 + jj;
                             const uint8_t* brow = W + (size_t)(j - rowshift) * (K / 2);
                             XIAOTU_DECODE_GROUP_AVX512(brow, g);
