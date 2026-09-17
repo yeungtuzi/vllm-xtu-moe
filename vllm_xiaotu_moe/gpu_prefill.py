@@ -1188,10 +1188,13 @@ class PrefetchSlot:
             )
 
 
-def slot_for_shapes(tensors, device):
+def slot_for_shapes(tensors, device, nslots: int = 0):
     """按**形状**取/建全局环形槽(所有层共享同一 key),并 alloc 出复用缓冲。
 
-    与 `prefetch_layer` 共用 `_SLOTS`,深度/下限语义一致(≥2;单槽是正确性 bug)。
+    与 `prefetch_layer` 共用 `_SLOTS`。**注意**:`prefetch_layer` 的"≥2 槽"下限是因为
+    它在**侧流上为下一层预取**,单槽会覆盖正在用的权重(正确性 bug);
+    而 **engine-shards 的同步路径** staging 与 GEMM 都在**同一条流**上严格有序
+    ⇒ **单槽是安全的**,且能省 3.59 GiB(§601)。
     返回的 `slot.bufs` 可直接当 `kmajor_from_engine_shards(..., dst=slot.bufs)` 的目标。
     """
     dev = torch.device(device) if not isinstance(device, torch.device) else device
@@ -1199,8 +1202,11 @@ def slot_for_shapes(tensors, device):
     key = (dev.index,) + shapes
     slots = _SLOTS.get(key)
     if slots is None:
-        nslots = max(2, int(os.environ.get("XIAOTU_MOE_PREFETCH_SLOTS", "2") or 2))
-        slots = [PrefetchSlot() for _ in range(nslots)]
+        if nslots and int(nslots) > 0:
+            n = max(1, int(nslots))
+        else:
+            n = max(2, int(os.environ.get("XIAOTU_MOE_PREFETCH_SLOTS", "2") or 2))
+        slots = [PrefetchSlot() for _ in range(n)]
         _SLOTS[key] = slots
     i = _RING.get(key, 0)
     _RING[key] = i + 1

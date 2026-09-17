@@ -1326,7 +1326,7 @@ class _XiaotuExpertsMixin:
                         (_E, hidden_size // _gk, 2 * _I),
                         (_E, _I // 2, hidden_size),
                         (_E, _I // _gk, hidden_size),
-                    ), _dev)
+                    ), _dev, nslots=1)   # 【§601】同步路径单槽即安全(同流有序),省 3.59 GiB
                     _km = kmajor_from_engine_shards(
                         engine, _dev, hidden_size, _I, _E, _gk, dst=_slot.bufs
                     )
