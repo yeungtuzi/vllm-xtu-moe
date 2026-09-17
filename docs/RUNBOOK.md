@@ -386,6 +386,10 @@ python scripts/test_engine_determinism.py 11     # 11 次运行 10/10 逐位相�
    (util=0.90 ⇒ **3.95 GiB**;util=0.55 ⇒ 17.8 GiB)。而预填充 preflight 要 8.4 GiB
    ⇒ **util ≥ 0.8 时 GPU 预填充必然逐层被拒、静默退回 CPU(且混合模式比纯 CPU 更慢)**。
    解法见 §5.8:**显式给 `--kv-cache-memory` 把 KV 池封顶**。
+6b. **kill 服务后必须确认 GPU 显存真的释放**:vLLM 的 worker 常变成**僵尸**(`Zl`, ppid=1)
+   并**继续占着显存**(实测两个 worker 各占 37.9 GiB)⇒ 下一个服务会在启动时 OOM。
+   做法:`nvidia-smi --query-compute-apps=pid,used_memory` 查到 pid 后**反复 `kill -9`** 并等待,
+   直到 `memory.used` 归零再启下一个。(脚本 `/tmp/xtu_killall.sh` 是这套清理。)
 7. **长 prompt 的"预热后只要 ~1 秒"是 prefix-cache 命中,不是预填充吞吐**(§591):
    用**完全相同的 prompt** 连发,第 2 次起整段 KV 命中,量到的是"缓存命中 + 首步"。
    凡是报"预填充 tok/s"的行,必须用**每次从头就不同**的 prompt(首 token 就不同)
