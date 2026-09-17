@@ -1181,6 +1181,13 @@ def _install_ced_diag_shim() -> list[str]:
     return ["init_attn_backend(ced diag)"]
 
 
+# 【§604c fail-safe】metadata 侧与切片侧之间的**唯一握手**。
+# metadata 侧每被调用一次就把 `win` 写成"本步实际改写成的窗口长度"(改写=窗口长,未改写=0);
+# 切片侧**必须**看到 `win > 0` 才允许切。这样即使某一层没被换上 FastPrefill 后端
+# (⇒ 元数据整步没改写),切片也会**自动停用** —— 从"崩"降级为"不生效"。
+_CED_STATE: dict = {"win": 0, "log": 0}
+
+
 def _install_ced_fastprefill_shim() -> list[str]:
     """③ CED 预填充捷径(**默认关**,`XIAOTU_CED_FASTPREFILL=1` 才装,且需 `--kv-sharing-fast-prefill`)。
 
@@ -1261,6 +1268,7 @@ def _install_ced_fastprefill_shim() -> list[str]:
         orig_mk = None
     if orig_mk is not None and not getattr(orig_mk, "_xtu_ced", False):
         win = int(os.environ.get("XIAOTU_CED_WINDOW", "0") or 0)
+        _md_n = [0]
 
         @functools.wraps(orig_mk)
         def make_kv_sharing_fast_prefill_common_attn_metadata(cam, *a, **kw):
@@ -1275,7 +1283,24 @@ def _install_ced_fastprefill_shim() -> list[str]:
                 _log(f"ced 窗口扩展失败(本步不改写): {type(exc).__name__}: {exc}")
                 return cam
             if idx is None:
+                _CED_STATE["win"] = 0        # 【fail-safe】本步未改写 ⇒ 切片侧必须停用
+                # 【§604c 诊断】看清"为什么没武装":`_ced_window_indices` 需要
+                # 单请求 + max_query_len > w;这两个属性在这版 vLLM 里叫什么必须实测。
+                if os.environ.get("XIAOTU_CED_DIAG") == "1" and _md_n[0] < 10:
+                    _md_n[0] += 1
+                    _q = getattr(cam, "query_start_loc", None)
+                    _log(f"[ced-diag] metadata **未武装** w={w} "
+                         f"num_reqs={getattr(cam, 'num_reqs', 'NA')} "
+                         f"max_query_len={getattr(cam, 'max_query_len', 'NA')} "
+                         f"num_actual_tokens={getattr(cam, 'num_actual_tokens', 'NA')} "
+                         f"qsl_shape={None if _q is None else tuple(_q.shape)} "
+                         f"attrs={[k for k in dir(cam) if not k.startswith('_')][:24]}")
                 return cam                      # 本步未武装:完全走上游"未改写"行为
+            _CED_STATE["win"] = int(idx[1])   # 【fail-safe】本步确实改写成了这么长的窗口
+            if os.environ.get("XIAOTU_CED_DIAG") == "1" and _md_n[0] < 10:
+                _md_n[0] += 1
+                _log(f"[ced-diag] metadata **已改写** w={w} "
+                     f"num_logits_indices={idx[1]} padded_shape={tuple(idx[0].shape)}")
             import dataclasses as _dc
             cam2 = _dc.replace(cam, logits_indices_padded=idx[0],
                                num_logits_indices=idx[1])
@@ -1412,10 +1437,20 @@ def _install_ced_slice_shim() -> list[str]:
         w = st["win"]
         if t <= w:
             return orig_layer(self, *a, **kw)
+        if int(_CED_STATE.get("win", 0)) <= 0:
+            # 【§604c fail-safe】metadata 侧本步**没有**改写 ⇒ 绝不能切,否则
+            # slot_mapping(全长)> q 行(窗口长)⇒ `slot_mapping must not exceed q row count`。
+            if os.environ.get("XIAOTU_CED_DIAG") == "1" and _CED_STATE["log"] < 5:
+                _CED_STATE["log"] += 1
+                _log("[ced-diag] 切片**被 fail-safe 拦住**(metadata 本步未改写)⇒ 本步不切片")
+            return orig_layer(self, *a, **kw)
         for name in TOK:
             v = ba.arguments.get(name)
             if hasattr(v, "shape") and v is not None and v.shape and int(v.shape[0]) == t:
                 ba.arguments[name] = v[-w:]
+        if os.environ.get("XIAOTU_CED_DIAG") == "1" and st["hits"] < 30:
+            _log(f"[ced-diag] 层**切片** layer_idx={st.get('idx', {}).get(id(self))} "
+                 f"t={t} -> {w}")
         st["hits"] += 1
         return orig_layer(*ba.args, **ba.kwargs)
 
