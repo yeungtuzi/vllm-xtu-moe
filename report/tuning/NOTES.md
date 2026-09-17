@@ -19792,3 +19792,31 @@ forward_many (moe_v2.hpp:544)
 ③ `moe_v2_packed4.hpp:1041+` batched 那族的入口
 各插一个 `XTU_PROBE`(env 门控,已就位),跑一次 M=1 bench ⇒ **哪条亮就走哪条**,然后在那条路径上
 按 lk 口径(每条 FMA 配几次访存,lk=0.15)做对照与优化。
+
+### §536(i) ✅✅ 找到根因所在:解码路径**确实调用** `matmul_packed4_group`,但它的 **FAST_FP4 优化路径被条件挡掉了**
+在 `matmul_packed4_group` 的**函数入口**(FAST_FP4 判断之前)、`gate_up_slice_batch_impl@1128`、
+`down_slice_batch_impl@1187` 各插 env 门控探针后,M=1 实跑(`XIAOTU_MOE_TRACE=1`)命中:
+
+```
+[trace] nsliced-ENTER            ← forward_many_nsliced
+[trace] gate_up_slice_batch_impl@1128
+[trace] down_slice_batch_impl@1187
+[trace] MPG ENTRY                ← matmul_packed4_group **被调用**
+[trace] PHASE-C(reduce)
+```
+而 §536f 已用插桩证明:**该函数内的两个 `FAST_FP4` 块都不执行**
+(`moe_v2_packed4.hpp:254` 与 `:704`,条件都是 `if (FAST_FP4 && gk == 32 && (K & 31) == 0 && M*K <= 4<<20)`)。
+
+⇒ **结论(证据链完整)**:我们的解码 MXFP4 GEMV 走的是 `matmul_packed4_group` 里
+**FAST_FP4 之下那条通用实现**(即没有 `vdpbf16ps`、也没有 LUT+fp32 展开的那条),
+**精心写的 FAST_FP4 路径在解码上是被绕过的**。这正是"每线程交付带宽只有 lk 一半"的最可能来源,
+也解释了 §530-§536 一路的反汇编困惑:我一直在看**没被启用**的优化路径。
+
+### 下一步(唯一动作,已备好精确表达式)
+打印条件三要素,**但只能放在函数入口**(`gk`/`gn` 在函数体内后面才定义,插在入口会编译失败 —— 已踩两次):
+入口处能用的量是 **模板参数 `FAST_FP4`** 与**形参 `groupK`/`K`/`M`/`N`** ⇒ 打印
+`"[trace] MPG COND FAST_FP4=%d groupK=%d K=%d M=%d"`, `(int)FAST_FP4, groupK, K, M`。
+* 若 `FAST_FP4=0` ⇒ 该实例的 traits 把 FastFP4 传成 false(查 `Packed4WeightTraitsBase` 的模板实参);
+* 若 `groupK != 32` ⇒ 调用点传进来的 groupK 不是 32(查 `forward_many_nsliced` 的 `groupK` 来源),
+  那么**修法可能只是把参数/条件对齐**,就能直接启用现成的 FAST_FP4 内核。
+无论哪种,都指向**一个具体的、可改的参数/条件**,而不是再猜内层。

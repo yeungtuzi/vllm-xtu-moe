@@ -224,6 +224,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                                  // **同一块激活**,原来各转一遍 ⇒ 转换次数减半(§131 处方第 1 步)。
                                  // 不做"跨 job 缓存":rowmap 内容每层都会被重写,按指针做键会陈旧。
                                  const float* a32_in = nullptr, float** a32_out = nullptr) {
+        { static const bool _p=[](){ const bool on=(std::getenv("XIAOTU_MOE_TRACE")!=nullptr); if(on) fprintf(stderr,"[trace] MPG ENTRY\n"); return true;}(); (void)_p; }
     auto arow_at = [&](int i) -> const uint16_t* {
         return A + (size_t)(rowmap ? rowmap[i] : (uint32_t)i) * (size_t)K;
     };
@@ -1130,6 +1131,7 @@ struct Packed4WeightTraitsBase
                                          size_t eid, int groupN, int groupK, int n0, int n1,
                                          const uint32_t* rowmap = nullptr,
                                          size_t cstride = 0, long row0 = 0, size_t up_off = 0) {
+        { static const bool _p=[](){ const bool on=(std::getenv("XIAOTU_MOE_TRACE")!=nullptr); if(on) fprintf(stderr,"[trace] gate_up_slice_batch_impl@1128\n"); return true;}(); (void)_p; }
         if (me <= 0) return;
         if (n1 < 0 || n1 > inter) n1 = inter;
         if (n1 <= n0) return;
@@ -1188,6 +1190,7 @@ struct Packed4WeightTraitsBase
                                       const float* w2_gs, float* down_buf, int hidden, int inter,
                                       size_t eid, int groupN, int groupK, int n0, int n1,
                                       size_t cstride = 0, long row0 = 0) {
+        { static const bool _p=[](){ const bool on=(std::getenv("XIAOTU_MOE_TRACE")!=nullptr); if(on) fprintf(stderr,"[trace] down_slice_batch_impl@1187\n"); return true;}(); (void)_p; }
         if (me <= 0) return;
         if (n1 < 0 || n1 > hidden) n1 = hidden;
         if (n1 <= n0) return;
