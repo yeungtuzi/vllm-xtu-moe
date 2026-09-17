@@ -20889,3 +20889,45 @@ token_ids、首个生成 token 及其 logprob),存成 `report/tuning/ced_prefill
    情况需要处理 —— 把余数并入前一个 chunk 即可;**`MBT < 255` 时整体禁用 CED**(直接 fallback)。
 3. **不需要** per-layer attention metadata、**不需要** mHC 状态序列化。
 ⇒ 下一步即可开始编码:先做第 1 项(默认关、可单独验证"跳过层后 KV 仍正确"),再做第 2 项。
+
+## §574 ✅ **③ 的重大转折**:上游**已有** CED 等价的通用机制(`kv_sharing_fast_prefill`),V4.1 只是**没 opt-in**
+### (a) 发现(全在主线代码里,不是我们写的)
+* `vllm/config/cache.py:221` —— `kv_sharing_fast_prefill: bool = False`,docstring:
+  *"In some KV sharing setups, e.g. YOCO …, **some layers can skip tokens corresponding to prefill**."*
+  CLI:`--kv-sharing-fast-prefill`(`engine/arg_utils.py:1297`),**默认关**。
+* `v1/worker/gpu/attn_utils.py:156 get_kv_sharing_fast_prefill_eligible_layers()`:
+  *"the eligible layers are the **contiguous suffix of KV-sharing layers**"* —— 反向遍历注意力层,
+  取连续尾部的 KV 共享层。判定依据是 `attn_module.kv_sharing_target_layer_name`。
+* `v1/attention/backends/utils.py:997 create_fast_prefill_custom_backend()`:给 eligible 层套一个
+  `FastPrefillAttentionBuilder`,其 `build()` 先用
+  **`make_kv_sharing_fast_prefill_common_attn_metadata()` 改写 common attention metadata**;
+* 该改写(`utils.py:631-676`)做的事:**把 eligible 层的 query 限制到 `logits_indices`**
+  (即每请求的最后一个位置)⇒ 这些层在预填充时**只算 1 个 token** ⇒ **预填充提前退出**。
+* runner 侧:`gpu_model_runner.py:4254` 有硬约束 ——
+  `assert not self.num_prompt_logprobs, "--kv-sharing-fast-prefill produces incorrect logprobs for prompt tokens"`。
+
+### (b) 对 V4.1 的三个结论
+1. ✅ **不必从零写"两相预填充"**:上游已有通用机制(后端包装 + metadata 改写 + 提前退出),
+   我们要做的是**让 V4.1 opt-in**;
+2. ❌ **V4.1 目前没 opt-in**:`grep kv_sharing_target_layer_name vllm/models/deepseek_v41/` **零命中**
+   —— V4.1 的 KV 共享是用 `compress_ratios` + `kv_source_layer_ids` + 压缩器那套表达的,
+   没有向这个通用机制登记 ⇒ 即使开 `--kv-sharing-fast-prefill`,`eligible 集合也是空的`(no-op);
+3. ⚠️ **通用改写对 V4.1 不够**:它只保留 **logits 位置(1 token/请求)**,而 V4.1 的 decoder 层
+   **每层仍有自己的 SWA**(报告 §2.2:"for any layer i, the local keys and values are derived
+   directly from the current layer's hidden state h_i")⇒ 必须保留**最后 `2·w_win−1 = 255` 个位置**,
+   否则层 21..39 的 SWA KV 在窗口内缺失 ⇒ 后续解码读到缺项 ⇒ 错。
+   (这与 §573 的窗口结论完全一致,只是实现载体换成了上游的 metadata 改写。)
+
+### (c) 修正后的 ③ 实现路线(比 §573 更小)
+1. 给 V4.1 的 decoder 层(21..39)登记 `kv_sharing_target_layer_name` → 指向层 20 的缓存
+   (在 `deepseek_v41/attention.py` 里按 `kv_source_layer_id == 20 and not is_kv_source` 判定);
+2. 开 `--kv-sharing-fast-prefill`;
+3. **把 eligible 层的 query 集合从"logits 位置"改成"最后 255 个位置"**(V4.1 专属调整);
+4. **验收必须改成"生成结果"口径**:该模式下 **prompt logprobs 被上游明确判为不正确**(见 (a) 的 assert)
+   ⇒ §572 建立的 `prompt_logprobs` 黄金基线**不能用于该模式的最终验收**;
+   可用的是 **greedy 生成文本逐字节一致**(`probe_greedy.py` + `correctness_prompts.json`,
+   且 §572 已实测"首 token 在 native 噪声下始终稳定")。
+### (d) 下一步
+先做最小可验证实验:只做第 1+2 步(登记 + 开标志),看 eligible 集合是否非空、
+`FastPrefill` 后端能否在 V4.1 的稀疏注意力后端上正常工作、以及"只算 1 token"是否如预期
+**破坏** SWA(预期破坏 ⇒ 正好反证第 3 步的必要性),再用 greedy 生成口径验收。
