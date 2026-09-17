@@ -98,6 +98,15 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     per32k = _env_gib("XIAOTU_VRAM_RESERVE_WORKSPACE_GIB_PER_32K", LONG_SEQ_WORKSPACE_GIB_PER_32K)
     cap_ws = _env_gib("XIAOTU_VRAM_RESERVE_WORKSPACE_CAP_GIB", LONG_SEQ_WORKSPACE_CAP_GIB)
     long_ws = min(cap_ws, per32k * (maxlen / 32768.0))
+    # 【§552 实测】maxlen=1M 时 vLLM 自己的"非 KV"占用约 20 GiB(KV 上限 2.53 GiB、权重 ~8 GiB 的前提下
+    # 实测峰值 30.7 GiB)⇒ 1M 档只剩很少空间给常驻层。对照组:3 层常驻(10 GiB)时 **32K 预填充 OOM**,
+    # 0 层时通过(剩 9.7 GiB)。所以按 R-VRAM 优先级(1M 上下文 > 常驻层)在这里**给 maxlen 加硬上限**。
+    # 边界待更细的 maxlen 扫描来替换成公式;当前用保守阶跃(实测边界在 2-3 层之间)。
+    resident_cap = None
+    if maxlen >= 1_000_000:
+        resident_cap = 2
+    elif maxlen >= 262_144:
+        resident_cap = 3
     reserve = VRAM_RESERVE_GIB + long_ws
     budget = max(0.0, budget - reserve)
 
@@ -140,6 +149,10 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     # 优先级 4:专家层常驻(收益最高 = 解码器靠前的层)
     n = int(budget // per_layer) if per_layer > 0 else 0
     n = max(0, min(n, len(RESIDENT_PRIORITY)))
+    # 【§552 实测硬上限】maxlen 很长时 vLLM 自己的"非 KV"占用很大(1M 实测峰值 30.7 GiB),
+    # 解析式会高估可用空间 ⇒ 用实测标定的阶跃上限兜住(3 层常驻时 32K 预填充 OOM,0 层通过,边界 2-3)。
+    if resident_cap is not None and n > resident_cap:
+        n = resident_cap
     taken = RESIDENT_PRIORITY[:n]
     # 把连续的编号压成区间写法(20,21,22 -> "20-22")
     spec = _ranges([int(x) for x in taken])
