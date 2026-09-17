@@ -1264,17 +1264,22 @@ def _install_ced_fastprefill_shim() -> list[str]:
 
         @functools.wraps(orig_mk)
         def make_kv_sharing_fast_prefill_common_attn_metadata(cam, *a, **kw):
-            # A) 先把窗口算出来(需要 w_win);这里用 static 因调用在**每步一次**的 metadata 构建里,
-            #    不在任何热循环中(§543 的教训只针对逐元素/逐票循环)。
+            # 【§579 修】**武装判据必须与"层切片"完全一致**,否则会出现
+            # "metadata 被改写成只剩 logits 位置、而层仍喂全长"⇒ 实测崩在
+            # `slot_mapping must not exceed q row count`(1256 次)。
+            # 故:未武装 ⇒ **原样返回**(不要委托上游 —— 上游会把 query 限制成 logits 位置)。
             try:
-                w = win or int(getattr(cam, "_xtu_ced_w", 0) or 0) or 255
+                w = win or 255
                 idx = _ced_window_indices(cam, w)
-                if idx is not None:
-                    cam = cam._replace(logits_indices_padded=idx[0],
-                                       num_logits_indices=idx[1])
             except Exception as exc:  # noqa: BLE001
-                _log(f"ced 窗口扩展失败(退回上游行为): {type(exc).__name__}: {exc}")
-            return orig_mk(cam, *a, **kw)
+                _log(f"ced 窗口扩展失败(本步不改写): {type(exc).__name__}: {exc}")
+                return cam
+            if idx is None:
+                return cam                      # 本步未武装:完全走上游"未改写"行为
+            import dataclasses as _dc
+            cam2 = _dc.replace(cam, logits_indices_padded=idx[0],
+                               num_logits_indices=idx[1])
+            return orig_mk(cam2, *a, **kw)
 
         make_kv_sharing_fast_prefill_common_attn_metadata._xtu_ced = True  # type: ignore
         _bu.make_kv_sharing_fast_prefill_common_attn_metadata = (
@@ -1284,10 +1289,20 @@ def _install_ced_fastprefill_shim() -> list[str]:
 
 
 def _ced_window_indices(cam, w: int):
-    """把"每请求最后 w 个位置"展平成 padded 索引张量(num_logits_indices, tensor)。"""
+    """把"每请求最后 w 个位置"展平成 padded 索引张量;返回 None = **本步不武装**。
+
+    武装条件(必须与模型侧的层切片一致,§579):
+    * **单请求**(多请求 flat batch 不能切"最后 N 行");
+    * 本步是 prefill 且 query 长度 > w(`max_query_len > w`);
+    ⇒ 只有满足时才改写 metadata;否则原样返回,保证"不切片 ⇒ 不改写"。
+    """
     import torch
     qsl = getattr(cam, "query_start_loc", None)
     if qsl is None or qsl.numel() < 2:
+        return None
+    if int(getattr(cam, "num_reqs", 0) or 0) != 1:
+        return None
+    if int(getattr(cam, "max_query_len", 0) or 0) <= int(w):
         return None
     n_req = int(qsl.numel()) - 1
     idxs = []

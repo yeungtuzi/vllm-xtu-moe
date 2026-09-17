@@ -55,7 +55,10 @@ LONG_SEQ_WORKSPACE_GIB_PER_32K = 5.0
 LONG_SEQ_WORKSPACE_CAP_GIB = 6.0
 GPU_PREFILL_GIB = 3.0           # MBT=8192 的激活/工作区 + ping/pong 双槽的额外部分(待精确测,先保守按 3.0)
                                 # 注:双槽本身 ≈ 2×一层 K-major(TP=2 每层 ~1.7 GB)≈ 3.4 GB,已含在此数内
-DRAFT_GIB_PER_RANK = 7.388 / 2  # mtp 全量 7.388 GiB,TP=2 ⇒ 每 rank 一半
+DRAFT_GIB_PER_RANK = 7.388 / 2  # **草稿 = DSpark 投机解码**(算法名);其权重在 checkpoint 里
+                                # 存为 `mtp.0/1/2`(config `num_nextn_predict_layers=3`),
+                                # 沿用 DeepSeek-V3 的 MTP 命名 ⇒ **mtp 是权重命名,不是算法名**。
+                                # 全量 7.388 GiB,TP=2 ⇒ 每 rank 一半
 RESIDENT_GIB_PER_LAYER = 3.36   # V4.1:6.72/TP(=2)
 GPU_PREFILL_HOST_GIB = 0.0      # 【§508 更正】GPU 预填充走 ping/pong(2 槽)+ 从**引擎分片**直接填 K-major
                                 # ⇒ 主机侧代价 **0**。此前记的 253 GiB/rank 是"Python 侧再 clone 一份"
