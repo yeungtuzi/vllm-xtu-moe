@@ -927,6 +927,8 @@ static void bind_moe_class(py::module& m, const char* name) {
             return d;
         })
         // which: 0 = w13 shard(node), 1 = w2 shard(node), 2 = w13 scales, 3 = w2 scales
+        // 【§610】一次性把自有 host 分片锁页(幂等;返回成功个数)。
+        .def("pin_hostbufs", [](MOE& self) -> size_t { return self.pin_hostbufs(); })
         .def("copy_hostbuf_to_device",
              [](MOE& self, int which, int node, uintptr_t dst, uintptr_t stream) -> size_t {
             const void* src = self.host_wbuf(which, node);

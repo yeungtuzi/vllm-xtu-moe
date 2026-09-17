@@ -1533,6 +1533,33 @@ public:
     size_t shard_w2_cbytes() const { return g_w2_cbytes_; }
     // which: 0 = w13 (per-node shard), 1 = w2 (per-node shard),
     //        2 = w13 scales (single copy), 3 = w2 scales (single copy)
+    // 【§610】把**自有 host 分片就地锁页**(cudaHostRegister)。
+    //
+    // 为什么:GPU 预填充的 staging 是从这些分片 DMA 到显存的。它们是 `mmap`/`numa_alloc_onnode`
+    // 出来的 **pageable** 内存,实测只有 16-21 GB/s;而同一台机器上**锁页**拷贝是 **26.85 GB/s**
+    // (微基准 5.74 s/chunk vs 现在的 8.9 s)⇒ 每 chunk 省 ~3 s,直接换算成预填充吞吐。
+    // **不额外占内存**(只是把已有页锁住,不复制),符合"不得额外多占系统内存"的约束。
+    // 返回成功锁页的缓冲个数;失败只记数不抛(调用方可回退到 pageable)。
+    size_t pin_hostbufs() {
+        size_t ok = 0, tried = 0;
+        auto reg = [&](const void* ptr, size_t bytes) {
+            if (!ptr || !bytes) return;
+            ++tried;
+            cudaError_t rc = cudaHostRegister(const_cast<void*>(ptr), bytes,
+                                              cudaHostRegisterDefault);
+            if (rc == cudaSuccess || rc == cudaErrorHostMemoryAlreadyRegistered) ++ok;
+            else fprintf(stderr, "[pin] cudaHostRegister 失败(%zu bytes): %s\n",
+                         bytes, cudaGetErrorString(rc));
+        };
+        const size_t n13 = shard_w13_node_bytes(), n2 = shard_w2_node_bytes();
+        for (size_t i = 0; i < w13_shard_.size(); ++i) reg(w13_shard_[i], n13);
+        for (size_t i = 0; i < w2_shard_.size(); ++i) reg(w2_shard_[i], n2);
+        reg(w13_g_, scale_w13_bytes());
+        reg(w2_g_, scale_w2_bytes());
+        fprintf(stderr, "[pin] host 分片锁页: %zu/%zu 个缓冲成功\n", ok, tried);
+        return ok;
+    }
+
     const void* host_wbuf(int which, int node) const {
         if (which == 0) return (node >= 0 && node < (int)w13_shard_.size()) ? w13_shard_[node] : nullptr;
         if (which == 1) return (node >= 0 && node < (int)w2_shard_.size()) ? w2_shard_[node] : nullptr;
