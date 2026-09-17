@@ -21052,3 +21052,40 @@ for layer_name, attn_module in attn_layers.items():
   (含中点层的 query/KV 分离、`cache[1]` 丢弃、logits 零填充且只采末位);
 * **精度档位**:128(近似,omlx 选择)vs 255(我们论证的精确档)——建议**先做 255 精确档**,
   用 §572 的"首 token/贪心文本一致"验收;要更快要精度就再切 128 并**明确标注精度代价**。
+
+## §578 ③ 层循环级切片的**实现设计**(按 §577 修正方向;读 `model.py:706-768` 后落定,含三个致命细节)
+### (a) 插桩点(读完代码后确定)
+`DeepseekV4Model.forward` 的层循环(`model.py:706-721`)是把状态**串起来**的:
+```python
+hidden_states, residual, post_mix, res_mix, pre_mix, previous_aux = layer(
+    hidden_states, positions, input_ids, pre_mix, post_mix, res_mix, residual,
+    engram_hashes, engram_mask, capture_previous_aux=idx in self.aux_hidden_state_layers)
+```
+⇒ **回调方直接使用每层返回的值** ⇒ 只要某一层返回"尾部切片"的尺寸,后续层自然全部按尾部走
+(无需改层循环本身)= **可以做到纯插件实现**(monkeypatch 层的 forward),不必改主线文件。
+
+### (b) 三个必须处理的细节(本轮新发现)
+1. **必须按请求切片,不能切 flat batch 的尾部**。vLLM 把多请求 token 连续排成一条 flat batch
+   (`query_start_loc` 分段)⇒ "最后 N 行"只对**单请求**批正确。**第一版门控:仅当本批恰好是
+   单个连续 prefill**(`positions` 单调且 `positions[-1]-positions[0]+1 == numel`)时启用,
+   其余情形**直接走原路径**(fail-open,不改行为)。
+2. **aux / DSpark 交互**:`dspark_target_layer_ids=[37,38,39]` 落在被切范围内,而
+   `previous_aux` 是**投机器预热**(`DSpark.capture_prompt`)用的;切了会让 draft 上下文不全。
+   **第一版门控:开着投机解码时禁用 CED**(omlx 也是把 verify 块留在正常路径,并把
+   `capture_prompt` 的 span 改成 aux 的长度)。后续要做再按 omlx 的口径处理。
+3. **末尾必须零填充回全长**:runner 用 `hidden_states[logits_indices]` 取采样位置,
+   模型返回短张量会**索引错位**。做法:包住 `DeepseekV4Model.forward`,在返回前把
+   尾部隐藏状态**零填充回 `T`**(被跳过位置填 0),采样位置在尾部内 ⇒ 索引语义不变
+   (omlx 同样用零填充 + "跳过位置不采样")。
+### (c) 与 §576 的关系:两处**都要**,不是二选一
+* **元数据改写**(§576 第 2 项,窗口 = 尾部长度):让被切层的**注意力**只处理尾部 query;
+* **隐藏状态切片**(本节):让被切层的**MLP/MoE** 也只处理尾部 —— 这才是本机(CPU MoE 主导)
+  能拿到收益的关键。
+* §576 第 1 项的判据**必须修正**:eligible 只能是 **ratio-1 连续尾段(21..39,共 19 层)**;
+  中点层 20 保持完整(它的压缩器需要完整隐状态;这样只多花 1 层的全序列代价,换来实现简单)。
+### (d) 精度档位
+* 尾部长度 `XIAOTU_CED_WINDOW`:默认 **255**(§573b 论证的**精确**档);取 128 是 omlx 的**近似**档
+  (它自己的测试断言长序列末位 logits 与完整计算不等)⇒ 想要更快再切 128,并必须标注精度代价。
+### (e) 验收(沿用 §572/§576c)
+①短 prompt(T ≤ 窗口)与关闭时**逐位一致**;②长 prompt **greedy 生成文本逐字节一致**(精确档应当成立);
+③预填充耗时下降(2048-token 目标 ≥35%);④R-VRAM/数值门/确定性三门不退化。
