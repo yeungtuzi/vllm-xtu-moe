@@ -19,7 +19,7 @@ PORT="${PORT:-8700}"
 TAG="${TAG:-acc}"
 HOST="${HOST:-127.0.0.1}"
 MODEL="${MODEL:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master}"
-SERVED="${SERVED:-dsv41}"
+SERVED="${SERVED:-dsv41-xtu}"   # ⚠️ 必须与服务的 --served-model-name 一致,否则全部请求 4xx(Successful=0)
 LENS="${LENS:-32,256,1024,4096,16384,32768}"
 CONC="${CONC:-1,2,4,8}"
 OUTLEN="${OUTLEN:-128}"
