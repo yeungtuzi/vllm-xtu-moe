@@ -26,7 +26,7 @@ THREADS="${THREADS:-60}"   # 与 serve_v41.sh 的新默认一致(TP=2 ⇒ 每 ra
 TAG="${TAG:-xtuown}"
 WCOPY="${WCOPY:-}"          # 留空 = 用代码的条件默认(GPU 预填充开则 1,关则 0)
 RELEASE_SOURCE="${RELEASE_SOURCE:-1}"
-SPIN="${SPIN:-0}"
+SPIN="${SPIN:-300}"
 GP_MIN="${GP_MIN:-0}"      # VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:>0 时 qlen>=该值 的层走 GPU 预填充
 RESIDENT="${RESIDENT:-}"  # XIAOTU_MOE_GPU_RESIDENT_LAYERS,如 0-3,20-22
 RESIDENT_BUDGET_GB="${RESIDENT_BUDGET_GB:-}"   # 常驻额度(§509:必须在 KV 之后预算,否则会挤掉 1M 上下文)

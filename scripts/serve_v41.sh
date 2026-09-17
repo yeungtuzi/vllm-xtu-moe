@@ -210,9 +210,13 @@ if [ "$VRAM_POLICY" = "1" ]; then
   fi
 fi
 THREADS_DEFAULT="${THREADS_DEFAULT:-60}"
-# 自旋 5000 µs 是 §355 记录过的正反馈灾难(48 层 × 3 相 × 5 ms ⇒ 池几乎永不停转),
-# 与上面的超订叠在一起会互相放大 ⇒ 默认 0(完全不自旋,worker 直接 futex 睡)。
-SPIN_DEFAULT="${SPIN_DEFAULT:-0}"
+# 【§557 更正】自旋默认从 **0 改成 300**(与插件 hybrid_model.py 的 setdefault 一致)。
+# 历史:§355 记录过 **5000 µs** 是正反馈灾难(48 层 × 3 相 × 5 ms ⇒ 池几乎永不停转),
+# 于是当时钉成 0 —— 但那是**过度推广**。两次实测(§526、§557,解码形状 M=1/DEDUP=6):
+#   SPIN=0 → 0.94-1.00 ms/层("完全不自旋"让每次 phase 唤醒都走 futex,每层白付 ~0.5 ms)
+#   SPIN=300 → 0.44 ms/层(快 2.2×);  SPIN=1000/未设 → 0.44 / 0.43
+# ⇒ 正确区间是"几百微秒",既不是 0 也不是 5000。
+SPIN_DEFAULT="${SPIN_DEFAULT:-300}"
 XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
 {
   echo "XIAOTU_MOE_THREADS=${XIAOTU_MOE_THREADS:-$THREADS_DEFAULT}"
