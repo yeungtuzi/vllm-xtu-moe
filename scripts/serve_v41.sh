@@ -199,7 +199,7 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
 VRAM_POLICY="${VRAM_POLICY:-1}"
 POLICY_GP_MIN=""; POLICY_RESIDENT=""; POLICY_DRAFT=""
 if [ "$VRAM_POLICY" = "1" ]; then
-  _PLAN="$(MAXLEN="$MAXLEN" "$PY" -m vllm_xiaotu_moe.vram_policy --maxlen "$MAXLEN" --emit-env 2>/dev/null \
+  _PLAN="$(MAXLEN="$MAXLEN" "$PY" -m vllm_xiaotu_moe.vram_policy --maxlen "$MAXLEN" --tp "$TP" --emit-env 2>/dev/null \
             | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' || true)"
   if [ -n "$_PLAN" ]; then
     POLICY_GP_MIN="$(printf '%s\n' "$_PLAN" | sed -n 's/^VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=//p')"

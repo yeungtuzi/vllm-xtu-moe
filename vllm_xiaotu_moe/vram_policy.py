@@ -102,11 +102,17 @@ def plan(*, maxlen: int, free_gib: float | None = None,
     # 实测峰值 30.7 GiB)⇒ 1M 档只剩很少空间给常驻层。对照组:3 层常驻(10 GiB)时 **32K 预填充 OOM**,
     # 0 层时通过(剩 9.7 GiB)。所以按 R-VRAM 优先级(1M 上下文 > 常驻层)在这里**给 maxlen 加硬上限**。
     # 边界待更细的 maxlen 扫描来替换成公式;当前用保守阶跃(实测边界在 2-3 层之间)。
+    # 【§554 实测,TP 相关】1M 档:TP=2 实测 2 层通过(峰值 38.25/38.28 GiB,余 ~2.2 GiB)、3 层 OOM;
+    # TP=1 实测 **0 层**时峰值 35.4 GiB(余 ~5 GiB)⇒ 再加 1 层(+6.72)必超 ⇒ TP=1 上限 0。
+    # 根因:maxlen 很长时 vLLM 自身的非 KV 占用(~20 GiB)不在解析式里,只能靠实测标定。
+    _tp_eff = max(1, int(_env_gib("XIAOTU_T_VRAM_TP", os.environ.get("TP", 2))))
     resident_cap = None
     if maxlen >= 1_000_000:
-        resident_cap = 2
+        resident_cap = 2 if _tp_eff <= 2 else 0
+        if _tp_eff == 1:
+            resident_cap = 0
     elif maxlen >= 262_144:
-        resident_cap = 3
+        resident_cap = 3 if _tp_eff >= 2 else 1
     reserve = VRAM_RESERVE_GIB + long_ws
     budget = max(0.0, budget - reserve)
 
@@ -223,8 +229,12 @@ def main() -> int:
     ap.add_argument("--free-gib", type=float, default=None,
                     help="KV 之后**实测**的剩余显存(给了就用它,否则用解析口径)")
     ap.add_argument("--emit-env", action="store_true")
+    ap.add_argument("--tp", type=int, default=int(__import__("os").environ.get("TP", 2)),
+                    help="张量并行度:每层常驻/draft 的每卡占用按 6.72/TP 与 7.388/TP 缩放(默认 2)")
     a = ap.parse_args()
-    p = plan(maxlen=a.maxlen, free_gib=a.free_gib)
+    _tp = max(1, int(getattr(a, "tp", 2)))
+    _scale = 2.0 / _tp
+    p = plan(maxlen=a.maxlen, resident_per_layer_gib=6.72 / _tp, gpu_prefill_gib=None, draft_gib=7.388 / _tp, free_gib=a.free_gib)
     if a.emit_env:
         print(emit_env(p))
         return 0
