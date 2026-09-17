@@ -1099,6 +1099,195 @@ def _install_engram_ablate_shim() -> list[str]:
     return [f"Engram.forward(ablate via {path})"]
 
 
+def _install_ced_diag_shim() -> list[str]:
+    """③ 的诊断探针(**默认关**,`XIAOTU_CED_DIAG=1` 才装):把 fast-prefill 相关的
+    "层名 / 类型 / compress_ratio / KV cache group" 一次性打出来(§575d)。
+
+    为什么必须先问清:上游 `get_kv_sharing_fast_prefill_eligible_layers()` 用
+    `get_layers_from_vllm_config(vllm_config, Attention)` 取层,而 V4.1 的注意力类是
+    `DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC)` —— **是否属于 `Attention`
+    必须实测**;而且 `init_attn_backend` 是用 **`kv_cache_group_spec.layer_names`** 去命中
+    eligible 集合的,所以"该填哪个名字"也只有在真机上才看得准。
+    **本探针只打印,不改任何行为。**
+    """
+    if os.environ.get("XIAOTU_CED_DIAG") != "1":
+        return []
+    try:
+        from vllm.v1.worker.gpu import attn_utils as _au
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip ced diag shim: {type(exc).__name__}: {exc}")
+        return []
+    orig = getattr(_au, "init_attn_backend", None)
+    if orig is None or getattr(orig, "_xtu_ced_diag", False):
+        return []
+
+    def _dump(kv_cache_config, vllm_config):
+        import vllm.attention.layer as _al
+        from vllm.model_executor.layers.attention_layer_base import (
+            AttentionLayerBase as _ALB,
+        )
+        try:
+            from vllm.config.vllm import get_layers_from_vllm_config as _gl
+        except Exception:  # noqa: BLE001
+            from vllm.config import get_layers_from_vllm_config as _gl  # type: ignore
+        print(f"[ced-diag] kv_sharing_fast_prefill="
+              f"{getattr(vllm_config.cache_config, 'kv_sharing_fast_prefill', '?')}",
+              flush=True)
+        for base_name, base in (("Attention", getattr(_al, "Attention", None)),
+                                ("AttentionLayerBase", _ALB)):
+            if base is None:
+                continue
+            try:
+                d = _gl(vllm_config, base)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ced-diag] {base_name}: get_layers 失败 {exc}", flush=True)
+                continue
+            print(f"[ced-diag] {base_name}: {len(d)} 个模块", flush=True)
+            shown = 0
+            for k, m in d.items():
+                cr = getattr(m, "compress_ratio", None)
+                iks = getattr(m, "is_kv_source", None)
+                kst = getattr(m, "kv_sharing_target_layer_name", None)
+                if cr is None and iks is None and kst is None:
+                    if shown < 3:
+                        print(f"[ced-diag]    {k}  (无 CR/源/共享属性)", flush=True)
+                        shown += 1
+                    continue
+                print(f"[ced-diag]    {k}  compress_ratio={cr} is_kv_source={iks} "
+                      f"kv_sharing_target={kst!r}", flush=True)
+            # 上游 eligible 判决的实际返回
+            try:
+                el = _au.get_kv_sharing_fast_prefill_eligible_layers(vllm_config)
+                print(f"[ced-diag] 上游 eligible={len(el)} {sorted(el)[:6]}", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ced-diag] eligible 判决失败 {type(exc).__name__}: {exc}", flush=True)
+        try:
+            for g in kv_cache_config.kv_cache_groups[:3]:
+                print(f"[ced-diag] kv_cache_group layer_names[:6]="
+                      f"{list(g.layer_names)[:6]}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ced-diag] groups 读取失败 {exc}", flush=True)
+
+    @functools.wraps(orig)
+    def init_attn_backend(kv_cache_config, vllm_config, device, *a, **kw):
+        try:
+            _dump(kv_cache_config, vllm_config)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ced-diag] dump 失败 {type(exc).__name__}: {exc}", flush=True)
+        return orig(kv_cache_config, vllm_config, device, *a, **kw)
+
+    init_attn_backend._xtu_ced_diag = True  # type: ignore[attr-defined]
+    _au.init_attn_backend = init_attn_backend
+    return ["init_attn_backend(ced diag)"]
+
+
+def _install_ced_fastprefill_shim() -> list[str]:
+    """③ CED 预填充捷径(**默认关**,`XIAOTU_CED_FASTPREFILL=1` 才装,且需 `--kv-sharing-fast-prefill`)。
+
+    复用上游已有的"eligible 层改写 attention metadata + 提前退出"框架,只补两处 V4.1 专属差异:
+
+    A) **eligible 判据**:上游用 `get_layers_from_vllm_config(vllm_config, Attention)`,而 V4.1 的
+       `DeepseekV4Attention` 继承的是 `AttentionLayerBase`(**不是** `Attention`)⇒ 上游对 V4.1
+       结构上必然返回空集。这里改成用 `AttentionLayerBase` 遍历,筛
+       `compress_ratio > 0 and not is_kv_source`(即"读共享压缩 KV、但自己仍有 SWA"的消费者层 = 21..39)。
+       **不动 `get_kv_cache_spec`** ⇒ 各层 SWA 缓存照旧分配(§575a 的否决点绕开)。
+
+    B) **保留哪些 query 位置**:上游只保留 `logits_indices`(每请求 1 个位置),而 V4.1 的 decoder 层
+       每层有自己的 SWA(窗口 `w_win`),必须保留**最后 `2·w_win−1` 个位置**(§573b 的因果论证)。
+       做法:把索引集合扩成"每个请求最后 W 个位置"再**委托给上游原函数** ⇒ 整套
+       `query_start_loc`/`seq_lens`/block_table/slot_mapping 的重建逻辑全部免费复用。
+    """
+    if os.environ.get("XIAOTU_CED_FASTPREFILL") != "1":
+        return []
+    applied: list[str] = []
+    try:
+        import vllm.v1.worker.gpu.attn_utils as _au
+        from vllm.model_executor.layers.attention_layer_base import (
+            AttentionLayerBase as _ALB,
+        )
+        from vllm.config.vllm import get_layers_from_vllm_config as _gl
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip ced fastprefill shim: {type(exc).__name__}: {exc}")
+        return []
+
+    orig_elig = getattr(_au, "get_kv_sharing_fast_prefill_eligible_layers", None)
+    if orig_elig is not None and not getattr(orig_elig, "_xtu_ced", False):
+        @functools.wraps(orig_elig)
+        def get_kv_sharing_fast_prefill_eligible_layers(vllm_config, *a, **kw):
+            out = set(orig_elig(vllm_config, *a, **kw))    # 上游结果(对 V4.1 为空)
+            try:
+                d = _gl(vllm_config, _ALB)
+                mine = {n for n, m in d.items()
+                        if getattr(m, "compress_ratio", 0)
+                        and not getattr(m, "is_kv_source", False)}
+                if mine:
+                    print(f"[ced-fastprefill] 追加 V4.1 eligible {len(mine)} 层: "
+                          f"{sorted(mine)[:3]} … {sorted(mine)[-1:]}", flush=True)
+                out |= mine
+            except Exception as exc:  # noqa: BLE001
+                _log(f"ced eligible 追加失败: {type(exc).__name__}: {exc}")
+            return out
+
+        get_kv_sharing_fast_prefill_eligible_layers._xtu_ced = True  # type: ignore
+        _au.get_kv_sharing_fast_prefill_eligible_layers = (
+            get_kv_sharing_fast_prefill_eligible_layers)
+        applied.append("get_kv_sharing_fast_prefill_eligible_layers(V4.1 判据)")
+
+    try:
+        import vllm.v1.attention.backends.utils as _bu
+        orig_mk = getattr(_bu, "make_kv_sharing_fast_prefill_common_attn_metadata", None)
+    except Exception:  # noqa: BLE001
+        orig_mk = None
+    if orig_mk is not None and not getattr(orig_mk, "_xtu_ced", False):
+        win = int(os.environ.get("XIAOTU_CED_WINDOW", "0") or 0)
+
+        @functools.wraps(orig_mk)
+        def make_kv_sharing_fast_prefill_common_attn_metadata(cam, *a, **kw):
+            # A) 先把窗口算出来(需要 w_win);这里用 static 因调用在**每步一次**的 metadata 构建里,
+            #    不在任何热循环中(§543 的教训只针对逐元素/逐票循环)。
+            try:
+                w = win or int(getattr(cam, "_xtu_ced_w", 0) or 0) or 255
+                idx = _ced_window_indices(cam, w)
+                if idx is not None:
+                    cam = cam._replace(logits_indices_padded=idx[0],
+                                       num_logits_indices=idx[1])
+            except Exception as exc:  # noqa: BLE001
+                _log(f"ced 窗口扩展失败(退回上游行为): {type(exc).__name__}: {exc}")
+            return orig_mk(cam, *a, **kw)
+
+        make_kv_sharing_fast_prefill_common_attn_metadata._xtu_ced = True  # type: ignore
+        _bu.make_kv_sharing_fast_prefill_common_attn_metadata = (
+            make_kv_sharing_fast_prefill_common_attn_metadata)
+        applied.append(f"make_kv_sharing_fast_prefill_common_attn_metadata(窗口={win or '默认'})")
+    return applied
+
+
+def _ced_window_indices(cam, w: int):
+    """把"每请求最后 w 个位置"展平成 padded 索引张量(num_logits_indices, tensor)。"""
+    import torch
+    qsl = getattr(cam, "query_start_loc", None)
+    if qsl is None or qsl.numel() < 2:
+        return None
+    n_req = int(qsl.numel()) - 1
+    idxs = []
+    for r in range(n_req):
+        s = int(qsl[r].item()); e = int(qsl[r + 1].item())
+        if e <= s:
+            continue
+        idxs.append(list(range(max(s, e - w), e)))
+    if not idxs:
+        return None
+    flat = [i for g in idxs for i in g]
+    pad = getattr(cam, "logits_indices_padded", None)
+    n = len(flat)
+    if pad is not None and pad.numel() >= n:
+        out = pad.clone()
+        out[:n] = torch.tensor(flat, dtype=pad.dtype, device=pad.device)
+        return out, n
+    t = torch.tensor(flat, dtype=torch.int64, device=qsl.device)
+    return t, n
+
+
 def apply_mainline_shims() -> list[str]:
     """Idempotently install all shims; returns the list of things applied."""
     if not mixed_mode_enabled():
@@ -1116,6 +1305,8 @@ def apply_mainline_shims() -> list[str]:
         _install_build_kernel_probe,
         _install_engram_materialize_shim,
         _install_engram_ablate_shim,
+        _install_ced_diag_shim,
+        _install_ced_fastprefill_shim,
         _install_oracle_shims,
         _install_prepack_shims,
         _install_mxfp4_cpu_convert_shim,

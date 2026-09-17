@@ -20970,3 +20970,33 @@ for layer_name, attn_module in attn_layers.items():
 ①服务能起 + 日志确认 eligible 集合 = 层 21..39;②`T ≤ 255` 的请求与今天**逐位一致**;
 ③长 prompt 下 **greedy 生成文本与关闭时逐字节一致**(§572 已证"首 token 在 native 噪声下稳定");
 ④预填充耗时相对关闭时下降(2048-token 目标 ~35%,8192 ~44%,见 §573c)。
+
+## §576 ✅ ③ 实现落地(**env 门控、默认关**):两处 wrapper 复用上游改写,并查明"上游对 V4.1 必然空集"的**类型级**原因
+### (a) 硬事实(实测 + 读码)
+* `Attention` 的真实来源是 `vllm.model_executor.layers.attention import Attention`
+  (不是 `vllm.attention`,诊断 shim 第一版就是因此报 `No module named 'vllm.attention'`);
+* V4.1 的注意力类是 `class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC)`
+  ⇒ **不是 `Attention` 的子类** ⇒ 上游 `get_kv_sharing_fast_prefill_eligible_layers()` 里
+  `get_layers_from_vllm_config(vllm_config, Attention)` 对 V4.1 **必然返回空 dict**
+  ⇒ eligible **结构上必为空**(不只是"没登记属性")。**开 `--kv-sharing-fast-prefill` 今天必然是 no-op**,
+  实测也证实:开标志启动,服务正常(351.3 s / 峰值 629.6 GiB 不变)。
+* 另外 `get_kv_cache_spec()` 里"凡有 `kv_sharing_target_layer_name` 就 `continue`"⇒ **绝不能**用那个属性
+  给 V4.1 登记(会丢 SWA,§575a)。
+
+### (b) 实现(我们的插件里两处 wrapper,`XIAOTU_CED_FASTPREFILL=1` 才装)
+1. **eligible 判据**:包住 `attn_utils.get_kv_sharing_fast_prefill_eligible_layers`,在上游结果上并上
+   `get_layers_from_vllm_config(vllm_config, AttentionLayerBase)` 里
+   `compress_ratio > 0 and not is_kv_source` 的层(= 21..39);
+   **完全不动 `get_kv_cache_spec`** ⇒ SWA 缓存照旧。
+2. **窗口**:包住 `backends/utils.make_kv_sharing_fast_prefill_common_attn_metadata`,
+   **先把索引集合替换成"每请求最后 W 个位置"再委托上游原函数**
+   (`XIAOTU_CED_WINDOW`,默认 255)⇒ 上游那套 `query_start_loc`/`seq_lens`/block_table/slot_mapping
+   的重建逻辑**全部免费复用**。
+* 安装时机已实测:插件导入时即装(日志 `mainline shims applied (32)` 里含这两项),
+  **早于** `init_attn_backend`(KV cache 初始化时读 eligible)✓;
+* 默认关时 `apply_mainline_shims` 里**不出现**这两项 ⇒ 出货路径零改动 ✓。
+
+### (c) 待验证(下一轮,已明确)
+① 日志出现 `[ced-fastprefill] 追加 V4.1 eligible N 层: ...`(N 应为 19);② 服务能起、无 assert;
+③ `T ≤ 255` 的请求与关闭 CED 时**逐位一致**;④ 长 prompt 下 **greedy 生成文本逐字节一致**;
+⑤ 预填充耗时下降(2048-token 目标 ~35%)。**本节只到"代码就位 + 默认零影响",效果未证。**

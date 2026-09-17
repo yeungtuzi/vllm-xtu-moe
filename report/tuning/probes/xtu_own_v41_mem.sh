@@ -40,6 +40,7 @@ CD_TIMING="${CD_TIMING:-0}"       # 1 = 打开**引擎侧**每层分相计时([c
                                    #   比 LAYER_TIMING 更有用:它写在引擎回调里,所以 **cudagraph replay 时也会打**
                                    #   (Python 的 apply() 在 replay 时不执行 ⇒ LAYER_TIMING 量不到稳态解码)。
 LAYER_TIMING="${LAYER_TIMING:-0}"   # 1 = 打开每层分相计时(§515)      # 1 = 参考脚本的 --compilation-config {"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_DECODE_ONLY"}          # 1 = 开 DSpark 投机(draft=mtp,默认常驻 GPU)
+KVSHARE="${KVSHARE:-0}"    # 1 = 传 --kv-sharing-fast-prefill(§574/§575 的 ③ 实验)
 PREFIX_CACHE="${PREFIX_CACHE:-1}"   # 0 = --no-enable-prefix-caching(用于"预填充可复现性"对照实验,§572)
 PROFILE_DIR="${PROFILE_DIR:-}"   # 非空 = 开 torch profiler;
                                  #   服务起来后 `curl -X POST localhost:$PORT/start_profile` / `/stop_profile`,
@@ -119,6 +120,7 @@ RUN_ENV="$RUN_ENV" READY_TIMEOUT="${READY_TIMEOUT:-2400}" \
   $( [ "$PREFIX_CACHE" = "1" ] && echo --enable-prefix-caching || echo --no-enable-prefix-caching ) \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --kernel-config '{"enable_jit_warmup": false}' \
+  $( [ "$KVSHARE" = "1" ] && echo --kv-sharing-fast-prefill ) \
   $( [ -n "$PROFILE_DIR" ] && printf -- "--profiler-config {\"profiler\":\"torch\",\"torch_profiler_dir\":\"%s\",\"torch_profiler_with_stack\":false}" "$PROFILE_DIR" ) \
   $( [ "$COMPILE" = "1" ] && echo --compilation-config "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"mode\":\"VLLM_COMPILE\"${JITCACHE_CC_EXTRA}}" ) \
   $( [ "$SPEC" = "1" ] && echo --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' ) \
