@@ -30,6 +30,8 @@ PY="$ENV/bin/python"
 
 run_one() {  # $1=len $2=conc $3=n $4=warm
   local L="$1" C="$2" N="$3" W="$4" RN=""
+  # ⚠️ 预热轮与正式轮**必须不同 seed**:同 seed ⇒ prompt 完全相同 ⇒ 正式轮整段命中前缀缓存
+  #    (TTFT 掉到几百 ms),量到的就不是预填充(§603 实测:L=16384 C=1 假得 469ms)。
   [ "$W" = "1" ] && RN="warm_"
   XIAOTU_ENV_FILE=/dev/null "$PY" -m vllm.entrypoints.cli.main bench serve \
     --backend openai-chat --host "$HOST" --port "$PORT" \
@@ -37,7 +39,7 @@ run_one() {  # $1=len $2=conc $3=n $4=warm
     --endpoint /v1/chat/completions \
     --dataset-name random --random-input-len "$L" --random-output-len "$OUTLEN" \
     --num-prompts "$N" --max-concurrency "$C" \
-    --ignore-eos --seed "$((L + C))" \
+    --ignore-eos --seed "$((L + C + (100000 * W)))" \
     --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \
     --save-result --result-dir "$OUTDIR" \
     --result-filename "${RN}L${L}_C${C}.json" 2>&1 | grep -E 'Successful|Benchmark duration|Request throughput|Output token throughput|Mean TTFT|Mean TPOT|Mean ITL' | sed "s/^/  [L=$L C=$C]/"
