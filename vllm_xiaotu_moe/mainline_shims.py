@@ -1600,12 +1600,14 @@ def _install_ced_slice_shim() -> list[str]:
                     _swa_len = int(_sm.numel())
         except Exception:  # noqa: BLE001
             _swa_len = -1
-        if _swa_len != int(w):
-            if os.environ.get("XIAOTU_CED_DIAG") == "1" and _CED_STATE["log"] < 8:
-                _CED_STATE["log"] += 1
-                _log(f"[ced-diag] 不切片:SWA slot_mapping 长度={_swa_len} ≠ 窗口 {w} "
-                     f"(t={t})⇒ 以 SWA 侧为准(它才是 KV-insert 的约束)")
-            return orig_layer(self, *a, **kw)
+        # 【§604h】**不再因为 SWA 长度不等就放弃切片**:KV-insert 那一侧由
+        # `_install_ced_kvinsert_shim` 把 `slot_mapping` 对齐到 q 行数(浅拷贝,
+        # 语义见该函数 docstring)。这里只在诊断下记录长度差,便于审计。
+        if _swa_len > 0 and _swa_len != int(w) and os.environ.get("XIAOTU_CED_DIAG") == "1" \
+                and _CED_STATE["log"] < 8:
+            _CED_STATE["log"] += 1
+            _log(f"[ced-diag] 切片照做;SWA slot_mapping 长度={_swa_len} ≠ 窗口 {w} "
+                 f"⇒ 由 KV-insert 对齐 shim 处理(t={t})")
         if not (int(_CED_STATE.get("win", 0)) > 0
                 and int(_CED_STATE.get("toks", -1)) == int(t)):
             # 【§604c fail-safe】metadata 侧本步**没有**改写 ⇒ 绝不能切,否则
