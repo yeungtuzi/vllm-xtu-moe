@@ -35,7 +35,7 @@ wait "${pids[@]}" 2>/dev/null
 aborts=0; timeouts=0; ok=0
 for i in $(seq 1 "$N"); do
   rc="$(cat "$OUT/$i.rc" 2>/dev/null || echo 99)"
-  if grep -q "WATCHDOG fired" "$OUT/$i.log" 2>/dev/null; then
+  if grep -q "WATCHDOG" "$OUT/$i.log" 2>/dev/null; then
     aborts=$((aborts+1)); echo "  [$i] **丢票**(WATCHDOG) rc=$rc"
     grep -a -A2 "WATCHDOG fired" "$OUT/$i.log" | head -4 | sed 's/^/       /'
   elif [ "$rc" = "124" ]; then timeouts=$((timeouts+1)); echo "  [$i] 正常(跑满超时被 kill)"

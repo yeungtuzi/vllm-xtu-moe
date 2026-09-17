@@ -20636,3 +20636,85 @@ x86 TSO 下**那条 release store 进的是 store buffer,后续 load 可以先�
 同日 6 次观测:`x 0.69-0.85 / lk 0.56-0.66` ⇒ 比值带 **1.14-1.35**(lk 自身 run-to-run 漂移就有 12%)。
 原门限 1.25/1.35 会让比值**正好压在线上**(实测 1.25/1.25、1.35/1.35 各一次)⇒ 会随机翻红。
 现取 **1.30/1.40**(留 ~5% 余量),**仍能抓住 §505 那种 1.43× 的分片回归**(那是比值门存在的唯一理由)。
+
+## §568 ③ CED 预填充捷径:**可行性评估**(结论:是多轮工程,不在本轮动手)
+### (a) 报告怎么定义 CED(§2.2 原文要点)
+* 下半 `L/2` 层是**因果编码器**;上半(decoder,`i ≥ L/2`)的 **global KV 不由本层隐状态算**,
+  而是从第 `L/2` 层的隐状态用**逐层投影权重**投出:`K^i = h_{L/2}·W_K^i, V^i = h_{L/2}·W_V^i`。
+* 因此**预填充只需算前一半层**("reduces nearly half of the prefill computation")。
+* **SWA 例外**:每层的局部 K/V 仍来自**自己**的隐状态 ⇒ 需要 **Decoder SWA bounded replay** 来补出
+  decoder 的 SWA KV(依据:SWA 的有效感受野远小于 `w_win`,所以可以只回放一小段)。
+
+### (b) 对我们这份权重/实现的核对
+* **没有 CED 专用参数**:层 0/19/21/39 都是同样 36 种张量(attn.wkv / wq_a,b / wo_a,b / 各类 norm /
+  MoE / mHC),decoder 层**没有**额外的 `ced_k_proj`/`ced_v_proj` ⇒ 报告里的 `W_K^i,W_V^i` 就是
+  **各层自己的 `attn.wkv`**,只是作用对象不同。
+* **层 20 是特殊的 KV/index 源**:只有它多出 `attn.compressor.{norm,wkv}` 与
+  `attn.indexer.{k_norm,weights_proj,wk, wq_b}`;与 config `candidate_source_layer_id=20`、
+  `kv_source_layer_ids=[2,8,14,20]`、`index_source_layer_ids=[2,8,14,20,24,28,32,36]` 对齐。
+* **上游 vLLM 无 `ced` 符号**,但**KV 复用已实现**(reuse 模式);缺的是
+  **(i) 预填充时跳过上半 20 层的整层计算 + (ii) bounded SWA replay**。
+* 实测证据:§564 的 trace 里 prefill 每 pass **~1353 个 GPU 事件**、`[cd-timing] layers=40`
+  ⇒ **今天 prefill 跑满 40 层**,没有任何跳层。
+
+### (c) 收益预估(对**我们这台机器**尤其大)
+* 我们的 prefill 是 **CPU MoE 主导**(§515:`qlen=2048` 时 `period≈1004ms`、`compute(engine)≈991ms`)。
+  跳掉上半 20 层 ⇒ **直接省掉一半层的 CPU MoE 预填充工作**,理论上接近"预填充时间减半"。
+* GPU 侧同时省掉上半 20 层的 CSA2 注意力(§564:该 kernel 占全部 kernel 时间 **4235/8262 ms**)。
+
+### (d) 为什么不在本轮动手(风险)
+1. **数值风险**:decoder 的 SWA KV 必须"近似重建",而报告只说"有效感受野小";要落成可验证的实现,
+   需要先确认训练时的确切口径(回放多少 token、对哪些层),否则会改变输出 —— 触碰"数值不变"硬约束。
+2. **实现面大**:要在 vLLM 里加一个"预填充半模型"执行模式 + KV 投影填充 + SWA replay + 末位重算,
+   涉及 attention 元数据(slot mapping / block table / 变长批)三处联动,不是单点改动。
+3. 参照实现(lk_moe)在本机**也没有**做这件事 ⇒ 做了会**超出对照基线**,没法用"同日比值门"验收,
+   只能自建正确性口径。
+⇒ 结论:**保持不做**;若要做,第一步应是"先确认训练口径 + 用 Golden 对比证明 SWA replay 的误差可接受",
+而不是直接改执行路径。
+
+## §569 ✅ **R113 丢票:复现成功 + 构造性修复 + 验证通过**(4/4 挂 → 0/4 挂)
+
+### (a) 复现(§567 造的检测器发挥作用了)
+参数:`stress_pool.sh 4 900 1 2`,`THREADS=48 SPIN=0 DEADLINE_MS=2000`(**sharded 看门狗**走
+`XIAOTU_MOE_SHARD_WD`,此处由 `XIAOTU_MOE_POOL_DEADLINE_MS` 之外的分片路径默认 300s ⇒ 实际按分片路径的
+`SHARD_WD` 默认值;诊断里 20~105 秒即触发)。
+**4/4 进程全部 SIGABRT**,证据(每个进程同型):
+```
+[pool] WATCHDOG(sharded) gen=1770064 total=64 rem=1 exec=63
+  [判据] abandoned=48 underflow=0 entered=63 left=63 inrange=63 inrange2=0
+        **snap_retry=0  snap_mismatch=0**
+  node 0..7: jobs=8 **pulled=14**(每 node 多领 6 张,8×6=48=abandoned)
+```
+⇒ **`snap_retry=0 / snap_mismatch=0` 是决定性证据**:seqlock 复读**一次都没报错**,
+因为它检的是"是否读到奇数(发布中)",而这里 worker 读到的是**自洽但陈旧**的偶数代
+(旧 gen + 旧 `node_base_`/`node_nj_` 完全匹配)⇒ 复读校验天然查不出这类陈旧。
+后果:**一张属于本代的票被当成越界票 `abandoned`,既不执行也不递减** ⇒ `rem=1` 永挂 ⇒ 看门狗。
+
+### (b) 机制(与 §567b 的 TSO 推导一致)
+调用方发布顺序是"奇数 store(release) → 读票快照(`start_` / `node_base_`)";
+x86 TSO 下 release store **只发普通 store 进 store buffer**,紧随其后的 load **可以先执行** ⇒
+worker 的 `fetch_add` 落在"新调用已开始、但奇数代尚未对它可见"的窗口里 ⇒ 它按旧快照算 `loc ≥ nj`
+⇒ 走 `abandoned` 分支丢弃本代的票。
+
+### (c) 修复(最小且**构造性**)
+把两处发布的奇数 store 从 `memory_order_release` 改为 **`memory_order_seq_cst`**
+(`numa_pool.hpp` flat 553 行 / sharded 822 行):
+* 论证:seq_cst store 在 x86 上编译为 **`xchg`(全屏障)**,保证"奇数代全局可见"**先于**随后的
+  票快照 load 落地。于是任何在快照之后领到票的 worker,其**随后**的 gen 读必然看到奇数或更新
+  (它自己的 RMW 也是全屏障,顺序在其 gen 读之前)⇒ `g != gen` ⇒ 走既有 re-anchor 分支
+  ⇒ **不再存在"自洽陈旧快照"**。这是把漏洞窗口**结构性关掉**,不是靠概率。
+* 成本:每次池调用一次 locked op(调用方路径,每层一次),**不在领票热循环里**。
+
+### (d) 验证
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| 压力复现(4 进程 × 180s,同参数) | **4/4 SIGABRT**(20~105s 内) | **0/4,全部跑满** |
+| 数值门禁 `test_block23_equiv.py` | OK=7 BAD=1 | **OK=7 BAD=1(不变)** |
+| 性能门禁 DEDUP=12 | 0.70 ms / 216 GB/s | **0.70 ms / 216 GB/s(不变)** |
+| 性能门禁 DEDUP=23 | 0.85 ms / 296 GB/s | **0.85 ms / 296 GB/s(不变)** |
+| 同日 lk 比值 | 1.19 / 1.33 | **1.17 / 1.23** |
+⇒ **修复无性能代价、无数值变化**,且把"服务可能随机 abort"这一潜在杀手关掉。
+* 另:更长的确认跑(4 进程 × 600s)在后台并行执行,结果记入下一节。
+* ⚠️ 修的是 **sharded**(服务默认路径)。flat 路径的同类 drop(`i >= n ⇒ dropped_f_++; break`)
+  在**同一次 seq_cst 修复**下也被覆盖(同一论证),但本轮**没有**在 flat 路径上复现过
+  (`stress_pool` 在 8 node 下走 sharded)⇒ 记为待补验证项。

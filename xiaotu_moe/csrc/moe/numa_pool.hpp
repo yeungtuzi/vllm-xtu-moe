@@ -545,7 +545,12 @@ public:
             // 复读一致 ⇒ 查不出来 ⇒ worker 丢票 ⇒ remaining_ 永不归零)。
             // 原有的"先掀 gen 再读 counter_ 以保证陈旧票落在 start_ 之前"不变。
             gen = current_gen_.load(std::memory_order_relaxed) + 2;   // 下一个偶数代
-            current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
+            // 【R113 修,§569】**必须是 seq_cst**:奇数代必须在"读票计数器"之前**全局可见**。
+            // 用 release 时 x86 TSO 只发一条普通 store(进 store buffer),紧随其后的
+            // `counter_.load()` 可以先执行 ⇒ worker 会出现"票属于本代,但随后读 gen 仍是旧偶数"
+            // 的自洽陈旧快照 ⇒ 它把本代的票当越界票丢弃(既不执行也不递减)⇒ remaining_ 永挂。
+            // seq_cst 在 x86 上编译成 `xchg`(全屏障),保证该 store 先于下面的 load 落地。
+            current_gen_.store(gen - 1, std::memory_order_seq_cst);   // 奇数:发布中
             pub_window_delay_();   // 【R113 诊断】默认 0,仅在复现竞态时非 0
             start_ = counter_.load();
             n_ = n;
@@ -813,7 +818,8 @@ public:
                 for (int _i = 0; _i < settle_iters; ++_i) __builtin_ia32_pause();
             }
             uint64_t gen = current_gen_.load(std::memory_order_relaxed) + 2;
-            current_gen_.store(gen - 1, std::memory_order_release);   // 奇数:发布中
+            // 【R113 修,§569】同样必须 seq_cst:见 flat 路径处的完整论证。
+            current_gen_.store(gen - 1, std::memory_order_seq_cst);   // 奇数:发布中
             pub_window_delay_();   // 【R113 诊断】默认 0,仅在复现竞态时非 0
             total = 0;
             for (int n = 0; n < nnodes; ++n) {
