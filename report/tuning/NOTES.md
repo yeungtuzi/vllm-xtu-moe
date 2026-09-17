@@ -21909,3 +21909,34 @@ slot_mapping.numel()`**,即可知道三者里哪个还是全长;最可能是 `po
 (它由调用方传入,可能与 `hidden_states` 不是同一个被切的视图)或 `kv`
 (它经 `_run_parallel_input_projections` 产生,若该处读了**未切**的 buffer 就会是 301)。
 **修法**同样是把不匹配的那个按 `q` 行数对齐(与 slot_mapping 同一思路),仍不需要改 vLLM 文件。
+
+## §604i CED:**300-token prompt 已经跑通**(真实生成、零 kernel 错误);≥1024 变成 CUDA 非法访存
+### (a) 本轮新增
+`_install_ced_kvinsert_shim` 里除了 `slot_mapping`,再把 **`positions` 与 `kv` 也按 `q` 行数对齐**
+(层切片只切了"模型逐 token 入参",这两者是在 attention 内部派生/由调用方单独传入的),
+并打印四者行数诊断。
+### (b) 实测(c6)
+```
+[ced-diag] 行数 q=301 kv=301 pos=301 sm=301          ← 未切片时四者一致
+层切片=4   KV-insert 对齐=2
+must not exceed = 0 ; row counts must match = 0      ← ✅ 两种 kernel 校验错误都消失
+```
+**`long_300` 已能跑通并给出正常生成**:
+| | 文本 |
+|---|---|
+| 基线(关)| `'[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[['` |
+| CED | `'# The lambda calculus is a formal system in mathematical logic for expressing co'` |
+⇒ 与基线**不同**(CED 是近似,设计上只保证"最后 `2·w_win−1` 个位置"的等价性);
+而且这个语料本身是**退化 prompt**(同一句重复 70 次),基线的 `[[[[…` 正是退化输出,
+所以这条用例**不适合做等价判据**,应换成有真实语义的长 prompt。
+### (c) 剩余问题:`long_1024 / long_4096` → `CUDA error: an illegal memory access`(2 次,engine 挂)
+这与 `long_300` 的差别只有长度 ⇒ 最可疑的是:
+* `kv[-qn:]` / `positions[-qn:]`(以及 `sm[-qn:]`)产生了**内核不接受的视图/基址**
+  (它们与 kernel 内部的 stride/block 对齐假设相关);
+* 或者:对齐条件用的是"**本步**做过改写"(`_CED_STATE["win"]>0`,步级作用域),
+  于是对**没被切片的那些层**(22..39,t 已经是 255)也可能触发对齐,索引到从未写过的 SWA 槽位。
+**下一步(二选一,都便宜)**
+1. 把对齐条件收紧为"**本层确实被切片**"(用一个逐层标记,而不是步级 `_CED_STATE`),
+   再试 1024/4096;
+2. 不用切片视图,而是 `sm[-qn:].contiguous()` / `positions[-qn:].contiguous()`(排除视图对齐问题)。
+### (d) 总结:路径已打通到"能跑",剩下的是**正确性/边界**问题(不是"机制不通")
