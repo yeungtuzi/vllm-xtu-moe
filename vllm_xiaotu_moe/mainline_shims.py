@@ -1185,7 +1185,7 @@ def _install_ced_diag_shim() -> list[str]:
 # metadata 侧每被调用一次就把 `win` 写成"本步实际改写成的窗口长度"(改写=窗口长,未改写=0);
 # 切片侧**必须**看到 `win > 0` 才允许切。这样即使某一层没被换上 FastPrefill 后端
 # (⇒ 元数据整步没改写),切片也会**自动停用** —— 从"崩"降级为"不生效"。
-_CED_STATE: dict = {"win": 0, "log": 0}
+_CED_STATE: dict = {"win": 0, "toks": -1, "log": 0}
 
 
 def _install_ced_fastprefill_shim() -> list[str]:
@@ -1284,6 +1284,7 @@ def _install_ced_fastprefill_shim() -> list[str]:
                 return cam
             if idx is None:
                 _CED_STATE["win"] = 0        # 【fail-safe】本步未改写 ⇒ 切片侧必须停用
+                _CED_STATE["toks"] = -1
                 # 【§604c 诊断】看清"为什么没武装":`_ced_window_indices` 需要
                 # 单请求 + max_query_len > w;这两个属性在这版 vLLM 里叫什么必须实测。
                 if os.environ.get("XIAOTU_CED_DIAG") == "1" and _md_n[0] < 10:
@@ -1297,6 +1298,9 @@ def _install_ced_fastprefill_shim() -> list[str]:
                          f"attrs={[k for k in dir(cam) if not k.startswith('_')][:24]}")
                 return cam                      # 本步未武装:完全走上游"未改写"行为
             _CED_STATE["win"] = int(idx[1])   # 【fail-safe】本步确实改写成了这么长的窗口
+            # 【§604d】还记录**本步的令牌数**:切片侧要求"当前层看到的 T"与它**完全相等**,
+            # 这样上一步骤留下的陈旧标志绝不会误放行(实测陈旧标志正是崩溃的直接原因)。
+            _CED_STATE["toks"] = int(getattr(cam, "num_actual_tokens", -1) or -1)
             if os.environ.get("XIAOTU_CED_DIAG") == "1" and _md_n[0] < 10:
                 _md_n[0] += 1
                 _log(f"[ced-diag] metadata **已改写** w={w} "
@@ -1437,12 +1441,14 @@ def _install_ced_slice_shim() -> list[str]:
         w = st["win"]
         if t <= w:
             return orig_layer(self, *a, **kw)
-        if int(_CED_STATE.get("win", 0)) <= 0:
+        if not (int(_CED_STATE.get("win", 0)) > 0
+                and int(_CED_STATE.get("toks", -1)) == int(t)):
             # 【§604c fail-safe】metadata 侧本步**没有**改写 ⇒ 绝不能切,否则
             # slot_mapping(全长)> q 行(窗口长)⇒ `slot_mapping must not exceed q row count`。
             if os.environ.get("XIAOTU_CED_DIAG") == "1" and _CED_STATE["log"] < 5:
                 _CED_STATE["log"] += 1
-                _log("[ced-diag] 切片**被 fail-safe 拦住**(metadata 本步未改写)⇒ 本步不切片")
+                _log(f"[ced-diag] 切片被 fail-safe 拦住(metadata 本步未改写或令牌数不匹配:"
+                     f"win={_CED_STATE.get('win')} toks={_CED_STATE.get('toks')} t={t})⇒ 本步不切片")
             return orig_layer(self, *a, **kw)
         for name in TOK:
             v = ba.arguments.get(name)
