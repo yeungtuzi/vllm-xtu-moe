@@ -1639,11 +1639,20 @@ def _install_ced_slice_shim() -> list[str]:
         # 而不是"等于 t 的才切" —— 实测层 22..39 的 `t` 已是 255 而 `positions` 仍是 301,
         # 用 `== t` 就漏掉了它 ⇒ rotary/compressor 拿错位置 ⇒ **CUDA 非法访存**。
         need = w if t > w else t
-        for name in TOK:
-            v = ba.arguments.get(name)
+        # 【§604m】**不再依赖固定入参名**:`TOK` 那张表是按 `nvidia/model.py` 的签名写的,
+        # 而实际跑的是 `nvidia/vl_model.py`(traceback 里是 vl_model.py:309)⇒ 名字对不上,
+        # `positions` 永远切不到(诊断里 `q=255 kv=255 **pos=301**` 出现 14 次)。
+        # 改成:**凡 shape[0] > need 的入参一律切到最后 need 行**(按形状判,与签名无关)。
+        _sliced = []
+        for _name in list(ba.arguments.keys()):
+            v = ba.arguments.get(_name)
             if hasattr(v, "shape") and v is not None and len(getattr(v, "shape", ())) \
                     and int(v.shape[0]) > need:
-                ba.arguments[name] = v[-need:]
+                ba.arguments[_name] = v[-need:]
+                _sliced.append(f"{_name}:{int(v.shape[0])}->{need}")
+        if os.environ.get("XIAOTU_CED_DIAG") == "1" and st["hits"] < 30:
+            _log(f"[ced-diag] 层切片(按形状)layer_idx={st.get('idx', {}).get(id(self))} "
+                 f"t={t} need={need} 切了={_sliced}")
         if os.environ.get("XIAOTU_CED_DIAG") == "1" and st["hits"] < 30:
             _log(f"[ced-diag] 层**切片** layer_idx={st.get('idx', {}).get(id(self))} "
                  f"t={t} -> {w}")
