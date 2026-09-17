@@ -7,6 +7,13 @@
 
 [中文](README.md) · English (default)
 
+> **📌 Current release: v0.21.0** (2026-09-17) — **GPU prefill went from
+> "can be enabled but slower / OOMs" to "can be enabled, 2.0-2.8× faster, with honest
+> memory accounting"**, plus a full official `vllm bench serve` acceptance sweep
+> (6 prompt lengths × C=1/2/4/8).
+> [Release notes](RELEASE_NOTES_v0.21.0.md) ·
+> [Releases](https://github.com/yeungtuzi/vllm-xtu-moe/releases/tag/v0.21.0)
+
 ---
 
 ## The problem it solves
@@ -73,6 +80,22 @@ vllm serve <MODEL_DIR> \
   --tensor-parallel-size 1 \
   --max-model-len 8192 \
   --gpu-memory-utilization 0.85 \
+
+# 4) (optional, recommended) also put **long prefill on the GPU** — measured
+#    2.0-2.8x faster on DeepSeek-V4.1-Flash. Two prerequisites:
+#    ① threshold >= 3072 tokens (below that the CPU path is cheaper);
+#    ② you MUST cap the KV pool explicitly, otherwise vLLM fills VRAM and GPU
+#       prefill is silently rejected layer-by-layer (falls back to CPU).
+vllm serve <MODEL_DIR> \
+  --tensor-parallel-size 2 \
+  --max-model-len 1048576 \
+  --max-num-batched-tokens 8192 \
+  --kv-cache-memory 4294967296 \
+  --gpu-memory-utilization 0.55 \
+  --speculative-config dspark
+# VRAM recipe (TP=2 / MBT=8192): non-KV 10 + KV 4 + staging 7.2 + first-request
+# growth 7.7 + activations ~= 33 GiB. Full table: docs/RUNBOOK.md §5.9.
+# To check it is really on GPU: the log must contain `GPU prefill ACTIVE`.
   --enforce-eager
 ```
 
@@ -93,6 +116,42 @@ Full install notes and environment variables:
 **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)**.
 Step-by-step guides plus preliminary measurements for **DeepSeek-V4-Flash**:
 **[`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md)**.
+
+## Measured performance (v0.21.0)
+
+> Machine: 2x AMD EPYC 9654 (192 cores) / 3x A100-40GB / DDR5-4800 24 channels.
+> Protocol: **TP=2**, fully warmed up, unique prompts (no prefix-cache hits),
+> official `vllm bench serve`. Raw data:
+> [`report/tuning/logs/bench_serve_acc2/`](report/tuning/logs/bench_serve_acc2/).
+
+### GPU prefill vs CPU prefill (DeepSeek-V4.1-Flash, client-side TTFT)
+
+| prompt | CPU prefill | **GPU prefill** | speedup |
+|---|---|---|---|
+| ~3.7K | 24.17 s (151 tok/s) | **12.11 s (302 tok/s)** | **2.0x** |
+| ~7.0K | 42.17 s (165 tok/s) | **15.19 s (460 tok/s)** | **2.8x** |
+
+Cost model (measured): **~8.9 s fixed per chunk + 0.79 ms/token**. The fixed term is
+**143.6 GiB/rank** of expert weights moved per chunk (TP=2, 40 layers x 3.589 GiB),
+so **the larger `--max-num-batched-tokens`, the better**.
+
+### End to end (official `vllm bench serve`; TP=2 / MBT=8192 / GPU prefill / KV capped at 4 GiB)
+
+| prompt | TTFT C=1 | TTFT C=8 | total tok/s C=1 | total tok/s C=8 | TPOT C=1 |
+|---|---|---|---|---|---|
+| 32 | 0.47 s | 3.5 s | 37 | 95 | 36.2 ms |
+| 256 | 1.98 s | 10.9 s | 55 | 134 | 43.6 ms |
+| 1024 | 10.0 s | 23.6 s | 65 | 242 | 64.6 ms |
+| 4096 | 12.8 s | 46.4 s | 200 | 379 | 66.3 ms |
+| 16384 | 34.5 s | 170 s | 399 | 455 | 54.4 ms |
+| 32768 | 70.9 s | 333 s | 420 | 454 | 58.4 ms |
+
+**Reading it**: ① total throughput for long prompts **saturates at ~420-455 tok/s**
+(the ceiling is the fixed per-chunk GPU-prefill cost); ② **TTFT is linear in length and
+strongly coupled to concurrency** — prefill is a serial shared resource; ③ short prompts
+(32/256) stay on the CPU and have sub-second TTFT.
+
+---
 
 ## How it works (one paragraph)
 
@@ -149,6 +208,19 @@ vllm-xtu-moe/
 - **FP8 CPU kernel performance** is not yet optimized — correctness first.
 - **Expert parallelism (expert_map) is not supported**; TP>1 uses weight sharding.
 - **Interleaved gate/up layouts** (`SWIGLUOAI`, gpt-oss family) are unsupported.
+- **GPU prefill chunk ceiling is `--max-num-batched-tokens 8192`**
+  (DeepSeek-V4.1-Flash on A100-40GB): `16384` OOMs, and the OOM happens in
+  **attention** (`fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`), not in the MoE —
+  a 16K chunk's activations plus staging do not fit.
+- **Enabling GPU prefill requires an explicit KV cap** (`--kv-cache-memory`): by default
+  vLLM fills VRAM up to `--gpu-memory-utilization`, so the prefill staging is rejected
+  layer by layer and it silently falls back to the CPU. See `docs/RUNBOOK.md` §5.8.
+- **③ CED prefill shortcut: mechanism implemented, disabled by default, no gain today.**
+  Every conflict was traced to **two upstream invariants**: `mhc/tilelang.py:345` asserts
+  `x.shape == (num_tokens, hidden_size)` (a layer may not return fewer rows than the step's
+  `num_tokens`), and `positions` comes from a runner-level global buffer that a plugin-level
+  layer wrapper cannot reach. Getting the actual gain therefore requires threading the
+  effective token count through **upstream vLLM**. Evidence: `report/tuning/NOTES.md` §571-§604.
 
 ## License and third parties
 
