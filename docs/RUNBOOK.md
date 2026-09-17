@@ -511,6 +511,11 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 | 显存配方(TP=2/MBT=8192) | 非KV 10 + KV 4 + staging 7.2 + 首请求增长 7.7 + 激活 ≈ **33 GiB** | §599/§600 |
 | ⚠️ 别开 `--enforce-eager` | 它让 free 从 12.95 掉到 **1.4 GiB**,预填充被 preflight 拒(§600c) | 用 CUDA graph 的默认 |
 
+**阈值取 3072,不要用 1024**(§603 实测):成本模型是
+`GPU ≈ 8.9 s/chunk 固定 + 0.79 ms/token` vs `CPU ≈ 3.9 ms/token` ⇒ **盈亏平衡 ~2860 token**;
+用 1024 会让 1-3K 的 prompt 白付 ~9 s(L=1024 的 TTFT 从 CPU 的 ~4 s 变成 **10.03 s**)。
+`vram_policy --emit-env` 现在输出 **3072**(可用 `XIAOTU_GPU_PREFILL_SWITCH_TOKENS` 覆盖)。
+
 **判定"是否真的走了 GPU"**:日志应出现 `GPU prefill ACTIVE`(每个模块一次,40 层×rank 数);
 若出现 `GPU prefill DISABLED ... only N GiB is free` ⇒ 按 §5.8 封顶 KV 或降 MBT。
 
