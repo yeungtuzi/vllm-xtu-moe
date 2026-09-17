@@ -498,10 +498,21 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 | 主机内存峰值 | 629.4 GiB | §570 |
 | 数值/确定性 | `OK=7 BAD=1 max_rel=1.873e-02`;greedy ×2 逐字节 5/5 | §570 |
 
-**想要更快的预填充**(可选,需自行验证):把 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1024` 打开,
-并按 §5.8 **必须**把 KV 池封顶(1M×2 并发 ⇒ `--kv-cache-memory` ≈ 4.4 GiB,策略会直接算给你),
-且 `MBT ≥ 8192`;此时 8K chunk 的预填充约 **694 tok/s(2.7× CPU)**。
-**风险**:并发预填充下的 staging 显存竞争尚未验证,且 §594 的 4 条修法未落地 ⇒ 不够稳定,不建议直接挂 harness。
+**⭐ GPU 预填充(§594-§602 修完后,推荐开启)**:`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1024`
++ **必须**按 §5.8 封顶 KV 池 + `MBT=8192`(见下表的显存账)。
+
+| 项 | 值 | 依据 |
+|---|---|---|
+| 实测收益(prompt 3655 / 6980) | **12.1 s → 302 tok/s** / **15.2 s → 460 tok/s** | §602,**2.0× / 2.8×** 于同期 CPU 路径(24.2 s / 42.2 s)|
+| 成本结构 | `≈8.9 s 固定 + 0.79 ms/token` / chunk | 固定项 = 每 chunk 搬 **143.6 GiB/rank** 专家权重(TP=2,40 层×3.589)|
+| staging 真实峰值 | **7.2 GiB/卡**(槽 3.59 + raw 3.16 + 暂存 0.45) | §600/§601;**旧口径 6.72 只算了槽**,会放过注定 OOM 的配置 |
+| preflight 门槛 | `staging × 1.10` ≈ **7.9 GiB 空闲** | §600b |
+| **MBT 上限** | **8192**(16384 **会 OOM**) | §602(d):16K chunk 的激活+staging 在 40 GB 卡上放不下,OOM 点是 attention 的 `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert` |
+| 显存配方(TP=2/MBT=8192) | 非KV 10 + KV 4 + staging 7.2 + 首请求增长 7.7 + 激活 ≈ **33 GiB** | §599/§600 |
+| ⚠️ 别开 `--enforce-eager` | 它让 free 从 12.95 掉到 **1.4 GiB**,预填充被 preflight 拒(§600c) | 用 CUDA graph 的默认 |
+
+**判定"是否真的走了 GPU"**:日志应出现 `GPU prefill ACTIVE`(每个模块一次,40 层×rank 数);
+若出现 `GPU prefill DISABLED ... only N GiB is free` ⇒ 按 §5.8 封顶 KV 或降 MBT。
 
 **最终性能验收口径(用户 2026-09-17 指定)**:所有问题收口后用 **官方 `vllm bench serve`**(非自研探针),
 `TP=2` + 充分预热,覆盖超短~32K prompt × C=1/2/4/8;详见 `report/tuning/FUTURE_PLAN.md`。
