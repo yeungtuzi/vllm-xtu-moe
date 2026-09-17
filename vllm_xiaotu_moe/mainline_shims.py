@@ -1431,6 +1431,65 @@ def _ced_window_indices(cam, w: int):
     return t, n
 
 
+def _install_ced_kvinsert_shim() -> list[str]:
+    """【§604h】CED 切片后 **KV-insert 的 `slot_mapping` 仍是全长** ⇒ `slot_mapping must not exceed q row count`。
+
+    根因(§604f):`attention.py:869` 的 fused insert 用的是
+    `attn_metadata[self.swa_cache_layer.prefix].slot_mapping`,那是一个**独立的** metadata
+    (实测它的 builder 不走 `FastPrefillAttentionBuilder.build()`,所以我们改写的
+    `logits_indices_padded` 到不了它)。而层已经被切到 `w` 行 ⇒ 长度不匹配。
+
+    做法(**不改 vLLM 文件**):在 `DeepseekV4Attention._fused_qnorm_rope_kv_insert` 外面包一层,
+    当"本步确实做过 CED 改写"(`_CED_STATE["win"] > 0`)且 `slot_mapping` 比 `q` 行数长时,
+    **把 slot_mapping 切到最后 `q.shape[0]` 项**(浅拷贝 metadata,不动共享对象)。
+
+    语义:`positions`/`q`/`kv` 都已被层切片切成"最后 w 个位置",slot_mapping 的后 w 项正是
+    这些位置对应的 cache 槽位 ✓;窗口外的 SWA 条目本就不需要(decoder 层只依赖最后
+    `2·w_win−1` 个位置,§573b)。
+    """
+    if os.environ.get("XIAOTU_CED_FASTPREFILL") != "1":
+        return []
+    try:
+        from vllm.models.deepseek_v41.attention import DeepseekV4Attention as _A
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip ced kvinsert shim: {type(exc).__name__}: {exc}")
+        return []
+    orig = getattr(_A, "_fused_qnorm_rope_kv_insert", None)
+    if orig is None or getattr(orig, "_xtu_ced_kv", False):
+        return []
+
+    @functools.wraps(orig)
+    def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
+        try:
+            if int(_CED_STATE.get("win", 0)) > 0 and isinstance(attn_metadata, dict):
+                swa = getattr(self, "swa_cache_layer", None)
+                pfx = getattr(swa, "prefix", None)
+                md = attn_metadata.get(pfx) if pfx is not None else None
+                sm = getattr(md, "slot_mapping", None)
+                qn = int(q.shape[0])
+                if sm is not None and int(sm.numel()) > qn > 0:
+                    import copy as _cp
+                    nmd = _cp.copy(md)
+                    try:
+                        object.__setattr__(nmd, "slot_mapping", sm[-qn:])
+                    except Exception:  # noqa: BLE001
+                        setattr(nmd, "slot_mapping", sm[-qn:])
+                    _nd = dict(attn_metadata)
+                    _nd[pfx] = nmd
+                    attn_metadata = _nd
+                    if os.environ.get("XIAOTU_CED_DIAG") == "1" and _CED_STATE["log"] < 24:
+                        _CED_STATE["log"] += 1
+                        _log(f"[ced-diag] KV-insert:slot_mapping {int(sm.numel())} → {qn}"
+                             f"(按 q 行数对齐)")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"ced kv-insert 对齐失败(本层走原路径): {type(exc).__name__}: {exc}")
+        return orig(self, q, kv, positions, attn_metadata)
+
+    _fused_qnorm_rope_kv_insert._xtu_ced_kv = True  # type: ignore
+    _A._fused_qnorm_rope_kv_insert = _fused_qnorm_rope_kv_insert
+    return ["DeepseekV4Attention._fused_qnorm_rope_kv_insert(CED slot_mapping 对齐)"]
+
+
 def _install_ced_slice_shim() -> list[str]:
     """③ CED **层循环级切片**(§578):让 decoder 半区的层(21..39)只处理**尾部 token**。
 
@@ -1642,6 +1701,7 @@ def apply_mainline_shims() -> list[str]:
         _install_ced_diag_shim,
         _install_ced_fastprefill_shim,
         _install_ced_slice_shim,
+        _install_ced_kvinsert_shim,
         _install_oracle_shims,
         _install_prepack_shims,
         _install_mxfp4_cpu_convert_shim,
