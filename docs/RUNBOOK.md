@@ -450,3 +450,58 @@ TAG=gpf KV_CACHE_BYTES=4729960528 GP_MIN=1024 MAXLEN=1048576 SEQS=2   bash repor
 盈亏平衡在 **chunk ≈ 3000 token**。
 ⚠️ **`--max-num-batched-tokens=32768` 目前会 hang**(§593(f),启动后 GPU 0%、日志刷
 `shm_broadcast...60 seconds`)⇒ 先别用,修好再上。
+
+### 5.9 ⭐ 推荐的生产/挂 harness 配置(最稳定且高效;2026-09-17 定稿)
+
+**一句话:TP=2 / 1M 上下文 / 显式 12 GiB KV / 投机开 / **GPU 预填充关** / 常驻层 0 / 编译关。**
+
+```bash
+cd /home/user/lvllm/vllm-xiaotu-moe
+VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0 \
+TAG=harness PORT=8700 GPUS=0,1 TP=2 MAXLEN=1048576 SEQS=8 MBT=8192 LOAD=auto GPU_UTIL=0.90 \
+SPEC=1 COMPILE=0 THREADS=60 SPIN=300 KV_CACHE_BYTES=12884901888 \
+  bash scripts/serve_v41.sh
+# READY ≈ 390 s(Engram 189 GiB 流式 + 逐层释放)
+# 健康检查
+curl -s localhost:8700/v1/models | head -c 120
+curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"dsv41","messages":[{"role":"user","content":"1+1=?"}],"max_tokens":8,"temperature":0}'
+```
+
+**每个旋钮的依据(都是实测,不是猜)**
+
+| 旋钮 | 值 | 依据 |
+|---|---|---|
+| `TP=2` | 2 | R-VRAM 默认;**GPU 预填充要求 TP≥2**(TP=1 staging 不摊薄 6.72→13.45 GiB,§592(e)) |
+| `MAXLEN` | 1048576 | R-VRAM 优先级 1,**不可降级** |
+| `KV_CACHE_BYTES` | **12 GiB** | 复现 §570 验收过的 KV 容量(**6,724,586 token = 1M 并发 6.41×**);同时**刻意留出 ~13 GiB 空闲**做长序列工作区(§513c 的 32K OOM 根因就是这里被 KV 吃光)。**必须显式给**,理由见 §5.8 |
+| `SPEC=1` | DSpark | 实测 **16.64 vs 13.85 t/s**(+20%),TPOT 36.75 vs 42.86 ms;greedy 5/5 逐字节一致 |
+| **`GPU_PREFILL_MIN_TOKENS=0`** | **关** | §592/§593/§594:MBT=8192 以下 GPU 预填充的**每 chunk 固定成本 ~11.6 s**(80% 是 staging),默认 chunk(~2048)下只有 **155 tok/s vs CPU 258 tok/s**;要赢需 chunk ≥3000 且先修 §594 的 4 条。**先保证稳定** |
+| `SEQS=8` | 8 | 挂 harness 要并发;KV 12 GiB 足够(短 prompt 下容量以 Mtoken 计) |
+| `MBT=8192` | 8192 | 与 §570 一致;⚠️ **别用 32768**(§593(f) 会 hang) |
+| `COMPILE=0` | 关 | 实测 CUDA graph 无收益(43.19 → 44.73 ms;我们的 step 被 CPU↔GPU 边界切成 41 段) |
+| `GPU_RESIDENT_LAYERS`(空) | 0 层 | §584 实测**负收益**(TPOT 43.19 vs 42.86;C=4 −12%);这块显存改投 KV 收益确定 |
+| `THREADS=60` | 每 rank 60 | 本机 24 CCD 拐点;TP=2 下 184/rank 会 368 线程超订 |
+| `SPIN=300` | 300 | SPIN=0 时每层白付 ~0.5 ms futex(0.94-1.00 vs 0.44 ms/层) |
+| `ENGRAM_LAST=1` | 默认 | 峰值主机内存 **629.4 GiB vs 1087.6 GiB(−42%)** |
+| `RELEASE_SOURCE=1` | 默认 | 逐层 load/slice/release,主机专家内存 522→253 GiB |
+
+**预期性能(TP=2,单流,TPOT ≈ 0.92 ms/层)**
+| 场景 | 数值 | 出处 |
+|---|---|---|
+| 单流解码 | **16.64 tok/s,TPOT 36.75 ms** | ShareGPT 16 题 C=1(§570) |
+| C=4 | 30.47 tok/s,TPOT 111.19 ms | 同上 |
+| 短 prompt 首 token | ~30 ms + 调度 | §587 |
+| **冷预填充(不命中缓存)** | **~258-285 tok/s**(4K prompt ≈ 14 s) | §591 |
+| **prefix-cache 命中** | **~600-700 ms**(首步+调度) | §591 ⇒ **多轮/agent 复用同一上下文时几乎免费** |
+| 1M 上下文并发 | 6.41× | §570 |
+| 主机内存峰值 | 629.4 GiB | §570 |
+| 数值/确定性 | `OK=7 BAD=1 max_rel=1.873e-02`;greedy ×2 逐字节 5/5 | §570 |
+
+**想要更快的预填充**(可选,需自行验证):把 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1024` 打开,
+并按 §5.8 **必须**把 KV 池封顶(1M×2 并发 ⇒ `--kv-cache-memory` ≈ 4.4 GiB,策略会直接算给你),
+且 `MBT ≥ 8192`;此时 8K chunk 的预填充约 **694 tok/s(2.7× CPU)**。
+**风险**:并发预填充下的 staging 显存竞争尚未验证,且 §594 的 4 条修法未落地 ⇒ 不够稳定,不建议直接挂 harness。
+
+**最终性能验收口径(用户 2026-09-17 指定)**:所有问题收口后用 **官方 `vllm bench serve`**(非自研探针),
+`TP=2` + 充分预热,覆盖超短~32K prompt × C=1/2/4/8;详见 `report/tuning/FUTURE_PLAN.md`。
