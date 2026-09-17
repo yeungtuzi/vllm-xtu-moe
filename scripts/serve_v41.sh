@@ -227,13 +227,17 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   echo "XIAOTU_MOE_RESIDENT_BUDGET_GB=${XIAOTU_MOE_RESIDENT_BUDGET_GB:-0}"
   echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-${POLICY_GP_MIN:-0}}"
   echo "XIAOTU_RELEASE_SOURCE=${XIAOTU_RELEASE_SOURCE:-1}"
-  # 【§562】**R11 的"Engram 最后加载"默认开启**。实测(TP=2/maxlen=1024,同旗标):
+  # 【§562】**R11 的"Engram 最后加载"默认保持关闭(0)** —— 内存收益极大但**正确性未过**:
+  #   * 内存实测(TP=2/maxlen=1024,同旗标):不开 1087.6 GiB / 开 **642.1 GiB(−41%)**,启动还更快;
+  #   * **但 greedy A/B 不过**:同臂(=0 两次、同一进程)5/5 逐字节相同(探针有效),
+  #     **跨臂(=0 vs =1)只有 1/5** ⇒ 会改变模型输出 ⇒ 违反"数值/兼容性不变",故**不许默认开**。
+  #   * 想复现内存收益:XIAOTU_ENGRAM_LAST=1;要在正确性查清后再谈默认。
   #   不开 → 服务树峰值 1087.6 GiB(Engram 在 t=62s 就物化,压在整个专家装载期上)
   #   开启 → 峰值 **642.1 GiB(−41%)**,而且启动更快(352s vs 436s),0 错误
   #   日志证据:`streamed layers.14.engram.embed.weight -> …(45.8 GiB)` /
   #             `re-loaded 4 real Engram tensor(s) … (no extra peak)` /
   #             `materialized 2 Engram table(s) AFTER the expert phase (IRON_RULES R11)`
-  echo "XIAOTU_ENGRAM_LAST=${XIAOTU_ENGRAM_LAST:-1}"
+  echo "XIAOTU_ENGRAM_LAST=${XIAOTU_ENGRAM_LAST:-0}"
   # 【§504 的结论,§519 更正】**多 rank 同机时"分片单位"与"核切分单位"必须一致**:
   #   * §504 遇到的问题是真的:NPS1(2 node)+TP=2 时按 node 分片会退化成 nshard_=1 ⇒
   #     分片路径失效、退回"每 socket 一份副本"⇒ **权重存 2 份**;
@@ -257,7 +261,7 @@ nohup env \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-${POLICY_GP_MIN:-0}}" \
   XIAOTU_RELEASE_SOURCE="${XIAOTU_RELEASE_SOURCE:-1}" \
-  XIAOTU_ENGRAM_LAST="${XIAOTU_ENGRAM_LAST:-1}" \
+  XIAOTU_ENGRAM_LAST="${XIAOTU_ENGRAM_LAST:-0}" \
   XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-$THREADS_DEFAULT}" \
   XIAOTU_MOE_NSLICE_SMALL="${XIAOTU_MOE_NSLICE_SMALL:-0}" \
   XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
