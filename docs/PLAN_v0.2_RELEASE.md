@@ -23,3 +23,14 @@
 ## 4. 性能摘要格式(对齐 lvllm RELEASE_NOTES)
 **硬件表 + 两列(Plain decode / dspark)**,数字用 `vllm bench serve` 的 **output tok/s**,**TTFT 单列**;
 数据源必须是 **ShareGPT**(`scripts/bench_sharegpt.sh`),**不能用 random**(§8.1 三条理由)。
+
+---
+
+## 5. 执行状态(2026-09-18)
+
+| 步骤 | 状态 |
+|---|---|
+| 1. 当前这版(SPEC=0/1 对照 + 图表 + 硬件表 + 两列摘要) | ✅ 已在 `RELEASE_NOTES_v0.2.md` §3.2 |
+| 2. 优化 prefill(原目标 ≥1500 tok/s) | ✅ **已大幅推进,但换了口径**:用户裁定改为产品尺子(A)。CPU 预填充路径的每层 43-80 ms 浪费被清除(§619/§619d),唯一 prompt TTFT **−38~40%**;GPU 预填充按 §594 路线继续,不再设 1500 硬门槛。**天花板分析**:每 chunk 的 token 相关成本 ≈0.79-0.93 ms/token ⇒ 吞吐渐近上限 ≈1080-1270 tok/s,`max(DMA, 计算)` 重叠后也受此约束 ⇒ **1500 需要 GPU MoE kernel 再快 ~30%**,这是后续方向而不是本版承诺。 |
+| 3. 统一口径 + 撤回 0.20/0.21 + 改名 0.2pre + 发布 `v0.2` | 🔄 文档已改(§622);Release/tag 操作见 `docs/RUNBOOK.md` §5.8b |
+| 4. `--backend openai` 不触发思考这一口径漏洞 | ✅ 已查明并写入 `BENCH_REFERENCE.md` §9.1 与 `RELEASE_NOTES_v0.2.md` §3.4;`openai-chat` 列待补 |
