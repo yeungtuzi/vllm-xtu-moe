@@ -40,3 +40,8 @@ fixtures/*.npz
 
 # 报告插图用的中文字体(8 MB,不入库;make_report_figures.py 会自动下载)
 docs/figures/fonts/
+
+# ---- 本会话 transcript 派生的回放数据集(绝不入库:仓库是公开的)-------------
+# 内容 = 用户与 agent 的真实对话原文。用 `python scripts/make_dsh_replay.py` 现场重建。
+report/tuning/replay/dsh_*.json
+report/tuning/replay/dsh_*.jsonl
