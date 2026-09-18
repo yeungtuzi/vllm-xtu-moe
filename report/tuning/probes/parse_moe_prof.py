@@ -14,11 +14,16 @@ import sys
 import statistics as st
 from collections import defaultdict
 
-# [MOE-PROF] calls=… na=… M=… maxme=… skew(...)=… A=…ms A2=…ms B0=…ms B=…ms C=…ms ovh=…ms (sum …ms)
-NUM = r"([0-9.]+)"
+# **实际格式是分桶版**(moe_v2.hpp 的 `[NS-PROF]`),按 M 分桶、每 200 次打印:
+#   [NS-PROF] bucket=M<=2 calls=40 na=6.0 | per-call(us): setup=123 A=45 B=678 C=9 ovh=3 TOTAL=858
+# (M<=2 = 解码/dspark draft;M3-8 = 小 prefill;M>8 = 真 prefill)
 PAT = re.compile(
+    r"\[NS-PROF\]\s*bucket=(\S+)\s+calls=(\d+)\s+na=([0-9.]+)\s*\|\s*per-call\(us\):\s*"
+    r"setup=([0-9.]+)\s+A=([0-9.]+)\s+B=([0-9.]+)\s+C=([0-9.]+)\s+ovh=([0-9.]+)\s+TOTAL=([0-9.]+)")
+# 旧的聚合格式([MOE-PROF])也保留兼容
+PAT_OLD = re.compile(
     r"\[MOE-PROF\]\s*calls=(\d+)\s+na=(\S+)\s+M=(\S+).*?"
-    rf"A={NUM}ms\s+A2={NUM}ms\s+B0={NUM}ms\s+B={NUM}ms\s+C={NUM}ms\s+ovh={NUM}ms")
+    r"A=([0-9.]+)ms\s+A2=([0-9.]+)ms\s+B0=([0-9.]+)ms\s+B=([0-9.]+)ms\s+C=([0-9.]+)ms\s+ovh=([0-9.]+)ms")
 
 
 def main() -> int:
@@ -30,30 +35,34 @@ def main() -> int:
     with open(path, errors="ignore") as fh:
         for line in fh:
             m = PAT.search(line)
-            if not m:
+            if m:
+                bucket, calls, na = m.group(1), int(m.group(2)), float(m.group(3))
+                setup, A, B, C, ovh = (float(m.group(i)) for i in range(4, 8))
+                tot = float(m.group(9))
+                rows[bucket].append((calls, na, setup, A, B, C, ovh, tot))
                 continue
-            na, M = float(m.group(2)), float(m.group(3))
-            vals = [float(m.group(i)) for i in range(4, 10)]
-            rows[int(round(M))].append((na, vals))
-    if not rows:
-        print(f"[parse] {path} 里没有可解析的 [MOE-PROF] 行")
-        print("        提示:XIAOTU_MOE_PROFILE=1 才开;打印是**按窗口**的,窗口大小见 moe_v2.hpp")
-        return 1
-    hdr = (f"{'M(token)':>9}{'na(分配)':>10}{'样本':>5}"
-           f"{'A':>8}{'A2':>8}{'B0':>8}{'B':>8}{'C':>8}{'ovh':>8}{'sum':>9}{'tok/s':>9}")
+            mo = PAT_OLD.search(line)
+            if mo:
+                rows[f"M={mo.group(3)}"].append(
+                    (int(mo.group(1)), float(mo.group(2)), float(mo.group(5)),
+                     float(mo.group(4)), float(mo.group(6)) + float(mo.group(7)),
+                     float(mo.group(8)), float(mo.group(9)),
+                     sum(float(mo.group(i)) for i in range(4, 10))))
+    hdr = (f"{'bucket':>8}{'calls':>7}{'na':>7}"
+           f"{'setup':>9}{'A':>8}{'B':>8}{'C':>8}{'ovh':>7}{'TOTAL':>9}")
     print(hdr)
     print("-" * len(hdr))
-    for M in sorted(rows):
-        samples = rows[M]
-        na = st.mean(s[0] for s in samples)
-        cols = [st.mean(s[1][i] for s in samples) for i in range(6)]
-        tot = sum(cols)
-        # 单次调用(一层)的 ms ⇒ 该步 40 层 ⇒ 该 M 的 token 吞吐
-        tps = M / (tot * 40 / 1000.0) if tot > 0 else 0.0
-        print(f"{M:>9}{na:>10.0f}{len(samples):>5}"
-              + "".join(f"{c:>8.1f}" for c in cols) + f"{tot:>9.1f}{tps:>9.1f}")
-    print("\n列含义:A=分发/准备 A2=setup(含 scratch) B0/B=主体 C=收尾/归约 ovh=其它;"
-          "\n       sum=单层合计(ms);tok/s=按 40 层估的该 M 的引擎吞吐(与 cd-timing 交叉验证)。")
+    for b in sorted(rows):
+        sm = rows[b]
+        n = len(sm)
+        avg = lambda i: st.mean(x[i] for x in sm)  # noqa: E731
+        print(f"{b:>8}{avg(0):>7.0f}{avg(1):>7.1f}"
+              + "".join(f"{avg(i):>9.1f}" for i in range(2, 8)))
+    print("\n每列 = **per-call 微秒**(即每层的耗时);bucket 由 M=batch token 数决定。")
+    print("  M<=2  = 解码(1 + 投机 token)、dspark draft")
+    print("  M3-8  = 很小的 prefill")
+    print("  M>8   = 真 prefill(ShareGPT/长 prompt)")
+    print("\n读法:若 M>8 桶里 setup 或 A 占比大 ⇒ 改线程池/分组;若 B 占绝大部分 ⇒ 是内核算力本身。")
     return 0
 
 
