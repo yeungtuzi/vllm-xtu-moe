@@ -92,8 +92,13 @@ if [ "$JITCACHE" = "1" ]; then
     _jit_used="(本次不编译 ⇒ 不改 Triton 目录,沿用 ~/.triton/cache)"
   fi
   echo "[jitcache] 固定缓存目录 = $JITCACHE_DIR $_jit_used"
-  [ "${JITCACHE_COMPILING:-0}" = "1" ] && {
+  # NOTE: must not end on a false `[ ... ] && { ... }`. Callers source this file
+  # under `set -e`, and a sourced file's status becomes the `source` builtin's
+  # status, so a non-zero last command aborts the caller (serve_mainline.sh
+  # exited right here whenever JITCACHE_COMPILING != 1).
+  if [ "${JITCACHE_COMPILING:-0}" = "1" ]; then
     echo "[jitcache]   TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
     echo "[jitcache]   TORCHINDUCTOR_CACHE_DIR=$TORCHINDUCTOR_CACHE_DIR"
-  }
+  fi
 fi
+true
