@@ -247,7 +247,14 @@ bool auto_ep_setup(const void* key, const MOEConfigV2& cfg) {
     void* base = ::mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     ::close(fd);
     if (base == MAP_FAILED) return false;
-    if (created) std::memset(base, 0, sizeof(EpShmHeader));
+    // 【§626 修】**必须无条件清零 header**,不能只在 `created` 时清。
+    // 原来只在"自己创建"时 memset ⇒ 服务被 `kill -9` 后留在 `/dev/shm` 的段
+    // (每层 320 MiB × 40 层 = 14 GB,见 NOTES §626)会在下次启动时被**原样复用**,
+    // 于是 `hdr->gen` / `hdr->arrive` 带着上一轮的计数 ⇒ EP 屏障**永久自旋**,
+    // 表现为 `RPC call to sample_tokens timed out` / `EngineDeadError`。
+    // 时序安全:两个 rank 都在**引擎构造期**走到这里(远早于第一次 `run_moe_and_ep`),
+    // 都写零是幂等的;随后第一个屏障从 gen=0 正常开始。
+    std::memset(base, 0, sizeof(EpShmHeader));
 
     EpShmHeader* hdr = reinterpret_cast<EpShmHeader*>(base);
     hdr->world = world;
