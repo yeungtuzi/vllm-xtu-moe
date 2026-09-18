@@ -22046,3 +22046,29 @@ long_1024/4096 : 仍失败(kernel 校验/非法访存,崩=6)
 CED 的完整技术结论已闭环:机制链全部走通(切片/元数据/对齐/诊断)、
 逐层定位到**两个独立的上游不变量冲突**(`num_tokens` 断言 + `positions` 的全局来源),
 并给出唯一正确路径(**上游 PR**)。插件内实现到此为止,代码默认关、零回归风险。
+
+## §611 ⭐ 真实 ShareGPT 负载的瓶颈定位:与 GPU 预填充**无关**,在**小 qlen 的 CPU 预填充**
+### (a) 事实(prof1:TP=2 / MAXLEN=8192 / GP_MIN=4096 / CD_TIMING=1 / LAYER_TIMING=1)
+* 日志里 **`GPU prefill ACTIVE` / `DISABLED` 各 0 次** ⇒ 真实 ShareGPT 请求**从未到过 qlen≥4096**
+  (它们只有几十~几百 token);那条 `qlen=8192, period=1910ms/层, engine=1651ms/层` 是
+  **启动期 dummy/profile 前向**(CPU 算,40×1.9s≈76s —— 也是启动慢的一部分)。
+* cd-timing 按 qlen 归类(engine=CPU 引擎):
+  | qlen | period/层 | engine/层 |
+  |---|---|---|
+  | 1(解码) | 0.90 ms | 0.41 ms |
+  | 4 | 4.90 ms | 1.53 ms |
+  | 26 | 8.43 ms | **7.44 ms** |
+* `layer-timing`(Python 侧):`pre=0.049ms eng=85.6ms post=0.024ms` ⇒ **开销全在 engine 这一段**,
+  Python 前后处理可忽略(这是混合混算的平均值,单看 qlen=26 那档更清楚)。
+### (b) 结论
+* 按 qlen=2048 的 ~258 tok/s 折算,qlen=26 **本该 2.5 ms/层**,实测 **7.44 ms/层**
+  ⇒ **每层 ~5 ms 固定开销 × 40 层 ≈ 200 ms/步**;227 token 的 ShareGPT prompt 因此变成 **~2.2 s TTFT(~100 tok/s)**;
+* **GPU 预填充对这条负载分布毫无帮助**(固定成本 ~9 s/chunk,阈值以下必走 CPU),
+  所以"锁页+重叠"对 **C=1 output token/s(13.79)** 无用 —— 它只帮长 prompt(≥3-4K)。
+### (c) 下一步(唯一有数据支撑的杠杆)
+拆那 ~5 ms/层 的固定开销:候选按嫌疑排序 ——
+①**线程池唤醒/汇合**(SPIN=300 已有,但 qlen 很小时工作项太少、同步成本占比高);
+②**每层的 segmentation/bookkeeping**(`_build_segmentation` + expert grouping);
+③**每调用一次的缓冲 resize/分配**(`[setup-prof]` 的 `resize=` 分项可以读到)。
+工具:引擎内已有 `[setup-prof]`(n=…, pre_bookkeeping/resize/…)与 `[MOE-PROF]`,
+先按 qlen∈{1,8,26,128,512} 打出来,再决定改哪一处。
