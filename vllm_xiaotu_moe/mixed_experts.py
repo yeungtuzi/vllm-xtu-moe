@@ -890,8 +890,20 @@ class _XiaotuExpertsMixin:
         # "张量实际的字节数/形状"摆在一起打一次 —— 不一致一眼可见。
         if not getattr(self, "_eng_shape_dbg", False):
             self._eng_shape_dbg = True
-            _e13 = int(cfg.expert_num) * 2 * int(cfg.intermediate_size) * (int(cfg.hidden_size) // 2)
-            _e2 = int(cfg.expert_num) * int(cfg.hidden_size) * (int(cfg.intermediate_size) // 2)
+            # Bytes per weight element for THIS engine: 4-bit engines pack two
+            # elements per byte, BF16 stores two bytes, FP8 one. The old
+            # hardcoded `// 2` assumed the 4-bit layout and therefore printed
+            # half the true size for FP8/BF16, which reads exactly like a real
+            # shape mismatch (it cost a debugging detour on GLM-5.3).
+            _bpe = (
+                0.5
+                if self._engine_attr in ("MOE_MXFP4", "MOE_WNA16")
+                else (2.0 if self._engine_attr == "MOE_BF16" else 1.0)
+            )
+            _e13 = int(
+                cfg.expert_num * 2 * cfg.intermediate_size * cfg.hidden_size * _bpe
+            )
+            _e2 = int(cfg.expert_num * cfg.hidden_size * cfg.intermediate_size * _bpe)
             print(
                 f"[xtu-eng-shape] {getattr(layer, 'layer_name', '?')} "
                 f"cfg(E={cfg.expert_num} H={cfg.hidden_size} I={cfg.intermediate_size} "
