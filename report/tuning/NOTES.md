@@ -22515,3 +22515,48 @@ README 里原有那张"end-to-end"表其实早就显示了同一件事(32-token 
 1. **报 TPOT 必须同时给 prompt/上下文长度**,否则 36.75 与 60 看起来像矛盾,其实都对;
 2. 想比"解码速度",最干净的口径是**同 prompt 集下的 TPOT**;跨 prompt 集比 TPOT 没有意义;
 3. README/README_EN 的支撑矩阵行已改;RUNBOOK §5.9、MILESTONE、FUTURE_PLAN 的同类拼接处已加提醒。
+
+## §622 ⭐⭐ 「等效参数」同机 A/B:lvllm + lk-moe(arm A)vs 主线 vLLM + xiaotu-moe(arm B)
+用户 2026-09-18 的要求:"如果你认为是口径不同,那就用**等效参数**做一个 A/B,把
+lvllm+lk-moe 和我们的 vllm+xiaotu-moe 做一个完整的对比,既比较 prefill(短/长),
+也比较 output(短/长)。这个问题我始终不能满意。"
+
+### (a) 设计(为什么这样才可归因)
+脚本:`scripts/ab_lvllm_matrix.sh`(新)。
+* **两个 arm 跑在同一个 conda env(`/home/user/anaconda3/envs/lvllm`,vLLM 2.5.0)里**
+  ⇒ vLLM 基座、模型加载路径、GPU kernel 全同,**唯一变量 = CPU MoE 引擎**(§483 的同一原则)。
+  arm B 的插件由 site-packages 里受 `XTU_PLUGIN=1` 门控的 `.pth` 装载,不 pip install,也不影响 arm A。
+  ready 后做**纯度断言**:arm A 日志不得出现 `vllm-xtu-moe`,arm B 必须出现。
+* **参数以 lvllm 自己的 V4.1 启动脚本为准**(`Lvllm/commands/dsv41_serve_tp2_3090_dspark.sh`):
+  `TP=2 / MAXLEN=65536 / MBT=8192 / SEQS=2 / GPU_UTIL=0.95 / dtype=bfloat16 /
+   kv-cache-dtype=fp8_ds_mla / tokenizer-mode=deepseek_v4 / compilation-config
+   {"cudagraph_mode":"FULL_DECODE_ONLY","mode":"VLLM_COMPILE"} / enable-prefix-caching /
+   enable-chunked-prefill / default-chat-template-kwargs {"enable_thinking":false}`。
+  只做本机必需的最小改动:**线程两边同为 60**(参考机 96c、本机 192c;§483 已论证必须同值)。
+  两个 arm 各用自己的 busy-wait 策略(arm A `LK_POWER_SAVING=1`,arm B `XIAOTU_MOE_SPIN_IDLE_US=300`)。
+* **GPU 预填充两边都关**(arm A `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1e9`;
+  arm B `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1e9`)⇒ 量的是**纯 CPU MoE 引擎**。
+* 客户端 = 官方 `vllm bench serve`,2×2 矩阵:prompt ∈ {256, 8192} × output ∈ {32, 1024}、
+  C=1、N=4、`--ignore-eos` 强制长度;报三个独立量 `output_throughput / mean_ttft_ms / mean_tpot_ms`。
+* **踩到的两个坑(已修)**:
+  1. 参考 env 里**没装 pandas**,`--dataset-name custom` 会挂在 `pd.read_json`,而且真实错误被
+     `importlib.metadata.metadata("vllm")` 的 `PackageNotFoundError` 掩盖(该 env 的发行版名叫
+     `lvllm`,`vllm` 元数据不存在)⇒ 改用 `--dataset-name random`(两边拿到**逐字节相同**的 prompt)。
+  2. `random` 数据集的 prompt 由 `--seed` 决定 ⇒ **同 seed 的相邻格子会整段命中前缀缓存**:
+     实测 8192/o32 的 TTFT=64.2 s,而同 prompt 的 8192/o1024 只有 **1.2 s**。
+     修法:每个格子给 `seed = P*1000 + O*10 + C`(只由形状决定 ⇒ 两个 arm 仍逐字节相同),
+     并在矩阵前加一发预热。
+
+### (b) arm A 实测(lvllm + lk-moe,CPU-only,C=1,N=4,每格独立 seed)
+| prompt | output | output_throughput | TTFT | mean TPOT | TTFT 占比 |
+|---|---|---|---|---|---|
+| 256 | 32 | 11.19 | **2153 ms** | 22.80 ms | 74.7% |
+| 256 | 1024 | 40.08 | **2163 ms** | 22.86 ms | 8.5% |
+| 8192 | 32 | 0.49 | **64178 ms** | 22.56 ms | 98.9% |
+| 8192 | 1024 | 11.70 | **64162 ms** | 22.82 ms | 73.3% |
+
+**arm A 的两个特征(很重要)**:
+1. **解码 1/TPOT ≈ 43.9 tok/s,且与上下文/输出长度无关**(22.56-22.86 ms 几乎不动:
+   256-token 与 8192-token prompt 的 TPOT 相同);
+2. **预填充 ≈ 119-128 tok/s**(256 tok→2.15 s;8192 tok→64.2 s)⇒ 每 token ≈ 7.8 ms,
+   且近似线性(固定成本很小)。
