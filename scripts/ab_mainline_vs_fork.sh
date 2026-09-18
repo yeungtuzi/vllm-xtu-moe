@@ -5,7 +5,7 @@
 #   同一个 `xiaotu_moe.so`、同一份 `bench_lat.sh`、同一台机器,
 #   fork 编排 **26.81 ms** TPOT,主线曾 **1225 ms**(47×)。
 #   差异**不在代码 diff 里**,只有把同一份引擎放进两种编排对跑才会现形
-#   —— 这正是"支持主线"唯一可验证的定义(见 docs/PLUGIN_INTERFACE.md)。
+#   —— 这正是"支持主线"唯一可验证的定义(见 dev-docs/PLUGIN_INTERFACE.md)。
 #
 # 用法:
 #   bash scripts/ab_mainline_vs_fork.sh                 # 两边都起,跑 C=1
@@ -13,7 +13,7 @@
 #   SKIP_MAINLINE=1 bash scripts/ab_mainline_vs_fork.sh # 复用已在跑的 8071
 #   MAINLINE_PORT=8071 FORK_PORT=8070 ...
 #
-# 产物:report/tuning/raw/ab_{mainline,fork}_c<N>.json + 终端对照表。
+# 产物:dev-docs/report/tuning/raw/ab_{mainline,fork}_c<N>.json + 终端对照表。
 #
 # License: Apache-2.0
 set -uo pipefail
@@ -47,9 +47,9 @@ launch_and_wait() {
   setsid "$@" > "$log" 2>&1 < /dev/null &
   disown 2>/dev/null || true
   # 【坑】"Application startup complete" 是 vLLM 写进**服务自己的日志**
-  # (report/tuning/logs/$tag.log)的;我们捕获的 stdout 里只有 serve 脚本打印的
+  # (dev-docs/report/tuning/logs/$tag.log)的;我们捕获的 stdout 里只有 serve 脚本打印的
   # "[mainline] READY tag=..." / "[lk_port] READY tag=..."。两个文件都要看。
-  local slog="$ROOT/report/tuning/logs/$tag.log"
+  local slog="$ROOT/dev-docs/report/tuning/logs/$tag.log"
   local waited=0
   while [ "$waited" -lt "$READY_TIMEOUT_S" ]; do
     if grep -qa "READY tag=" "$log" 2>/dev/null \
@@ -66,7 +66,7 @@ launch_and_wait() {
 
 stop_tag() {
   local tag="$1"
-  local pf="$ROOT/report/tuning/logs/$tag.pid"
+  local pf="$ROOT/dev-docs/report/tuning/logs/$tag.pid"
   [ -f "$pf" ] && { kill -TERM "$(cat "$pf")" 2>/dev/null || true; }
   sleep 10
   local p
@@ -85,7 +85,7 @@ run_bench() {
   local port="$1" tag="$2" c="$3" model="$4"
   PORT="$port" TAG="$tag" MODEL="$model" SERVER_TAG="$tag" CS="$c" \
     timeout 1800 bash scripts/bench_lat.sh >/dev/null 2>&1 || true
-  local j="$ROOT/report/tuning/raw/${tag}_c${c}.json"
+  local j="$ROOT/dev-docs/report/tuning/raw/${tag}_c${c}.json"
   [ -f "$j" ] || { echo "NA NA NA"; return; }
   python3 -c "
 import json;d=json.load(open('$j'))
@@ -153,7 +153,7 @@ PY
 done
 printf -- '--------------------------------------------------------------\n'
 note "口径提醒:TPOT 已排除预填充;不要用 wall/out_tokens(会把预填充算进去,见 PLUGIN_INTERFACE §3)"
-note "raw: report/tuning/raw/ab_{mainline,fork}_c*.json"
+note "raw: dev-docs/report/tuning/raw/ab_{mainline,fork}_c*.json"
 
 if [ "${KEEP_SERVERS:-0}" != "1" ]; then
   note "清理服务(KEEP_SERVERS=1 可保留)…"

@@ -1,2 +1,0 @@
-{"kind": "ttft", "target_len": 1024, "chars": 4812, "ttft_s": 9.918, "total_s": 9.919, "chunks": 2, "best_rep": 0, "prefill_tok_per_s": 103.2, "label": "mainline_fixed", "ts": "2026-09-14T10:04:58"}
-{"kind": "ttft", "target_len": 2048, "chars": 9625, "ttft_s": 3.379, "total_s": 3.379, "chunks": 2, "best_rep": 0, "prefill_tok_per_s": 606.1, "label": "mainline_fixed", "ts": "2026-09-14T10:05:01"}

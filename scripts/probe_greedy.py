@@ -4,14 +4,14 @@
 用法:  scripts/probe_greedy.py <out.json> [port] [model]
 输出:  {"<id>": {"text": ..., "usage": ...}, ...}
 说明:  temperature=0 + seed 固定;两边用同一份 prompt 文件
-       (report/tuning/correctness_prompts.json),文本一致即认为 MoE 计算路径等价。
+       (dev-docs/report/tuning/correctness_prompts.json),文本一致即认为 MoE 计算路径等价。
 """
 import json, sys, urllib.request
 
 out_path = sys.argv[1]
 port = sys.argv[2] if len(sys.argv) > 2 else "8090"
 model = sys.argv[3] if len(sys.argv) > 3 else "DeepSeek-V4-Flash-xiaotu"
-prompts = json.load(open("/home/user/lvllm/vllm-xiaotu-moe/report/tuning/correctness_prompts.json"))
+prompts = json.load(open("/home/user/lvllm/vllm-xiaotu-moe/dev-docs/report/tuning/correctness_prompts.json"))
 
 res = {}
 for p in prompts:

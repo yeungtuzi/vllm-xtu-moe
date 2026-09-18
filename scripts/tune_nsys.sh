@@ -13,7 +13,7 @@ export VLLM_USE_FLASHINFER_SAMPLER=0 HF_HUB_OFFLINE=1 VLLM_ENGINE_READY_TIMEOUT_
 export OMP_NUM_THREADS="${OMP:-48}" XIAOTU_MOE_THREADS="${THREADS:-96}"
 export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="${PREFILL_MIN:-384}"
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
-mkdir -p "$ROOT/report/tuning/nsys"
+mkdir -p "$ROOT/dev-docs/report/tuning/nsys"
 MODEL_DIR="${MODEL:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master}"
 ARGS=(
   "$MODEL_DIR"
@@ -27,5 +27,5 @@ ARGS=(
 )
 [ "$EAGER" = "1" ] && ARGS+=(--enforce-eager)
 exec /usr/local/cuda/bin/nsys profile -t cuda,nvtx --cuda-memory-usage=false \
-  --force-overwrite true -o "$ROOT/report/tuning/nsys/$TAG" \
+  --force-overwrite true -o "$ROOT/dev-docs/report/tuning/nsys/$TAG" \
   vllm serve "${ARGS[@]}"

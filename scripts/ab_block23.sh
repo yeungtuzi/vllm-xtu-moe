@@ -18,7 +18,7 @@ cd "$ROOT"
 BUILD="$ROOT/xiaotu_moe/build"
 SO="$BUILD/_xiaotu_moe_C_avx512_vnni.cpython-312-x86_64-linux-gnu.so"
 ROUNDS="${ROUNDS:-4}"
-OUT="${OUT:-$ROOT/report/tuning/ab_block23.txt}"
+OUT="${OUT:-$ROOT/dev-docs/report/tuning/ab_block23.txt}"
 ENVV="XIAOTU_LAYER1_NPZ=${NPZ:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master} \
 OMP_NUM_THREADS=1 BS=${BS:-6} REP=${REP:-79} DEDUP=${DEDUP:-12} XIAOTU_MOE_THREADS=${THREADS:-192} XIAOTU_MOE_PROFILE=1"
 

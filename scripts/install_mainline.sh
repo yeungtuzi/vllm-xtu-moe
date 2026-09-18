@@ -7,7 +7,7 @@
 #   LEVEL=2 bash scripts/install_mainline.sh    # + PR2(A100/SM80 的 FP8 o_proj)
 #   LEVEL=3 bash scripts/install_mainline.sh    # + PR3(SM80 DS-V4 移植,21 文件)
 #
-# 补丁级别(逐块"为什么主线做不到"的理由见 docs/UPSTREAM_DRIFT.md):
+# 补丁级别(逐块"为什么主线做不到"的理由见 dev-docs/UPSTREAM_DRIFT.md):
 #   L0  零补丁(纯插件):只走 `vllm.general_plugins` 入口 + OOT 注册表覆盖。
 #       **本机(DS-V4 / 2x A100-40GB)不可用于真实服务**,缺两件上游还没有的能力:
 #         - VLLM_EXPERTS_LOAD_DEVICE=cpu(pr1):没有它,138 GB 专家权重无处安放;

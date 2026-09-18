@@ -1,6 +1,6 @@
 """让**原生(未打补丁)**的 vLLM 主线也能跑混合模式:4 处薄壳 monkey-patch。
 
-背景:混合模式需要主线的 4 处配合(见 `docs/ARCHITECTURE.md` §5):
+背景:混合模式需要主线的 4 处配合(见 `dev-docs/ARCHITECTURE.md` §5):
   1. routed-expert 权重必须建在 CPU(否则 100+ GB 专家在构造时就 OOM);
   2. oracle 必须优先选 CPU 后端(GPU 平台默认不选);
   3. CPU 后端的 AMX 重打包必须跳过(它会破坏原始权重布局,且依赖可能未编译的

@@ -6,7 +6,7 @@
 #   SWEEP="NBT=4096 NBT=16384" BASE="MODE=dsv4 MAXLEN=262144" C=64 OUT=128 \
 #     bash scripts/tune_sweep_serve.sh
 #
-# 每个变体写成 report/tuning/summary.jsonl 的一行(server_tag 标明配置),
+# 每个变体写成 dev-docs/report/tuning/summary.jsonl 的一行(server_tag 标明配置),
 # 便于事后按 server_tag 汇总。BASE 里的键值对会作为所有变体的默认环境变量。
 #
 # License: Apache-2.0
@@ -52,7 +52,7 @@ for variant in $SWEEP; do
     MAXLEN="$MAXLEN" KV_DTYPE="$KV_DTYPE" GPU_UTIL="$GPU_UTIL" KV_MEM_BYTES="$KV_MEM_BYTES" \
     SEQS="$SEQS" MAX_NBT="$MAX_NBT" PREFILL_MIN="$PREFILL_MIN" THREADS="$THREADS" OMP="$OMP" \
     EAGER="${EAGER:-1}" ENV_EXTRA="${ENV_EXTRA:-}" \
-    bash "$ROOT/scripts/tune_serve.sh" > "$ROOT/report/tuning/logs/$TAG.serve.log" 2>&1
+    bash "$ROOT/scripts/tune_serve.sh" > "$ROOT/dev-docs/report/tuning/logs/$TAG.serve.log" 2>&1
   # 自己再确认一次就绪(tune_serve 可能因为端口上还有旧进程而提前返回)
   READY=0
   for _ in $(seq 1 120); do

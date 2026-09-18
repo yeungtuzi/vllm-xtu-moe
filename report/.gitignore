@@ -1,8 +1,0 @@
-# Profiler raw artifacts (regenerable; the human-readable summary is committed)
-*.qdstrm
-*.sqlite
-*.nsys-rep
-# Compiled benchmark binaries
-st_*
-rd1
-stream

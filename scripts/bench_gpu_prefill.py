@@ -2,7 +2,7 @@
 """GPU prefill 的**性能证明**:上游 MARLIN MXFP4 vs 我们的 CPU 引擎(同一层真实权重)。
 
 回答的问题:把大 batch 的预填充切到 GPU,到底快多少、在哪个 batch 之上才划算?
-(设计文档 `docs/GPU_PREFILL_MAINLINE.md` §2.2 的 DMA 预算模型:一次完整预填充
+(设计文档 `dev-docs/GPU_PREFILL_MAINLINE.md` §2.2 的 DMA 预算模型:一次完整预填充
  ≈ 69 GiB / 20 GB/s ≈ 3.4 s,与 batch 无关 ⇒ batch 越大越划算。)
 
 用法:

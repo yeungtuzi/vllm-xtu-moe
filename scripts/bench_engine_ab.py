@@ -17,7 +17,7 @@
                        DEDUP=23 xiaotu 0.82-0.85 ms/层 vs lk 0.67
   ⇒ 验收 ① `≤0.70 ms/层` **已达标**;`每线程 ≥2.2 GB/s` 在 DEDUP=12 差 15%(已完整归因:
   内核向量化维度,lane=K vs lk 的 lane=输出列;服务端真实形状 na≈32 时已达 2.92 GB/s·线程
-  超过 lk)。结论鏈见 report/tuning/NOTES.md §113-§128。
+  超过 lk)。结论鏈见 dev-docs/report/tuning/NOTES.md §113-§128。
 
 **门禁**:`scripts/check_engine_aligned.sh` 一条命令跑"数值对拍 + 本基准"(R55:任何动
 numa_pool 同步结构或内层循环的改动都必须先过对拍,轮 68/70 两次事故都是 bench 全过而对拍挂)。

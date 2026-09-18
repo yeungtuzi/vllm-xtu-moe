@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """GPU prefill(P1)的数值对拍:上游 `fused_experts`(MXFP4 W4A16)vs 我们的 CPU 引擎。
 
-**为什么需要它**:v0.2 的 GPU-prefill 设计(`docs/GPU_PREFILL_MAINLINE.md`)要把大 batch 的
+**为什么需要它**:v0.2 的 GPU-prefill 设计(`dev-docs/GPU_PREFILL_MAINLINE.md`)要把大 batch 的
 预填充从 CPU 引擎切到**主线上游的 GPU MoE 内核**,复用 `fused_experts(hidden, w1, w2, ...)`。
 切之前必须证明**两边数值一致**,否则整条路线不可用。
 

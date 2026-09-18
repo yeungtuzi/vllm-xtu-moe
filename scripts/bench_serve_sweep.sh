@@ -24,7 +24,7 @@ LENS="${LENS:-32,256,1024,4096,16384,32768}"
 CONC="${CONC:-1,2,4,8}"
 OUTLEN="${OUTLEN:-128}"
 WARMUP="${WARMUP:-1}"
-OUTDIR="$ROOT/report/tuning/logs/bench_serve_$TAG"
+OUTDIR="$ROOT/dev-docs/report/tuning/logs/bench_serve_$TAG"
 mkdir -p "$OUTDIR"
 PY="$ENV/bin/python"
 

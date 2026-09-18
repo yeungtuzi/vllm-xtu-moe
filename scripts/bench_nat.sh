@@ -12,7 +12,7 @@
 # License: Apache-2.0
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RAW="$ROOT/report/tuning/raw"; mkdir -p "$RAW"
+RAW="$ROOT/dev-docs/report/tuning/raw"; mkdir -p "$RAW"
 PORT="${PORT:-8070}"
 MODEL="${MODEL:-DeepSeek-V4-Flash-xiaotu}"
 L="${L:-512}"
@@ -21,7 +21,7 @@ N="${N:-8}"
 OUT="${OUT:-128}"
 SERVER_TAG="${SERVER_TAG:-unknown}"
 TAG="${TAG:-nat${L}_c${C}_n${N}_out${OUT}}"
-DS="$ROOT/report/tuning/datasets/nat${L}.jsonl"
+DS="$ROOT/dev-docs/report/tuning/datasets/nat${L}.jsonl"
 TOKENIZER="${TOKENIZER:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master}"
 export HF_HUB_OFFLINE=1
 export PATH=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin:$PATH
@@ -38,7 +38,7 @@ export PATH=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin:$PATH
     --save-result --result-dir "$RAW" --result-filename "$TAG.json"
 } > "$RAW/$TAG.log" 2>&1 || { echo "[bench_nat] FAILED tag=$TAG"; tail -20 "$RAW/$TAG.log"; exit 1; }
 
-python3 - "$RAW/$TAG.json" "$TAG" "$SERVER_TAG" "$C" "$N" "$OUT" "$L" "$ROOT/report/tuning/summary.jsonl" <<'PY'
+python3 - "$RAW/$TAG.json" "$TAG" "$SERVER_TAG" "$C" "$N" "$OUT" "$L" "$ROOT/dev-docs/report/tuning/summary.jsonl" <<'PY'
 import json, sys, datetime
 src, tag, server_tag, C, N, out, ctx, dst = sys.argv[1:]
 d = json.load(open(src))

@@ -1,6 +1,0 @@
-spin=100 load=60.65 abspin100_c1: 10.14 tok/s (10.14/stream) ttft 4525.5 ms tpot 76.01 ms step 225.94 ms (2.971 tok/step)
-spin=100 [cd-timing] layers=43 qlen=6 k=6 period=3.95ms compute=2.97ms rest=0.98ms (compute 75%, rest 25%)
-spin=100 [cd-timing] layers=43 qlen=6 k=6 period=3.81ms compute=2.88ms rest=0.93ms (compute 76%, rest 24%)
-serve failed 0
-serve failed 300
-[ab-spin] done

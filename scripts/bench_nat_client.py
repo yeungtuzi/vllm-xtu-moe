@@ -10,7 +10,7 @@
 用法:
   L=1024 C=1 N=8 OUT=128 python scripts/bench_nat_client.py
   L=1024 C=2 N=8 OUT=128 TAG=nat1024_c2
-输出:report/tuning/raw/<TAG>.json + 一行进 summary.jsonl(natural_text=1, client=self)
+输出:dev-docs/report/tuning/raw/<TAG>.json + 一行进 summary.jsonl(natural_text=1, client=self)
 """
 import asyncio
 import json
@@ -20,7 +20,7 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RAW = os.path.join(ROOT, "report/tuning/raw")
+RAW = os.path.join(ROOT, "dev-docs/report/tuning/raw")
 os.makedirs(RAW, exist_ok=True)
 
 L = int(os.environ.get("L", "1024"))
@@ -31,7 +31,7 @@ PORT = os.environ.get("PORT", "8070")
 MODEL = os.environ.get("MODEL", "DeepSeek-V4-Flash-xiaotu")
 SERVER_TAG = os.environ.get("SERVER_TAG", "unknown")
 TAG = os.environ.get("TAG", f"nat{L}_c{C}_n{N}_out{OUT}")
-DS = os.environ.get("DS", os.path.join(ROOT, f"report/tuning/datasets/nat{L}.jsonl"))
+DS = os.environ.get("DS", os.path.join(ROOT, f"dev-docs/report/tuning/datasets/nat{L}.jsonl"))
 
 import aiohttp  # noqa: E402
 
@@ -146,7 +146,7 @@ async def main():
     }
     with open(os.path.join(RAW, f"{TAG}.json"), "w") as f:
         json.dump({"summary": rec, "requests": results}, f, ensure_ascii=False, indent=1)
-    with open(os.path.join(ROOT, "report/tuning/summary.jsonl"), "a") as f:
+    with open(os.path.join(ROOT, "dev-docs/report/tuning/summary.jsonl"), "a") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     print(
         f"[nat-client] {TAG}: {rec['out_tok_per_s']} tok/s "

@@ -14,7 +14,7 @@
 """
 import argparse, json, threading, time, urllib.request, urllib.error
 
-DS = "report/tuning/datasets"
+DS = "dev-docs/report/tuning/datasets"
 
 
 def _post(port, prompt, max_tokens):

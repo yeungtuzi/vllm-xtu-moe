@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 投机解码 draft 长度(k)扫描 —— 单卡 256K 已知好配置,只变 num_speculative_tokens。
 #
-# 动机(report/tuning/NOTES.md §35):实测逐位置接受率为
+# 动机(dev-docs/report/tuning/NOTES.md §35):实测逐位置接受率为
 #   p = [0.667, 0.393, 0.179, 0.048, 0.036]
 # 而我们的 MoE 成本 ∝ (1+k)·C(每个 (row,expert) 对都要重新流一遍 12.6 MB 专家权重),
 # 于是第 4/5 个 draft token 的期望收益(0.048/0.036)远低于其代价 ⇒ 预测 k=2 最优:
@@ -16,7 +16,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-LOGS="$ROOT/report/tuning/logs"
+LOGS="$ROOT/dev-docs/report/tuning/logs"
 PORT="${PORT:-8070}"
 K_LIST="${K_LIST:-2 3 5}"
 MODEL_DIR="${MODEL_DIR:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master}"

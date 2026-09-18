@@ -582,7 +582,7 @@ class _XiaotuExpertsMixin:
             )
         # `select_experts` only implements softmax/sigmoid. Silently mapping any
         # other scoring function onto softmax picks the WRONG experts (see
-        # docs/UPSTREAM.md §2.1), so refuse instead of degrading quietly.
+        # dev-docs/UPSTREAM.md §2.1), so refuse instead of degrading quietly.
         if self.scoring_func not in ("softmax", "sigmoid"):
             raise ValueError(
                 f"xiaotu CPU backend has no fallback routing for "
@@ -1151,7 +1151,7 @@ class _XiaotuExpertsMixin:
         # 与"常驻层"是两件事:常驻层把权重永久留在显存;这里每次 forward 把本层
         # 原始 MXFP4 权重 H2D 一遍、算完即弃(V4.1 = 6.72 GiB/层)。
         # 因此它只在 batch 足够大、能把这次**固定 DMA** 摊薄时才划算 ⇒ 必须阈值门控;
-        # 阈值怎么按 PCIe 带宽/显卡能力选,见 docs/GPU_PREFILL.md。
+        # 阈值怎么按 PCIe 带宽/显卡能力选,见 dev-docs/GPU_PREFILL.md。
         # 三个硬性前提(任一不满足就留在 CPU):
         #   * 只是 MXFP4 后端 —— gpu_moe_layer 的 Triton 内核只实现了 fp4+e8m0;
         #   * 不能在图捕获里(V4.1 走图,捕获期开新 H2D 会作废捕获);
@@ -1506,7 +1506,7 @@ class XiaotuCPUExpertsInt4(_XiaotuExpertsMixin, CPUExpertsInt4):
     零点:引擎的 int4 表是"中心 8"(`value = nibble - 8`),只等价于**对称**量化。
     GPTQ 检查点的 `qzeros` 存的是 `zp - 1`(主线 AMX 重排里 `+1` 还原),所以对称
     模型的 qzeros 全为 7 → zp=8;若出现非 8 的零点,`_require_symmetric` 会显式报错
-    (逐组零点需要内核侧支持,见 docs/ROADMAP.md)。
+    (逐组零点需要内核侧支持,见 dev-docs/ROADMAP.md)。
     """
 
     _engine_attr = "MOE_WNA16"
@@ -1599,7 +1599,7 @@ class XiaotuCPUExpertsInt4(_XiaotuExpertsMixin, CPUExpertsInt4):
                     f"xiaotu INT4 backend only implements symmetric quantization "
                     f"(effective zero point 8); {name} has zero points in "
                     f"[{vmin}, {vmax}]. Per-group zero points need kernel "
-                    "support; see docs/ROADMAP.md (INT4 checkpoint adaptation)."
+                    "support; see dev-docs/ROADMAP.md (INT4 checkpoint adaptation)."
                 )
 
     def _validate_weights(self, layer, ex_w13, ex_w2) -> None:

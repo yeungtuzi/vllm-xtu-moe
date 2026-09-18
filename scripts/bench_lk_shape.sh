@@ -9,13 +9,13 @@
 #     --num-prompts 50 --max-concurrency 4 --tokenizer <0731 快照>
 #
 # 用法:TAG=dsv4_tp1_lkshape PORT=8090 scripts/bench_lk_shape.sh
-# 结果:report/tuning/raw/<TAG>.{json,log} + 一行 summary.jsonl(标记 lk_shape=1)
+# 结果:dev-docs/report/tuning/raw/<TAG>.{json,log} + 一行 summary.jsonl(标记 lk_shape=1)
 #
 # License: Apache-2.0
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RAW="$ROOT/report/tuning/raw"
+RAW="$ROOT/dev-docs/report/tuning/raw"
 mkdir -p "$RAW"
 
 PORT="${PORT:-8090}"
@@ -42,7 +42,7 @@ export PATH=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin:$PATH
     --save-result --result-dir "$RAW" --result-filename "$TAG.json"
 } > "$RAW/$TAG.log" 2>&1 || { echo "[bench_lk_shape] FAILED tag=$TAG"; tail -25 "$RAW/$TAG.log"; exit 1; }
 
-python3 - "$RAW/$TAG.json" "$TAG" "$SERVER_TAG" "$C" "$N" "$ROOT/report/tuning/summary.jsonl" <<'PY'
+python3 - "$RAW/$TAG.json" "$TAG" "$SERVER_TAG" "$C" "$N" "$ROOT/dev-docs/report/tuning/summary.jsonl" <<'PY'
 import json, sys, datetime
 src, tag, server_tag, C, N, dst = sys.argv[1:]
 d = json.load(open(src))

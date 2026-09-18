@@ -65,7 +65,7 @@ SPEC_CONFIG="${SPEC_CONFIG:-{\"method\":\"dspark\",\"num_speculative_tokens\":5,
 #
 # MAXSEQS(默认 1):并发批大小上限。**实测关键**:=1(原值)时 vLLM 同时只调度一个
 #   序列,并发请求被完全串行化 —— 聚合吞吐恒定 ~13 tok/s、与并发无关,而单请求延迟
-#   线性变差(C=8 时 64 token 要 21 s)。见 report/tuning/NOTES.md §400。
+#   线性变差(C=8 时 64 token 要 21 s)。见 dev-docs/report/tuning/NOTES.md §400。
 #   默认仍为 1 以保持既有行为不变;做吞吐测试时用 MAXSEQS=8/16 覆盖。
 #
 # License: Apache-2.0
@@ -112,7 +112,7 @@ if [ "$COMPILE" = "1" ]; then
   CC_JSON="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"mode\":\"VLLM_COMPILE\"${JITCACHE_CC_EXTRA}}"
 fi
 
-OUTDIR="$ROOT/report/tuning/logs"; mkdir -p "$OUTDIR"
+OUTDIR="$ROOT/dev-docs/report/tuning/logs"; mkdir -p "$OUTDIR"
 LOG="$OUTDIR/$TAG.log"
 
 if [ ! -f "$CKPT/config.json" ]; then
@@ -164,7 +164,7 @@ export CUDA_VISIBLE_DEVICES="$GPUS"
 #   THREADS      未设时插件按 n_ccd×5 自动调优(本机 24 CCD ⇒ 120),这里钉成 **192**
 #                (实测数据见下面 XIAOTU_MOE_THREADS 那一段;旧值 60 是错的)。
 # 一律写成 "${VAR:-<现值>}":**默认行为逐字不变**,但允许从外部覆盖做 A/B。
-# 调参时配合 report/tuning/NOTES.md §389。
+# 调参时配合 dev-docs/report/tuning/NOTES.md §389。
 # ---- 环境变量文件桥 ----------------------------------------------------------
 # 实测:vLLM spawn EngineCore 时会**静默丢弃**部分 XIAOTU_* (THREADS/SPIN_IDLE_US/
 # GPU_RESIDENT_LAYERS/RELEASE_SOURCE 都丢过),于是"设了开关却没生效、且无日志"。

@@ -5,7 +5,7 @@
 #   * `serve_lk_port.sh` 走的是 **lk 编排 fork**(Lvllmds4-x + 我们的移植提交),
 #     性能数字最好,但要跟着 fork 走;
 #   * 本脚本走 **mainline vLLM + 插件**(`vllm.general_plugins` 入口),
-#     不需要改任何主线源码 —— 见 `docs/UPSTREAM_DRIFT.md` 的"形态 0"。
+#     不需要改任何主线源码 —— 见 `dev-docs/UPSTREAM_DRIFT.md` 的"形态 0"。
 #
 # 用法:
 #   ENV=/path/to/mainline-venv TAG=mymain PORT=8071 bash scripts/serve_mainline.sh
@@ -163,7 +163,7 @@ if [ "${CHECK:-1}" = "1" ]; then
     echo "[mainline] ⚠️ 自检有未通过项,仍继续启动(CHECK_STRICT=1 可改为拒绝)"
   fi
 fi
-OUTDIR="$ROOT/report/tuning/logs"; mkdir -p "$OUTDIR"
+OUTDIR="$ROOT/dev-docs/report/tuning/logs"; mkdir -p "$OUTDIR"
 LOG="$OUTDIR/$TAG.log"
 rm -f /dev/shm/xiaotu_ep_*.bin 2>/dev/null || true
 

@@ -93,7 +93,7 @@ vllm serve <DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 ```
 
 > 纯 CPU prefill 只适合短提示:2K token 就要 ~93 s(§1.4)。长提示请让 GPU 流式路径接管
-> (`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS`,细节见 [`GPU_PREFILL.md`](GPU_PREFILL.md))。
+> (`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS`,细节见 `GPU_PREFILL.md`)。
 
 离线冒烟(自带计时;`SKIP_TOK=1` 走固定 token 提示,`0` 走英文提示词模板):
 
@@ -186,7 +186,7 @@ CUDA_VISIBLE_DEVICES=0 TEST_MODEL=<DIR> CONCURRENCY=1 OUT_TOKENS=16 SKIP_TOK=0 \
 
 ## 2. 目标 FP8 模型(暂不声明支持)
 
-> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `docs/HANDOFF_v0.2pre.md` §5.1。
+> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `内部交接 HANDOFF_v0.2pre.md` §5.1。
 
 ---
 
@@ -201,7 +201,7 @@ CUDA_VISIBLE_DEVICES=0 TEST_MODEL=<DIR> CONCURRENCY=1 OUT_TOKENS=16 SKIP_TOK=0 \
 | DS-V4 服务端并发 | `report/server_conc.jsonl`;`scripts/server_concurrency_test.py` |
 | 引擎 MXFP4 / FP8 吞吐 | `scripts/bench_cpu_engine.py`、`scripts/bench_fp8_engine.py` |
 
-图表由 `python report/make_figs.py` 从 `report/*.json` 重新生成,输出在 `report/fig/`。
+图表由 `python report/make_figs.py` 从 `report/*.json` 重新生成,输出在 `内部数据 fig/`。
 
 > 免责声明:以上均为**单机初步实测**,共享机器上存在其他负载(会话记录里标注了当时的
 > `load average` 与并发任务);不同批次之间的绝对值可能相差 10–30%,请以趋势与量级为准。

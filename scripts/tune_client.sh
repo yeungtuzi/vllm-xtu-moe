@@ -9,15 +9,15 @@
 #       IN_LEN=N(合成输入长度,用于长上下文点,会改用 random 数据集)。
 #
 # 结果:
-#   report/tuning/raw/<TAG>.json     vLLM 原生结果(含逐请求 ttft/itl)
-#   report/tuning/raw/<TAG>.log      客户端完整输出
-#   report/tuning/summary.jsonl      一行一条汇总(含 server_tag / 并发 / 输出长度)
+#   dev-docs/report/tuning/raw/<TAG>.json     vLLM 原生结果(含逐请求 ttft/itl)
+#   dev-docs/report/tuning/raw/<TAG>.log      客户端完整输出
+#   dev-docs/report/tuning/summary.jsonl      一行一条汇总(含 server_tag / 并发 / 输出长度)
 #
 # License: Apache-2.0
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RAW="$ROOT/report/tuning/raw"
+RAW="$ROOT/dev-docs/report/tuning/raw"
 mkdir -p "$RAW"
 
 PORT="${PORT:-8081}"
@@ -58,7 +58,7 @@ fi
 } > "$RAW/$TAG.log" 2>&1 || { echo "[tune_client] FAILED tag=$TAG"; tail -20 "$RAW/$TAG.log"; exit 1; }
 
 python3 - "$RAW/$TAG.json" "$TAG" "$SERVER_TAG" "$C" "$N" "$OUT" "$RATE" "${IN_LEN:-sharegpt}" \
-        "$ROOT/report/tuning/summary.jsonl" <<'PY'
+        "$ROOT/dev-docs/report/tuning/summary.jsonl" <<'PY'
 import json, sys, os, datetime
 src, tag, server_tag, C, N, out, rate, inlen, dst = sys.argv[1:]
 d = json.load(open(src))

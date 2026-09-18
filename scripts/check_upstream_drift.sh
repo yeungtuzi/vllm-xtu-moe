@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Upstream drift check for vllm-xtu-moe.
 #
-# Development principle (see report/tuning/IRON_RULES.md R10): the mainline moves
+# Development principle (see dev-docs/report/tuning/IRON_RULES.md R10): the mainline moves
 # fast, so we check it on a schedule and follow up, instead of discovering the
 # drift months later.  This script answers three questions:
 #
@@ -251,6 +251,6 @@ fi
 if [ "$DRIFT" -eq 0 ]; then
   echo "RESULT: no actionable drift - HEAD installable-or-pinned, patches apply, API surface intact."
 else
-  echo "RESULT: DRIFT detected - follow up (see report/tuning/IRON_RULES.md R10)."
+  echo "RESULT: DRIFT detected - follow up (see dev-docs/report/tuning/IRON_RULES.md R10)."
 fi
 exit "$DRIFT"

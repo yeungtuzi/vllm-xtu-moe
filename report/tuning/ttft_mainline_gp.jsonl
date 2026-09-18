@@ -1,4 +1,0 @@
-{"kind": "ttft", "target_len": 256, "chars": 1203, "ttft_s": 3.257, "total_s": 3.257, "chunks": 2, "best_rep": 0, "prefill_tok_per_s": 78.6, "label": "mainline_gp", "ts": "2026-09-14T09:43:58"}
-{"kind": "ttft", "target_len": 1024, "chars": 4812, "ttft_s": 7.843, "total_s": 7.843, "chunks": 2, "best_rep": 0, "prefill_tok_per_s": 130.6, "label": "mainline_gp", "ts": "2026-09-14T09:44:05"}
-{"kind": "ttft", "target_len": 2048, "chars": 9625, "ttft_s": 3.544, "total_s": 3.544, "chunks": 2, "best_rep": 0, "prefill_tok_per_s": 577.9, "label": "mainline_gp", "ts": "2026-09-14T09:44:28"}
-{"kind": "ttft", "target_len": 4096, "chars": 19251, "ttft_s": 10.718, "total_s": 10.718, "chunks": 2, "best_rep": 0, "prefill_tok_per_s": 382.2, "label": "mainline_gp", "ts": "2026-09-14T09:44:39"}

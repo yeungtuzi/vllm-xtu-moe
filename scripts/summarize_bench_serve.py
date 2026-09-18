@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """把 `vllm bench serve --save-result` 的 json 汇总成一张表(供 BENCH_REFERENCE 用)。
 
-用法: python scripts/summarize_bench_serve.py report/tuning/logs/bench_serve_<tag>
+用法: python scripts/summarize_bench_serve.py dev-docs/report/tuning/logs/bench_serve_<tag>
 """
 import glob
 import json
@@ -15,7 +15,7 @@ def g(d, *names, default=None):
     return default
 
 def main() -> int:
-    d = sys.argv[1] if len(sys.argv) > 1 else "report/tuning/logs/bench_serve_acc"
+    d = sys.argv[1] if len(sys.argv) > 1 else "dev-docs/report/tuning/logs/bench_serve_acc"
     rows = []
     for p in sorted(glob.glob(os.path.join(d, "*.json"))):
         try:

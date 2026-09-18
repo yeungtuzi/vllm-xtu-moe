@@ -3,7 +3,7 @@
 #
 # 所有可变项都从环境变量进来,便于把"一次实验"记录成一行可复现的命令。
 # 启动后会等待 /v1/models 就绪,并把关键日志行(加载耗时、KV 容量、后端/引擎形状)
-# 写到 report/tuning/logs/<TAG>.meta。
+# 写到 dev-docs/report/tuning/logs/<TAG>.meta。
 #
 # 用法(MODE=dsv4|qwen38):
 #   MODE=dsv4 TAG=dsv4_tp1_fp8kv PORT=8081 TP=1 MAXLEN=262144 KV_DTYPE=fp8_ds_mla \
@@ -22,7 +22,7 @@ set -euo pipefail
 MODE="${MODE:-dsv4}"
 TAG="${TAG:-${MODE}_$(date +%m%d_%H%M%S)}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUTDIR="$ROOT/report/tuning/logs"
+OUTDIR="$ROOT/dev-docs/report/tuning/logs"
 mkdir -p "$OUTDIR"
 
 PORT="${PORT:-8081}"

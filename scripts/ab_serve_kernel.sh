@@ -5,15 +5,15 @@
 # 在同一时间窗口内交替测,并在每段记录 loadavg。
 #
 # 用法:scripts/ab_serve_kernel.sh            # 需要 /tmp/{old,new}_vnni.so
-# 产出:report/tuning/ab_serve_kernel.txt + raw/*_aba_*.json
+# 产出:dev-docs/report/tuning/ab_serve_kernel.txt + raw/*_aba_*.json
 #
 # License: Apache-2.0
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-LOGS="$ROOT/report/tuning/logs"
+LOGS="$ROOT/dev-docs/report/tuning/logs"
 SO="xiaotu_moe/build/_xiaotu_moe_C_avx512_vnni.cpython-312-x86_64-linux-gnu.so"
-OUT="$ROOT/report/tuning/ab_serve_kernel.txt"
+OUT="$ROOT/dev-docs/report/tuning/ab_serve_kernel.txt"
 SPEC='{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","model":"/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master"}'
 PY=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python
 

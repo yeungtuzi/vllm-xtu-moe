@@ -93,4 +93,4 @@ gh issue create --repo vllm-project/vllm \
 ## 修订记录
 
 - **2026-09-09(第 1 版)** — RFC 草稿(先发 issue 征求方向,不直接提 PR)。
-  依据:`docs/BENCHMARKS.md` 与 `docs/GPU_PREFILL.md` 的实测数据。
+  依据:`docs/BENCHMARKS.md` 与 `dev-docs/GPU_PREFILL.md` 的实测数据。

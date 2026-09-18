@@ -428,7 +428,7 @@ def _build_segmentation(topk_ids, topk_weights, num_experts, device):
 
     **必须是形状静态的**:CUDA graph 捕获期间不允许出现数据相关的形状
     (`ids[ok]` 这种布尔掩码索引会触发 `cudaErrorStreamCaptureUnsupported`,
-    见 report/tuning/TRIED_AND_REVERTED.md R14)。所以无效/不属于本 rank 的
+    见 dev-docs/report/tuning/TRIED_AND_REVERTED.md R14)。所以无效/不属于本 rank 的
     id 不删除,而是**归入垃圾桶专家桶 `num_experts`**(它排在最后,内核 grid=E
     不会读它)⇒ 与"过滤掉"完全等价。
 
@@ -1049,7 +1049,7 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
                               n_experts: int, group_k: int, dst=None):
     """K-major device weights built from the engine's OWN host buffers.
 
-    WHY (report/tuning/NOTES.md §459): the GPU prefill path used to stream the
+    WHY (dev-docs/report/tuning/NOTES.md §459): the GPU prefill path used to stream the
     checkpoint source tensors, which forced ``XIAOTU_RELEASE_SOURCE=0`` and cost an
     extra ~269 GiB of host memory (measured: EngineCore hit 1073 GB RSS before
     finishing the load, with ~3 GB free per NUMA node). But the engine already owns
@@ -1146,7 +1146,7 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
 
 
 def prebuild_pinned_kmajor(tensors: list, workers: int = 6) -> None:
-    """两阶段预建 K-major 缓存(见 report/tuning/TRIED_AND_REVERTED.md R4)。
+    """两阶段预建 K-major 缓存(见 dev-docs/report/tuning/TRIED_AND_REVERTED.md R4)。
 
     阶段 1(**纯 CPU**):并行做字节转置并放进缓存(不锁页)。任何时刻都安全,
       包括 CUDA graph 捕获期间,所以它能在 warmup 期间就跑起来 —— 这也是启动
@@ -1344,7 +1344,7 @@ def gpu_moe_layer(
         # ("dependency created on uncaptured work in another stream"),整个捕获作废。
         # 常驻槽位的数据在构建时就已写完(阻塞 H2D + 之后早已完成的事件),图内
         # 不需要这个等待;非捕获时仍然保留(预取路径靠它保证顺序)。
-        # 见 report/tuning/TRIED_AND_REVERTED.md R14。
+        # 见 dev-docs/report/tuning/TRIED_AND_REVERTED.md R14。
         if not torch.cuda.is_current_stream_capturing():
             torch.cuda.current_stream(device).wait_event(slot.ready)
         w13_t, s13_t, w2_t, s2_t = slot.bufs

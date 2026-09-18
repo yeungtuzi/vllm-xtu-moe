@@ -17,7 +17,7 @@
 > 全链路开源、可改造、可审计。
 
 * **定位**:科研 / 教学 / 小型实体应用,以及**信息安全要求高、性能要求不极端、预算受限**的场景
-  —— 对这类用户,"看得见、改得动、审得清"是硬需求,性能只要够用。
+  —— 对这类项目,"看得见、改得动、审得清"是硬需求,性能只要够用。
 * **动机**:8×H100 级 GPU 服务器起步数百万、高端上千万,科研教学不现实;
   而把专家权重放在 CPU/DRAM、只把注意力/KV 放 GPU,不仅省一个数量级的钱,
   还让模型**可以被研究**(逐层逐专家统计、插桩、安全性评估)。
@@ -230,7 +230,7 @@ NENGINES=14 REP=150 QLEN=1 LK_THREADS=120 DEDUP=6 MODE=serial \
 | 构建/部署 | `scripts/build_engine_variants.sh`、`scripts/deploy_engine.sh` |
 | 基准 | `scripts/bench_lat.sh`、`scripts/bench_cd_plumbing.py`、`scripts/bench_vs_lkmoe.py` |
 | 正确性 | `scripts/test_block23_equiv.py`、`scripts/probe_greedy.py` |
-| 文档 | `docs/REPORT_vllm-xtu-moe.md`(项目报告 + 插图)、`docs/PERFORMANCE_OPTIMIZATION.md`、`report/tuning/NOTES.md`(§300–§332)、`report/tuning/IRON_RULES.md`(铁律 R1–R9)、`report/tuning/TRIED_AND_REVERTED.md`(R1–R112)、`docs/OPTIMIZATION_RETROSPECTIVE.md`(人机协作复盘) |
+| 文档 | `内部报告 REPORT_vllm-xtu-moe.md`(项目报告 + 插图)、`内部文档 PERFORMANCE_OPTIMIZATION.md`、`内部调优记录 NOTES.md`(§300–§332)、`内部纪律 IRON_RULES.md`(铁律 R1–R9)、`内部记录 TRIED_AND_REVERTED.md`(R1–R112)、`(内部) OPTIMIZATION_RETROSPECTIVE.md`(人机协作复盘) |
 
 ---
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """生成**自然文本 + 精确上下文长度**的基准数据集。
 
-动机(report/tuning/NOTES.md §36):之前的单路基线用 sharegpt 的短 prompt
+动机(dev-docs/report/tuning/NOTES.md §36):之前的单路基线用 sharegpt 的短 prompt
 (实测只有 ~21 token/条),而 `--dataset-name random` 的随机 token 会让 draft
 接受率崩塌(位置0 由 0.67 掉到 0.35)。两者都不是目标场景。
 本脚本从 ShareGPT 的真实对话里拼出**指定 token 长度**的 prompt,
-写到 report/tuning/datasets/nat<LEN>.jsonl(每行 {"prompt": ...}),
+写到 dev-docs/report/tuning/datasets/nat<LEN>.jsonl(每行 {"prompt": ...}),
 供 `vllm bench serve --dataset-name custom --dataset-path <file>` 使用。
 
 用法:LENS="128 512 1024 4096" N=8 scripts/make_nat_dataset.py
@@ -22,7 +22,7 @@ TOK = os.environ.get(
 )
 LENS = [int(v) for v in os.environ.get("LENS", "128 512 1024 4096").split()]
 N = int(os.environ.get("N", "8"))
-OUTDIR = os.path.join(ROOT, "report/tuning/datasets")
+OUTDIR = os.path.join(ROOT, "dev-docs/report/tuning/datasets")
 os.makedirs(OUTDIR, exist_ok=True)
 
 from transformers import AutoTokenizer  # noqa: E402

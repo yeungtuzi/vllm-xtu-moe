@@ -6,7 +6,7 @@ PORT="${1:-8070}"; shift || true
 LENS=("$@"); [ ${#LENS[@]} -eq 0 ] && LENS=(8192 16384 24576 32768)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 for N in "${LENS[@]}"; do
-  F="$ROOT/report/tuning/datasets/nat$N.jsonl"
+  F="$ROOT/dev-docs/report/tuning/datasets/nat$N.jsonl"
   [ -f "$F" ] || { echo "len=$N SKIP(无数据集)"; continue; }
   python3 - "$PORT" "$F" "$N" <<'PY'
 import json,sys,time,urllib.request,urllib.error

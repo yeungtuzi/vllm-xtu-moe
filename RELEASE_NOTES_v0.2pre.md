@@ -2,7 +2,7 @@
 
 **主题:让 vllm-xtu-moe 在 vLLM 主线最新版上跑起来,并提供一条命令的安装方式。**
 
-v0.1.0 的性能数字全部来自 **lk 编排链 fork**(`Lvllmds4-x`);用户要装两套东西,
+v0.1.0 的性能数字全部来自 **lk 编排链 fork**(`Lvllmds4-x`);项目要装两套东西,
 而且 fork 与主线已经漂移、无法随主线 rebase。v0.2 把这条链**搬回主线**。
 
 ---
@@ -24,8 +24,8 @@ v0.1.0 的性能数字全部来自 **lk 编排链 fork**(`Lvllmds4-x`);用户要
 
 > 如果你已经装了初版 v0.2.0 的 wheel 且**停留在旧主线 `6c73b08dec`**,可以继续用;
 > 一旦升级主线,请换用本次重切的 wheel。完整过程见
-> [`report/tuning/NOTES.md`](report/tuning/NOTES.md) §368 与
-> [`report/tuning/IRON_RULES.md`](report/tuning/IRON_RULES.md) R10。
+> `内部调优记录 NOTES.md` §368 与
+> `内部纪律 IRON_RULES.md` R10。
 
 ---
 
@@ -44,7 +44,7 @@ v0.1.0 的性能数字全部来自 **lk 编排链 fork**(`Lvllmds4-x`);用户要
 
 ## 1. 主线支持(目标第 1/2/3 条)
 
-### 1.1 漂移审计 → [`docs/UPSTREAM_DRIFT.md`](docs/UPSTREAM_DRIFT.md)
+### 1.1 漂移审计 → `内部文档 UPSTREAM_DRIFT.md`
 
 三棵树(fork / 主线+SM 补丁 / 干净主线)的完整 diff 审计,量化"只保留必要 hunk 后
 补丁有多少行、涉及多少文件"。
@@ -90,7 +90,7 @@ v0.1.0 的性能数字全部来自 **lk 编排链 fork**(`Lvllmds4-x`);用户要
 
 **这条同时暴露了一类方法论问题**:异步/同步这种"执行模型"开关**必须在真实服务负载下 A/B** ——
 分层计时(`period` 只反映投递,不反映异步算完)与隔离微基准(单 rank、背靠背调用,
-worker 永不 park)都**覆盖不到它**。已写成 [`docs/PLUGIN_INTERFACE.md`](docs/PLUGIN_INTERFACE.md) §3 的"测量陷阱"。
+worker 永不 park)都**覆盖不到它**。已写成 `(内部) PLUGIN_INTERFACE.md` §3 的"测量陷阱"。
 
 ---
 
@@ -131,7 +131,7 @@ TAG=myrun bash scripts/check_mainline_env.sh    # 某个已启动实例的 .env 
 
 已接入 `serve_mainline.sh` 启动前(`CHECK=0` 跳过,`CHECK_STRICT=1` 不通过即拒绝启动)。
 
-### 4.2 新增:接口契约 [`docs/PLUGIN_INTERFACE.md`](docs/PLUGIN_INTERFACE.md)
+### 4.2 新增:接口契约 `(内部) PLUGIN_INTERFACE.md`
 
 把**引擎哪些默认值由宿主节奏决定**写成可查的 10 条契约表(每条附证据与后果),
 并记录两条会得出错误结论的**测量陷阱**。
@@ -146,7 +146,7 @@ fork+我们引擎 vs 主线+插件,按 **TPOT** 口径出对照表(>1.5× 标退
 
 `--cudagraph-capture-sizes` 只列解码尺寸 + 阈值 + `MBT ≥ 阈值` **三个开关缺一不可**
 (缺任一都会让 GPU 预填充**静默失效**)。主线实测:**1750 token → TTFT 3.379 s(606 t/s)**,
-是纯 CPU 基线的 **2.6×**。详见 [`docs/GPU_PREFILL_MAINLINE.md`](docs/GPU_PREFILL_MAINLINE.md)。
+是纯 CPU 基线的 **2.6×**。详见 `(内部) GPU_PREFILL_MAINLINE.md`。
 
 ---
 

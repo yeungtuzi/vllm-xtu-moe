@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 """生成项目报告(PPT)用的插图。
 
-所有数字来自本机实测(见 report/tuning/NOTES.md §300–§327 与 report/tuning/raw/)。
-输出:`docs/figures/*.png`(200 dpi,16:9 友好)。
+所有数字来自本机实测(见 dev-docs/report/tuning/NOTES.md §300–§327 与 dev-docs/report/tuning/raw/)。
+输出:`dev-docs/figures/*.png`(200 dpi,16:9 友好)。
 
 用法:
   python scripts/make_report_figures.py            # 全部生成
-  OUT=docs/figures python scripts/make_report_figures.py
+  OUT=dev-docs/figures python scripts/make_report_figures.py
 
-字体:优先用 docs/figures/fonts/NotoSansSC-Regular.otf(中文);缺失时退化为英文标签。
+字体:优先用 dev-docs/figures/fonts/NotoSansSC-Regular.otf(中文);缺失时退化为英文标签。
 """
 import os
 import sys

@@ -17,7 +17,7 @@
 # License: Apache-2.0
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RAW="$ROOT/report/tuning/raw"; mkdir -p "$RAW"
+RAW="$ROOT/dev-docs/report/tuning/raw"; mkdir -p "$RAW"
 PORT="${PORT:-8260}"
 MODEL="${MODEL:-dsv41-xtu}"
 DATASET="${DATASET:-/home/user/lvllm/ShareGPT_V3_unfiltered_cleaned_split.json}"

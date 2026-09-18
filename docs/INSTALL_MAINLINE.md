@@ -35,7 +35,7 @@ conda activate xtu02
 python -m pip install -U pip
 ```
 
-**实测**:✅(见 `report/tuning/NOTES.md §334`)
+**实测**:✅(见 `内部调优记录 NOTES.md §334`)
 
 ---
 
@@ -76,7 +76,7 @@ VLLM_USE_PRECOMPILED=1 pip install -e .     # 复用官方预编译二进制,避
 > ⚠️ **`mxfp4` 的那部分补丁已被上游吸收** —— 新版主线自带 native
 > `Mxfp4MoeBackend.CPU` 与 `prepare_mxfp4_moe_layer_for_cpu`,
 > 所以旧 `pr1` 里的 3 个 hunk 只剩 2 个需要打。**每次升级主线都要重问"这条上游做了吗"**,
-> 见 `report/tuning/IRON_RULES.md` R10.5。
+> 见 `内部纪律 IRON_RULES.md` R10.5。
 
 用仓库自带脚本一键应用(它会自己找 `<tree>/vllm`):
 
@@ -197,7 +197,7 @@ python scripts/probe_greedy.py /tmp/greedy.json 8071
 
 ---
 
-*本文件的每一步都在本机执行并记录;执行日志见 `report/tuning/logs/` 与 `report/tuning/NOTES.md §334`。*
+*本文件的每一步都在本机执行并记录;执行日志见 `内部调优记录 logs/` 与 `内部调优记录 NOTES.md §334`。*
 
 ---
 
@@ -207,7 +207,7 @@ python scripts/probe_greedy.py /tmp/greedy.json 8071
 LEVEL=0 bash scripts/install_mainline.sh    # 一个补丁都不打,只装插件
 ```
 
-只走 `vllm.general_plugins` 入口 + OOT 注册表覆盖(即 `docs/UPSTREAM_DRIFT.md` 的**形态 0**)。
+只走 `vllm.general_plugins` 入口 + OOT 注册表覆盖(即 `内部文档 UPSTREAM_DRIFT.md` 的**形态 0**)。
 
 | 能力 | `LEVEL=0`(纯插件) | `LEVEL=1`(默认,pr0+pr1) |
 |---|---|---|
@@ -228,7 +228,7 @@ LEVEL=0 bash scripts/install_mainline.sh    # 一个补丁都不打,只装插件
 
 ⇒ 所以 v0.2 的"最小补丁集"就是 **pr0 + pr1 = 4 个文件**;
 `pr2`/`pr3` 是 **A100/SM80 专属**(非 A100 机器不需要),
-按 `LEVEL=2/3` 选装。逐块理由见 `patches/upstream/*.patch` 头部注释与 `docs/UPSTREAM_DRIFT.md`。
+按 `LEVEL=2/3` 选装。逐块理由见 `patches/upstream/*.patch` 头部注释与 `内部文档 UPSTREAM_DRIFT.md`。
 
 ## 10. 装完之后:起服务前先过一遍宿主契约自检
 
@@ -240,7 +240,7 @@ TAG=myrun bash scripts/check_mainline_env.sh    # 检查某个已启动实例的
 ```
 
 它断言的是**那些缺失时不会报错、只会静默变慢(实测可达 30×)的开关**
-—— 完整清单与证据见 **`docs/PLUGIN_INTERFACE.md`**。最要紧的两个:
+—— 完整清单与证据见 **`(内部) PLUGIN_INTERFACE.md`**。最要紧的两个:
 
 * `XIAOTU_MOE_SPIN_IDLE_US=0`(缺失 ⇒ 解码从 37 ms 漂到 1225 ms/token)
 * `XIAOTU_MOE_NSLICE_SMALL=0`(缺失 ⇒ 60 个 worker 全部参与每一相)

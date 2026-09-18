@@ -41,7 +41,7 @@ import os
 
 __all__ = ["wrap_engine_class"]
 
-# MXFP4 打包布局(与 checkpoint 一致;见 docs/ARCHITECTURE.md):
+# MXFP4 打包布局(与 checkpoint 一致;见 dev-docs/ARCHITECTURE.md):
 #   w13 [E, 2I, H/2] uint8   w2 [E, H, I/2] uint8
 #   s13 [E, 2I, H/groupK]    s2 [E, H, I/groupK]   (e8m0 字节)
 _SHAPE_RULES = {

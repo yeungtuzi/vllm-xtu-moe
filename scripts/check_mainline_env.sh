@@ -3,7 +3,7 @@
 #
 # 为什么需要:同一个 `xiaotu_moe.so`,在 fork 编排下 26.81 ms/token,在主线下曾达
 # 1225 ms/token(47×)。差异**完全不在代码 diff 里**,而在宿主喂给引擎的节奏与配套开关上
-# (见 docs/PLUGIN_INTERFACE.md)。这些开关缺失时**不会报错,只会静默变慢**,
+# (见 dev-docs/PLUGIN_INTERFACE.md)。这些开关缺失时**不会报错,只会静默变慢**,
 # 所以必须在启动时断言,而不是等基准跑出来才发现。
 #
 # 用法:
@@ -20,7 +20,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # ---- 取值来源:优先读取已启动实例的 .env 记录,否则用当前 env 的默认 ----
 SRC="current shell"
 if [ -n "${TAG:-}" ]; then
-  ENVF="$ROOT/report/tuning/logs/$TAG.env"
+  ENVF="$ROOT/dev-docs/report/tuning/logs/$TAG.env"
   if [ -f "$ENVF" ]; then
     SRC="$ENVF"
     # 从 `k='v'` / `k=v` 记录里取回(serve_mainline.sh 写的格式)

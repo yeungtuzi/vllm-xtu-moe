@@ -12,8 +12,8 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-LOGS="$ROOT/report/tuning/logs"
-OUT="$ROOT/report/tuning/spin_sweep.txt"
+LOGS="$ROOT/dev-docs/report/tuning/logs"
+OUT="$ROOT/dev-docs/report/tuning/spin_sweep.txt"
 PY=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python
 SPINS="${SPINS:-5000 300 1000}"
 SPEC='{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","model":"/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master"}'

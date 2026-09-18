@@ -45,3 +45,9 @@ docs/figures/fonts/
 # 内容 = 用户与 agent 的真实对话原文。用 `python scripts/make_dsh_replay.py` 现场重建。
 report/tuning/replay/dsh_*.json
 report/tuning/replay/dsh_*.jsonl
+
+# ---- 内部开发文档(不发布)---------------------------------------------------
+# GitHub **不支持"仓库内某目录私有"**:公开仓库里所有路径都对所有人可见。
+# 所以内部文档(开发纪律、详细调优记录、内部报告、pptx/pdf)一律不进版本库,
+# 只保留在本地工作副本 / 独立的私有仓库里。对外发布的是 docs/ 与 RELEASE_NOTES_*.md。
+dev-docs/

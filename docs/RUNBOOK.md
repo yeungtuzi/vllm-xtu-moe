@@ -18,7 +18,7 @@ NVIDIA A100-PCIE-40GB(SM 8.0)· AMD EPYC 9654(无 AMX)。
 
 本插件通过官方 `vllm.general_plugins` 入口加载,**不需要 fork**。混合模式所需的
 几处主线配合由插件自带(`vllm_xiaotu_moe/mainline_shims.py`)以 monkey-patch
-方式提供(见 [`ARCHITECTURE.md`](ARCHITECTURE.md))。
+方式提供(见 `ARCHITECTURE.md`)。
 
 **方式 A:pip(最简)**
 
@@ -49,10 +49,41 @@ VLLM_USE_PRECOMPILED=1 pip install -e .  # 复用预编译算子,避免长时间
 git clone https://github.com/yeungtuzi/vllm-xtu-moe.git
 cd vllm-xtu-moe
 
-# 2a) 构建内置 CPU 引擎的原生扩展(生成 5 个 ISA 变体,约 90 秒)
+# 2a) 构建内置 CPU 引擎的原生扩展(生成 6 个 ISA 变体,约 3-6 分钟)
 PYTHON=$(which python) bash scripts/build_engine_variants.sh
-#    产物: xiaotu_moe/build/_xiaotu_moe_C_{scalar,avx2,avx512_base,avx512_vnni,avx512_bf16}.so
+#    产物: xiaotu_moe/build/_xiaotu_moe_C_{scalar,avx2,avx512_base,avx512_vnni,avx512_bf16,avx512_bf16_vbmi}.so
 #    运行时由 xiaotu_moe/loader.py 按 /proc/cpuinfo 自动选择最高可用变体
+
+# 2a')【§630/§631】编译器与调优开关(都可选,留空用默认)
+#    CXX=g++-16           编译器。**§630 实测:g++-16 比 g++-11 快 ~5%(大预填充形状)**;
+#                         clang++-23 无优势(大形状反而慢 1.6%)⇒ 中选用 g++-16(trunk,
+#                         实验性版本;若不可用退回 g++-11,行为正确但慢 ~5%)。
+#    MTUNE=znver4         `-mtune` 只改调度、不改 ISA(绝不能改成 `-march=znver4`,
+#                         那会把 AVX-512 塞进 scalar/avx2 兜底变体)。**§631 实测单独用会更差,
+#                         故默认不中选**;仅在 `XIAOTU_MOE_FOLD_SCALE=1` 时对小结/BS=227
+#                         有 −3.4% 额外收益。`g++-11` 不认识 `znver4`。
+#    EXTRA_FLAGS=...      透传宏,例如 `-DXIAOTU_MOE_FOLD_SCALE=0` 回到 §631 之前的数值路径。
+#
+#    内核开关(源码默认值,见 xiaotu_moe/csrc/moe/moe_v2_packed4.hpp 顶部)。**v0.2.1 中选值**:
+#      XIAOTU_MOE_FOLD_SCALE  默认 **1**。把每 (列,K 组) 的 block scale 折到权重侧,
+#                             消掉每个 (行,列,组) 多出来的第 3 条 FMA 端口指令
+#                             ⇒ 大预填充 −8.2~−8.4%。**只在 MRT>=2 时生效**(mr=1 时旧式更省一条
+#                             FMA 端口指令)。数值门 `OK=7 BAD=1` / `me=1 max_rel=1.873e-02`
+#                             **逐位不变**,确定性 10/10。
+#      XIAOTU_MOE_GEMM_MR     默认 **6**。行块高度 = "一次解码出来的权重喂给几行 token"。
+#                             真实负载每专家 M≈6 ⇒ MR=6 让权重**只读一遍**(MR=4 要两遍)
+#                             ⇒ BS=227 −13.6%。
+#      XIAOTU_MOE_GEMM_NR_DEFAULT 默认 **2**;`XIAOTU_MOE_GEMM_NR` 仍可运行时覆盖(=0 回退 GEMV 路径)。
+#      XIAOTU_MOE_GEMM_NR_CT  默认 **2**。把 NR 变成**编译期**常量 ⇒ 所有 `acc[MR][N]` 数组
+#                             从 `[6][8]`(48 个 zmm)收紧到 `[6][2]`(12 个)⇒ 通用回退路径不再溢出。
+#      XIAOTU_MOE_TILE_ALLMR  默认 **1**。tile 特化覆盖**所有** mr(循环边界写成字面量,
+#                             数组才有资格进 zmm)。`=3` 时 mr=4/5 掉进通用回退路径,
+#                             M=4/5 实测 1.02/1.09 ms/层;`=1` 后 0.63/0.70(−38%/−36%)。
+#      ⚠️ M(=每专家行数 = batch token×top_k/活跃专家数)决定最优 MR:`MR=6` 对
+#         V4.1(M≈B/64)、V4(M≈B/42.7)、GLM-5.3(M≈B/36)三者都最优或近似最优;
+#         推导与按模型定制的命令见内部《GLM-5.3-Flash 分析》§3(不随仓库发布)。
+#  示例:`CXX=g++-16 PYTHON=$(which python) bash scripts/build_engine_variants.sh`
+#  验证:`bash scripts/ab_compilers.sh gcc16`(内部调优记录见《与 lk_moe 的 A/B》轮 4-7)
 
 # 2b) 安装插件
 pip install -e .
@@ -103,7 +134,7 @@ xiaotu_moe variant = _avx512_bf16
 | `XIAOTU_GPU_PREFETCH_AHEAD` | `1` | 预取下一层的权重(双槽流水) |
 
 阈值推荐与实测见 [`BENCHMARKS.md`](BENCHMARKS.md);机制见
-[`GPU_PREFILL.md`](GPU_PREFILL.md)。
+`GPU_PREFILL.md`。
 
 ### 3.3 观测 / 调试(默认关闭)
 
@@ -129,7 +160,9 @@ xiaotu_moe variant = _avx512_bf16
 | `--trust-remote-code` | 通常不需要 | 主流模型配置已进入主线 |
 | `JITCACHE=1`(env,默认) | **保持开启** | 把编译缓存钉到固定目录,见 §3.5 |
 
-### 3.5 JIT 固定缓存目录(`JITCACHE`,用户 2026-09-17 要求)
+### 3.5 JIT 固定缓存目录(`JITCACHE`)
+
+> **背景(v0.1 起)**:每次启动都重新 JIT 太慢,所以把编译缓存固定到一个目录,跨重启复用。
 
 **症状**:用 `--compilation-config '{"mode":"VLLM_COMPILE",…}'` 时,**每换一个旗标、每改一行我们
 的代码,启动后第一个请求就把逐形状的 Triton 内核从头编一遍**(`jit_monitor` 警告 20-60 s/形状)。
@@ -141,7 +174,7 @@ xiaotu_moe variant = _avx512_bf16
 所以 `~/.triton/cache` 攒下的内核用不上。
 
 **做法**:三个启动器(`scripts/serve_v41.sh`、`scripts/serve_mainline.sh`、
-`report/tuning/probes/xtu_own_v41_mem.sh`)都 source `scripts/lib_jitcache.sh`:
+`<内部探针>/xtu_own_v41_mem.sh`)都 source `scripts/lib_jitcache.sh`:
 
 | 旋钮 | 默认 | 含义 |
 |---|---|---|
@@ -209,7 +242,7 @@ export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384     # 0 = 全部 CPU
 
 ### 4.2 目标 FP8 模型(暂不声明支持)
 
-> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `docs/HANDOFF_v0.2pre.md` §5.1。
+> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `内部交接 HANDOFF_v0.2pre.md` §5.1。
 
 ### 4.3 其它 MoE 模型
 
@@ -249,7 +282,7 @@ SPEC_OFF=1 bash scripts/serve_prod_8070.sh            # 关投机:高并发吞�
 权重后放不下;FP4 KV(`nvfp4_ds_mla`)在 A100/SM80 被主线拒绝,512K 单卡也会 OOM。
 
 **已知问题**:TP=2 的每层跨 rank 同步使低并发延迟变差(EP=0 时 qlen=1 的每层
-`period 4.63 ms = compute 0.86 + rest 3.77`);解法见 `docs/PERFORMANCE_OPTIMIZATION.md §7`
+`period 4.63 ms = compute 0.86 + rest 3.77`);解法见内部《性能优化》§7
 (CPU-TP:把合并放进引擎内部,而不是每层一次集合通信)。
 
 **健康检查**:
@@ -285,9 +318,9 @@ curl -s http://127.0.0.1:8070/metrics | grep -E "num_requests_running|spec_decod
 
 ---
 
-## 5. DeepSeek-V4.1-Flash 运行手册(v2026-09-18;数据出处见 `report/tuning/NOTES.md` §564-§578)
+## 5. DeepSeek-V4.1-Flash 运行手册(v2026-09-18;数据出处见 `内部调优记录 NOTES.md` §564-§578)
 
-### 5.1 出货默认(不要凭记忆改,以下为实测过的组合)
+### 5.1 中选默认(不要凭记忆改,以下为实测过的组合)
 
 | 项 | 默认 | 依据 |
 |---|---|---|
@@ -313,7 +346,7 @@ python -m vllm_xiaotu_moe.vram_policy --maxlen 1048576 --max-num-seqs 2 --tp 2 -
 ```
 任一项不足即按优先级 fallback;**绝不额外多占系统内存**。
 
-**输入口径(§592 全部改成"用户不用填"或"实测值")**
+**输入口径(§592 全部改成"不用填"或"实测值")**
 | 量 | 值 | 来源 |
 |---|---|---|
 | 卡可用显存 | 39.49 GiB | A100-40G 实测 |
@@ -325,14 +358,14 @@ python -m vllm_xiaotu_moe.vram_policy --maxlen 1048576 --max-num-seqs 2 --tp 2 -
 | 单层专家权重 | staging/2(TP=2 时 3.36) | — |
 
 ⚠️ **GPU 预填充要求 `--tensor-parallel-size >= 2`**:TP=1 时 staging 不摊薄(6.72→13.45 GiB,
-preflight 要 16.8),单卡必然放不下 ⇒ 策略直接判否(用户裁决:不指望 TP=1 跑它)。
+preflight 要 16.8),单卡必然放不下 ⇒ 策略直接判否(**不指望 TP=1 跑它**)。
 
 ### 5.3 启动与验收命令
 
 ```bash
 # 启动(TP=2/1M/投机/常驻层,真实权重)
 TAG=acc1m PORT=8315 MAXLEN=1048576 SEQS=8 GPUS=0,1 SPEC=1 RESIDENT=20-21 GP_MIN=1024 THREADS=60 \
-  bash report/tuning/probes/xtu_own_v41_mem.sh        # 自带内存峰值采样
+  bash <内部探针>/xtu_own_v41_mem.sh        # 自带内存峰值采样
 
 # 1M 配置的实测(§570):READY 388 s;峰值 629.4 GiB;KV 6,724,586 tokens(1M 并发 6.41×);
 # 显存 35.98 GiB/卡(**总占用**;其中 KV 池 12.01 GiB —— 别把总占用当 KV,§592(b));greedy 5/5。
@@ -361,7 +394,7 @@ python scripts/test_engine_determinism.py 11     # 11 次运行 10/10 逐位相�
 | `XIAOTU_CED_WINDOW` | 255 | CED 尾部长度(255=精确档论证,128=omlx 近似档) |
 | `XIAOTU_MOE_VARIANT` | 未设 | 强制 ISA 变体(变体是 pybind11 全局注册,**一变体一进程**) |
 
-### 5.5 验收/诊断工具(都在 `report/tuning/probes/`)
+### 5.5 验收/诊断工具(内部探针,不随仓库发布)
 
 | 工具 | 用途 |
 |---|---|
@@ -417,7 +450,7 @@ python -m vllm_xiaotu_moe.vram_policy --maxlen 1048576 --max-num-seqs 2 --tp 2 -
 #     (serve_v41.sh 已自动接线:`XIAOTU_KV_CACHE_BYTES` → `--kv-cache-memory`)
 
 # 2) 探针里也可以直接钉:
-TAG=gpf KV_CACHE_BYTES=4729960528 GP_MIN=1024 MAXLEN=1048576 SEQS=2   bash report/tuning/probes/xtu_own_v41_mem.sh
+TAG=gpf KV_CACHE_BYTES=4729960528 GP_MIN=1024 MAXLEN=1048576 SEQS=2   bash <内部探针>/xtu_own_v41_mem.sh
 ```
 
 **为什么要这样**:vLLM 的 KV 池是"把 util 填满"来定尺寸的,与 `maxlen` 无关
@@ -459,7 +492,7 @@ TAG=gpf KV_CACHE_BYTES=4729960528 GP_MIN=1024 MAXLEN=1048576 SEQS=2   bash repor
 
 **"发行一个版本" = 版本号 + git tag + `gh release create` 三件事,缺一不可。**
 2026-09-17 的 v0.2 只做了前两件 ⇒ GitHub 的 Releases 页面仍显示旧的 v0.2.0(Latest),
-用户"看不到新版本"。正确流程:
+客户端"看不到新版本"。正确流程:
 
 ```bash
 # 1) 版本号
@@ -474,17 +507,13 @@ gh release create v0.2 --title "vllm-xtu-moe v0.2 — <主题>" \
 gh release list --limit 5        # 复核 Latest 是否已切到新版本
 ```
 
-**撤回中间版本(2026-09-18 执行:撤回 `v0.21.0`)** —— 用户裁定把"真正支持 V4.1 +
-预填充性能优化"的版本作为 `v0.2`;旧的 `0.2.0` 全仓库改名 **`0.2pre`**;`v0.21.0` 中间产物撤回:
+**版本口径(2026-09-18 定案)** —— "真正支持 V4.1 + 预填充性能优化"的那次作为 `v0.2` 发布;
+更早那次"主线化"的 `0.2.0` 全仓库改名 **`0.2pre`**(它的 git tag `v0.2.0` 保留作归档,
+但**文档里一律称 `0.2pre`**)。开发过程中曾有一个只含 GPU 预填充修复的中间构建,
+**从未正式发布**,其内容已并入 `v0.2`,不作为任何版本号出现。
 ```bash
-gh release delete v0.21.0 --yes          # 删 GitHub Release
-git push origin :refs/tags/v0.21.0       # 删远端 tag
-git tag -d v0.21.0                       # 删本地 tag
-git tag -l                               # 复核:只剩 v0.1.0 / v0.2.0(0.2pre 的历史 tag)/ v0.2
+git tag -l        # 复核:v0.1.0 / v0.2.0(0.2pre 的历史 tag)/ v0.2 / v0.2.1
 ```
-⚠️ **`v0.2.0` 这个 tag 要留着**(它是 `0.2pre` 那次"主线化"发行的归档),
-但**文档里一律称它为 `0.2pre`**,避免与新的 `v0.2` 混淆。`RELEASE_NOTES_v0.21.0.md`
-也保留作历史,但文件顶部要标注"已撤回,内容并入 `v0.2`"。
 
 ### 5.9 ⭐ 推荐的生产/挂 harness 配置(最稳定且高效;2026-09-17 定稿)
 
@@ -554,8 +583,8 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 **判定"是否真的走了 GPU"**:日志应出现 `GPU prefill ACTIVE`(每个模块一次,40 层×rank 数);
 若出现 `GPU prefill DISABLED ... only N GiB is free` ⇒ 按 §5.8 封顶 KV 或降 MBT。
 
-**最终性能验收口径(用户 2026-09-17 指定)**:所有问题收口后用 **官方 `vllm bench serve`**(非自研探针),
-`TP=2` + 充分预热,覆盖超短~32K prompt × C=1/2/4/8;详见 `report/tuning/FUTURE_PLAN.md`。
+**最终性能验收口径(v0.2 起)**:所有问题收口后用 **官方 `vllm bench serve`**(非自研探针),
+`TP=2` + 充分预热,覆盖超短~32K prompt × C=1/2/4/8;详见内部《未来规划》。
 
 ### 5.10 ⭐ 两个"给客户端用"的服务端参数(2026-09-18 定稿;**默认都开**)
 
@@ -570,7 +599,7 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 * 作用:chat/completions 的 `usage` 里出现
   `"prompt_tokens_details": {"cached_tokens": N}` ⇒ DSH 才能算出**缓冲命中率**。
   不打开时该字段缺失,客户端只能显示 0 或干脆不显示。
-* 我们的默认:`TOK_DETAILS=1`(在 `report/tuning/probes/xtu_own_v41_mem.sh` 里),
+* 我们的默认:`TOK_DETAILS=1`(在 `<内部探针>/xtu_own_v41_mem.sh` 里),
   `TOK_DETAILS=0` 可关。
 
 #### (b) 思考强度(**reasoning effort**)
@@ -616,7 +645,7 @@ llm-pi-ai:
   (`tokenizers/deepseek_v41_encoding.py:183`;`DEFAULT_REASONING_EFFORT = "high"`)。
   **`minimal` / `medium` 会被 V4.1 直接 `ValueError`** —— 它们只在 OpenAI 协议的 `Literal`
   里合法(是给别的模型用的)⇒ **DSH 的 `reasoningEfforts` 里绝不要声明 `minimal`/`medium`**,
-  否则用户一点就是 400。
+  否则客户端一点就是 400。
 * 正因为 effort 是 **1..100 的数值预算**,客户端若能送整数,就得到"细粒度思考强度"
   (例如 `reasoning_effort: 60`)。
 * `off` 的**值不能留空**:留空 = "支持,但不送参数",对 V4.1 等于**仍然开思考**。

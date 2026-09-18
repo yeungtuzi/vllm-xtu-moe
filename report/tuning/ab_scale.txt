@@ -1,6 +1,0 @@
-r=1 kernel=base2  load=1.25   [NS-PROF] bucket=M3-8  calls=200 na=32.0 | per-call(us): setup=245 A=1164 B=1018 C=178 ovh=0 TOTAL=2604
-r=1 kernel=scale  load=1.23   [NS-PROF] bucket=M3-8  calls=200 na=32.0 | per-call(us): setup=246 A=919 B=924 C=500 ovh=0 TOTAL=2590
-r=2 kernel=base2  load=1.29   [NS-PROF] bucket=M3-8  calls=200 na=32.0 | per-call(us): setup=245 A=1429 B=1240 C=340 ovh=0 TOTAL=3254
-r=2 kernel=scale  load=1.35   [NS-PROF] bucket=M3-8  calls=200 na=32.0 | per-call(us): setup=244 A=1052 B=893 C=289 ovh=0 TOTAL=2479
-r=3 kernel=base2  load=1.40   [NS-PROF] bucket=M3-8  calls=200 na=32.0 | per-call(us): setup=242 A=1315 B=1499 C=794 ovh=0 TOTAL=3851
-r=3 kernel=scale  load=1.45   [NS-PROF] bucket=M3-8  calls=200 na=32.0 | per-call(us): setup=247 A=1256 B=1316 C=687 ovh=0 TOTAL=3506

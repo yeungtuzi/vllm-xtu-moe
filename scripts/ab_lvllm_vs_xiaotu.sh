@@ -22,8 +22,8 @@
 #   bash scripts/ab_lvllm_vs_xiaotu.sh both     # 顺序跑两个 arm
 #   bash scripts/ab_lvllm_vs_xiaotu.sh report   # 只对比已存档的两边
 #   CS="1 2 4" SPEC=1 THREADS=96 bash ... both  # 改协议
-# 产物:report/tuning/raw/ab_lvllm_{a,b}_c<N>.json、report/tuning/raw/ab_lvllm_{a,b}_greedy.json
-# 日志:report/tuning/logs/abl_{a,b}.log(服务)、report/tuning/logs/abl_{a,b}.bench.log
+# 产物:dev-docs/report/tuning/raw/ab_lvllm_{a,b}_c<N>.json、dev-docs/report/tuning/raw/ab_lvllm_{a,b}_greedy.json
+# 日志:dev-docs/report/tuning/logs/abl_{a,b}.log(服务)、dev-docs/report/tuning/logs/abl_{a,b}.bench.log
 #
 # License: Apache-2.0
 set -uo pipefail
@@ -63,7 +63,7 @@ PORT_A="${PORT_A:-8190}"
 PORT_B="${PORT_B:-8191}"
 READY_TIMEOUT="${READY_TIMEOUT:-2400}"
 
-OUTDIR="$ROOT/report/tuning/logs"; RAW="$ROOT/report/tuning/raw"
+OUTDIR="$ROOT/dev-docs/report/tuning/logs"; RAW="$ROOT/dev-docs/report/tuning/raw"
 mkdir -p "$OUTDIR" "$RAW"
 PTH="$ENV/lib/python3.12/site-packages/zz_xiaotu_plugin.pth"
 # 产物后缀:做线程/旋钮扫描时用 ATAG=<suffix> 避免覆盖正式 arm 结果

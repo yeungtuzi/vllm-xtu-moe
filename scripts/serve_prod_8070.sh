@@ -3,7 +3,7 @@
 #
 #   MODE=fast (日常交互推荐):单卡、256K 上下文、DSpark 投机解码
 #       实测 C=1 单路 85 ms/token(11.8 tok/s/路),TTFT 0.63 s;
-#       关投机时吞吐口径 C=128 可达 106 tok/s(见 docs/PERFORMANCE_OPTIMIZATION.md §15)。
+#       关投机时吞吐口径 C=128 可达 106 tok/s(见 dev-docs/PERFORMANCE_OPTIMIZATION.md §15)。
 #   MODE=1m  (默认,需要 1M 上下文):TP=2、1M 上下文、DSpark 投机解码
 #       实测 C=1 单路 266 ms/token(3.7 tok/s/路),TTFT 2.2 s;KV 容量 1,876,112 tokens。
 #
@@ -28,7 +28,7 @@ if [ "${SPEC_OFF:-0}" = "1" ]; then
   SPEC=""
 else
   # DSpark(与 lk-moe 生产同款,block=5)。注意:CUDA graph 下草稿模型捕获会崩,
-  # 所以这里强制 eager;换来单路延迟 ~+43%(见 docs/PERFORMANCE_OPTIMIZATION.md §16)。
+  # 所以这里强制 eager;换来单路延迟 ~+43%(见 dev-docs/PERFORMANCE_OPTIMIZATION.md §16)。
   SPEC="{\"method\":\"dspark\",\"model\":\"$CKPT\",\"num_speculative_tokens\":4}"
 fi
 

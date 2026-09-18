@@ -16,7 +16,7 @@ Usage
 -----
     python scripts/make_dsh_replay.py                  # newest session, 2K..32K
     python scripts/make_dsh_replay.py --session <path/to/session.v3.jsonl.zstd>
-    python scripts/make_dsh_replay.py --lens 2048,4096,8192 --outdir report/tuning/replay
+    python scripts/make_dsh_replay.py --lens 2048,4096,8192 --outdir dev-docs/report/tuning/replay
 
 Outputs, per requested length N:  ``dsh_<N>.json`` (ShareGPT-style) and
 ``dsh_<N>.jsonl`` (``{"prompt": ..., "output_tokens": 128}`` for
@@ -93,7 +93,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--session", default=None, help="path to session.v3.jsonl.zstd")
     ap.add_argument("--lens", default="2048,4096,8192,16384,32768")
-    ap.add_argument("--outdir", default="report/tuning/replay")
+    ap.add_argument("--outdir", default="dev-docs/report/tuning/replay")
     ap.add_argument("--turns", type=int, default=40, help="how many trailing turns to concatenate")
     ap.add_argument("--tokenizer", default=os.environ.get("DSH_REPLAY_TOKENIZER", ""))
     args = ap.parse_args()

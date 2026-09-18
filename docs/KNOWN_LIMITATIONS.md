@@ -34,7 +34,7 @@ sparse 关闭(--hf-overrides '{"index_topk": null}'):
 
 | 限制 | 说明 |
 |---|---|
-| **专家并行(expert_map / EP)** | ✅ 已支持(TP=2 + EP);EP 存储分片改动了专家分配/加载/映射,当前代码上的模型复验状态见 `docs/HANDOFF_v0.2pre.md` §5.1 |
+| **专家并行(expert_map / EP)** | ✅ 已支持(TP=2 + EP);EP 存储分片改动了专家分配/加载/映射,当前代码上的模型复验状态见 `内部交接 HANDOFF_v0.2pre.md` §5.1 |
 | **不支持 `apply_router_weight_on_input`** | 少数模型使用该选项 |
 | **不支持交错 gate/up 布局** | `SWIGLUOAI`(gpt-oss 系)把 gate/up 交错存在 `w13` 中;引擎按 packed 布局取数,因此该情形由 `_supports_activation` 拒绝 |
 | **INT4/WNA16 只支持对称量化** | GPTQ / compressed-tensors 的 `w13 [E, K/8, 2I] int32` + 组缩放会在引擎构造时重排为引擎布局(`[E, 2I, K/2]` u8 + `[E, N, K/group]` 缩放),**zero point 必须为 8**(对称)—— GPTQ 存 `zp-1`,即检查点的 `qzeros` 全为 7。出现非 8 的零点(非对称 AWQ/GPTQ)或 AWQ 的 N-packed 布局时插件**显式报错**,不会静默算错 |
@@ -100,8 +100,8 @@ python scripts/tiny_moe_equiv.py         # CPU/GPU 专家端到端等价性
 
 ## 7. 更新(2026-09-18)
 
-### 7.1 已修复:**线程池丢票竞态(R113)** —— 见 `report/tuning/NOTES.md` §569
-* 复现:专用压力器(`report/tuning/probes/stress_pool.{py,sh}`)**4/4 进程在 20~105 s 内 SIGABRT**,
+### 7.1 已修复:**线程池丢票竞态(R113)** —— 见 `内部调优记录 NOTES.md` §569
+* 复现:专用压力器(`内部探针 probes/stress_pool.{py,sh}`)**4/4 进程在 20~105 s 内 SIGABRT**,
   证据 `WATCHDOG(sharded) total=64 rem=1 exec=63 abandoned=48 node*: jobs=8 pulled=14`,
   **`snap_retry=0 snap_mismatch=0`**(seqlock 复读检不出"自洽但陈旧"的快照)。
 * 根因:调用方"奇数发布 store(release)"在 x86 上只进 store buffer,紧随其后的票快照 load 可以先执行

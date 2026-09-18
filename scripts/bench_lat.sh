@@ -16,7 +16,7 @@
 # License: Apache-2.0
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RAW="$ROOT/report/tuning/raw"; mkdir -p "$RAW"
+RAW="$ROOT/dev-docs/report/tuning/raw"; mkdir -p "$RAW"
 PORT="${PORT:-8070}"
 MODEL="${MODEL:-DeepSeek-V4-Flash-xiaotu}"
 L="${L:-512}"

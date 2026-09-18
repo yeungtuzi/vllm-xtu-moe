@@ -66,7 +66,7 @@ if [ "$MINBATCH" -gt "$MBT" ]; then
   MINBATCH="$MBT"
 fi
 
-OUTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/report/tuning/logs"
+OUTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/dev-docs/report/tuning/logs"
 mkdir -p "$OUTDIR"
 LOG="$OUTDIR/$TAG.log"
 rm -f /dev/shm/xiaotu_ep_*.bin 2>/dev/null || true

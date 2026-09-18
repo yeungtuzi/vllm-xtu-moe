@@ -9,7 +9,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-LOGS="$ROOT/report/tuning/logs"
+LOGS="$ROOT/dev-docs/report/tuning/logs"
 TAG="${TAG:-nat_k5}"
 PORT="${PORT:-8070}"
 SKIP_SERVE="${SKIP_SERVE:-0}"

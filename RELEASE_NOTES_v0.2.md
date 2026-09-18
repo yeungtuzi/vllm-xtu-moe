@@ -3,15 +3,14 @@
 **本版是交付版。** 它把两件事合在一起:
 
 1. **DeepSeek-V4.1-Flash(748B)全链路可用** —— 1M 上下文 + GPU 预填充 + 投机解码
-   (这部分原先以中间版本 `v0.21.0` 发布,**现已撤回**,见文末「版本口径」);
+   (这部分在开发过程中曾单独构建过一次,该构建**从未正式发布**,见文末「版本口径」);
 2. **CPU 预填充路径的实测性能优化** —— 去掉每层 **43-80 ms** 的纯浪费,
    唯一 prompt 的首 token 延迟 **−38~40%**(详见 §1、§3)。
 
-> 版本口径(用户 2026-09-18 裁定)
+> 版本口径(v0.2 定案)
 > * **`v0.2`(本文)= 交付版**;
 > * 原 `v0.2.0`(2026-09-14「主线化」版,**不支持 V4.1**)全仓库改称 **`0.2pre`**;
-> * `v0.21.0`(2026-09-17,只有 GPU 预填充修复)**已撤回**:GitHub Release 与 tag 均删除,
->   内容并入本版。
+> * 开发中曾有一个只含 GPU 预填充修复的中间构建,**从未正式发布**,其内容已并入本版。
 
 ---
 
@@ -45,7 +44,7 @@ need(down,both,act,bf16,row)=71,71,71,71,71   me_max=1246  me_sum=11399 (=NASS �
 已逐个核对(`both` 由 gate/up 写满、`abf16` 由融合 SiLU 写满、`down` 由 down GEMM 写满、
 `rowmap` 紧接着写满;`xg`/`act` 全仓库无读取点)。
 
-| | 修前(0.2pre/0.21.0) | **v0.2** |
+| | 修前(0.2pre) | **v0.2** |
 |---|---|---|
 | `resize` 段 / 层(M≈1.9K) | **43-80 ms** | **56-78 µs** |
 | 每层真实扩容次数 | **355** | **0** |
@@ -97,7 +96,7 @@ need(down,both,act,bf16,row)=71,71,71,71,71   me_max=1246  me_sum=11399 (=NASS �
 | C=4 | <!--PENDING:plain_c4--> | <!--PENDING:plain_ttft_c4--> | <!--PENDING:ds_c4--> | <!--PENDING:ds_ttft_c4--> |
 | C=8 | <!--PENDING:plain_c8--> | <!--PENDING:plain_ttft_c8--> | <!--PENDING:ds_c8--> | <!--PENDING:ds_ttft_c8--> |
 
-**v0.2 相对上一版(`v0.21.0`)在同口径下的变化(Plain,`--backend openai`,C=1/4/8,out≤128)**
+**v0.2 相对上一版(`0.2pre`)在同口径下的变化(Plain,`--backend openai`,C=1/4/8,out≤128)**
 
 | 并发 | output tok/s(旧 → 新) | TTFT ms(旧 → 新) | mean TPOT ms(旧 → 新) |
 |---|---|---|---|
@@ -109,7 +108,7 @@ need(down,both,act,bf16,row)=71,71,71,71,71   me_max=1246  me_sum=11399 (=NASS �
 * **解码速度(TPOT)没有变化** —— 这一版改的是预填充;
   C=1 的 output tok/s 涨 21%,**全部来自 TTFT 从 2224 → 1339 ms**;
 * C=4/C=8 基本不变:并发下 TTFT 已被摊薄,预填充不再是瓶颈(见 §3.3);
-* 因此**报数必须带 output 长度**(用户 2026-09-18 的裁定)。
+* 因此**报数必须带 output 长度**(v0.2 起的固定口径)。
 
 ### 3.3 ⭐ output 长度决定 `output_throughput` 里有多少是解码
 
@@ -142,7 +141,7 @@ DSH 的真实路径是 `/v1/chat/completions` + 默认开思考。两列都测�
 
 ### 3.5 唯一 prompt 的预填充(不命中前缀缓存,量的是真预填充)
 
-| prompt tokens | 0.2pre/0.21.0 | **v0.2** | 变化 |
+| prompt tokens | 0.2pre | **v0.2** | 变化 |
 |---|---|---|---|
 | 806-820 | 6.077 s(132.6 tok/s) | **4.688 s(174.9 tok/s)** | −23% / +32% |
 | 1889-1893 | 13.765 s(137.5 tok/s) | **10.558 s(178.9 tok/s)** | −23% / +30% |
@@ -151,7 +150,7 @@ DSH 的真实路径是 `/v1/chat/completions` + 默认开思考。两列都测�
 
 两个 arm 跑在**同一个 conda env**(vLLM 2.5.0 基座)、参数照抄 lvllm 自己的 V4.1 启动脚本、
 CPU 线程数两边同为 60、GPU 预填充两边都关、prompt 逐字节相同(纯度断言通过)。
-完整表/repro:`report/tuning/AB_LVLLM_VS_XIAOTU.md`;分析:`report/tuning/NOTES.md` §622。
+完整表/repro:`内部调优记录 AB_LVLLM_VS_XIAOTU.md`;分析:`内部调优记录 NOTES.md` §622。
 
 | prompt | output | lk-moe out_tput | 本插件 | B/A | lk-moe TTFT | 本插件 TTFT | B/A | lk-moe TPOT | 本插件 TPOT | B/A |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -217,7 +216,7 @@ bash /tmp/run_replay2.sh <TAG>
 * GPU 预填充的 chunk 上限 **MBT=8192**(16384 会 OOM,点在 attention 的
   `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`);
 * **`nshard_>=2`(本机恒真)时 legacy `forward_many` 是死代码** —— 优化只需看 `forward_many_nsliced`;
-* CED(③ 预填充捷径)仍未实现,原因与边界见 `report/tuning/NOTES.md` §604;
+* CED(③ 预填充捷径)仍未实现,原因与边界见 `内部调优记录 NOTES.md` §604;
 * `--backend openai` 的 ShareGPT 数字**不含思考**,与 DSH 真实负载不同(§3.4)。
 
 ---
@@ -228,5 +227,5 @@ bash /tmp/run_replay2.sh <TAG>
 |---|---|---|
 | `v0.1.0` | 首版(lk 编排链 fork) | 历史 |
 | `v0.2.0` → **`0.2pre`** | 2026-09-14「主线化」;**不支持 V4.1** | tag 保留作归档,文档改称 `0.2pre` |
-| `v0.21.0` | 2026-09-17 中间产物(V4.1 + GPU 预填充修复) | **已撤回**(Release + tag 均删除) |
+| *(中间构建)* | v0.2 开发中只含 GPU 预填充修复的一次构建 | **从未发布**,内容并入 v0.2 |
 | **`v0.2`** | **本版:V4.1-Flash + CPU 预填充优化** | **交付版** |

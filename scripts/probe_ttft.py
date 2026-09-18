@@ -3,7 +3,7 @@
 
 Measures **true time-to-first-token** (streaming, first chunk) for a given prompt
 length, plus the effective prefill rate. This is the verification client for the
-GPU-prefill three switches (see docs/GPU_PREFILL_MAINLINE.md §2.4): with GPU
+GPU-prefill three switches (see dev-docs/GPU_PREFILL_MAINLINE.md §2.4): with GPU
 prefill off, long prompts are served by the CPU engine at ~45 t/s and TTFT grows
 linearly; with it on, TTFT is dominated by a ~constant weight-DMA term.
 
@@ -17,7 +17,7 @@ Env:
   LENS    comma list of target prompt token counts (default 256,1024,2048)
   LABEL   free-form label copied into every row (for A/B comparison)
   REP     repetitions per length, keeps the best (default 1)
-  OUT     jsonl output path (default report/tuning/ttft_<LABEL>.jsonl)
+  OUT     jsonl output path (default dev-docs/report/tuning/ttft_<LABEL>.jsonl)
   UNIQUE  1 (默认) = **每次重复都用全新 prompt**(首 token 就不同)⇒ 量的是**真预填充**;
           0 = 复用同一 prompt(旧行为)⇒ 量到的是 **prefix-cache 命中 + 首步**,不是预填充吞吐。
 
@@ -40,7 +40,7 @@ PORT = int(os.environ.get("PORT", "8071"))
 LENS = [int(v) for v in os.environ.get("LENS", "256,1024,2048").split(",") if v]
 LABEL = os.environ.get("LABEL", "na")
 REP = int(os.environ.get("REP", "1"))
-OUT = os.environ.get("OUT", f"report/tuning/ttft_{LABEL}.jsonl")
+OUT = os.environ.get("OUT", f"dev-docs/report/tuning/ttft_{LABEL}.jsonl")
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
 
 # ~4.7 chars/token English filler; content is irrelevant, only length matters.
