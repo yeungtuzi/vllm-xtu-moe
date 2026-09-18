@@ -218,7 +218,37 @@ bash scripts/serve_glm53_mainline.sh        # 默认 TP=2、GPU 0/1、bf16 KV
 * **TTFT 由 CPU 预填充主导**(`XIAOTU_*GPU_PREFILL_MIN_TOKENS=0`);GPU 预填充(R-VRAM 优先级 2)
   尚未在 GLM 上开启,是下一个明确靶子。
 
-### 2.4 数值与稳定性
+### 2.4 上下文 / 显存预算(TP=2,单卡 A100-40GB)
+
+| 项 | 实测 |
+|---|---|
+| 每 rank 模型权重 | **8.75 GiB** |
+| KV cache 可用 | **23.0 GiB**(`gpu-memory-utilization 0.90`)|
+| **KV 容量** | **615,660 tokens**(bf16)|
+| 主机内存 | ~595 GB(引擎单份 NUMA 分片 + vLLM 源张量)|
+
+⇒ **40 GB 卡上无法同时满足 1M 上下文与 bf16 KV**(1M 需要约 40 GiB/rank 的 KV)。
+GLM 的模型上限是 1M,但本机可行上限约 **61.5 万 token**。要上 1M 需要更大的卡,
+或 fp8 KV —— 而 **SM8x 稀疏 MLA 后端只支持 bf16 KV**,所以当前无解,属硬件/KV 约束。
+
+### 2.5 预填充成本模型(为什么长 prompt 的 TTFT 是秒级)
+
+引擎侧微基准(`scripts/bench_fp8_mcurve.py`,E=288 / H=4096 / I=2048,60 线程;
+**单进程满 I**,服务里 TP=2 每 rank I=1024 ≈ 一半工作量):
+
+| 每专家行数 M | 1 | 6 | 12 | 28 | 57 | 114 |
+|---|---|---|---|---|---|---|
+| ms / 层 | 31.6 | 61.9 | 105.8 | 244.0 | 493.3 | 959.7 |
+| 专家-token 吞吐 | 9.1k | 27.9k | 32.7k | 33.1k | 33.3k | **34.2k /s** |
+
+**读法**:M≥28 后每层的"专家-token 吞吐"饱和在 **~33k/s** ⇒ 预填充是**吞吐受限**,
+与并发无关。`M = B/36`,所以 4096-token 的 chunk 每层 M≈114 ⇒ 42 层约 40 s 量级,
+与实测 **TTFT 29.3 s**(4096-in)同量级。
+⇒ 想把长 prompt 的 TTFT 压下来,**必须让预填充走 GPU**:而现有的 GPU 预填充路径
+(`vllm_xiaotu_moe/gpu_prefill.py`)只实现了 **MXFP4** 流式内核,GLM 的 **FP8** 需要新的
+GPU 内核 —— 这是下一轮最大的一块工作。
+
+### 2.6 数值与稳定性
 
 * 层内数值(`GLM_MODEL=<ckpt> python scripts/test_glm53_fp8_layer.py <layer> 8`):
   真实权重 RMS 相对误差 **3.6e-5 ~ 3.1e-4**(门限 1e-3);

@@ -29,6 +29,15 @@ logical→physical topk 机制,只把最后的 attention 核换成可移植 Trit
 > 该后端由模型侧显式绑定(`glm5next` 的 DSA 层),**不改变其它模型的选路**;
 > 本插件的 CPU 专家路径对该模型早有验证(`scripts/test_glm53_fp8_layer.py`)。
 
+**上下文上限(硬件约束)**:在 2×A100-40GB / TP=2 上,bf16 KV 只能提供
+**615,660 token** 的 KV 容量(23.0 GiB/rank)。GLM 的模型上限是 1M,但
+**本机无法同时满足 1M 上下文与 bf16 KV**(需要约 40 GiB/rank);
+而 SM8x 稀疏 MLA 后端**只支持 bf16 KV**,所以 1M 在当前硬件上不可达。
+
+**长 prompt 的 TTFT 是秒级(CPU 预填充)**:引擎预填充吞吐饱和在 ~33k 专家-token/s
+(见 `MODEL_GUIDES.md` §2.5),4096-token 的 TTFT 实测 **29.3 s**。
+现有 GPU 预填充实现只覆盖 MXFP4,GLM 的 FP8 走 GPU 需要新的内核(未实现)。
+
 ## 2. 后端能力
 
 | 限制 | 说明 |
