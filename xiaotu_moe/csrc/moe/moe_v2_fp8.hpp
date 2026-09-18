@@ -124,6 +124,158 @@ inline void matmul_fp8_quant_range(const uint16_t* A, const uint8_t* W, const fl
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// FP8 (MR, NR) register blocking.
+//
+// The legacy path walks one row at a time, so for every (row, column) pair it
+// re-decodes the same weight byte and re-loads the same activation chunk: a
+// batch routed to one expert re-reads that expert's N*K bytes M times (M = rows
+// this expert got). GLM-5.3-Flash's real shapes put M in 1..12, so weight
+// traffic is up to 12x what it needs to be.
+//
+// This tile path decodes each weight vector once and feeds it to MR rows, and
+// loads each activation vector once for NR columns:
+//     instr/MAC ~ 1/16 + decode/(MR*16) + activation/(NR*16)
+// Register budget: acc[MR][NR] + av[MR] + wv[NR] + ~4 <= 32 zmms, so (12,1),
+// (8,1), (6,2), (5,3) and (4,4) all fit.
+//
+// Compact NUMA shard support: `rowshift` maps a global output row j to the
+// shard-local row j-rowshift, so the same kernel serves the dense block and a
+// node's compact [gate][up] slice (see MOE_V2::shard_fill_w13). `rowmap` lets
+// the activation row come from a gathered buffer.
+//
+// The tiled path requires groupK (and K) to be a multiple of kVW; other
+// geometries fall back to the legacy kernel (dense only).
+// ---------------------------------------------------------------------------
+#ifndef XIAOTU_MOE_FP8_MR
+#define XIAOTU_MOE_FP8_MR 6
+#endif
+#ifndef XIAOTU_MOE_FP8_NR
+#define XIAOTU_MOE_FP8_NR 2
+#endif
+
+#if defined(__AVX512F__)
+template <int MRT, int NRT>
+inline void fp8_tile_avx512(const uint16_t* A, const uint8_t* W, const float* S,
+                            float* C, int N, int K, int gn, int gk,
+                            int group_count, int kb_stride, int j0, int rowshift,
+                            const uint32_t* rowmap, int m0) {
+    __m512 acc[MRT][NRT];
+    for (int r = 0; r < MRT; ++r)
+        for (int jj = 0; jj < NRT; ++jj) acc[r][jj] = _mm512_setzero_ps();
+
+    // Column bases are loop-invariant; hoist the row pointers out of the k loop.
+    const uint8_t* wrow[NRT];
+    for (int jj = 0; jj < NRT; ++jj)
+        wrow[jj] = W + (size_t)(j0 + jj - rowshift) * (size_t)K;
+
+    for (int g = 0; g < group_count; ++g) {
+        const int kbase = g * gk;
+        const int kend = (kbase + gk < K) ? (kbase + gk) : K;
+        __m512 sv[NRT];
+        for (int jj = 0; jj < NRT; ++jj)
+            sv[jj] = _mm512_set1_ps(S[(size_t)((j0 + jj) / gn) * kb_stride + g]);
+        for (int k = kbase; k < kend; k += kVW) {
+            __m512 wv[NRT];
+            for (int jj = 0; jj < NRT; ++jj)
+                wv[jj] = _mm512_mul_ps(fp8::e4m3x16_to_fp32(wrow[jj] + k), sv[jj]);
+            for (int r = 0; r < MRT; ++r) {
+                const uint16_t* ap =
+                    A + (size_t)(rowmap ? rowmap[m0 + r]
+                                        : (uint32_t)(m0 + r)) * (size_t)K + k;
+                const __m512 av = load_bf16_as_f32(ap);
+                for (int jj = 0; jj < NRT; ++jj)
+                    acc[r][jj] = _mm512_fmadd_ps(wv[jj], av, acc[r][jj]);
+            }
+        }
+    }
+    for (int r = 0; r < MRT; ++r)
+        for (int jj = 0; jj < NRT; ++jj)
+            C[(size_t)(m0 + r) * N + j0 + jj] = vhsum(acc[r][jj]);
+}
+#endif
+
+// C[M,N] fp32 = A[M,K]bf16 x W[N,K]fp8^T for columns [n0, n1), MR x NR tiled.
+// W/S are indexed by GLOBAL row for the scale table (`(j0+jj)/gn`), and by
+// SHARD-LOCAL row for the weights (`j0+jj-rowshift`).
+inline void matmul_fp8_tiled_range(const uint16_t* A, const uint8_t* W, const float* S,
+                                   float* C, int M, int N, int K,
+                                   int groupN, int groupK, int n0, int n1,
+                                   int rowshift, const uint32_t* rowmap) {
+#if defined(__AVX512F__)
+    if (M <= 0 || K <= 0 || n1 <= n0) return;
+    const int gk = groupK > 0 ? groupK : 1;
+    if ((gk % kVW) != 0 || (K % kVW) != 0) {
+        // Geometry the tile path does not cover; the legacy kernel is dense-only,
+        // so this is reachable only with rowshift == 0 (see the trait guards).
+        matmul_fp8_quant_range(A, W, S, C, M, N, K, groupN, groupK, n0, n1);
+        return;
+    }
+    const int gn = groupN > 0 ? groupN : 1;
+    const int group_count = (K + gk - 1) / gk;
+    const int kb_stride = group_count;
+    constexpr int MR = XIAOTU_MOE_FP8_MR;
+    constexpr int NR = XIAOTU_MOE_FP8_NR;
+    for (int m0 = 0; m0 < M; m0 += MR) {
+        const int mr = (M - m0 < MR) ? (M - m0) : MR;
+        for (int j0 = n0; j0 < n1; j0 += NR) {
+            const int nj0 = n1 - j0;
+            const int nj = (nj0 < NR) ? nj0 : NR;
+#define XIAOTU_FP8_TILE_ARGS A, W, S, C, N, K, gn, gk, group_count, kb_stride, j0, rowshift, rowmap, m0
+#define XIAOTU_FP8_DISPATCH_MR(MRT)                                              \
+    if (mr == (MRT)) {                                                           \
+        if (nj == 1)      fp8_tile_avx512<MRT, 1>(XIAOTU_FP8_TILE_ARGS);         \
+        else if (nj == 2) fp8_tile_avx512<MRT, 2>(XIAOTU_FP8_TILE_ARGS);         \
+        else if (nj == 3) fp8_tile_avx512<MRT, 3>(XIAOTU_FP8_TILE_ARGS);         \
+        else              fp8_tile_avx512<MRT, 4>(XIAOTU_FP8_TILE_ARGS);         \
+        continue;                                                                \
+    }
+#if XIAOTU_MOE_FP8_MR >= 1
+            XIAOTU_FP8_DISPATCH_MR(1)
+#endif
+#if XIAOTU_MOE_FP8_MR >= 2
+            XIAOTU_FP8_DISPATCH_MR(2)
+#endif
+#if XIAOTU_MOE_FP8_MR >= 3
+            XIAOTU_FP8_DISPATCH_MR(3)
+#endif
+#if XIAOTU_MOE_FP8_MR >= 4
+            XIAOTU_FP8_DISPATCH_MR(4)
+#endif
+#if XIAOTU_MOE_FP8_MR >= 5
+            XIAOTU_FP8_DISPATCH_MR(5)
+#endif
+#if XIAOTU_MOE_FP8_MR >= 6
+            XIAOTU_FP8_DISPATCH_MR(6)
+#endif
+#if XIAOTU_MOE_FP8_MR >= 7
+            XIAOTU_FP8_DISPATCH_MR(7)
+#endif
+#if XIAOTU_MOE_FP8_MR >= 8
+            XIAOTU_FP8_DISPATCH_MR(8)
+#endif
+#if XIAOTU_MOE_FP8_MR >= 9
+            XIAOTU_FP8_DISPATCH_MR(9)
+#endif
+#if XIAOTU_MOE_FP8_MR >= 10
+            XIAOTU_FP8_DISPATCH_MR(10)
+#endif
+#if XIAOTU_MOE_FP8_MR >= 11
+            XIAOTU_FP8_DISPATCH_MR(11)
+#endif
+#if XIAOTU_MOE_FP8_MR >= 12
+            XIAOTU_FP8_DISPATCH_MR(12)
+#endif
+#undef XIAOTU_FP8_DISPATCH_MR
+#undef XIAOTU_FP8_TILE_ARGS
+        }
+    }
+#else
+    // Non-AVX512 ISA: keep the portable legacy kernel.
+    matmul_fp8_quant_range(A, W, S, C, M, N, K, groupN, groupK, n0, n1);
+#endif
+}
+
 inline void matmul_fp8_quant(const uint16_t* A, const uint8_t* W, const float* S,
                              float* C, int M, int N, int K,
                              int groupN, int groupK) {
@@ -226,6 +378,58 @@ struct FP8WeightTraits : WeightTraitsBase<FP8WeightTraits> {
         const float* sbase = fp8_scale_base(w2_g, eid, hidden, inter, groupN, groupK);
         fp8_detail::matmul_fp8_quant_range(act, base, sbase, down, 1, hidden, inter, groupN, groupK,
                                            n0, n1);
+    }
+
+    // ---- Batched (M>1) slice variants --------------------------------------
+    // `me` rows of ONE expert in a single GEMM call, so each weight vector is
+    // decoded once and shared across MR rows (matmul_fp8_tiled_range). Honors
+    // the compact NUMA-shard geometry that forward_many_nsliced passes
+    // (cstride/row0/up_off), where W points at this node's [gate][up] slice.
+    static void gate_up_slice_batch_impl(int me, const uint16_t* xg, const void* w13,
+                                         const void* w13_g, const float* w13_gs,
+                                         float* both_buf, int inter, int hidden,
+                                         size_t eid, int groupN, int groupK,
+                                         int n0, int n1,
+                                         const uint32_t* rowmap = nullptr,
+                                         size_t cstride = 0, long row0 = 0,
+                                         size_t up_off = 0) {
+        (void)w13_gs;
+        if (me <= 0) return;
+        if (n1 < 0 || n1 > inter) n1 = inter;
+        if (n1 <= n0) return;
+        const int n2 = 2 * inter;
+        const size_t rowb = (size_t)hidden;                        // fp8: 1 byte/elem
+        const size_t S = cstride ? cstride : (size_t)n2 * rowb;    // per-expert stride
+        const size_t r0 = (size_t)(row0 < 0 ? 0 : row0);
+        const size_t uoff = up_off ? up_off : (size_t)inter * rowb;
+        const uint8_t* gbase = static_cast<const uint8_t*>(w13) + eid * S;
+        const float* sbase = fp8_scale_base(w13_g, eid, n2, hidden, groupN, groupK);
+        // gate rows [0, inter): shard-local row = global row - r0
+        fp8_detail::matmul_fp8_tiled_range(xg, gbase, sbase, both_buf, me, n2, hidden,
+                                           groupN, groupK, n0, n1, (int)r0, rowmap);
+        // up rows [inter, 2*inter): stored right after the gate slice in a shard
+        fp8_detail::matmul_fp8_tiled_range(xg, gbase + uoff, sbase, both_buf, me, n2, hidden,
+                                           groupN, groupK, inter + n0, inter + n1,
+                                           (int)(r0 + (size_t)inter), rowmap);
+    }
+
+    static void down_slice_batch_impl(int me, const uint16_t* actg, const void* w2,
+                                      const void* w2_g, const float* w2_gs,
+                                      float* down_buf, int hidden, int inter,
+                                      size_t eid, int groupN, int groupK,
+                                      int n0, int n1,
+                                      size_t cstride = 0, long row0 = 0) {
+        (void)w2_gs;
+        if (me <= 0) return;
+        if (n1 < 0 || n1 > hidden) n1 = hidden;
+        if (n1 <= n0) return;
+        const size_t rowb = (size_t)inter;                         // fp8: 1 byte/elem
+        const size_t S = cstride ? cstride : (size_t)hidden * rowb;
+        const size_t r0 = (size_t)(row0 < 0 ? 0 : row0);
+        const uint8_t* base = static_cast<const uint8_t*>(w2) + eid * S;
+        const float* sbase = fp8_scale_base(w2_g, eid, hidden, inter, groupN, groupK);
+        fp8_detail::matmul_fp8_tiled_range(actg, base, sbase, down_buf, me, hidden, inter,
+                                           groupN, groupK, n0, n1, (int)r0, nullptr);
     }
 
     // Per-expert scale table base; a degenerate all-ones table (thread-local, so
