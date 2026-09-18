@@ -960,6 +960,7 @@ def kmajor_from_engine_shards_v2(engine, device, hidden: int, inter: int,
     ns = int(geo["ns"])
     if ns < 2 or not geo["w13_node_bytes"] or not geo["w2_node_bytes"]:
         return None
+    _pin_engine_hostbufs(engine)
     H, I, E = int(hidden), int(inter), int(n_experts)
     rb13 = H // 2
     rb2 = I // 2
@@ -1018,6 +1019,30 @@ def kmajor_from_engine_shards_v2(engine, device, hidden: int, inter: int,
                   flush=True)
             a.update({"dma": 0.0, "asm": 0.0, "tr": 0.0})
     return out
+
+
+_PIN_DONE = {"n": -1}
+
+
+def _pin_engine_hostbufs(engine) -> None:
+    """【§612】首次走 GPU 预填充时,把引擎自有的 host 分片**就地锁页一次**。
+
+    为什么:这些分片是 `mmap`/`numa_alloc_onnode` 的 **pageable** 内存,实测 DMA 只有
+    16-21 GB/s;而同一机器上**锁页**拷贝是 **26.85 GB/s**(微基准 5.74 s/chunk)⇒
+    每 chunk 固定成本 8.9 s → ~5.4 s。**不额外占内存**(只是锁住已有页,不复制)。
+    幂等;失败只告警不抛(继续用 pageable)。`XIAOTU_GPF_PIN=0` 可关。
+    """
+    if _PIN_DONE["n"] >= 0 or os.environ.get("XIAOTU_GPF_PIN", "1") == "0":
+        return
+    try:
+        n = int(engine.pin_hostbufs())
+        _PIN_DONE["n"] = n
+        print(f"[vllm-xtu-moe] GPU 预填充:引擎 host 分片锁页 {n} 个缓冲"
+              f"(DMA 16-21 → 26.85 GB/s)", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        _PIN_DONE["n"] = -1
+        print(f"[vllm-xtu-moe] ⚠️ host 分片锁页不可用(继续 pageable): "
+              f"{type(exc).__name__}: {exc}", flush=True)
 
 
 def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
