@@ -272,9 +272,20 @@ output_throughput = sum(actual_output_lens) / dur_s     # dur_s = 整个 benchma
   **自然停止、短输出(16 条共 1193 token ≈ 75/条)、227-token prompt** 的口径,
   与 §9.2 的 `--ignore-eos` 长输出口径**不可直接比**。
 * **不是回归**:同 prompt 同参数 A/B,mean TPOT **43.32 → 42.46 ms**(median 36.26 → 34.20)。
-* 机制线索:CPU MoE 引擎在解码关键路径上(解码桶 `[NS-PROF]` TOTAL **755-1056 µs/层** ×40
-  ≈ **30-42 ms**,占 TPOT 的 70-95%)⇒ 内容→路由→活跃专家数会直接搬动 TPOT。
-  **完整归因实验的原始数据见 `report/tuning/raw/attr_*.json` 与 `plen_*.json`。**
+* **受控归因(同一服务、同一参数,只换 prompt 集;C=1、`--ignore-eos` 强制 128 输出)**:
+
+| prompt 均值 | 解码时上下文 | mean TPOT | p50 | TTFT | output_tput |
+|---|---|---|---|---|---|
+| 17 tok | ~145 | **33.5 ms** | 33.4 | 162 ms | 28.98 |
+| 165 tok | ~293 | **39.8 ms** | 37.3 | 947 ms | 21.31 |
+| 438 tok | ~566 | **53.5 ms** | 56.5 | 2456 ms | 13.84 |
+
+  ⇒ **主因是 prompt(=上下文)长度,不是输出长度**:同样 438-token prompt,
+  `--ignore-eos` 开/关(输出 128 vs 65)TPOT 为 53.5 vs 58.4 ms —— 同量级且方向不一致。
+* **机制**:TPOT = **CPU MoE(与上下文无关,≈30-42 ms)** + **GPU 稀疏注意力(随上下文增长后饱和)**。
+  解码桶 `[NS-PROF]` TOTAL **755-1056 µs/层** × 40 = **30-42 ms** ⇒ 短上下文时 TPOT 几乎**全是 CPU MoE**,
+  `1/33.5ms ≈ 30 tok/s` 就是当前解码地板。
+* 原始数据:`report/tuning/raw/attr_*.json`、`plen_*.json`、`sgpre_pc0_o*.json`、`sgpost_pc0_o*.json`。
 
 ### 9.4 v0.2 的 ShareGPT 数字(两列)
 | 口径 | 是否开思考 | C=1 out tok/s | C=1 TTFT | C=1 mean TPOT |

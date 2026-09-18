@@ -10,7 +10,8 @@
 > 本文写于 **2026-09-16/17**,当时 DeepSeek-V4.1-Flash **尚未落地**。现在:
 > **它在 v0.2 上全链路跑通并验收** —— 1M 上下文 + GPU 预填充 + 投机解码;
 > 主机峰值 **629.4 GiB(-42%)**、KV **6,724,586 tokens(1M 并发 6.41x)**、
-> 单流 **16.64 tok/s / TPOT 36.75 ms**、greedy x2 **5/5 逐字节相同**、
+> 单流 **16.64 output tok/s / TTFT 1339 ms**(out≤128,prompt 均值 227);
+> **TPOT 随上下文变化**(受控实测 17/165/438-token prompt ⇒ **33.5/39.8/53.5 ms**)、greedy x2 **5/5 逐字节相同**、
 > 数值门 `OK=7 BAD=1 max_rel=1.873e-02`、确定性 10/10。
 >
 > * 发行说明:[`RELEASE_NOTES_v0.2.md`](../RELEASE_NOTES_v0.2.md)

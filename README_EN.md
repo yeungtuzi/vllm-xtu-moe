@@ -20,7 +20,7 @@
 
 | Model | Status | Key numbers (measured on our machine) |
 |---|---|---|
-| **DeepSeek-V4.1-Flash** (748B) | ✅ **v0.2** | full chain (**1M context + GPU prefill + speculative**); host peak **629.4 GiB (-42%)**; KV **6.72M tokens (6.41x 1M concurrency)**; single stream **16.64 tok/s / TPOT 36.75 ms**; greedy ×2 **5/5 byte-identical** |
+| **DeepSeek-V4.1-Flash** (748B) | ✅ **v0.2** | full chain (**1M context + GPU prefill + speculative**); host peak **629.4 GiB (-42%)**; KV **6.72M tokens (6.41x 1M concurrency)**; ShareGPT C=1 **16.64 output tok/s, TTFT 1339 ms** (out<=128, mean prompt 227 tok); **TPOT rises with context: 33.5 ms at a 17-token prompt -> 53.5 ms at 438 tokens** (see "TPOT is not a constant" below); greedy x2 **5/5 byte-identical** |
 | **DeepSeek-V4-Flash** | ✅ 0.2pre | end to end on the mainline (serve / `bench_lat` C=1/2/4 / numeric gate `OK=7 BAD=1` / startup self-check) |
 
 * **Why V4.1-Flash works**: 38.5% of its weights are a **pure lookup table**
@@ -136,6 +136,24 @@ Step-by-step guides plus preliminary measurements for **DeepSeek-V4-Flash**:
 **[`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md)**.
 
 ## Measured performance (v0.2)
+
+> **TPOT is not a constant: it grows with the KV context.** Measured on one service with one
+> config, varying **only** the prompt set (C=1, 128 forced output tokens, prefix cache off):
+> 17-token prompt -> **33.5 ms**; 165-token -> **39.8 ms**; 438-token -> **53.5 ms**.
+> Output length is *not* the driver (same 438-token prompt, 128 vs 65 output tokens: 53.5 vs 58.4 ms).
+> Mechanism: TPOT = CPU MoE (context-independent, ~30-42 ms) + GPU sparse attention (grows with
+> context, then saturates). So both "36.75 ms" and "60 ms" are correct measurements taken at
+> different contexts -- **always publish TPOT together with the prompt/context length**.
+>
+> **`output_throughput` contains TTFT**: `output_tput ~= 1/(TTFT/L + TPOT)`. Measured: at L=128 it
+> reaches only **74%** of the pure-decode ceiling `1/TPOT`; at L>=1024 it reaches **96-98%**.
+> **Always publish `output tok/s` together with the output length.**
+>
+> **`--backend openai` does NOT trigger thinking**: it posts to `/v1/completions` with the raw
+> prompt, and V4.1 renders thinking only through the chat template. The numbers below are the
+> **non-thinking** regime (comparable with historical numbers). DSH's real path is
+> `/v1/chat/completions` with thinking on by default.
+
 
 > Machine: 2x AMD EPYC 9654 (192 cores) / 3x A100-40GB / DDR5-4800 24 channels.
 > Protocol: **TP=2**, fully warmed up, unique prompts (no prefix-cache hits),

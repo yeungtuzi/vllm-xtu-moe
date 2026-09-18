@@ -112,20 +112,20 @@ DeepSeek-V4-Flash 的**推荐参数与实测数据**见
 >
 > 本文档里的**实测数据不是同一时点的**,请按此判读:
 >
-> | 结论 | 验证于 | 在 0.2pre 代码上复验? |
+> | 结论 | 验证于 | 在 **v0.2** 代码上复验? |
 > |---|---|---|
-> | **DeepSeek-V4-Flash 主线端到端**(服务、`bench_lat` C=1/2/4、数值门禁 `OK=7 BAD=1`、启动自检) | **0.2pre**(2026-09-14) | ✅ **是** |
-> | **DeepSeek-V4.1-Flash 全链路**(1M 上下文 / GPU 预填充 / 投机解码;`vllm bench serve` 6 长度 × 4 并发) | **v0.2**(2026-09-17) | ✅ **是** |
+> | **DeepSeek-V4-Flash 主线端到端**(服务、`bench_lat` C=1/2/4、数值门禁 `OK=7 BAD=1`、启动自检) | **0.2pre**(2026-09-14) | ⏸️ **未复验**(清单见 [`docs/HANDOFF_v0.2pre.md`](docs/HANDOFF_v0.2pre.md) §5.1) |
+> | **DeepSeek-V4.1-Flash 全链路**(1M 上下文 / GPU 预填充 / 投机 / ShareGPT 端到端 / 长 prompt 回放) | **v0.2**(2026-09-18) | ✅ **是**(即本页数据) |
 >
-> 原因:v0.2 改动了**所有模型都会走的路径**(执行模型 `XIAOTU_MOE_ASYNC=0`、
-> 小 batch 路径 `NSLICE_SMALL=0`、**EP 存储分片**)。**除 DeepSeek-V4-Flash 外均需复验**,
-> 复验清单与命令见 **[`docs/HANDOFF_v0.2pre.md`](docs/HANDOFF_v0.2pre.md)** §5.1。
+> 原因:v0.2 改动了**所有模型都会走的路径**(CPU 预填充的 scratch 布局、执行模型
+> `XIAOTU_MOE_ASYNC=0`、小 batch 路径 `NSLICE_SMALL=0`、**EP 存储分片**)。
+> **V4.1-Flash 已在 v0.2 上完整复验**;**其余模型仍需复验**,不要默认沿用旧数字。
 
 ### 已验证模型
 
 | 模型 | 状态 | 关键数据(均为本机实测) |
 |---|---|---|
-| **DeepSeek-V4.1-Flash**(748B) | ✅ **v0.2** | **1M 上下文 + GPU 预填充 + 投机**全链路;主机峰值 **629.4 GiB(−42%)**;KV **6.72M tokens(1M 并发 6.41×)**;单流 **16.64 tok/s / TPOT 36.75 ms**;greedy ×2 **5/5 逐字节相同** |
+| **DeepSeek-V4.1-Flash**(748B) | ✅ **v0.2** | **1M 上下文 + GPU 预填充 + 投机**全链路;主机峰值 **629.4 GiB(−42%)**;KV **6.72M tokens(1M 并发 6.41×)**;ShareGPT C=1 **16.64 output tok/s,TTFT 1339 ms**(out≤128,prompt 均值 227);**TPOT 与上下文强相关:17-token prompt 33.5 ms → 438-token 53.5 ms**(见下方「TPOT 不是常数」);greedy ×2 **5/5 逐字节相同** |
 | **DeepSeek-V4-Flash** | ✅ 0.2pre | 主线端到端(服务 / `bench_lat` C=1/2/4 / 数值门禁 `OK=7 BAD=1` / 启动自检) |
 
 * **V4.1-Flash 为什么能支持**:38.5% 的权重是**纯查找表**(Engram,183 GiB,每 token 只需 ~12 KB
@@ -140,7 +140,49 @@ DeepSeek-V4-Flash 的**推荐参数与实测数据**见
 > 机器:2×AMD EPYC 9654(192 核)/ 3×A100-40GB / DDR5-4800 24 通道。
 > 口径:**TP=2**、充分预热、唯一 prompt(不命中前缀缓存)、官方 `vllm bench serve`。
 > 原始数据在 [`report/tuning/logs/bench_serve_acc2/`](report/tuning/logs/bench_serve_acc2/),
-> 完整表见 [`report/tuning/BENCH_REFERENCE.md`](report/tuning/BENCH_REFERENCE.md) §7。
+> 完整表见 [`report/tuning/BENCH_REFERENCE.md`](report/tuning/BENCH_REFERENCE.md) §7 与 §9。
+
+### ⭐ ShareGPT 摘要(v0.2;`output tok/s` 与 `TTFT` **两个独立量,不折算**)
+
+口径:`--dataset-name sharegpt`、`--sharegpt-output-len 128`、`--num-prompts 16`、前缀缓存开、
+`--backend openai`(**裸补全,不触发思考** —— 见下方「口径警告」)。
+
+| 并发 | Plain:output tok/s | Plain:TTFT (ms) | dspark:output tok/s | dspark:TTFT (ms) |
+|---|---|---|---|---|
+| **C=1** | **16.64** | **1339** | _待补_ | _待补_ |
+| C=4 | 42.50 | 745 | _待补_ | _待补_ |
+| C=8 | 50.03 | 1100 | _待补_ | _待补_ |
+
+**v0.2 相对上一版(撤回的 `v0.21.0`)同口径的变化(Plain)**:C=1 output tok/s **13.75 → 16.64(+21%)**、
+TTFT **2224 → 1339 ms(−40%)**;而 **mean TPOT 43.32 → 42.46 ms 不变** ——
+**涨的全部是 TTFT 那一项,不是解码**。
+
+### ⭐ TPOT 不是常数:它随**上下文长度**变化(这也解释了"到底 36 还是 60 ms")
+**同一台服务、同一组参数,只换 prompt 集**(C=1、`--ignore-eos` 强制 128 输出、前缀缓存关):
+
+| prompt 均值 | 解码时上下文 | mean TPOT | p50 TPOT | TTFT | output tok/s |
+|---|---|---|---|---|---|
+| 17 tok | ~145 | **33.5 ms** | 33.4 | 162 ms | 28.98 |
+| 165 tok | ~293 | **39.8 ms** | 37.3 | 947 ms | 21.31 |
+| 438 tok | ~566 | **53.5 ms** | 56.5 | 2456 ms | 13.84 |
+
+* **输出长度不是主因**:同样 438-token prompt,`--ignore-eos` 开/关(输出 128 vs 65 token)
+  TPOT 是 53.5 vs 58.4 ms —— 一个量级内,方向还不一致(噪声/内容)。
+* **prompt 长度才是主因**:17 → 438 token,TPOT **33.5 → 53.5 ms(+60%)**。
+  本页下面的"end-to-end"表其实早就显示了同一件事(32-token prompt 36.2 ms → 1024-token 64.6 ms)。
+* **机制**:TPOT = **CPU MoE(与上下文无关,≈30-42 ms)** + **GPU 稀疏注意力(随上下文增长、然后饱和)**。
+  引擎实测解码桶 `[NS-PROF]` = 755-1056 µs/层 × 40 层 = **30-42 ms** ⇒ 短上下文时
+  TPOT 几乎**全是 CPU MoE**,`1/33.5ms ≈ 30 tok/s` 就是当前解码地板。
+* ⇒ **所以"36.75 ms"和"60 ms"都对**,只是量在不同上下文上;**报 TPOT 必须同时给上下文/prompt 长度**。
+* ⇒ `output_throughput` 里 TTFT 的占比由 **output 长度**决定:
+  `output_tput ≈ 1/(TTFT/L + TPOT)`;实测 L=128 只到纯解码上限的 **74%**,L≥1024 达 **96-98%**。
+
+### ⚠️ 口径警告:`--backend openai` **不触发思考**
+`--backend openai` 打 `/v1/completions` 并原样发 prompt,而 V4.1 的思考只在 prompt encoder
+(经 chat template)里渲染 ⇒ **裸补全路径不开思考**。DSH 的真实路径是 `/v1/chat/completions` + 默认开思考。
+上表是**非思考**口径(与历史数字可比);`openai-chat` 列待补。
+判断依据是"template 有没有被套上",不是 backend 的名字 —— `custom` 数据集不加
+`--skip-chat-template` 时会在客户端套一次,**那条路径也会开思考**。
 
 ### GPU 预填充 vs CPU 预填充(DeepSeek-V4.1-Flash,客户端 TTFT)
 
@@ -151,6 +193,19 @@ DeepSeek-V4-Flash 的**推荐参数与实测数据**见
 
 成本模型(实测):**每个 chunk ≈ 8.9 s 固定 + 0.79 ms/token**。固定项 = 每个 chunk 都要把
 **143.6 GiB/rank** 的专家权重搬一遍(TP=2,40 层 × 3.589 GiB)⇒ **chunk(`--max-num-batched-tokens`)越大越划算**。
+
+### DSH 开发会话回放(长 prompt;**这不是 ShareGPT**)
+
+ShareGPT 平均 prompt 只有 ~227 token,**永远触发不到 GPU 预填充**(阈值 4096)。
+用本机 DSH transcript 的末尾若干轮原文按 token 截断,得到真实的长 prompt 曲线
+(C=1、out=128、**CPU 预填充**;`python scripts/make_dsh_replay.py` 现场重建):
+
+| prompt | 2048 | 4096 | 8192 | 16384 | 32768 |
+|---|---|---|---|---|---|
+| TTFT | 11.43 s | 21.99 s | 42.58 s | 85.25 s | 172.56 s |
+| 预填充速率 | 179 tok/s | 186 | 192 | 192 | 190 |
+
+⇒ 预填充速率**线性且稳定在 ~190 tok/s**(固定成本已被摊平)。GPU 预填充的同一曲线见 `RELEASE_NOTES_v0.2.md` §3.6。
 
 ### 端到端(官方 `vllm bench serve`,TP=2 / MBT=8192 / GPU 预填充 / KV 封顶 4 GiB / 关前缀缓存)
 

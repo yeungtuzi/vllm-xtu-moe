@@ -510,7 +510,7 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 | `TP=2` | 2 | R-VRAM 默认;**GPU 预填充要求 TP≥2**(TP=1 staging 不摊薄 6.72→13.45 GiB,§592(e)) |
 | `MAXLEN` | 1048576 | R-VRAM 优先级 1,**不可降级** |
 | `KV_CACHE_BYTES` | **12 GiB** | 复现 §570 验收过的 KV 容量(**6,724,586 token = 1M 并发 6.41×**);同时**刻意留出 ~13 GiB 空闲**做长序列工作区(§513c 的 32K OOM 根因就是这里被 KV 吃光)。**必须显式给**,理由见 §5.8 |
-| `SPEC=1` | DSpark | 实测 **16.64 vs 13.85 t/s**(+20%),TPOT 36.75 vs 42.86 ms;greedy 5/5 逐字节一致 |
+| `SPEC=1` | DSpark | 实测 **16.64 vs 13.85 t/s**(+20%),TPOT 36.75 vs 42.86 ms;greedy 5/5 逐字节一致。<br>⚠️**TPOT 必须连上下文一起读**:同一服务的受控实测(只换 prompt 集)是 **33.5 / 39.8 / 53.5 ms** 对应 17 / 165 / 438 token 的 prompt(README「TPOT 不是常数」)。上表那两个值取自**短 prompt** 口径,不要拿它跟长 prompt 的数字比 |
 | **`GPU_PREFILL_MIN_TOKENS=0`** | **关** | §592/§593/§594:MBT=8192 以下 GPU 预填充的**每 chunk 固定成本 ~11.6 s**(80% 是 staging),默认 chunk(~2048)下只有 **155 tok/s vs CPU 258 tok/s**;要赢需 chunk ≥3000 且先修 §594 的 4 条。**先保证稳定** |
 | `SEQS=8` | 8 | 挂 harness 要并发;KV 12 GiB 足够(短 prompt 下容量以 Mtoken 计) |
 | `MBT=8192` | 8192 | 与 §570 一致;⚠️ **别用 32768**(§593(f) 会 hang) |
