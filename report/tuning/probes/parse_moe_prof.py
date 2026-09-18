@@ -37,7 +37,7 @@ def main() -> int:
             m = PAT.search(line)
             if m:
                 bucket, calls, na = m.group(1), int(m.group(2)), float(m.group(3))
-                setup, A, B, C, ovh = (float(m.group(i)) for i in range(4, 8))
+                setup, A, B, C, ovh = (float(m.group(i)) for i in range(4, 9))
                 tot = float(m.group(9))
                 rows[bucket].append((calls, na, setup, A, B, C, ovh, tot))
                 continue
