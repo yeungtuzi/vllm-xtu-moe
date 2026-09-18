@@ -107,7 +107,7 @@
 * **C=1 的 output tok/s(13.79)偏低,主因是 TTFT 2222 ms** —— ShareGPT 平均 prompt 只有
   **227 token**,实测**全部走 CPU 预填充**(~100 tok/s)。这是当前最该攻的点。
 
-![bench](docs/figures/v0210_bench_serve.png)
+![bench](docs/figures/v02_bench_serve.png)
 
 ### 5.3 裸预填充口径(随机 token,仅用于量预填充本身)
 

@@ -9,7 +9,7 @@
 数据源:
   A) ShareGPT:report/tuning/raw/sg*_c*.json  (scripts/bench_sharegpt.sh 产出)
   B) 长度×并发扫描(裸预填充):report/tuning/logs/bench_serve_acc2/L*_C*.json
-输出:docs/figures/v0210_bench_serve.png(200 dpi)
+输出:docs/figures/v02_bench_serve.png(200 dpi)
 用法: python report/tuning/probes/plot_bench_serve.py
 """
 import glob
@@ -136,7 +136,7 @@ def main() -> int:
     d.grid(alpha=.3, which="both"); d.legend(title=T("prompt 长度", "prompt len"), fontsize=8)
 
     fig.tight_layout(rect=[0, 0, 1, 0.97])
-    out = os.path.join(FIG, "v0210_bench_serve.png")
+    out = os.path.join(FIG, "v02_bench_serve.png")
     fig.savefig(out, dpi=200)
     print("已生成", out)
     return 0
