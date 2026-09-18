@@ -167,6 +167,17 @@ inline void matmul_fp8_quant_range(const uint16_t* A, const uint8_t* W, const fl
 #ifndef XIAOTU_MOE_FP8_WIDE_HI
 #define XIAOTU_MOE_FP8_WIDE_HI 11
 #endif
+// Third plan for the very small row counts, where a wider column block pays off
+// more than a taller row block: (4,4) measured 4-11% faster than (6,2) at M<=4.
+#ifndef XIAOTU_MOE_FP8_SMALL_MR
+#define XIAOTU_MOE_FP8_SMALL_MR 4
+#endif
+#ifndef XIAOTU_MOE_FP8_SMALL_NR
+#define XIAOTU_MOE_FP8_SMALL_NR 4
+#endif
+#ifndef XIAOTU_MOE_FP8_SMALL_HI
+#define XIAOTU_MOE_FP8_SMALL_HI 4
+#endif
 
 #if defined(__AVX512F__)
 template <int MRT, int NRT>
@@ -294,10 +305,18 @@ inline void matmul_fp8_tiled_range(const uint16_t* A, const uint8_t* W, const fl
     constexpr int MR = XIAOTU_MOE_FP8_MR;
     constexpr int NR = XIAOTU_MOE_FP8_NR;
 #if XIAOTU_MOE_FP8_ADAPT
-    // Measured M-curve (dev-docs/GLM53_SM80_PLAN.md §7.4, GLM shape, 60 threads):
-    // (6,2) is fastest for M<=6 and again from M=12 up, but M=7..11 pay
-    // ceil(M/6)=2 weight reads. The wide plan (12,1) fits MR*NR+MR+NR+4 = 29 zmm
-    // and lets those rows read the weights once, worth 10-17% there.
+    // Measured M-curve (dev-docs/GLM53_SM80_PLAN.md §7.4-7.5, GLM shape, 60
+    // threads). Three plans, chosen per call (per expert):
+    //   M <= 4          : (4,4)  -- widest column block wins, -4..-11%
+    //   7 <= M <= 11    : (12,1) -- tall/thin, avoids the ceil(M/6)=2 double read
+    //   otherwise       : (6,2)  -- best for 5..6 and for M >= 12 (at 12+ the
+    //                               12x1 tile's register pressure costs more
+    //                               than the second weight read)
+    if (M <= XIAOTU_MOE_FP8_SMALL_HI) {
+        fp8_tile_sweep<XIAOTU_MOE_FP8_SMALL_MR, XIAOTU_MOE_FP8_SMALL_NR>(
+            A, W, S, C, M, N, K, gn, gk, n0, n1, rowshift, rowmap);
+        return;
+    }
     if (M > MR && M <= XIAOTU_MOE_FP8_WIDE_HI) {
         fp8_tile_sweep<XIAOTU_MOE_FP8_WIDE_MR, 1>(A, W, S, C, M, N, K, gn, gk,
                                                   n0, n1, rowshift, rowmap);
