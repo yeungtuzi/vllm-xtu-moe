@@ -22072,3 +22072,34 @@ CED 的完整技术结论已闭环:机制链全部走通(切片/元数据/对齐
 ③**每调用一次的缓冲 resize/分配**(`[setup-prof]` 的 `resize=` 分项可以读到)。
 工具:引擎内已有 `[setup-prof]`(n=…, pre_bookkeeping/resize/…)与 `[MOE-PROF]`,
 先按 qlen∈{1,8,26,128,512} 打出来,再决定改哪一处。
+
+## §613 ⭐ 引擎内建分相抓到"每层固定开销"的确切位置(`[setup-prof]`)
+### (a) 实测(prof2:TP=2 / MAXLEN=8192 / GP_MIN=4096 / `XIAOTU_MOE_SETUP_PROF=1`)
+```
+[setup-prof] n=40 per-call(us): pre_bookkeeping=596.8  resize=13910.9  gather=0.1  nc_sub=14.5  total=14522.3
+```
+* **每个层调用平均 14.5 ms 花在 setup 上**,其中 **`resize` 桶 13.9 ms**(占 96%);
+* 同一服务的 cd-timing(预热后,qlen=582):`period=99.02ms = engine 84.93ms + rest 14.09ms`
+  ⇒ engine 占 86%、`rest` 只有 14 ms(即:预填充阶段**瓶颈在 CPU 引擎**,不是编排);
+* 预热后的 596/581/582-token prompt TTFT:**9.60 s(首形状,含 JIT)→ 4.64 s → 3.87 s**。
+### (b) `resize` 桶到底覆盖什么(源码锚点 `moe_v2.hpp:934→958`)
+不是单纯分配,而是**"给输出缓冲定尺 + 按专家重建索引"**:
+```cpp
+auto _suB = now();
+for (size_t ai = 0; ai < NASS; ++ai) { ...; per_expert[eid].push_back(ai); }   // O(NASS) 重建
+if (g.down.size()  < nx) g.down.resize(nx);      // 这几行已是"只增不减"(轮 71 修过)
+if (g.both.size()  < n2) g.both.resize(n2);
+if (g.act.size()   < ni) g.act.resize(ni);
+auto _suB2 = now();
+```
+⇒ `n=40` 的**平均** 13.9 ms 意味着**窗口内发生过一次"增长/重建"事件(约数百 ms)**,被 40 次调用摊平;
+而不是每层都付 13.9 ms。要判定是"一次性扩容"还是"每次重建",需要**把 n 调到 1**(逐调用打点)。
+### (c) 下一步(两个便宜的动作)
+1. `s_n % 40` 改成可配(env),用 `n=1` 打印**逐调用**的 setup 分项 ⇒ 立刻区分
+   "一次性扩容(只影响每步第一层)" vs "逐层重建(每层都付)";
+2. 若是**逐层重建**:把 `per_expert` 的 `clear()+push_back` 换成**复用+计数写回**(避免每层
+   O(NASS) 的 vector 操作与分配),这是纯 CPU 侧改动、风险低。
+### (d) 与 C=1 output tok/s 的关系
+ShareGPT(227 token)的 TTFT ≈2.2 s、C=1 output 13.79 ⇒ 每步 setup 的固定开销是其中**可砍的一块**;
+但注意本轮的 engine=84.93 ms/层(qlen=582)**大部分仍是真实计算**(582 token 在 CPU 上),
+所以先把 §(c) 拿到的逐调用数据看清,再决定改 setup 还是改计算路径。
