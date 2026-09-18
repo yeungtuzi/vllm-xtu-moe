@@ -641,9 +641,17 @@ public:
         }
 
         // SiLU output scratch: one [inter] f32 block per assignment.
-        act_scratch_.resize(NASS * (size_t)inter);
+        // 【§614 修】**必须"只增不减"**:`std::vector::resize(n)` 在 n 增大时会
+        // **值初始化(零填充)新增元素**;而 NASS 在不同步骤/层之间会振荡(4319…49152),
+        // 于是每次调用都要重新零填充 ~1.2 GB。
+        // 实测(`XIAOTU_MOE_SETUP_PROF_EVERY=1`,qlen=8192):**每层 resize=848.7 ms**,
+        // 40 层 ≈ 34 s —— 这是启动 dummy 前向与长 prompt 预填充里一块纯浪费。
+        // 修法与 轮71 给 `g.down/g.both/g.act/g.abf16` 的做法一致(见下面那段注释)。
+        if (act_scratch_.size() < NASS * (size_t)inter)
+            act_scratch_.resize(NASS * (size_t)inter);
         // Down output scratch: one [hidden] f32 block per assignment.
-        down_scratch_.resize(NASS * (size_t)hidden);
+        if (down_scratch_.size() < NASS * (size_t)hidden)
+            down_scratch_.resize(NASS * (size_t)hidden);
 
         // --- Adaptive dispatch ---------------------------------------------
         // Grouping pays when routing is concentrated (several tokens share an

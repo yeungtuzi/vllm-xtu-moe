@@ -22103,3 +22103,31 @@ auto _suB2 = now();
 ShareGPT(227 token)的 TTFT ≈2.2 s、C=1 output 13.79 ⇒ 每步 setup 的固定开销是其中**可砍的一块**;
 但注意本轮的 engine=84.93 ms/层(qlen=582)**大部分仍是真实计算**(582 token 在 CPU 上),
 所以先把 §(c) 拿到的逐调用数据看清,再决定改 setup 还是改计算路径。
+
+## §614 ⭐⭐ 引擎里一个**每层 848 ms** 的纯浪费:`act_scratch_`/`down_scratch_` 缺少"只增不减"
+### (a) 实测(`XIAOTU_MOE_SETUP_PROF_EVERY=1` ⇒ 逐调用)
+```
+[setup-prof] n=1 per-call(us): pre_bookkeeping=5655.9  resize=848726.2  gather=0.0  nc_sub=11.8  total=854394.0
+（连续 6 次调用都是 ~850 ms ⇒ **不是一次性,是每次调用**）
+```
+### (b) 根因(`moe_v2.hpp` 的 scratch 定尺)
+```cpp
+act_scratch_.resize(NASS * (size_t)inter);    // NASS = qlen*topk
+down_scratch_.resize(NASS * (size_t)hidden);
+```
+`std::vector::resize(n)`:n 增大 ⇒ **值初始化(零填充)新增元素**;n 减小 ⇒ 只是缩小(不释放容量)。
+NASS 在不同步骤/层之间**振荡**(4319…49152),于是**每次调用都重新零填充 ~1.2 GB**
+(qlen=8192:NASS=49152 ⇒ act 226 MB + down 1.0 GB)。
+**同文件里 `g.down/g.both/g.act/g.abf16` 在 轮71 已经改成"只增不减",这两行漏了。**
+### (c) 修法(§614,已提交待复测)
+```cpp
+if (act_scratch_.size()  < NASS * (size_t)inter)  act_scratch_.resize(...);
+if (down_scratch_.size() < NASS * (size_t)hidden) down_scratch_.resize(...);
+```
+### (d) 预期收益
+| 场景 | 现在 | 修后 |
+|---|---|---|
+| **启动 dummy 前向(qlen=8192)** | 40 × 0.85 s ≈ **34 s** | ≈ 0(只增长一次) |
+| 长 prompt prefill(qlen=8192,MBT=8192) | 每步 ~34 s | ≈ 0 |
+| ShareGPT(227 token,NASS=1362,34 MB/调用) | 40 × ~3.4 ms ≈ **136 ms/步** | ≈ 0 |
+⇒ 对 **TTFT** 是 6%(227 token)、对**长 prompt/启动**是**数量级**的改善。
