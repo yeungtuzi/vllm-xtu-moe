@@ -41,7 +41,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 ENG = os.environ.get("ENG", "xiaotu")
 if ENG == "lk":
-    sys.path.insert(0, "/home/user/anaconda3/envs/lvllmds4-x/lib/python3.12/site-packages")
+    # 【§622f】lk_moe 有**两个同名同版本但二进制不同**的安装(lvllm 与 lvllmds4-x,
+    # md5 不同)。要做"与服务级 A/B 同一个二进制"的对比,必须能指定用哪一个 ⇒
+    # 用 `LK_PY_PATH` 覆盖(留空则保持历史默认 lvllmds4-x)。
+    _lkp = os.environ.get("LK_PY_PATH",
+                         "/home/user/anaconda3/envs/lvllmds4-x/lib/python3.12/site-packages")
+    if _lkp:
+        sys.path.insert(0, _lkp)
 
 MODEL = os.environ.get("XIAOTU_LAYER1_NPZ", "")
 if not MODEL:
