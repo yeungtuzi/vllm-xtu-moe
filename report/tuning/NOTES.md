@@ -22222,3 +22222,31 @@ if (down_scratch_.size() < NASS * (size_t)hidden) down_scratch_.resize(...);
 用 `XIAOTU_MOE_NSLICE_SMALL`(现有开关)与 `XIAOTU_MOE_GROUP_FACTOR` 做**小 M 的 A/B**:
 如果 `NSLICE_SMALL=0`(不小子切)在 M=227 上明显更快,就说明"切得太碎"是主因,
 修法是把小 M 的切分策略改成"token 维并行"。
+
+## §618 ❗再更正:`NSLICE_SMALL` 只管 M≤40,ShareGPT(M≈227)走的是 **legacy 路径**
+### (a) 源码事实(`moe_v2.hpp:601-611`)
+```cpp
+if (nslice_small && NASS <= 4 * (size_t)pool_.nthreads()) {   // 4×60 = 240
+    ... forward_many_nsliced(M, k, ..., _wl);  return;        // N-sliced 小 batch 路径
+}
+// 否则落到下面的 legacy 路径
+std::fill(output, output + (size_t)M * (size_t)hidden, 0.f);
+```
+* `NASS = M × topk = 240` 对应 **M ≈ 40**;
+* **ShareGPT 平均 M≈227 ⇒ NASS≈1362 ≫ 240 ⇒ 走 legacy 路径**;
+* ⇒ **`§617(d)` 提议的 `NSLICE_SMALL` A/B 对 ShareGPT 无效**(只影响 M≤40),
+  该实验作废;M≤40 那段早已用 `small_batch_workers()` 调过(`XIAOTU_MOE_NSLICE_SMALL=0` 只是关闭它)。
+### (b) 因此 ShareGPT 长度的优化对象是 **legacy 路径**,它的结构(§616 的锚点)
+1. `std::fill` 清零输出(M×hidden×4 B,227 token 时 4.6 MB,可忽略);
+2. **Phase A**(pA0→pA1)= gate+up GEMM + 融合 SiLU + f32→bf16,按 `(专家, 节点, 子切)` 切作业;
+3. **Phase B**(pA1→pB1)= down GEMM;
+4. **Phase C**(pB1→pC)= 按权重累加。
+### (c) 下一步(修正后,仍然可做且低风险)
+1. **先取干净采样**:`report/tuning/logs/moeprof.memfoot.log` 目前 **0 行 `[NS-PROF]`**
+   (服务在 00:41 仍未 READY)——一旦就绪,`M>8` 桶的 setup/A/B 就能直接告诉我们
+   legacy 路径里"前置 vs 计算"的真实比例;
+2. 若 **setup 仍大**(>20%)⇒ 优化 `per_expert` 索引重建与分组决策(纯 CPU 侧,低风险);
+3. 若 **A/B(真计算)占绝大部分** ⇒ 只能动内核效率:
+   * 检查 Phase A 是否按 `(专家 × 节点 × 子切)` 切得**过碎**(每作业工作量小 ⇒ 固定开销高);
+   * 对小 M 改为 **token 维并行**(同一专家的多个 token 分给不同线程,一次 SIMD 处理更多 token);
+   * 这是内核级改动,必须先有干净采样证明"每作业工作量确实太小",否则不动手。
