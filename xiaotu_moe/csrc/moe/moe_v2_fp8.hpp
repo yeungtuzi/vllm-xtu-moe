@@ -153,6 +153,20 @@ inline void matmul_fp8_quant_range(const uint16_t* A, const uint8_t* W, const fl
 #ifndef XIAOTU_MOE_FP8_NR
 #define XIAOTU_MOE_FP8_NR 2
 #endif
+// Adaptive plan: for the row counts where the primary plan would read the
+// weights twice, switch to a taller/thinner plan that covers them in one pass.
+// 0 disables it (always use the primary (MR,NR)).
+#ifndef XIAOTU_MOE_FP8_ADAPT
+#define XIAOTU_MOE_FP8_ADAPT 1
+#endif
+#ifndef XIAOTU_MOE_FP8_WIDE_MR
+#define XIAOTU_MOE_FP8_WIDE_MR 12
+#endif
+// Upper row count for the wide plan; at 12+ the primary plan measured faster
+// again (register pressure in the 12x1 tile outweighs the extra weight read).
+#ifndef XIAOTU_MOE_FP8_WIDE_HI
+#define XIAOTU_MOE_FP8_WIDE_HI 11
+#endif
 
 #if defined(__AVX512F__)
 template <int MRT, int NRT>
@@ -193,6 +207,71 @@ inline void fp8_tile_avx512(const uint16_t* A, const uint8_t* W, const float* S,
         for (int jj = 0; jj < NRT; ++jj)
             C[(size_t)(m0 + r) * N + j0 + jj] = vhsum(acc[r][jj]);
 }
+
+// nj is always in [1, NR]; pick the matching compile-time column width.
+template <int MRT, int NR>
+inline void fp8_emit_nj(const uint16_t* A, const uint8_t* W, const float* S,
+                        float* C, int N, int K, int gn, int gk,
+                        int group_count, int kb_stride, int j0, int rowshift,
+                        const uint32_t* rowmap, int m0, int nj) {
+    if (nj == 1) {
+        fp8_tile_avx512<MRT, 1>(A, W, S, C, N, K, gn, gk, group_count, kb_stride,
+                                j0, rowshift, rowmap, m0);
+        return;
+    }
+    if constexpr (NR >= 2) {
+        if (nj == 2) {
+            fp8_tile_avx512<MRT, 2>(A, W, S, C, N, K, gn, gk, group_count,
+                                    kb_stride, j0, rowshift, rowmap, m0);
+            return;
+        }
+    }
+    if constexpr (NR >= 3) {
+        if (nj == 3) {
+            fp8_tile_avx512<MRT, 3>(A, W, S, C, N, K, gn, gk, group_count,
+                                    kb_stride, j0, rowshift, rowmap, m0);
+            return;
+        }
+    }
+    if constexpr (NR >= 4) {
+        fp8_tile_avx512<MRT, 4>(A, W, S, C, N, K, gn, gk, group_count, kb_stride,
+                                j0, rowshift, rowmap, m0);
+    }
+}
+
+// mr is always in [1, MR]; walk down to the matching compile-time row height.
+template <int MR, int NR, int MRT>
+inline void fp8_emit_mr(const uint16_t* A, const uint8_t* W, const float* S,
+                        float* C, int N, int K, int gn, int gk,
+                        int group_count, int kb_stride, int j0, int rowshift,
+                        const uint32_t* rowmap, int m0, int mr, int nj) {
+    if (mr == MRT) {
+        fp8_emit_nj<MRT, NR>(A, W, S, C, N, K, gn, gk, group_count, kb_stride,
+                             j0, rowshift, rowmap, m0, nj);
+        return;
+    }
+    if constexpr (MRT > 1)
+        fp8_emit_mr<MR, NR, MRT - 1>(A, W, S, C, N, K, gn, gk, group_count,
+                                     kb_stride, j0, rowshift, rowmap, m0, mr, nj);
+}
+
+// Full tile sweep for one (MR, NR) plan.
+template <int MR, int NR>
+inline void fp8_tile_sweep(const uint16_t* A, const uint8_t* W, const float* S,
+                           float* C, int M, int N, int K, int gn, int gk,
+                           int n0, int n1, int rowshift, const uint32_t* rowmap) {
+    const int group_count = (K + gk - 1) / gk;
+    const int kb_stride = group_count;
+    for (int m0 = 0; m0 < M; m0 += MR) {
+        const int mr = (M - m0 < MR) ? (M - m0) : MR;
+        for (int j0 = n0; j0 < n1; j0 += NR) {
+            const int rem = n1 - j0;
+            const int nj = (rem < NR) ? rem : NR;
+            fp8_emit_mr<MR, NR, MR>(A, W, S, C, N, K, gn, gk, group_count,
+                                    kb_stride, j0, rowshift, rowmap, m0, mr, nj);
+        }
+    }
+}
 #endif
 
 // C[M,N] fp32 = A[M,K]bf16 x W[N,K]fp8^T for columns [n0, n1), MR x NR tiled.
@@ -212,64 +291,20 @@ inline void matmul_fp8_tiled_range(const uint16_t* A, const uint8_t* W, const fl
         return;
     }
     const int gn = groupN > 0 ? groupN : 1;
-    const int group_count = (K + gk - 1) / gk;
-    const int kb_stride = group_count;
     constexpr int MR = XIAOTU_MOE_FP8_MR;
     constexpr int NR = XIAOTU_MOE_FP8_NR;
-    for (int m0 = 0; m0 < M; m0 += MR) {
-        const int mr = (M - m0 < MR) ? (M - m0) : MR;
-        for (int j0 = n0; j0 < n1; j0 += NR) {
-            const int nj0 = n1 - j0;
-            const int nj = (nj0 < NR) ? nj0 : NR;
-#define XIAOTU_FP8_TILE_ARGS A, W, S, C, N, K, gn, gk, group_count, kb_stride, j0, rowshift, rowmap, m0
-#define XIAOTU_FP8_DISPATCH_MR(MRT)                                              \
-    if (mr == (MRT)) {                                                           \
-        if (nj == 1)      fp8_tile_avx512<MRT, 1>(XIAOTU_FP8_TILE_ARGS);         \
-        else if (nj == 2) fp8_tile_avx512<MRT, 2>(XIAOTU_FP8_TILE_ARGS);         \
-        else if (nj == 3) fp8_tile_avx512<MRT, 3>(XIAOTU_FP8_TILE_ARGS);         \
-        else              fp8_tile_avx512<MRT, 4>(XIAOTU_FP8_TILE_ARGS);         \
-        continue;                                                                \
+#if XIAOTU_MOE_FP8_ADAPT
+    // Measured M-curve (dev-docs/GLM53_SM80_PLAN.md §7.4, GLM shape, 60 threads):
+    // (6,2) is fastest for M<=6 and again from M=12 up, but M=7..11 pay
+    // ceil(M/6)=2 weight reads. The wide plan (12,1) fits MR*NR+MR+NR+4 = 29 zmm
+    // and lets those rows read the weights once, worth 10-17% there.
+    if (M > MR && M <= XIAOTU_MOE_FP8_WIDE_HI) {
+        fp8_tile_sweep<XIAOTU_MOE_FP8_WIDE_MR, 1>(A, W, S, C, M, N, K, gn, gk,
+                                                  n0, n1, rowshift, rowmap);
+        return;
     }
-#if XIAOTU_MOE_FP8_MR >= 1
-            XIAOTU_FP8_DISPATCH_MR(1)
 #endif
-#if XIAOTU_MOE_FP8_MR >= 2
-            XIAOTU_FP8_DISPATCH_MR(2)
-#endif
-#if XIAOTU_MOE_FP8_MR >= 3
-            XIAOTU_FP8_DISPATCH_MR(3)
-#endif
-#if XIAOTU_MOE_FP8_MR >= 4
-            XIAOTU_FP8_DISPATCH_MR(4)
-#endif
-#if XIAOTU_MOE_FP8_MR >= 5
-            XIAOTU_FP8_DISPATCH_MR(5)
-#endif
-#if XIAOTU_MOE_FP8_MR >= 6
-            XIAOTU_FP8_DISPATCH_MR(6)
-#endif
-#if XIAOTU_MOE_FP8_MR >= 7
-            XIAOTU_FP8_DISPATCH_MR(7)
-#endif
-#if XIAOTU_MOE_FP8_MR >= 8
-            XIAOTU_FP8_DISPATCH_MR(8)
-#endif
-#if XIAOTU_MOE_FP8_MR >= 9
-            XIAOTU_FP8_DISPATCH_MR(9)
-#endif
-#if XIAOTU_MOE_FP8_MR >= 10
-            XIAOTU_FP8_DISPATCH_MR(10)
-#endif
-#if XIAOTU_MOE_FP8_MR >= 11
-            XIAOTU_FP8_DISPATCH_MR(11)
-#endif
-#if XIAOTU_MOE_FP8_MR >= 12
-            XIAOTU_FP8_DISPATCH_MR(12)
-#endif
-#undef XIAOTU_FP8_DISPATCH_MR
-#undef XIAOTU_FP8_TILE_ARGS
-        }
-    }
+    fp8_tile_sweep<MR, NR>(A, W, S, C, M, N, K, gn, gk, n0, n1, rowshift, rowmap);
 #else
     // Non-AVX512 ISA: keep the portable legacy kernel.
     matmul_fp8_quant_range(A, W, S, C, M, N, K, groupN, groupK, n0, n1);
