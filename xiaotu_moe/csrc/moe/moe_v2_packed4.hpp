@@ -547,6 +547,45 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                         for (int jj = 0; jj < nj; ++jj) acc[r][jj] = _mm512_setzero_ps();
                     // 【§623】scale 行基址每行只算一次(原来是每组 g 都做一次整数除法)
                     for (int jj = 0; jj < nj; ++jj) srow_of[jj] = ((j0 + jj) / gn) * kb_stride;
+                    // 【§625】**满 tile 特化**。`av[MR][2]` / `acc[MR][8]` 原来用**运行时**边界
+                    // `mr`/`nj` 索引 ⇒ 编译器只能把这两个数组放进**可寻址内存**,于是
+                    // `perf annotate` 里出现大量等距 512 字节的 `vmovaps %zmm,(%rbx)`
+                    // (av 恰好 4×2×64 = 512 字节)占 31% 周期。把 (mr==MR && nj==8) 这一支的
+                    // 循环边界写成**字面常量**,编译器就能把它们分配进 zmm 寄存器。
+                    // 数值:累加顺序与通用路径逐字相同(每 (行,列) 按 g 递增),只是不经过内存
+                    // ⇒ 由 test_block23_equiv.py 对拍验证。
+                    if (mr == MR && nj == 8) {
+                        __m512 acc[MR][8];
+                        for (int r = 0; r < MR; ++r)
+                            for (int jj = 0; jj < 8; ++jj) acc[r][jj] = _mm512_setzero_ps();
+                        int sr8[8];
+                        for (int jj = 0; jj < 8; ++jj) sr8[jj] = ((j0 + jj) / gn) * kb_stride;
+                        for (int g = 0; g < group_count; ++g) {
+                            const int base = g * 32;
+                            __m512 av[MR][2];
+                            for (int r = 0; r < MR; ++r) {
+                                const float* ap = a32 + (size_t)(m0 + r) * K + base;
+                                av[r][0] = _mm512_loadu_ps(ap);
+                                av[r][1] = _mm512_loadu_ps(ap + 16);
+                            }
+                            for (int jj = 0; jj < 8; ++jj) {
+                                const uint8_t* brow =
+                                    W + (size_t)(j0 + jj - rowshift) * (K / 2);
+                                XIAOTU_DECODE_GROUP_AVX512(brow, g);
+                                const __m512 sv = _mm512_set1_ps(row_scale(sr8[jj], g));
+                                for (int r = 0; r < MR; ++r) {
+                                    __m512 d = _mm512_mul_ps(wlo_, av[r][0]);
+                                    d = _mm512_fmadd_ps(whi_, av[r][1], d);
+                                    acc[r][jj] = _mm512_fmadd_ps(d, sv, acc[r][jj]);
+                                }
+                            }
+                        }
+                        for (int r = 0; r < MR; ++r)
+                            for (int jj = 0; jj < 8; ++jj)
+                                C[(size_t)(m0 + r) * N + j0 + jj] =
+                                    hsum512(acc[r][jj]) * global_scale;
+                        continue;
+                    }
                     for (int g = 0; g < group_count; ++g) {
                         const int base = g * 32;
                         __m512 av[MR][2];
