@@ -388,9 +388,16 @@ static bool async_init(CpuDecodeState* st) {
 template <typename MOET>
 static void run_moe_and_ep(MOET* engine, int qlen, int k, const uint16_t* hid,
                            const uint32_t* ids, const float* wts, float* out,
-                           double* ep_ms_out) {
+                           double* ep_ms_out, double* fwd_ms_out = nullptr) {
         static const bool fake_cpu = std::getenv("XIAOTU_MOE_FAKE_CPU") != nullptr;
+        // 【§619b】把 `forward_many` 自己的耗时单独量出来。`[cd-timing] compute` 包住的是
+        // `run_moe_and_ep`(= forward_many + EP 归约),而 `[NS-PROF] TOTAL` 只包 forward_many;
+        // 两者实测差 108 ms/层(qlen=1905)却无从归属 ⇒ 直接打点,别再靠推断。
+        auto t_f0 = std::chrono::steady_clock::now();
         if (!fake_cpu) engine->forward_many(qlen, k, ids, wts, hid, out);
+        auto t_f1 = std::chrono::steady_clock::now();
+        if (fwd_ms_out)
+            *fwd_ms_out = std::chrono::duration<double, std::milli>(t_f1 - t_f0).count();
         // ---- EP:把本 rank 的部分和与对端相加(共享内存,不进 GPU) ----
         {
             EpShmState* ep = nullptr;
@@ -853,7 +860,9 @@ static void bind_moe_class(py::module& m, const char* name) {
                 // EP(跨 rank 归约)是 compute 的一部分,单独拆出来看它占多少:
                 // TP=1 时 ep 恒为 0,所以"TP=1 vs TP=2 的 ep 差"就是这个归约的净成本。
                 static double sum_ep = 0;
+                static double sum_fwd = 0;
                 double ep_ms_last = 0.0;
+                double fwd_ms_last = 0.0;
                 static int n = 0;
                 static auto last_cb = std::chrono::steady_clock::now();
                 auto t_cb = std::chrono::steady_clock::now();
@@ -861,7 +870,7 @@ static void bind_moe_class(py::module& m, const char* name) {
                 // 【诊断专用】XIAOTU_MOE_FAKE_CPU=1:跳过 CPU MoE 计算(输出保持原值)。
                 // 用途:在服务里量出"该层纯 GPU 侧(注意力/dense+拷贝+派发)每层耗多少",
                 // 从而把 period 精确拆成 GPU 部分 与 CPU 部分。**绝不能用于正确性测试**。
-                run_moe_and_ep(engine, qlen, k, hid, ids, wts, out, &ep_ms_last);
+                run_moe_and_ep(engine, qlen, k, hid, ids, wts, out, &ep_ms_last, &fwd_ms_last);
                 if (timing) {
                     auto t_end = std::chrono::steady_clock::now();
                     const double compute_ms =
@@ -873,19 +882,21 @@ static void bind_moe_class(py::module& m, const char* name) {
                     sum_period += period_ms;
                     sum_wait += period_ms - compute_ms;
                     sum_ep += ep_ms_last;
+                    sum_fwd += fwd_ms_last;
                     if (++n % every == 0) {
                         fprintf(stderr,
                                 "[cd-timing] layers=%d qlen=%d k=%d "
-                                "period=%.2fms compute=%.2fms(engine=%.2f ep=%.2f) rest=%.2fms "
+                                "period=%.2fms compute=%.2fms(fwd=%.2f ep=%.2f other=%.2f) rest=%.2fms "
                                 "(compute %.0f%%, rest %.0f%%)\n",
                                 every, qlen, k,
                                 sum_period / every, sum_compute / every,
-                                (sum_compute - sum_ep) / every, sum_ep / every,
+                                sum_fwd / every, sum_ep / every,
+                                (sum_compute - sum_fwd - sum_ep) / every,
                                 sum_wait / every,
                                 100.0 * sum_compute / std::max(1e-9, sum_period),
                                 100.0 * sum_wait / std::max(1e-9, sum_period));
                         fflush(stderr);
-                        sum_compute = sum_period = sum_wait = sum_ep = 0.0;
+                        sum_compute = sum_period = sum_wait = sum_ep = sum_fwd = 0.0;
                     }
                 }
             };

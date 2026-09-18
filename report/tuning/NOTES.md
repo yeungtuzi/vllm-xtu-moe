@@ -22250,3 +22250,74 @@ std::fill(output, output + (size_t)M * (size_t)hidden, 0.f);
    * 检查 Phase A 是否按 `(专家 × 节点 × 子切)` 切得**过碎**(每作业工作量小 ⇒ 固定开销高);
    * 对小 M 改为 **token 维并行**(同一专家的多个 token 分给不同线程,一次 SIMD 处理更多 token);
    * 这是内核级改动,必须先有干净采样证明"每作业工作量确实太小",否则不动手。
+
+## §619 ⭐⭐⭐ 干净采样出炉 + 找到真正的每层大头:`std::vector::resize` 的**零填充**(实测 12-135 ms/层)
+
+### (a) 首先纠正两处口径(否则所有数字都会读错 40×)
+* \([cd-timing]\) 的 `period`/`compute` 是 **每次回调(=每层)** 的均值(源码
+  `binding.cpp:858-887`:`period = t_cb - last_cb`,callback-entry→callback-entry),
+  不是"40 层合计"。`every` 只是窗口长度。
+  自证:qlen=1893 时 `period=345.12 ms` × 40 层 = **13.80 s**,而实测 TTFT = **13.765 s**
+  (probe_ttft,LENS=2048⇒prompt_tokens=1893)—— 逐位吻合。
+* 因此 `[setup-prof]` 的 `per-call(us)` 也是**每层**值,与 `[NS-PROF]` 的 `per-call` 同尺度。
+
+### (b) 干净 `[NS-PROF]` 采样(TAG=moeprof,TP=2/MBT=8192/SEQS=4/THREADS=60,
+`XIAOTU_MOE_PROFILE=1`;这次 `M>8` 桶 `na=201.7/226.2` 是真实 ShareGPT 规模,
+不再被 qlen=8192 的 dummy 污染)
+
+| 桶 | calls | na | setup(µs) | A(µs) | B(µs) | C(µs) | TOTAL(µs/层) |
+|---|---|---|---|---|---|---|---|
+| M<=2 | 2 | 6.0 | 60-309 | 447-497 | 224-264 | 24-30 | **≈800-1056** |
+| M3-8 | 3 | 6-9 | 650-1032 | 913-1032 | 462-524 | 39-43 | **≈2069-2612** |
+| M>8 | 3 | 201.7 | 30467 | 23623 | 12308 | 383 | **66781** |
+| M>8 | 5 | 226.2 | 63459 | 88178 | 45569 | 1331 | **198537** |
+
+### (c) 关键交叉验证:`setup` 里 99% 是 `resize`
+同一次采样里 `[setup-prof]`(n=40 窗口)会把 A2 拆四段:
+
+```
+resize=63015.8  pre_bookkeeping=882.0  gather=0.0  nc_sub=18.8   total=63916.7   (qlen≈808)
+resize=133820.7 pre_bookkeeping=1525.4 gather=0.0  nc_sub=18.8   total=135365.0  (qlen≈1886)
+```
+⇒ `resize` 与 `[NS-PROF].setup` 逐项对应(30.5 ↔ 36.3/39.5;63.5 ↔ 63.0;
+NS-PROF 窗口跨请求所以略有混样)。**其余三段都在 1-20 µs 量级**,完全可忽略。
+也解释了 §616 那个"setup 占 16-47%"的观察 —— 它指的就是这个 `resize`。
+
+### (d) 根因:`resize` 桶的代码是"只增不减"的 `std::vector::resize`,而它会**值初始化**
+锚点(`moe_v2.hpp` 的 A2 段,`_suB`→`_suB2`)之间只有这段:
+```cpp
+if (g.down.size()  < nx) g.down.resize(nx);     // me*hidden  floats
+if (g.both.size()  < n2) g.both.resize(n2);     // me*2*inter floats
+if (g.act.size()   < ni) g.act.resize(ni);      // me*inter  floats
+if (g.abf16.size() < ni) g.abf16.resize(ni);    // me*inter  uint16
+if (g.rowmap.size() < me) g.rowmap.resize(me);
+```
+`std::vector<T>::resize(n)` 对新增元素做 **default-insert ⇒ `T()` ⇒ 全零填充**。
+§614 把 `act_scratch_/down_scratch_` 改成"只增不减"只解决了**反复**零填充,
+但**每一次创新高**仍然要零填充。而真实路由是**长尾**的:每层/每批的热点专家
+`me` 都在刷新各自的历史最大值 ⇒ 每次都有一段新的 `me*hidden*4` 字节被白写。
+`me*hidden*4`(hidden=5120)对单个热点专家就是 MB 级,长尾下有若干个这样的专家。
+
+### (e) 修法:`NoInitAlloc` —— 只去掉零填充,不改任何其它语义
+`moe_v2.hpp` 新增 `NoInitAlloc<T>`(提供"无参 `construct` 不做任何事"的
+`construct`),别名 `ScratchVec<T> = std::vector<T, NoInitAlloc<T>>`,用于:
+* `ExpBuf::xg/abf16/rowmap/both/act/down/ai_list`;
+* `act_scratch_/down_scratch_/both_scratch_/act_bf16_scratch_`。
+
+**安全性论证(逐个 write-before-read,已对源码核对)**:
+* `both` 由 `wt::gate_up_slice_batched` 写满(所有作业的 `[n0,n1)` 并集 = `[0,inter)` × 两半);
+* `abf16` 紧随其后由融合 SiLU 循环写满同一列区间;
+* `down` 由 `wt::down_slice_batched` 写满 `[0,hidden)`,Phase C 才读;
+* `rowmap` 在 resize 之后**立即**被 `for (m...) g.rowmap[m] = ai_list[m]/k` 写满;
+* `xg`、`g.act` **全仓库无任何读取点**(只有 resize 本身)⇒ 本来是纯占位;
+* `act_scratch_`/`down_scratch_` 是 N-sliced 路径的 Phase1→Phase2→Phase3 scratch,同样先写后读。
+
+分配的字节数、元素个数、`.data()` 指针**全部不变**,所以内核与所有下标运算
+看到的输入逐字节相同 —— 数值门禁与确定性回归是有效的验证器。
+
+### (f) 门禁(修后,重建 6 个 ISA 变体)
+```
+[1/2] 数值门禁 test_block23_equiv.py : OK=7 BAD=1   (me=1 的既有 NR=8 fp32 重结合偏差,不计入)
+[2/2] 性能门禁 bench_engine_ab.py    : DEDUP=12 0.69 ms/层 219 GB/s ; DEDUP=23 0.84 ms/层 300 GB/s
+                                       全部门禁通过(与 §570 基线 0.70/219、0.85/296 一致 ⇒ 无退化)
+```

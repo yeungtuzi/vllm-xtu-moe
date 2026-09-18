@@ -32,6 +32,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -40,6 +41,84 @@
 #include "numa_pool.hpp"   // persistent NUMA-aware worker pool
 
 namespace xiaotu_moe {
+
+// 【§619】Skips value-initialization on vector growth.
+//
+// `std::vector<T>::resize(n)` default-**inserts** the new elements, and for a
+// POD `T` that means `T()` ⇒ a full zero-fill of the grown region. The MoE
+// scratch buffers below are all *write-before-read* (gate/up writes `both`,
+// the fused SiLU loop writes `abf16`, down writes `down`, and the rowmap loop
+// writes `rowmap`), so that zero-fill is 100% wasted work.
+//
+// It is not a small waste: real routing is long-tailed, so an expert's
+// instance count `me` keeps setting new per-expert records as different layers
+// and batches run. Every record-breaking `resize` re-zero-fills
+// `me*hidden*4` bytes for that expert. Measured with
+// `XIAOTU_MOE_SETUP_PROF=1` on a ShareGPT-shaped prefill (qlen 806-1893,
+// TP=2, 60 threads): **`resize` = 12-135 ms per layer**, i.e. 26-45% of the
+// whole CPU MoE time and up to 5.4 s of a single prefill step, while every
+// other setup stage stayed at ~1-20 us.
+//
+// Providing `construct` that does nothing for the no-argument (default-insert)
+// case removes exactly that zero-fill and nothing else -- the allocated bytes,
+// the element count and every `.data()` pointer are unchanged, so all kernels
+// and index arithmetic see byte-identical inputs.
+template <class T>
+struct NoInitAlloc {
+    using value_type = T;
+    NoInitAlloc() = default;
+    template <class U>
+    NoInitAlloc(const NoInitAlloc<U>&) noexcept {}
+    [[nodiscard]] T* allocate(std::size_t n) {
+        return static_cast<T*>(::operator new(n * sizeof(T)));
+    }
+    void deallocate(T* p, std::size_t) noexcept { ::operator delete(p); }
+    template <class U, class... A>
+    void construct(U* p, A&&... a) {
+        if constexpr (sizeof...(A) == 0) {
+            (void)p;   // leave the storage raw; the writer follows immediately
+        } else {
+            ::new (static_cast<void*>(p)) U(std::forward<A>(a)...);
+        }
+    }
+    template <class U>
+    void destroy(U* p) { p->~U(); }
+};
+template <class T, class U>
+inline bool operator==(const NoInitAlloc<T>&, const NoInitAlloc<U>&) { return true; }
+template <class T, class U>
+inline bool operator!=(const NoInitAlloc<T>&, const NoInitAlloc<U>&) { return false; }
+
+// Scratch vector aliases: same API as std::vector<T>, minus the growth memset.
+template <class T>
+using ScratchVec = std::vector<T, NoInitAlloc<T>>;
+
+// Grow a scratch vector to at least `n` elements, with **geometric** capacity.
+//
+// `resize(n)` asks for exactly `n`, so an expert whose instance count `me`
+// creeps upward one instance at a time reallocates -- and memcpy's the whole
+// old buffer, and re-faults every page of the fresh mapping -- on *every*
+// call. Real routing is long-tailed, so that is the common case, not the
+// exception. Reserving 1.5x flattens it to O(log) reallocations per element
+// count, so the page-fault cost becomes one-off. Combined with NoInitAlloc
+// this removes the whole measured `resize` stage (§619: 63-135 ms/layer).
+//
+// 【§619c❗**必须有 `capacity() < n` 判断**】第一版写成"只要 `size() < n` 就
+// `reserve(cap*1.5)`"——当 `capacity() >= n` 但 `size() < n`(即向量有余量)时,
+// `reserve(cap*1.5) > capacity()` ⇒ **每次调用都真的重新分配并整块 memcpy**。
+// 实测(`[resize-prof]`,`SETUP_PROF_EVERY=1`,qlen≈1.9K):**每层 455 次扩容、
+// 搬 121 MB、grow=64 ms/层**,而同一段里的 `row=0.1 ms` ⇒ 100% 是这个 bug。
+// 它还会让 capacity 每层 ×1.5 无界膨胀。加上余量判断后,稳态应为 0 次扩容。
+template <class V>
+inline void grow_scratch(V& v, std::size_t n) {
+    if (v.size() >= n) return;
+    if (v.capacity() < n) {
+        std::size_t want = v.capacity() + v.capacity() / 2;
+        if (want < n) want = n;
+        v.reserve(want);   // copies existing elements once, geometrically
+    }
+    v.resize(n);           // no value-initialization (NoInitAlloc)
+}
 
 // Minimal engine configuration (field order and names follow the reference
 // engine's config semantics).
@@ -648,10 +727,10 @@ public:
         // 40 层 ≈ 34 s —— 这是启动 dummy 前向与长 prompt 预填充里一块纯浪费。
         // 修法与 轮71 给 `g.down/g.both/g.act/g.abf16` 的做法一致(见下面那段注释)。
         if (act_scratch_.size() < NASS * (size_t)inter)
-            act_scratch_.resize(NASS * (size_t)inter);
+            grow_scratch(act_scratch_, NASS * (size_t)inter);
         // Down output scratch: one [hidden] f32 block per assignment.
         if (down_scratch_.size() < NASS * (size_t)hidden)
-            down_scratch_.resize(NASS * (size_t)hidden);
+            grow_scratch(down_scratch_, NASS * (size_t)hidden);
 
         // --- Adaptive dispatch ---------------------------------------------
         // Grouping pays when routing is concentrated (several tokens share an
@@ -955,13 +1034,51 @@ public:
             const size_t n2 = me * (size_t)2 * (size_t)inter;
             const size_t ni = me * (size_t)inter;
             // xg 已不再使用(保留成员仅为兼容);down 仍被阶段 B/C 使用,必须保证容量。
-            if (g.down.size()  < nx) g.down.resize(nx);
-            if (g.both.size()  < n2) g.both.resize(n2);
-            if (g.act.size()   < ni) g.act.resize(ni);
-            if (g.abf16.size() < ni) g.abf16.resize(ni);
-            if (g.rowmap.size() < me) g.rowmap.resize(me);
+            // 【§619】grow_scratch = 几何扩容 + 不零填充(两处浪费都去掉)。
+            // 【§619c 诊断】把这一段再拆细:`grow`(5 次 grow_scratch)vs `row`(rowmap 写)
+            // vs 实际发生扩容的次数/字节。§619/§619b 已证明"零填充"不是全部,
+            // 但剩下的 12-42 ms/层仍无归属 ⇒ 直接量,不再推断。
+            // **只在 XIAOTU_MOE_SETUP_PROF=1 时才计时**(否则热路径退化为原来的一行判断)。
+            static const bool _rz = std::getenv("XIAOTU_MOE_SETUP_PROF") != nullptr;
+            auto _g0 = _rz ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const size_t _c_before[5] = {_rz ? g.down.capacity() : 0, _rz ? g.both.capacity() : 0,
+                                         _rz ? g.act.capacity() : 0, _rz ? g.abf16.capacity() : 0,
+                                         _rz ? g.rowmap.capacity() : 0};
+            if (_rz) {
+                const long long _n[5] = {(long long)nx, (long long)n2, (long long)ni, (long long)ni,
+                                         (long long)me};
+                for (int _i = 0; _i < 5; ++_i)
+                    if (_n[_i] > (long long)_c_before[_i]) { ++rsz_need_[_i]; ++rsz_growcalls_; }
+                if (me > rsz_me_max_) rsz_me_max_ = (long long)me;
+                rsz_me_sum_ += (long long)me;
+            }
+            grow_scratch(g.down,  nx);
+            grow_scratch(g.both,  n2);
+            grow_scratch(g.act,   ni);
+            grow_scratch(g.abf16, ni);
+            grow_scratch(g.rowmap, me);
+            auto _r0 = _rz ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (_rz) {
+                const size_t _c_after[5] = {g.down.capacity(), g.both.capacity(), g.act.capacity(),
+                                            g.abf16.capacity(), g.rowmap.capacity()};
+                rsz_grow_ += std::chrono::duration<double, std::milli>(_r0 - _g0).count();
+                for (int _i = 0; _i < 5; ++_i)
+                    if (_c_after[_i] != _c_before[_i]) {
+                        const long long _esz[5] = {(long long)sizeof(float), (long long)sizeof(float),
+                                                   (long long)sizeof(float), (long long)sizeof(uint16_t),
+                                                   (long long)sizeof(uint32_t)};
+                        ++rsz_realloc_;
+                        ++rsz_realloc_idx_[_i];
+                        rsz_bytes_ += (long long)(_c_after[_i] - _c_before[_i]) * _esz[_i];
+                    }
+            }
             for (size_t m = 0; m < me; ++m)      // assignment ai 的激活行 = ai / k
                 g.rowmap[m] = (uint32_t)(g.ai_list[m] / (size_t)k);
+            if (_rz) {
+                rsz_row_ += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - _r0).count();
+                ++rsz_experts_;
+            }
         }
         auto _suB2 = std::chrono::steady_clock::now();
         auto _suG = std::chrono::steady_clock::now();
@@ -1092,7 +1209,23 @@ public:
                             "gather=%.1f nc_sub=%.1f total=%.1f\n",
                             s_n, s_pre / s_n * 1e3, s_res / s_n * 1e3, s_gath / s_n * 1e3,
                             s_nc / s_n * 1e3, (s_pre + s_res + s_gath + s_nc) / s_n * 1e3);
+                    // 【§619c】resize 段的细分:grow(5 次 grow_scratch)/ row(rowmap 写)/
+                    // 实际扩容次数 / 扩容字节 / 活跃专家数
+                    fprintf(stderr, "[resize-prof] n=%d grow=%.1fus row=%.1fus "
+                            "realloc=%lld experts=%lld bytes=%lld | need(down,both,act,bf16,row)=%lld,%lld,%lld,%lld,%lld "
+                            "reallocidx=%lld,%lld,%lld,%lld,%lld growcalls=%lld me_max=%lld me_sum=%lld\n",
+                            s_n, rsz_grow_ / s_n * 1e3, rsz_row_ / s_n * 1e3,
+                            rsz_realloc_, rsz_experts_, rsz_bytes_,
+                            rsz_need_[0], rsz_need_[1], rsz_need_[2], rsz_need_[3], rsz_need_[4],
+                            rsz_realloc_idx_[0], rsz_realloc_idx_[1], rsz_realloc_idx_[2],
+                            rsz_realloc_idx_[3], rsz_realloc_idx_[4],
+                            rsz_growcalls_, rsz_me_max_, rsz_me_sum_);
+                    fflush(stderr);
                     s_pre = s_res = s_gath = s_nc = 0; s_n = 0;
+                    rsz_grow_ = rsz_row_ = 0.0;
+                    rsz_realloc_ = rsz_bytes_ = rsz_experts_ = 0;
+                    for (int _i = 0; _i < 5; ++_i) { rsz_need_[_i] = 0; rsz_realloc_idx_[_i] = 0; }
+                    rsz_growcalls_ = rsz_me_max_ = rsz_me_sum_ = 0;
                 }
             }
         }
@@ -1404,6 +1537,12 @@ private:
     // (实测 calls=40 na=12 → 80 na=6 → 120 na=4 → 160 na=3 → 200 na=2),
     // 而门禁/报告取的是最后一行 ⇒ 读到垃圾值(带宽被算成 36 GB/s)。
     size_t prof_win_ = 0;       // 本窗口内的调用数(打印后归零),用作分母
+    // 【§619c】resize 段内部的细分累加器(只在 XIAOTU_MOE_SETUP_PROF 打开时更新)
+    mutable double rsz_grow_ = 0.0, rsz_row_ = 0.0;
+    mutable long long rsz_realloc_ = 0, rsz_bytes_ = 0, rsz_experts_ = 0;
+    mutable long long rsz_need_[5] = {0, 0, 0, 0, 0};
+    mutable long long rsz_realloc_idx_[5] = {0, 0, 0, 0, 0};
+    mutable long long rsz_growcalls_ = 0, rsz_me_max_ = 0, rsz_me_sum_ = 0;
     int64_t prof_A_ = 0, prof_A2_ = 0, prof_B0_ = 0, prof_B_ = 0, prof_C_ = 0, prof_ovh_ = 0;
     size_t prof_M_ = 0, prof_na_ = 0;
     static bool diag_barrier() {
@@ -1421,21 +1560,28 @@ private:
     // 会以小 M 混进来。混在一起平均会把两件事搅成一本糊涂账(实测被误导过),
     // 所以分开累计并分别打印。
     struct ProfBucket { size_t calls = 0, na = 0; int64_t setup = 0, A = 0, B = 0, C = 0, ovh = 0; };
-    ProfBucket pbuf_[3];
     static int prof_bucket(size_t M) { return M <= 2 ? 0 : (M <= 8 ? 1 : 2); }
 
     void prof_add(size_t M, size_t na, int64_t dA, int64_t dA2, int64_t dB0,
                   int64_t dB, int64_t dC, int64_t dovh) {
         if (!prof_) return;
         {
-            ProfBucket& b = pbuf_[prof_bucket(M)];
+            // 【§619b 修】桶必须**跨引擎实例**累加,否则窗口只覆盖 200/40 = 5 次调用。
+            // `pbuf_` 是**成员**(每层一个引擎对象 ⇒ 40 份),而计数器 `npb` 是
+            // 函数内 `static`(全实例共享)⇒ 每 200 次调用只有一个引擎的桶被打印,
+            // 它的 calls 只有 ~5,读到的是"某一层"的数字,却被当成全体平均。
+            // 实测危害:同一个 qlen=1905 的 prefill 步骤,`[cd-timing] compute`=291 ms/层,
+            // 而 `[NS-PROF] M>8 TOTAL`=183 ms/层 —— 差 108 ms 无法归属,正是这个偏样造成的。
+            // 改为函数内 `thread_local` 桶(worker 线程调用)⇒ 窗口 = 真正的 200 次调用。
+            static thread_local ProfBucket spbuf[3];
+            static thread_local size_t npb = 0;
+            ProfBucket& b = spbuf[prof_bucket(M)];
             b.calls++; b.na += na;
             b.setup += dA2; b.A += dA; b.B += dB + dB0; b.C += dC; b.ovh += dovh;
             static const char* names[3] = {"M<=2 ", "M3-8 ", "M>8  "};
-            static size_t npb = 0;
             if (++npb % 200 == 0) {
                 for (int i = 0; i < 3; ++i) {
-                    ProfBucket& q = pbuf_[i];
+                    ProfBucket& q = spbuf[i];
                     if (!q.calls) continue;
                     double c = (double)q.calls;
                     fprintf(stderr,
@@ -1682,20 +1828,23 @@ private:
     // the steady-state hot loop does zero allocation (the prior local-vector
     // version regressed ~25% because it mmap/munmap'd every buffer every call).
     struct ExpBuf {
-        std::vector<uint16_t> xg, abf16;   // me*hidden / me*inter (bf16 rows)
-        std::vector<uint32_t> rowmap;      // me:每行在"去重输入"里的行号(轮 73 取代 gather)
-        std::vector<float>    both, act, down;  // me*2*inter / me*inter / me*hidden
-        std::vector<size_t>   ai_list;
+        // 【§619】ScratchVec (= NoInitAlloc) so the grow-only resize() calls in
+        // the A2 setup no longer zero-fill. See NoInitAlloc above for the
+        // measured cost and the write-before-read argument.
+        ScratchVec<uint16_t> xg, abf16;   // me*hidden / me*inter (bf16 rows)
+        ScratchVec<uint32_t> rowmap;      // me:每行在"去重输入"里的行号(轮 73 取代 gather)
+        ScratchVec<float>    both, act, down;  // me*2*inter / me*inter / me*hidden
+        ScratchVec<size_t>   ai_list;
     };
     mutable std::vector<ExpBuf> exp_;       // sized to nel; only active experts used
     mutable std::vector<int> active_;       // reusable list of active expert ids
     mutable std::vector<size_t> count_;     // per-expert instance counts
     mutable std::vector<size_t> inst_idx_;  // ai -> instance rank within its expert
     mutable std::vector<size_t> exp_off_;   // prefix sums for A2/B0 job mapping
-    std::vector<float> act_scratch_;
-    std::vector<float> down_scratch_;
-    std::vector<float> both_scratch_;          // N-parallel gate+up (2*inter/assign)
-    std::vector<uint16_t> act_bf16_scratch_;   // N-parallel bf16 activation
+    ScratchVec<float> act_scratch_;
+    ScratchVec<float> down_scratch_;
+    ScratchVec<float> both_scratch_;          // N-parallel gate+up (2*inter/assign)
+    ScratchVec<uint16_t> act_bf16_scratch_;   // N-parallel bf16 activation
     // Shared process-wide NUMA pool (one pool for ALL layers, mirroring lk_moe's
     // single Backend_NUMA engine). Per-layer pools would give ~61 x threads and
     // thrash the scheduler; a single pool keeps the total = XIAOTU_MOE_THREADS.
