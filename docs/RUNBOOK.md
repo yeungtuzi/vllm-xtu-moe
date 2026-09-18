@@ -599,9 +599,20 @@ llm-pi-ai:
 ```
 * 档位键只能取 `off|minimal|low|medium|high|xhigh|max`(`catalog.ts:74` 的 drift gate);
   值必须是 **vLLM 认得的拼写**,否则 400。
+* ⚠️ **V4.1 只认 5 个拼写**:`REASONING_EFFORT_MAPPINGS = {low:25, high:50, xhigh:75, max:100}`
+  加 `none`(关思考),另外还接受 **1..100 的整数**
+  (`tokenizers/deepseek_v41_encoding.py:183`;`DEFAULT_REASONING_EFFORT = "high"`)。
+  **`minimal` / `medium` 会被 V4.1 直接 `ValueError`** —— 它们只在 OpenAI 协议的 `Literal`
+  里合法(是给别的模型用的)⇒ **DSH 的 `reasoningEfforts` 里绝不要声明 `minimal`/`medium`**,
+  否则用户一点就是 400。
+* 正因为 effort 是 **1..100 的数值预算**,客户端若能送整数,就得到"细粒度思考强度"
+  (例如 `reasoning_effort: 60`)。
 * `off` 的**值不能留空**:留空 = "支持,但不送参数",对 V4.1 等于**仍然开思考**。
 * 只声明 `reasoningEfforts` 而不开 `compat.supportsReasoningEffort`,选择器会出现但
   请求里不带 `reasoning_effort`(`openai-completions` 下该开关才决定发送)。
+* 这一路**不需要额外服务端 flag**:本模型的 `architectures=["DeepseekV41ForCausalLM"]`
+  ⇒ vLLM 自动把 `tokenizer_mode` 设成 `deepseek_v41`(`config/model.py:709`),
+  走 V4.1 prompt encoder。
 
 **自检命令**
 ```bash
