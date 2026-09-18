@@ -289,6 +289,10 @@ struct FP8WeightTraits : WeightTraitsBase<FP8WeightTraits> {
     // Decode is compute-bound (a single token's GEMV re-decodes every weight row
     // on one thread), so small batches are fanned out over N slices as well.
     static constexpr bool kNSliceSmallM = true;
+    // Single-copy NUMA node sharding: one node-local copy of the expert weights
+    // instead of two per-socket replicas. The tiled kernel and the batched slice
+    // impls both honor the compact [gate][up] geometry it produces.
+    static constexpr bool kNodeShard = true;
     static constexpr size_t w13_bytes_impl(size_t E, size_t n2, size_t H) {
         return E * n2 * H * sizeof(uint8_t);  // [E][2I][H] fp8
     }

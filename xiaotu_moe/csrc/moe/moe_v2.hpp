@@ -207,6 +207,22 @@ struct WeightTraitsBase {
     static constexpr size_t w2_bytes(size_t E, size_t H, size_t I) {
         return Derived::w2_bytes_impl(E, H, I);
     }
+    // Per-row / per-expert byte geometry. The NUMA shard builder and the sharded
+    // reader must agree on the layout for every weight width (fp8/bf16: 1/2 bytes
+    // per element; packed4: 2 elements per byte), so both derive it from the
+    // trait's own *_bytes_impl instead of assuming a 4-bit layout.
+    static constexpr size_t w13_row_bytes(int H) {
+        return Derived::w13_bytes_impl(1, 1, (size_t)H);
+    }
+    static constexpr size_t w13_block_bytes(int I, int H) {
+        return Derived::w13_bytes_impl(1, (size_t)2 * (size_t)I, (size_t)H);
+    }
+    static constexpr size_t w2_row_bytes(int I) {
+        return Derived::w2_bytes_impl(1, 1, (size_t)I);
+    }
+    static constexpr size_t w2_block_bytes(int H, int I) {
+        return Derived::w2_bytes_impl(1, (size_t)H, (size_t)I);
+    }
     // gate_up: gate, up [inter] fp32 = x [hidden] bf16 x per-expert W13 [2*inter][hidden]^T
     // w13 points at expert block eid; w13_g optional per-expert block scale
     // [N/groupN][K/groupK]; w13_gs optional per-expert global scale (array) used
@@ -227,6 +243,13 @@ struct WeightTraitsBase {
     // forward_many can split the (N-rows of the) GEMV across all worker threads
     // (ktransformers `split_range_n` technique). BF16/FP8 stay single-chunk.
     static constexpr bool kNParallel = false;
+    // Single-copy NUMA node sharding. packed4 gets it through kNParallel; FP8
+    // opts in here so it also keeps ONE node-local copy of the expert weights
+    // instead of two per-socket replicas. A trait that sets either flag must
+    // make every reader compact-shard aware (forward_many routes all sharded
+    // traffic through forward_many_nsliced, whose batched impls take
+    // cstride/row0/up_off).
+    static constexpr bool kNodeShard = false;
     // Small-batch N-slicing: when a batch has only a few (token, rank)
     // assignments the per-token loop leaves all but a handful of workers idle,
     // and a single token's GEMV is compute-bound rather than bandwidth-bound, so
@@ -524,7 +547,7 @@ public:
         // 模式**已彻底删除**:它让全部线程读同一份内存(7/8 的读跨 node),解码
         // A 阶段慢 ~30 倍、端到端慢 1.67 倍。不要以任何形式恢复它。
         bool sharded_ok = false;
-        if constexpr (wt::kNParallel) {
+        if constexpr (wt::kNParallel || wt::kNodeShard) {
             if (std::getenv("XIAOTU_MOE_NOSHARD") == nullptr) {
                 // 【第 212 轮】多 rank 同机:分片数与 node 基址都按 rank 切开,
                 // 让 rank r 的 1/world 权重落在它自己那 1/world 个 NUMA node 上
@@ -668,6 +691,18 @@ public:
                 fprintf(stderr, "[group] packed4 large-batch -> grouping "
                                 "M=%d k=%d NASS=%zu nshard=%d\n",
                         M, k, _nass_gate, nshard_);
+        }
+        // Single-copy NUMA sharding for non-packed4 traits (FP8): every batch
+        // goes through the sharded nsliced path, whose batched impls understand
+        // the compact [gate][up] layout. The grouped/per-token paths below index
+        // `w13_` as a dense block, and in this mode `w13_` is node 0's compact
+        // slice, so they must not be reached.
+        if constexpr (wt::kNodeShard) {
+            if (nshard_ >= 2) {
+                forward_many_nsliced(M, k, expert_ids, weights, input, output, 0,
+                                     wlimit_override());
+                return;
+            }
         }
         // Small-batch N-slicing (decode): with few assignments the grouped and
         // per-token paths both leave most workers idle. Route them through the
@@ -1248,7 +1283,7 @@ public:
             // Compact-shard geometry (matches shard_fill_w13): node n stores
             // [gate cbytes][up cbytes] per expert, with global row0 = n*gu_crows.
             const size_t gu_crows = (size_t)inter / NS;
-            const size_t gu_rb = (size_t)hidden / 2;
+            const size_t gu_rb = wt::w13_row_bytes(hidden);   // trait width (packed4: H/2)
             const size_t gu_cbytes = gu_crows * gu_rb;
             std::vector<size_t> jc(NS, eoffA[na]);
             pfor_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
@@ -1357,7 +1392,7 @@ public:
             // Compact-shard geometry (matches shard_fill_w2): node n stores one
             // cbytes slice per expert, with global row0 = n*d_crows.
             const size_t d_crows = (size_t)hidden / NS;
-            const size_t d_rb = (size_t)inter / 2;
+            const size_t d_rb = wt::w2_row_bytes(inter);      // trait width (packed4: I/2)
             const size_t d_cbytes = d_crows * d_rb;
             std::vector<size_t> jc(NS, eoffB[na]);
             pfor_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
@@ -1723,11 +1758,11 @@ private:
     bool shard_fill_w13(const void* src) {
         if (!src || nshard_ < 2) return false;
         const size_t H = cfg_.hidden_size, I = cfg_.intermediate_size, E = cfg_.expert_num;
-        const size_t rowbytes = H / 2;
+        const size_t rowbytes = wt::w13_row_bytes((int)H);       // trait width (fp8: H)
         const int NS = nshard_;
         const size_t crows = I / NS;               // caller guarantees NS | I
         const size_t cbytes = crows * rowbytes;
-        const size_t stride = (size_t)2 * I * rowbytes;  // dense source expert block
+        const size_t stride = wt::w13_block_bytes((int)I, (int)H);  // dense source expert block
         const size_t total = (size_t)2 * cbytes * E;     // compact shard size
         g_w13_shard_bytes_ = total;
         g_w13_crows_ = crows;
@@ -1759,11 +1794,11 @@ private:
     bool shard_fill_w2(const void* src) {
         if (!src || nshard_ < 2) return false;
         const size_t H = cfg_.hidden_size, I = cfg_.intermediate_size, E = cfg_.expert_num;
-        const size_t rowbytes = I / 2;
+        const size_t rowbytes = wt::w2_row_bytes((int)I);        // trait width (fp8: I)
         const int NS = nshard_;
         const size_t crows = H / NS;               // caller guarantees NS | H
         const size_t cbytes = crows * rowbytes;
-        const size_t stride = H * rowbytes;              // dense source expert block
+        const size_t stride = wt::w2_block_bytes((int)H, (int)I);    // dense source expert block
         const size_t total = cbytes * E;                 // compact shard size
         g_w2_shard_bytes_ = total;
         g_w2_crows_ = crows;
