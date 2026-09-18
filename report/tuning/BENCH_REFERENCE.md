@@ -196,7 +196,7 @@
 口径:`--backend openai --dataset-name sharegpt --sharegpt-output-len 128 --num-prompts 16`,
 **前缀缓存开**;TTFT 单列,不摊进吞吐。
 
-### 8.2 实测(v0.21.0 生产配置:TP=2 / 1M / SPEC=1 / GPU 预填充 4096 / THREADS=60·rank⁻¹)
+### 8.2 实测(v0.2 生产配置:TP=2 / 1M / SPEC=1 / GPU 预填充 4096 / THREADS=60·rank⁻¹)
 `TAG=sg21s1 SERVER_TAG=v0210_spec1 CS="1 4 8" N=16 OUT=128`
 
 | 并发 | **output token/s** | TPOT(ms,原样) | **TTFT(ms)** | 完成 |

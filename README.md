@@ -6,11 +6,11 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 当前版本:v0.21.0**(2026-09-17)——**支持 DeepSeek-V4.1-Flash(748B)**:
+> **📌 当前版本:v0.2**(2026-09-17)——**支持 DeepSeek-V4.1-Flash(748B)**:
 > **1M 上下文 + GPU 预填充 + 投机解码**全链路验收通过;其中 **GPU 预填充快 2.0-2.8×**,
 > 并补齐官方 `vllm bench serve` 的完整验收数据(6 种 prompt 长度 × C=1/2/4/8)。
-> 发行说明:[`RELEASE_NOTES_v0.21.0.md`](RELEASE_NOTES_v0.21.0.md) ·
-> Releases: <https://github.com/yeungtuzi/vllm-xtu-moe/releases/tag/v0.21.0>
+> 发行说明:[`RELEASE_NOTES_v0.2.md`](RELEASE_NOTES_v0.2.md) ·
+> Releases: <https://github.com/yeungtuzi/vllm-xtu-moe/releases/tag/v0.2>
 >
 > 历史:另一条**把 lvllm 编排链移植进 vLLM fork** 的路线(两卡 A100-40GB 上解码 C=1 20.29 t/s、
 > 预填充 1287 t/s、1M 上下文)见 [`docs/MILESTONE_lk_port.md`](docs/MILESTONE_lk_port.md)。
@@ -112,10 +112,10 @@ DeepSeek-V4-Flash 的**推荐参数与实测数据**见
 >
 > 本文档里的**实测数据不是同一时点的**,请按此判读:
 >
-> | 结论 | 验证于 | 在 v0.2.0 代码上复验? |
+> | 结论 | 验证于 | 在 0.2pre 代码上复验? |
 > |---|---|---|
-> | **DeepSeek-V4-Flash 主线端到端**(服务、`bench_lat` C=1/2/4、数值门禁 `OK=7 BAD=1`、启动自检) | **v0.2.0**(2026-09-14) | ✅ **是** |
-> | **DeepSeek-V4.1-Flash 全链路**(1M 上下文 / GPU 预填充 / 投机解码;`vllm bench serve` 6 长度 × 4 并发) | **v0.21.0**(2026-09-17) | ✅ **是** |
+> | **DeepSeek-V4-Flash 主线端到端**(服务、`bench_lat` C=1/2/4、数值门禁 `OK=7 BAD=1`、启动自检) | **0.2pre**(2026-09-14) | ✅ **是** |
+> | **DeepSeek-V4.1-Flash 全链路**(1M 上下文 / GPU 预填充 / 投机解码;`vllm bench serve` 6 长度 × 4 并发) | **v0.2**(2026-09-17) | ✅ **是** |
 >
 > 原因:v0.2 改动了**所有模型都会走的路径**(执行模型 `XIAOTU_MOE_ASYNC=0`、
 > 小 batch 路径 `NSLICE_SMALL=0`、**EP 存储分片**)。**除 DeepSeek-V4-Flash 外均需复验**,
@@ -125,17 +125,17 @@ DeepSeek-V4-Flash 的**推荐参数与实测数据**见
 
 | 模型 | 状态 | 关键数据(均为本机实测) |
 |---|---|---|
-| **DeepSeek-V4.1-Flash**(748B) | ✅ **v0.21.0** | **1M 上下文 + GPU 预填充 + 投机**全链路;主机峰值 **629.4 GiB(−42%)**;KV **6.72M tokens(1M 并发 6.41×)**;单流 **16.64 tok/s / TPOT 36.75 ms**;greedy ×2 **5/5 逐字节相同** |
-| **DeepSeek-V4-Flash** | ✅ v0.2.0 | 主线端到端(服务 / `bench_lat` C=1/2/4 / 数值门禁 `OK=7 BAD=1` / 启动自检) |
+| **DeepSeek-V4.1-Flash**(748B) | ✅ **v0.2** | **1M 上下文 + GPU 预填充 + 投机**全链路;主机峰值 **629.4 GiB(−42%)**;KV **6.72M tokens(1M 并发 6.41×)**;单流 **16.64 tok/s / TPOT 36.75 ms**;greedy ×2 **5/5 逐字节相同** |
+| **DeepSeek-V4-Flash** | ✅ 0.2pre | 主线端到端(服务 / `bench_lat` C=1/2/4 / 数值门禁 `OK=7 BAD=1` / 启动自检) |
 
 * **V4.1-Flash 为什么能支持**:38.5% 的权重是**纯查找表**(Engram,183 GiB,每 token 只需 ~12 KB
   主机流量),官方生产栈也把它放在**主机内存**里 —— 与本项目 `XIAOTU_PLE_CPU=1` 思路一致;
   其余(CED / CSA2 / FP4 KV / DSpark 投机)由 vLLM 主线 `deepseek_v41` 提供,本插件负责 **MoE 层**。
   发布当天的可行性分析见 [`docs/V41_FLASH_ANALYSIS.md`](docs/V41_FLASH_ANALYSIS.md);
-  **落地实测与配置**见 [`RELEASE_NOTES_v0.21.0.md`](RELEASE_NOTES_v0.21.0.md) 与
+  **落地实测与配置**见 [`RELEASE_NOTES_v0.2.md`](RELEASE_NOTES_v0.2.md) 与
   [`docs/RUNBOOK.md`](docs/RUNBOOK.md) §5.9。
 
-## 性能实测(v0.21.0)
+## 性能实测(v0.2)
 
 > 机器:2×AMD EPYC 9654(192 核)/ 3×A100-40GB / DDR5-4800 24 通道。
 > 口径:**TP=2**、充分预热、唯一 prompt(不命中前缀缓存)、官方 `vllm bench serve`。

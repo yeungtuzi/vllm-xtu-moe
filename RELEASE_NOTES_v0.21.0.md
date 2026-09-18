@@ -1,3 +1,13 @@
+> # ⚠️ 本版本已撤回(2026-09-18)
+>
+> 用户裁定:中间产物 **`v0.21.0` 撤回**(GitHub Release 与 tag 均已删除),
+> 其内容(V4.1-Flash 支持 + GPU 预填充修复)**已并入 **`v0.2`** 发行**。
+> `v0.2` 才是交付版:**支持 DeepSeek-V4.1-Flash + CPU 预填充性能优化**。
+> 当前有效文档:[`RELEASE_NOTES_v0.2.md`](RELEASE_NOTES_v0.2.md)、[`docs/RUNBOOK.md`](docs/RUNBOOK.md)。
+> 本文仅作历史记录保留。
+
+---
+
 # vllm-xtu-moe v0.21.0 — 支持 DeepSeek-V4.1-Flash(748B)
 
 **本次最大的变化:把 DeepSeek-V4.1-Flash 跑成可用的生产配置** ——

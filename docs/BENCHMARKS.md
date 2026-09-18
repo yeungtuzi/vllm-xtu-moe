@@ -5,7 +5,7 @@
 
 ---
 
-> ### ✅ v0.21.0 新增数据(2026-09-17)
+> ### ✅ v0.2 新增数据(2026-09-17)
 >
 > **DeepSeek-V4.1-Flash(748B)** 已支持并验收。两组关键数字:
 >
@@ -30,7 +30,7 @@
 > | 32768 | 70.9 s | 333 s | 420 | 454 | 58.4 ms |
 >
 > 原始 json:`report/tuning/logs/bench_serve_acc2/`;完整表:`report/tuning/BENCH_REFERENCE.md` 第 7 节。
-> V4.1 全链路验收(1M 上下文 / 内存峰值 / 确定性):`RELEASE_NOTES_v0.21.0.md` 第 1 节。
+> V4.1 全链路验收(1M 上下文 / 内存峰值 / 确定性):`RELEASE_NOTES_v0.2.md` 第 1 节。
 >
 > 下文为**历史数据**(V4-Flash 等),未改动。
 

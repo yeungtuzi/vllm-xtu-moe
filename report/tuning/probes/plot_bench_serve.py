@@ -91,8 +91,8 @@ def main() -> int:
         print("没有可画的数据"); return 1
 
     fig, ax = plt.subplots(2, 2, figsize=(13.2, 8.6))
-    fig.suptitle(T("vllm-xtu-moe v0.21.0 性能实测  (2×A100-40GB TP=2 / 2×EPYC 9654 / 1.5 TiB DDR5 ~740 GB/s)",
-                   "vllm-xtu-moe v0.21.0 measured performance  (2xA100-40GB TP2 / 2xEPYC 9654 / 1.5 TiB DDR5 ~740 GB/s)"),
+    fig.suptitle(T("vllm-xtu-moe v0.2 性能实测  (2×A100-40GB TP=2 / 2×EPYC 9654 / 1.5 TiB DDR5 ~740 GB/s)",
+                   "vllm-xtu-moe v0.2 measured performance  (2xA100-40GB TP2 / 2xEPYC 9654 / 1.5 TiB DDR5 ~740 GB/s)"),
                  fontsize=12, y=0.985)
 
     # (1) ShareGPT:output tok/s vs 并发(Plain vs dspark)

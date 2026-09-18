@@ -458,21 +458,33 @@ TAG=gpf KV_CACHE_BYTES=4729960528 GP_MIN=1024 MAXLEN=1048576 SEQS=2   bash repor
 ### 5.8b ⚠️ 发行流程(踩过:只 push tag ≠ 发布 Release)
 
 **"发行一个版本" = 版本号 + git tag + `gh release create` 三件事,缺一不可。**
-2026-09-17 的 v0.21.0 只做了前两件 ⇒ GitHub 的 Releases 页面仍显示旧的 v0.2.0(Latest),
+2026-09-17 的 v0.2 只做了前两件 ⇒ GitHub 的 Releases 页面仍显示旧的 v0.2.0(Latest),
 用户"看不到新版本"。正确流程:
 
 ```bash
 # 1) 版本号
-sed -i 's/^version = .*/version = "0.21.0"/' pyproject.toml
-# 2) 写发行说明 RELEASE_NOTES_v0.21.0.md,然后 commit + push + 打 tag
-git add -A && git commit -m "release: v0.21.0"
+sed -i 's/^version = .*/version = "0.2"/' pyproject.toml
+# 2) 写发行说明 RELEASE_NOTES_v0.2.md,然后 commit + push + 打 tag
+git add -A && git commit -m "release: v0.2"
 git push origin main
-git tag -a v0.21.0 -m "..." && git push origin v0.21.0
+git tag -a v0.2 -m "..." && git push origin v0.2
 # 3) **关键一步:创建 GitHub Release**(否则页面上看不到)
-gh release create v0.21.0 --title "vllm-xtu-moe v0.21.0 — <主题>" \
-  --notes-file RELEASE_NOTES_v0.21.0.md
+gh release create v0.2 --title "vllm-xtu-moe v0.2 — <主题>" \
+  --notes-file RELEASE_NOTES_v0.2.md
 gh release list --limit 5        # 复核 Latest 是否已切到新版本
 ```
+
+**撤回中间版本(2026-09-18 执行:撤回 `v0.21.0`)** —— 用户裁定把"真正支持 V4.1 +
+预填充性能优化"的版本作为 `v0.2`;旧的 `0.2.0` 全仓库改名 **`0.2pre`**;`v0.21.0` 中间产物撤回:
+```bash
+gh release delete v0.21.0 --yes          # 删 GitHub Release
+git push origin :refs/tags/v0.21.0       # 删远端 tag
+git tag -d v0.21.0                       # 删本地 tag
+git tag -l                               # 复核:只剩 v0.1.0 / v0.2.0(0.2pre 的历史 tag)/ v0.2
+```
+⚠️ **`v0.2.0` 这个 tag 要留着**(它是 `0.2pre` 那次"主线化"发行的归档),
+但**文档里一律称它为 `0.2pre`**,避免与新的 `v0.2` 混淆。`RELEASE_NOTES_v0.21.0.md`
+也保留作历史,但文件顶部要标注"已撤回,内容并入 `v0.2`"。
 
 ### 5.9 ⭐ 推荐的生产/挂 harness 配置(最稳定且高效;2026-09-17 定稿)
 
