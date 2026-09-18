@@ -101,6 +101,18 @@ else
 fi
 
 COMMON="-std=c++17 -shared -fPIC -O3 -ffast-math -fno-finite-math-only"
+# 【§629c】编译器可切(`CXX=g++-14` 或 conda 的
+# `x86_64-conda-linux-gnu-g++`)。用来对照 lk_moe 的 GCC 13.3.1 世代与 Clang。
+CXX_BIN="${CXX:-g++}"
+# 【§630b】`MTUNE=<cpu>`:`-mtune` 只影响**调度**,不改 ISA ⇒ 不会破坏 ISA 变体阶梯
+# (绝不能用 `-march=znver4`,那会把 AVX-512 塞进 scalar/avx2 兜底变体)。
+MTUNE="${MTUNE:-}"
+# 【§631】`EXTRA_FLAGS` 透传额外宏(如 `-DXIAOTU_MOE_FOLD_SCALE=1`),用于 A/B。
+EXTRA_FLAGS="${EXTRA_FLAGS:-}"
+[[ -n "$MTUNE" ]] && COMMON="-mtune=$MTUNE $COMMON"
+[[ -n "$EXTRA_FLAGS" ]] && COMMON="$COMMON $EXTRA_FLAGS"
+echo ">> compiler: $($CXX_BIN --version | head -1)"
+echo ">> COMMON=$COMMON"
 
 VARIANTS=(
   "scalar|"
@@ -118,7 +130,7 @@ for entry in "${VARIANTS[@]}"; do
   OUT="$OUT_DIR/${mod}${PY_EXT}"
   echo ">> Building variant [$name] -> $OUT"
   # shellcheck disable=SC2086
-  g++ $COMMON $flags \
+  "$CXX_BIN" $COMMON $flags \
       -DXIAOTU_MOE_MODULE_NAME="$mod" \
       -I"$PY_INC" -I"$PYBIND11_INC" -I"$ROOT/csrc" \
       "${CUDA_FLAGS[@]}" \

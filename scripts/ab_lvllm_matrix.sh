@@ -30,8 +30,8 @@
 #   REPS=6 CS="1 4" bash scripts/ab_lvllm_matrix.sh
 #   ARMS="a" bash scripts/ab_lvllm_matrix.sh  # 只跑参考侧
 #
-# 产物:report/tuning/raw/abmx_{a,b}_p<P>_o<L>_c<C>.json
-#       日志:report/tuning/logs/abmx_{a,b}.log、raw/abmx_{a,b}.bench.log
+# 产物:dev-docs/report/tuning/raw/abmx_{a,b}_p<P>_o<L>_c<C>.json
+#       日志:dev-docs/report/tuning/logs/abmx_{a,b}.log、raw/abmx_{a,b}.bench.log
 #
 # License: Apache-2.0
 # ============================================================================
@@ -60,7 +60,7 @@ PORT_B="${PORT_B:-8191}"
 READY_TIMEOUT="${READY_TIMEOUT:-2400}"
 ATAG="${ATAG:-}"                       # 变体扫描时给结果文件名加后缀,避免覆盖基线
 
-OUTDIR="$ROOT/report/tuning/logs"; RAW="$ROOT/report/tuning/raw"
+OUTDIR="$ROOT/dev-docs/report/tuning/logs"; RAW="$ROOT/dev-docs/report/tuning/raw"
 mkdir -p "$OUTDIR" "$RAW"
 PTH="$ENV/lib/python3.12/site-packages/zz_xiaotu_plugin.pth"
 
@@ -153,17 +153,42 @@ launch_arm() {   # $1=arm
   warn "arm $arm 超时"; tail -20 "$log"; return 1
 }
 
+# 【§638】按**进程树**递归 kill。为什么必须这样:vLLM 的 API server 会 fork 出
+# `VLLM::EngineCore` 与 `VLLM::Worker_TP*` 子进程,**只 kill 父进程时它们会活下来并继续占着
+# 显存** ⇒ 下一个 arm 在启动时报 `Free memory on device cuda:0 (0.15/39.49 GiB) ...` 直接失败
+# (2026-09-18 实测,arm A 结束后两个 GPU 仍各占 39.5 GiB)。
+_kill_tree() {   # 先子后父;pid 不存在时静默返回
+  local p="$1" c
+  [ -n "$p" ] || return 0
+  for c in $(pgrep -P "$p" 2>/dev/null); do _kill_tree "$c"; done
+  kill -9 "$p" 2>/dev/null || true
+}
+
 stop_arm() {
   local pidf="$OUTDIR/abmx_$1.pid"
   [ -f "$pidf" ] || return 0
   local pid; pid="$(cat "$pidf")"
   kill "$pid" 2>/dev/null
   for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; kill -CHLD 1 2>/dev/null; sleep 3; done
-  kill -9 "$pid" 2>/dev/null; rm -f "$pidf"
-  for _ in $(seq 1 40); do
+  _kill_tree "$pid"
+  # 兜底:按命令行特征清掉可能被 reparent 到 init 的 vLLM 子进程(只在本脚本串行执行 arm 时安全)。
+  pkill -9 -f "VLLM::EngineCore" 2>/dev/null || true
+  pkill -9 -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
+  rm -f "$pidf"
+  local waited=0
+  for _ in $(seq 1 48); do
     local used; used=$(nvidia-smi --id="$(echo "$GPUS" | cut -d, -f1)" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
-    [ "${used:-9999}" -lt 1024 ] && break; sleep 5
+    if [ "${used:-9999}" -lt 1024 ]; then break; fi
+    waited=$((waited + 5))
+    [ $((waited % 20)) -eq 0 ] && warn "等待 arm $1 释放显存 … 已 ${waited}s(GPU0 used=${used} MiB)"
+    sleep 5
   done
+  local u0; u0=$(nvidia-smi --id="$(echo "$GPUS" | cut -d, -f1)" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
+  if [ "${u0:-9999}" -ge 1024 ]; then
+    warn "!! arm $1 停止后 GPU0 仍占 ${u0} MiB —— 下一个 arm 可能起不来"
+  else
+    note "  arm $1 已停止(显存已释放)"
+  fi
 }
 
 measure_arm() {  # $1=arm

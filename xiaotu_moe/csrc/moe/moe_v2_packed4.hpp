@@ -37,6 +37,125 @@
 
 #include "../kernels/bf16_gemm.hpp"
 
+// ---------------------------------------------------------------------------
+// 【§631】`XIAOTU_MOE_FOLD_SCALE`:把每 (输出列 j, K 组 g) 的 scale **折到权重侧**。
+//
+// 旧式(默认 0,数值与历史逐位一致):
+//     d  = wlo * avlo                 (mul)
+//     d  = fma(whi, avhi, d)          (fma)   -> d = 该 32-K 组的点积(16 lane 部分和)
+//     acc= fma(d, sv, acc)            (fma)   -> 折 scale + 水平归约累加
+//   ⇒ **每个 (行,列,组) 占 3 个 FMA 端口**;32 个真 MAC 用掉 48 个 lane-op
+//     ⇒ FMA 端口利用率 **64/96 = 67%**。
+//
+// 新式(=1):
+//     wlos = wlo * sv;  whis = whi * sv        (2 个 mul,**每 (列,组) 只做一次**,被 MR 行摊薄)
+//     acc  = fma(wlos, avlo, acc)              (fma)
+//     acc  = fma(whis, avhi, acc)              (fma)
+//   ⇒ MR=4 时每个 (行,列,组) 只占 **2.5 个 FMA 端口**(2 + 2/4)⇒ 理论 **1.2×**。
+//   机理:新式的两次 fma 同时完成"乘加"和"水平归约累加",不再有第 3 条只为折 scale、
+//   白白多花 16 个 lane 乘法的指令。(lk_moe 之所以不吃这个亏:它的 16 个 lane 就是
+//   16 个**输出列**,压根不需要水平归约 —— 见 NOTES §630 的反汇编对比。)
+//
+// **数值**:E8M0/fp32 的 block scale 都是 **2 的整数次幂**(E8M0 = 2^(b-127)),
+// 故 `w*sv` 是**精确**的(只动指数,不舍入);两种写法都只有 2 次舍入,但**分组不同**
+// ⇒ 低位可能差 1-2 ulp。因此本开关**只作用于 MR>=2 的 tile 路径**(预处理大 M),
+// **单行解码路径与 block_23 保持逐位不变** —— 数值门的 `me=1 max_rel=1.873e-02`
+// 与 `me=2/3` 用例不受影响。
+//
+// 【2026-09-18 实测:默认改为 1】
+//   * 数值门 `test_block23_equiv.py`:**OK=7 BAD=1,BAD 仍是 `me=1 max_rel=1.873e-02`(逐位不变)**;
+//     me>=2 的 7 项全部 <7e-4(门限 2e-3),其中 me=6 还从 6.602e-04 改善到 6.002e-04。
+//   * `test_wna16_repack.py` / `test_swiglu_clamp.py`:与 FOLD=0 **逐位相同**。
+//   * 确定性门 `test_engine_determinism.py 11`:**10/10 bit-identical**。
+//   * 性能(g++-16,THREADS=60,DEDUP=226,同一 session 的 lk 参照):
+//     BS=227 36.49→**35.24**(−3.4%)、BS=1893 253.40→**232.21**(−8.4%)、
+//     BS=8192 1053.72→**967.86**(−8.2%)、解码 0.41→0.42。
+//     ⇒ 我们/lk 从 1.201/1.164/1.130 降到 **1.160/1.066/1.038**(后两档**达标 ≤1.111**)。
+// ---------------------------------------------------------------------------
+#ifndef XIAOTU_MOE_FOLD_SCALE
+#define XIAOTU_MOE_FOLD_SCALE 1
+#endif
+
+// 【§632】`XIAOTU_MOE_TILE_ALLMR`:tile 特化覆盖的 `mr` 档位。
+//   0 = 只特化满 tile `mr==MR`;**3(默认)= 满 tile + `mr=3/2/1`**;1 = 全部 mr;2 = 满 tile + mr=2。
+// 开关只影响**码生成**(循环边界是字面量还是运行时值),不改变任何一次浮点运算的顺序
+// ⇒ 各档之间**逐位一致**。
+// 【§632 实测(MR=4 时代)**:** 扩到全部 mr 反而更差(BS=1893 +3.1%、BS=8192 +2.7%),
+// 因为多出来的 13 个 tile body 让热点函数变大、挤 I-cache ⇒ 当时默认保持 0。
+// 【§635 实测(MR=6 之后)**:** 必须补小 M 尾巴 —— 通用回退路径声明 `acc[MR][8]`
+// (= acc[6][8] = 48 个 zmm)会**剧烈溢出**,门禁形状 DEDUP=12(BS=6 ⇒ 每专家 M=3)
+// 从 0.65-0.69 退化到 **0.79 ms/层**(同日 lk 比值 1.46×,门限 1.30 ⇒ **FAIL**)。
+// 补 `mr=3/2/1` 三档(=3)后:
+//   | 形状 | ALLMR=0 | **ALLMR=3** | ALLMR=1 | lk |
+//   |---|---|---|---|---|
+//   | 门禁 DEDUP=12 | 0.79(1.46×)❌ | **0.51(0.944×)✅** | 0.52(0.945×) | 0.54 |
+//   | 门禁 DEDUP=23 | 0.71(1.22×) | **0.68(1.133×)✅** | 0.63(1.016×) | 0.60 |
+//   | BS=227 (na≈226) | 29.44 | **30.01(0.986×)✅** | 33.34(1.095×) | 30.44 |
+//   | BS=1893 | 224.23 | **227.29(1.044×)✅** | 242.10(1.112×) | 217.65 |
+// ⇒ **=3** 在真实形状上最好且门禁全过;=1 门禁更漂亮但真实形状差 5-6%。
+#ifndef XIAOTU_MOE_TILE_ALLMR
+// 【§637 实测:默认改为 1】**必须**给所有 `mr` 发 body。`=3` 时 `mr=4/5` 掉进通用回退路径,
+// M=4/5 实测 1.02/1.09 ms/层;`=1` 后 0.63/0.70(**−38%/−36%**),且 M=1..12 全档最优。
+// (M=1..12 的完整曲线见 report/tuning/AB_LVLLM_VS_XIAOTU.md 轮 7。)
+#define XIAOTU_MOE_TILE_ALLMR 1
+#endif
+
+// 【§634】(MR, NR) 的寄存器预算。
+// 每个 (g, tile) 需要的**常驻 zmm** ≈ `acc[MR][NR] + av[MR][2] + wlo/whi + wlos/whis + sv`
+//                              = MR*NR + 2*MR + 5,再叠加解码用的 ~7 个短命临时 ⇒ 上限 ~32。
+//   MR=4, NR=4 : 16 + 8  + 5 = 29  (当前)
+//   MR=6, NR=2 : 12 + 12 + 5 = 29  (同一个预算,但 **每个权重字节只读一遍**)
+// 为什么 MR 对**真实负载**比对 NR 更要紧:`na≈226` 使每专家 M≈6,
+//   * MR=4 ⇒ M=6 被切成 `mr=4` + `mr=2` **两遍**,权重字节被读 **2 次**;
+//     lk_moe 的内循环一次吃 8 行 ⇒ **只读 1 次**。这就是 perf 里我们
+//     `L1-dcache-loads = 2.0×`、`L1-dcache-load-misses = 5.0×` lk 的直接来源。
+//   * MR=6 ⇒ M=6 **一遍过**,权重只读 1 次;代价是 NR 从 4 降到 2
+//     (指令模型 0.25 → 0.156 instr/MAC,M=6;M=50 时 0.176 → 0.161)。
+//
+// 【§634 实测:默认改为 MR=6 / NR=2】同一 session、THREADS=60、DEDUP=226:
+//   | 形状 | lk_moe | MR=4/NR=4 | **MR=6/NR=2** | 比值 |
+//   |---|---|---|---|---|
+//   | BS=227 | 30.43 | 35.27 | **29.46** | **0.968×**(比 lk 还快 3%) |
+//   | BS=1893 | 217.56 | 234.30 | **223.34** | **1.027×** |
+//   | 解码 BS=1/DD=6 | 0.44 | 0.39 | 0.41 | 0.932× |
+//   BS=227 一步 **−16.5%**。数值门 `OK=7 BAD=1`(BAD 仍 `me=1 max_rel=1.873e-02`,逐位不变)、
+//   确定性 10/10 全部通过。
+#ifndef XIAOTU_MOE_GEMM_MR
+#define XIAOTU_MOE_GEMM_MR 6
+#endif
+#ifndef XIAOTU_MOE_GEMM_NR_DEFAULT
+#define XIAOTU_MOE_GEMM_NR_DEFAULT 2
+#endif
+// 【§637】`XIAOTU_MOE_GEMM_NR_CT`:**编译期** NR(>0 时生效,并禁用 `XIAOTU_MOE_GEMM_NR` 覆盖)。
+// 为什么必须有它 —— 修 §635 留下的"洞":
+//   通用回退路径(未被 tile 特化覆盖的 `mr`)声明 `__m512 acc[MR][8]`。NR 是**运行时**值时
+//   编译器无法收紧,于是 `MR=6` 时它是 `acc[6][8]` = **48 个 zmm** ⇒ 剧烈溢出。
+//   实测代价:`mr=3`(M=3)从 0.51 → **0.79 ms/层(+55%)**。
+//   而 `TILE_ALLMR=3` 只发 `mr∈{6,3,2,1}` ⇒ **`mr=4/5` 永远掉进这条路径**。
+//   M=4/5 落在哪些 batch?`M≈B·k/E`:V4.1(E=384,k=6)在 **B∈[256,320]**;V4(E=256)在 **[171,214]**;
+//   解码侧 B=8..10 也可能 —— 都是很常见的 chunk 尺寸。
+// 有了 NR_CT,数组变成 `acc[6][2]` = 12 个 zmm ⇒ **通用路径本身不再溢出**,
+// `mr=4/5` 无需专门 body,`mr` 的覆盖不再需要"猜哪些档会出现",对**所有模型/所有 batch**都安全。
+#ifndef XIAOTU_MOE_GEMM_NR_CT
+// 【§637 实测:默认改为 2】出货构建(= 实测用的 nct2_a1 那套 .so):
+//   THREADS=60 / DEDUP=226 / 同 session lk 参照
+//   | 形状 | 旧出货(MR=6,NR 运行时,ALLMR=3) | **NR_CT=2 + ALLMR=1** | lk_moe | 比值 |
+//   |---|---|---|---|---|
+//   | BS=227  | 30.20 | **29.75** | 30.23 | **0.984×** |
+//   | BS=1893 | 224.45 | **210.86** | 217.80 | **0.968×** |
+//   | BS=8192 | 964.96 | **876.22** | 932.85 | **0.939×** |
+//   | 解码 BS=1/DD=6 | 0.42 | **0.41** | 0.46 | **0.891×** |
+//   ⇒ **引擎级四个形状全部比 lk_moe 快**(0.89-0.98×)。
+//   M 曲线(DEDUP=6 ⇒ M=BS)也证明它填平了 mr=4/5 的悬崖:
+//   M=4 1.24→**0.63**(−49%)、M=5 1.30→**0.70**(−46%),且 M=1..12 每档最优。
+#define XIAOTU_MOE_GEMM_NR_CT 2   // 0 = 关闭(保持历史"运行时 NR"行为)
+#endif
+#if XIAOTU_MOE_GEMM_NR_CT > 0
+#define XIAOTU_TILE_NMAX XIAOTU_MOE_GEMM_NR_CT
+#else
+#define XIAOTU_TILE_NMAX 8
+#endif
+
 namespace xiaotu_moe {
 
 namespace packed4 {
@@ -424,7 +543,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         };
         // 【§623】每组 scale 的行基址 `(j/gn)*kb_stride` 与 g 无关 ⇒ 每个 j0 块**只算一次**,
         // 内层 g 循环里不再做整数除法(`perf annotate` 里那条 `cltd` 就是它)。
-        int srow_of[8];
+        int srow_of[XIAOTU_TILE_NMAX];
         // PERMV 解码用的 fp32 LUT(16 项,恰好一个 zmm);见 XIAOTU_DECODE_GROUP_AVX512
         const __m512 permv_tbl_ = _mm512_loadu_ps(lut);
         const __m256i lut_lo256_ = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_lo));
@@ -436,6 +555,19 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
 // 【§548】VBMI 一次解 4 组(64 字节)。映射经 /tmp/vbmi_idx4.cpp 逐位验证(§547):
 //   multishift(control,data);控制 = 4*(i%8) 与 32+4*(i%8)(所有 qword 相同);
 //   输出字节位置决定读哪个 qword;每 lane(=1 组)自然列序 = [n1_lo8, n2_lo8, n1_hi8, n2_hi8]。
+// 【§629c】**必须手动展开成 4 条**,不能用 `for (int _s...)`:
+// `_mm512_extracti32x4_epi32(v, imm)` 的 imm 必须是**常量**,GCC 会把常量上界的小循环折掉,
+// 但 **Clang 不折** ⇒ `error: argument to '__builtin_ia32_extracti32x4_mask' must be a
+// constant integer`。手动展开后 GCC/Clang 都能编,且语义逐字不变。
+#define XIAOTU_QUAD_ONE(S, WLO, WHI)                                                        \
+    {                                                                                       \
+        const __m128i _l = _mm512_extracti32x4_epi32(_n1, (S));                             \
+        const __m128i _r = _mm512_extracti32x4_epi32(_n2, (S));                             \
+        (WLO)[S] = _mm512_permutexvar_ps(                                                   \
+            _mm512_cvtepu8_epi32(_mm_unpacklo_epi64(_l, _r)), permv_tbl_);                  \
+        (WHI)[S] = _mm512_permutexvar_ps(                                                   \
+            _mm512_cvtepu8_epi32(_mm_unpackhi_epi64(_l, _r)), permv_tbl_);                  \
+    }
 #define XIAOTU_DECODE_QUAD_VBMI(b_row, g0, WLO, WHI)                                        \
     do {                                                                                    \
         const __m512i _raw = _mm512_loadu_si512((const void*)((b_row) + (size_t)(g0) * 16)); \
@@ -444,14 +576,8 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                                  _mm512_set1_epi64((long long)0x1C1814100C080400ULL), _raw), _m); \
         const __m512i _n2  = _mm512_and_si512(_mm512_multishift_epi64_epi8(                  \
                                  _mm512_set1_epi64((long long)0x3C3834302C282420ULL), _raw), _m); \
-        for (int _s = 0; _s < 4; ++_s) {                                                     \
-            const __m128i _l = _mm512_extracti32x4_epi32(_n1, _s);                           \
-            const __m128i _r = _mm512_extracti32x4_epi32(_n2, _s);                           \
-            (WLO)[_s] = _mm512_permutexvar_ps(                                               \
-                _mm512_cvtepu8_epi32(_mm_unpacklo_epi64(_l, _r)), permv_tbl_);               \
-            (WHI)[_s] = _mm512_permutexvar_ps(                                               \
-                _mm512_cvtepu8_epi32(_mm_unpackhi_epi64(_l, _r)), permv_tbl_);               \
-        }                                                                                    \
+        XIAOTU_QUAD_ONE(0, WLO, WHI) XIAOTU_QUAD_ONE(1, WLO, WHI)                          \
+        XIAOTU_QUAD_ONE(2, WLO, WHI) XIAOTU_QUAD_ONE(3, WLO, WHI)                          \
     } while (0)
 #endif
 
@@ -479,14 +605,35 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         // 分块后激活流量降为 1/NR,权重仍只解码一次/行。
         // 寄存器预算:acc[MR][NR] + av[MR][2] + wlo/whi/sv/d ⇒ MR=4,NR=4 时 28 个 zmm。
         // 数值:每个 (行, token) 仍是"每 K 组 mul+2×fma 后累加",与单行路径同序。
-        // 默认 NR=8(实测预填充 1.22×、解码 1.15×,数值对拍 8/8);=0 回退旧 GEMV 路径。
+        // 【§629】默认 **NR=4**(原为 8):见下方注释里的 back-to-back 实测(真实形状下全面更好)。
+        // `XIAOTU_MOE_GEMM_NR` 仍可覆盖;=0 回退旧 GEMV 路径。
+        // 【§634】(MR, NR) 改成**可编译期配置**:`XIAOTU_MOE_GEMM_MR` /
+        // `XIAOTU_MOE_GEMM_NR_DEFAULT`。理由见下方 (MR,NR) 寄存器预算的推导。
         static const int gemm_nr = [] {
             const char* e = std::getenv("XIAOTU_MOE_GEMM_NR");
-            return e ? std::atoi(e) : 8;
+            return e ? std::atoi(e) : XIAOTU_MOE_GEMM_NR_DEFAULT;
         }();
         if (gemm_nr > 0) {
-            constexpr int MR = 4;
-            const int NR = std::min(gemm_nr, 8);
+            constexpr int MR = XIAOTU_MOE_GEMM_MR;
+            // 【§629】NR=4(原为 8)。**在真实形状(DEDUP=226,na≈226)上 back-to-back 实测**,
+            // NR 从 8 降到 4 在三个档位全面更好:
+            //   BS=227  40.00 → 38.57 (−3.6%)
+            //   BS=1893 291.77 → 266.84 (−8.5%)
+            //   BS=8192 1253.90 → 1136.23 (−9.4%)
+            // 机制:NR 决定激活复用(越大越好)与累加器阵列 `acc[4][NR]` 的溢出(越大越糟);
+            // 真实负载 `na≈226` 使每个专家的 M 很小(BS=1893 时每专家仅 ~50 行),
+            // 小 NR 的溢出优势占上风。**数值安全**:NR 只决定"一次处理几列",
+            // 每个输出列的累加顺序(按 g 递增)完全不变 ⇒ 对拍逐位一致。
+            // ⚠️ 另注:试过"按 M 自适应(大 M 用 4、小 M 用 8)"反而更差(311.27/1301.47),
+            //    因为内核里的 M 是**每专家行数**(BS=1893 时 ~50),阈值根本触发不到,
+            //    而多出来的两支 static 查询/分支影响了 codegen。**用固定 4**。
+            // 解码档(M<=2)用 NR=8:实测 M=1 时 NR=4 的激活载入次数翻倍 ⇒ 0.59 vs 0.54 ms/层。
+#if XIAOTU_MOE_GEMM_NR_CT > 0
+            // 【§637】编译期 NR:所有 `acc[MR][N]` 数组随之收紧 ⇒ 通用回退路径不再溢出。
+            constexpr int NR = XIAOTU_MOE_GEMM_NR_CT;
+#else
+            const int NR = (M <= 2) ? 8 : std::min(gemm_nr, 8);
+#endif
 #if defined(__AVX512VBMI__)
             // 【§548】XIAOTU_MOE_VBMI_DECODE=1 时用 VBMI 版解码路径(4 组一次);
             // 累加顺序与下方完全一致(每 (行,token) 按 g 递增、组内 s 递增)⇒ 数值应逐位相同。
@@ -499,7 +646,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                     const int mr = std::min(MR, M - m0);
                     for (int j0 = n0; j0 < n1; j0 += NR) {
                         const int nj = std::min(NR, n1 - j0);
-                        __m512 acc[MR][8];
+                        __m512 acc[MR][XIAOTU_TILE_NMAX];
                         for (int r = 0; r < mr; ++r)
                             for (int jj = 0; jj < nj; ++jj) acc[r][jj] = _mm512_setzero_ps();
                         for (int g0 = 0; g0 < group_count; g0 += 4) {
@@ -542,50 +689,98 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 const int mr = std::min(MR, M - m0);
                 for (int j0 = n0; j0 < n1; j0 += NR) {
                     const int nj = std::min(NR, n1 - j0);
-                    __m512 acc[MR][8];
+                    __m512 acc[MR][XIAOTU_TILE_NMAX];
                     for (int r = 0; r < mr; ++r)
                         for (int jj = 0; jj < nj; ++jj) acc[r][jj] = _mm512_setzero_ps();
                     // 【§623】scale 行基址每行只算一次(原来是每组 g 都做一次整数除法)
                     for (int jj = 0; jj < nj; ++jj) srow_of[jj] = ((j0 + jj) / gn) * kb_stride;
-                    // 【§625】**满 tile 特化**。`av[MR][2]` / `acc[MR][8]` 原来用**运行时**边界
-                    // `mr`/`nj` 索引 ⇒ 编译器只能把这两个数组放进**可寻址内存**,于是
-                    // `perf annotate` 里出现大量等距 512 字节的 `vmovaps %zmm,(%rbx)`
-                    // (av 恰好 4×2×64 = 512 字节)占 31% 周期。把 (mr==MR && nj==8) 这一支的
-                    // 循环边界写成**字面常量**,编译器就能把它们分配进 zmm 寄存器。
-                    // 数值:累加顺序与通用路径逐字相同(每 (行,列) 按 g 递增),只是不经过内存
-                    // ⇒ 由 test_block23_equiv.py 对拍验证。
-                    if (mr == MR && nj == 8) {
-                        __m512 acc[MR][8];
-                        for (int r = 0; r < MR; ++r)
-                            for (int jj = 0; jj < 8; ++jj) acc[r][jj] = _mm512_setzero_ps();
-                        int sr8[8];
-                        for (int jj = 0; jj < 8; ++jj) sr8[jj] = ((j0 + jj) / gn) * kb_stride;
-                        for (int g = 0; g < group_count; ++g) {
-                            const int base = g * 32;
-                            __m512 av[MR][2];
-                            for (int r = 0; r < MR; ++r) {
-                                const float* ap = a32 + (size_t)(m0 + r) * K + base;
-                                av[r][0] = _mm512_loadu_ps(ap);
-                                av[r][1] = _mm512_loadu_ps(ap + 16);
-                            }
-                            for (int jj = 0; jj < 8; ++jj) {
-                                const uint8_t* brow =
-                                    W + (size_t)(j0 + jj - rowshift) * (K / 2);
-                                XIAOTU_DECODE_GROUP_AVX512(brow, g);
-                                const __m512 sv = _mm512_set1_ps(row_scale(sr8[jj], g));
-                                for (int r = 0; r < MR; ++r) {
-                                    __m512 d = _mm512_mul_ps(wlo_, av[r][0]);
-                                    d = _mm512_fmadd_ps(whi_, av[r][1], d);
-                                    acc[r][jj] = _mm512_fmadd_ps(d, sv, acc[r][jj]);
-                                }
-                            }
-                        }
-                        for (int r = 0; r < MR; ++r)
-                            for (int jj = 0; jj < 8; ++jj)
-                                C[(size_t)(m0 + r) * N + j0 + jj] =
-                                    hsum512(acc[r][jj]) * global_scale;
-                        continue;
+                    // 【§625/§629】满 tile 特化。`av[MRT][2]` / `acc[MRT][NRT]` 原来用**运行时**
+                    // 边界 `mr`/`nj` 索引 ⇒ 编译器只能把它们放进可寻址内存,`perf annotate`
+                    // 里表现为大量等距 512 字节的 `vmovaps`(占 31% 周期)。
+                    // 用宏把 MRT/NRT 展开成**字面量** ⇒ 边界编译期常量 ⇒ 有资格进 zmm。
+                    // 数值:累加顺序与通用路径逐字相同(每 (行,列) 按 g 递增、组内固定)。
+#define XIAOTU_TILE_BODY(MRT, NRT)                                                        \
+    {                                                                                     \
+        __m512 acc[MRT][NRT];                                                             \
+        for (int r = 0; r < (MRT); ++r)                                                   \
+            for (int jj = 0; jj < (NRT); ++jj) acc[r][jj] = _mm512_setzero_ps();          \
+        int srt[NRT];                                                                     \
+        for (int jj = 0; jj < (NRT); ++jj) srt[jj] = ((j0 + jj) / gn) * kb_stride;        \
+        for (int g = 0; g < group_count; ++g) {                                           \
+            const int base = g * 32;                                                      \
+            __m512 av[MRT][2];                                                            \
+            for (int r = 0; r < (MRT); ++r) {                                             \
+                const float* ap = a32 + (size_t)(m0 + r) * K + base;                      \
+                av[r][0] = _mm512_loadu_ps(ap);                                           \
+                av[r][1] = _mm512_loadu_ps(ap + 16);                                      \
+            }                                                                             \
+            for (int jj = 0; jj < (NRT); ++jj) {                                          \
+                const uint8_t* brow = W + (size_t)(j0 + jj - rowshift) * (K / 2);         \
+                XIAOTU_DECODE_GROUP_AVX512(brow, g);                                      \
+                const __m512 sv = _mm512_set1_ps(row_scale(srt[jj], g));                  \
+                /* 【§637b】折 scale **只在 MRT>=2 时**才划算:`mr=1` 时旧式是 1 mul + 2 fma = 3 个
+                 * FMA 端口,新式是 2 mul + 2 fma = 4 个 ⇒ **反而慢 33%**。通用循环里本来就写着
+                 * `if (mr >= 2)`,但特化 body 漏了这个条件 ⇒ 修掉它同时(a)让 `me=1` 的数值回到
+                 * 历史的 `max_rel=1.873e-02` 逐位不变,(b)去掉纯解码路径上的这个回退。 */       \
+                if constexpr (XIAOTU_MOE_FOLD_SCALE && (MRT) >= 2) {                      \
+                    const __m512 wlos = _mm512_mul_ps(wlo_, sv);                          \
+                    const __m512 whis = _mm512_mul_ps(whi_, sv);                          \
+                    for (int r = 0; r < (MRT); ++r) {                                     \
+                        acc[r][jj] = _mm512_fmadd_ps(wlos, av[r][0], acc[r][jj]);         \
+                        acc[r][jj] = _mm512_fmadd_ps(whis, av[r][1], acc[r][jj]);         \
+                    }                                                                     \
+                } else {                                                                  \
+                    for (int r = 0; r < (MRT); ++r) {                                     \
+                        __m512 d = _mm512_mul_ps(wlo_, av[r][0]);                         \
+                        d = _mm512_fmadd_ps(whi_, av[r][1], d);                           \
+                        acc[r][jj] = _mm512_fmadd_ps(d, sv, acc[r][jj]);                  \
+                    }                                                                     \
+                }                                                                         \
+            }                                                                             \
+        }                                                                                 \
+        for (int r = 0; r < (MRT); ++r)                                                   \
+            for (int jj = 0; jj < (NRT); ++jj)                                            \
+                C[(size_t)(m0 + r) * N + j0 + jj] = hsum512(acc[r][jj]) * global_scale;   \
+    }
+                    // 【§632】把特化从"只有 mr==MR"扩到 **所有 mr**(1/2/3/4)。
+                    // 为什么:§625 只特化了满 tile,mr<MR 的**尾巴**仍走下面的通用循环,
+                    // 那里 `av[MR][2]`/`acc[MR][8]` 又被**运行时** `mr`/`nj` 索引 ⇒ 只能放内存。
+                    // 而真实负载 `na≈226` 下每专家 M 很小(BS=227 时 M≈6)⇒ `M=6` 被切成
+                    // `mr=4` + `mr=2` 两块,**一半的工作量都在尾巴上**。
+                    // 数值:展开后每条 (行,列) 的 g 递增顺序与通用循环**逐字相同** ⇒ 逐位一致。
+#define XIAOTU_TILE_DISPATCH_R(MRT)                                                   \
+                    if (mr == (MRT)) {                                            \
+                        if (nj == 8) { XIAOTU_TILE_BODY(MRT, 8) continue; }        \
+                        if (nj == 6) { XIAOTU_TILE_BODY(MRT, 6) continue; }        \
+                        if (nj == 4) { XIAOTU_TILE_BODY(MRT, 4) continue; }        \
+                        if (nj == 2) { XIAOTU_TILE_BODY(MRT, 2) continue; }        \
                     }
+#if XIAOTU_MOE_TILE_ALLMR == 1
+                    XIAOTU_TILE_DISPATCH_R(6)
+                    XIAOTU_TILE_DISPATCH_R(5)
+                    XIAOTU_TILE_DISPATCH_R(4)
+                    XIAOTU_TILE_DISPATCH_R(3)
+                    XIAOTU_TILE_DISPATCH_R(2)
+                    XIAOTU_TILE_DISPATCH_R(1)
+#elif XIAOTU_MOE_TILE_ALLMR == 3
+                    // 【§635】MR=6 之后**必须**覆盖小 M 的尾巴,否则通用回退路径会声明
+                    // `acc[MR][8]`(= acc[6][8] = 48 个 zmm)而**剧烈溢出** ——
+                    // 门禁形状 DEDUP=12(BS=6 ⇒ 每专家 M=3)因此从 0.65-0.69 退化到 **0.78 ms/层**,
+                    // 同日 lk 比值 1.44×(门限 1.30)**FAIL**。
+                    // 只补真实会出现的尾巴档:`mr=3`(M=3,门禁/解码)与 `mr=2`/`mr=1`
+                    // (M≈50 的 8×6+2、M≈217 的 36×6+1)。
+                    XIAOTU_TILE_DISPATCH_R(MR)
+                    XIAOTU_TILE_DISPATCH_R(3)
+                    XIAOTU_TILE_DISPATCH_R(2)
+                    XIAOTU_TILE_DISPATCH_R(1)
+#elif XIAOTU_MOE_TILE_ALLMR == 2
+                    XIAOTU_TILE_DISPATCH_R(MR)
+                    XIAOTU_TILE_DISPATCH_R(2)
+#else
+                    XIAOTU_TILE_DISPATCH_R(MR)
+#endif
+#undef XIAOTU_TILE_DISPATCH_R
+#undef XIAOTU_TILE_BODY
                     for (int g = 0; g < group_count; ++g) {
                         const int base = g * 32;
                         __m512 av[MR][2];
@@ -599,6 +794,19 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                             const uint8_t* brow = W + (size_t)(j - rowshift) * (K / 2);
                             XIAOTU_DECODE_GROUP_AVX512(brow, g);
                             const __m512 sv = _mm512_set1_ps(row_scale(srow_of[jj], g));
+                            if constexpr (XIAOTU_MOE_FOLD_SCALE) {
+                                // 【§631】scale 折到权重侧(见文件头注释)。这里 mr 可能 < MR,
+                                // 摊薄比 MR 差一些;`mr==1` 的极端尾巴由下方 `mr>=2` 判定退回旧式。
+                                if (mr >= 2) {
+                                    const __m512 wlos = _mm512_mul_ps(wlo_, sv);
+                                    const __m512 whis = _mm512_mul_ps(whi_, sv);
+                                    for (int r = 0; r < mr; ++r) {
+                                        acc[r][jj] = _mm512_fmadd_ps(wlos, av[r][0], acc[r][jj]);
+                                        acc[r][jj] = _mm512_fmadd_ps(whis, av[r][1], acc[r][jj]);
+                                    }
+                                    continue;
+                                }
+                            }
                             for (int r = 0; r < mr; ++r) {
                                 __m512 d = _mm512_mul_ps(wlo_, av[r][0]);
                                 d = _mm512_fmadd_ps(whi_, av[r][1], d);
@@ -658,6 +866,20 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                     // Breaks the serial FMA dependency chain so EPYC's ~4-cycle
                     // FMA latency is hidden; reassociates fp32 (fine for inference).
                     const int p = g & 3;
+                    // 【§631】4 行共享一次"scale 折到权重":2 mul + 8 fma,
+                    // 替代旧的 4×(1 mul + 2 fma) = 12 ⇒ FMA 端口 1.2×。
+                    if constexpr (XIAOTU_MOE_FOLD_SCALE) {
+                        const __m512 wlos = _mm512_mul_ps(wlo_, sv);
+                        const __m512 whis = _mm512_mul_ps(whi_, sv);
+                        a0[p] = _mm512_fmadd_ps(wlos, _mm512_loadu_ps(p0 + base), a0[p]);
+                        a0[p] = _mm512_fmadd_ps(whis, _mm512_loadu_ps(p0 + base + 16), a0[p]);
+                        a1[p] = _mm512_fmadd_ps(wlos, _mm512_loadu_ps(p1 + base), a1[p]);
+                        a1[p] = _mm512_fmadd_ps(whis, _mm512_loadu_ps(p1 + base + 16), a1[p]);
+                        a2[p] = _mm512_fmadd_ps(wlos, _mm512_loadu_ps(p2 + base), a2[p]);
+                        a2[p] = _mm512_fmadd_ps(whis, _mm512_loadu_ps(p2 + base + 16), a2[p]);
+                        a3[p] = _mm512_fmadd_ps(wlos, _mm512_loadu_ps(p3 + base), a3[p]);
+                        a3[p] = _mm512_fmadd_ps(whis, _mm512_loadu_ps(p3 + base + 16), a3[p]);
+                    } else {
                     __m512 d0 = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p0 + base));
                     d0 = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p0 + base + 16), d0);
                     a0[p] = _mm512_fmadd_ps(d0, sv, a0[p]);
@@ -670,6 +892,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                     __m512 d3 = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p3 + base));
                     d3 = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p3 + base + 16), d3);
                     a3[p] = _mm512_fmadd_ps(d3, sv, a3[p]);
+                    }
                 }
                 const __m512 s0 = _mm512_add_ps(_mm512_add_ps(a0[0], a0[1]), _mm512_add_ps(a0[2], a0[3]));
                 const __m512 s1 = _mm512_add_ps(_mm512_add_ps(a1[0], a1[1]), _mm512_add_ps(a1[2], a1[3]));
