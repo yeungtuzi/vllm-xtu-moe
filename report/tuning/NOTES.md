@@ -22560,3 +22560,38 @@ lvllm+lk-moe 和我们的 vllm+xiaotu-moe 做一个完整的对比,既比较 pre
    256-token 与 8192-token prompt 的 TPOT 相同);
 2. **预填充 ≈ 119-128 tok/s**(256 tok→2.15 s;8192 tok→64.2 s)⇒ 每 token ≈ 7.8 ms,
    且近似线性(固定成本很小)。
+
+### (c) ⭐ 基线 A/B 结果(2026-09-18 05:10-05:38,**同一 env / 等效参数 / CPU-only / C=1**)
+`arm A = lvllm + lk-moe`;`arm B = lvllm 基座 + xiaotu-moe CPU 后端`(纯度已断言:
+A 无 `vllm-xtu-moe`,B 有;B 的日志显示 shim `routed_experts.lk_moe -> xiaotu_moe(LvLLM fork)`)。
+
+| prompt | output | arm A out_tput | arm B out_tput | **B/A** | arm A TTFT | arm B TTFT | **B/A** | arm A TPOT | arm B TPOT | **B/A** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 256 | 32 | 11.19 | 7.65 | **0.68×** | 2153 ms | 3022 ms | **0.71×** | 22.80 ms | 37.44 ms | **0.61×** |
+| 256 | 1024 | 40.08 | 27.62 | **0.69×** | 2163 ms | 3044 ms | **0.71×** | 22.86 ms | 33.26 ms | **0.69×** |
+| 8192 | 32 | 0.49 | 0.37 | **0.76×** | 64178 ms | 86117 ms | **0.75×** | 22.56 ms | 31.51 ms | **0.70×** |
+| 8192 | 1024 | 11.70 | 8.59 | **0.73×** | 64162 ms | 86355 ms | **0.74×** | 22.82 ms | 32.14 ms | **0.70×** |
+
+**换算成速率**
+| | prefill(短 256) | prefill(长 8192) | 解码 1/TPOT(256) | 解码 1/TPOT(8192) |
+|---|---|---|---|---|
+| **arm A (lk-moe)** | **119 tok/s** | **128 tok/s** | **43.9 tok/s** | **44.3 tok/s** |
+| **arm B (xiaotu)** | **85 tok/s** | **95 tok/s** | **26.7-30.1 tok/s** | **31.7 tok/s** |
+
+### (d) 结论(必须诚实记录)
+1. **用户的判断成立**:在**同 env、同基座、同参数、同 prompt(逐字节相同)、同客户端**的受控
+   A/B 下,**lk-moe 在 prefill 上快约 1.34-1.40×,在解码上快约 1.4-1.6×**。
+   我们此前 README 里的"16.64 tok/s vs 参考 25-27 t/s"并**不能**用"口径不同"完全解释掉 ——
+   同口径下我们确实更慢。
+2. 两个 arm 的 **prefill 都近似线性**(固定成本小),斜率差就是每 token 的引擎开销:
+   arm A ≈ **7.8 ms/token**,arm B ≈ **10.5 ms/token**。
+3. **arm A 的 TPOT 与上下文无关**(256 vs 8192 prompt:22.80 vs 22.56 ms);
+   arm B 在**这个配置**下同样基本无关(37.4 vs 31.5 ms,甚至更长 prompt 更快)。
+   ⇒ §621c 里"我们的 TPOT 随上下文涨到 60 ms"是**我们那套服务配置**(MAXLEN=1M /
+   `COMPILE=0` / 前缀缓存关)的现象,**不是**这个 fork 配置下的现象。
+   一个强线索:**本 A/B 用的是 `--compilation-config VLLM_COMPILE`(FULL_DECODE_ONLY)**,
+   而 RUNBOOK §5.9 把 `COMPILE=0` 定成了出货默认(当时理由是"无收益")。
+4. 下一步:跑 arm B 的旋钮扫描,把"慢"拆成"哪个默认值造成的":
+   `SPIN_IDLE_US`(§354 记录的 fork 最佳是 **0**,而本基线用的是 300)、
+   `THREADS`(参考机是"物理核÷GPU 数"= 48,本机同规则是 96;本基线两边都压成 60)、
+   `NSLICE_SMALL`(出货默认 0,§354 说它在 fork 上曾导致 1225 ms/token 的漂移)。

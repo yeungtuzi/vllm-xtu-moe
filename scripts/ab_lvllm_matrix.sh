@@ -58,6 +58,7 @@ ARMS="${ARMS:-a b}"
 PORT_A="${PORT_A:-8190}"
 PORT_B="${PORT_B:-8191}"
 READY_TIMEOUT="${READY_TIMEOUT:-2400}"
+ATAG="${ATAG:-}"                       # 变体扫描时给结果文件名加后缀,避免覆盖基线
 
 OUTDIR="$ROOT/report/tuning/logs"; RAW="$ROOT/report/tuning/raw"
 mkdir -p "$OUTDIR" "$RAW"
@@ -114,9 +115,15 @@ launch_arm() {   # $1=arm
             XIAOTU_MOE_SPIN_IDLE_US=300 XIAOTU_OOT_OVERRIDE=0 )
     if [ "$GPU_PREFILL" = "1" ]; then envs+=( VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1024 )
     else envs+=( VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1000000000 ); fi
-    printf 'XIAOTU_MOE_THREADS=%s\nXIAOTU_MOE_NSLICE_SMALL=0\nXIAOTU_MOE_ASYNC=0\nXIAOTU_MOE_SPIN_IDLE_US=300\n' \
-      "$THREADS" > "$OUTDIR/abmx_b.envfile"
-    envs+=( XIAOTU_ENV_FILE="$OUTDIR/abmx_b.envfile" )
+    # 我们的引擎默认(§5.9 出货配置)。B_* 环境变量可逐项覆盖,用来做"哪个旋钮造成差距"的扫描。
+    local B_NSLICE="${B_NSLICE_SMALL:-0}" B_ASYNC="${B_ASYNC:-0}" B_SPIN="${B_SPIN:-300}"
+    local B_THREADS="${B_THREADS:-$THREADS}"
+    printf 'XIAOTU_MOE_THREADS=%s\nXIAOTU_MOE_NSLICE_SMALL=%s\nXIAOTU_MOE_ASYNC=%s\nXIAOTU_MOE_SPIN_IDLE_US=%s\n' \
+      "$B_THREADS" "$B_NSLICE" "$B_ASYNC" "$B_SPIN" > "$OUTDIR/abmx_b.envfile"
+    envs+=( XIAOTU_ENV_FILE="$OUTDIR/abmx_b.envfile"
+            XIAOTU_MOE_THREADS="$B_THREADS" XIAOTU_MOE_NSLICE_SMALL="$B_NSLICE"
+            XIAOTU_MOE_ASYNC="$B_ASYNC" XIAOTU_MOE_SPIN_IDLE_US="$B_SPIN" )
+    [ -n "${B_EXTRA_ENV:-}" ] && envs+=( $B_EXTRA_ENV )
   fi
 
   note "启动 arm $arm (port=$port threads=$THREADS gpu_prefill=$GPU_PREFILL) → $log"
@@ -172,7 +179,7 @@ measure_arm() {  # $1=arm
   for P in $PROMPTS; do
     for O in $OUTPUTS; do
       for C in $CS; do
-        local rf="abmx_${arm}_p${P}_o${O}_c${C}.json"
+        local rf="abmx_${arm}${ATAG:-}_p${P}_o${O}_c${C}.json"
         # 【必须给每个格子不同的 seed】random 数据集由 seed 决定 prompt 序列:同 seed ⇒ 同 prompt ⇒
         # 开了前缀缓存的 arm 在第 2 个格子起**整段命中**,TTFT 会假性掉到 ~1 s(实测踩过:
         # 8192/o32 的 TTFT=63.2 s,而同 prompt 的 8192/o1024 只有 1.2 s)。seed 只由 (P,O,C) 决定
@@ -221,9 +228,9 @@ raw=sys.argv[1]
 rows={}
 for arm in ("a","b"):
     for f in sorted(os.listdir(raw)):
-        if f.startswith(f"abmx_{arm}_p") and f.endswith(".json"):
+        if f.startswith(f"abmx_{arm}") and f.endswith(".json") and "_p" in f:
             d=json.load(open(os.path.join(raw,f)))
-            key=tuple(x.replace(".json","") for x in f.split("_")[2:5])
+            key=tuple(f.split("_p",1)[1].replace(".json","").split("_"))
             rows[(arm,key)]=d
 keys=sorted({k for (a,k) in rows}, key=lambda t:(int(t[0][1:]),int(t[1][1:]),int(t[2][1:])))
 hdr=f"{'prompt':>7} {'out':>5} {'C':>3} | {'A out_tput':>10} {'A TTFT':>8} {'A TPOT':>7} | {'B out_tput':>10} {'B TTFT':>8} {'B TPOT':>7} | {'B/A tput':>8} {'B/A TTFT':>8}"
