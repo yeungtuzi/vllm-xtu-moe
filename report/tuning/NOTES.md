@@ -22321,3 +22321,77 @@ if (g.rowmap.size() < me) g.rowmap.resize(me);
 [2/2] 性能门禁 bench_engine_ab.py    : DEDUP=12 0.69 ms/层 219 GB/s ; DEDUP=23 0.84 ms/层 300 GB/s
                                        全部门禁通过(与 §570 基线 0.70/219、0.85/296 一致 ⇒ 无退化)
 ```
+
+## §619b ❗纠正 §618 的一处源码事实:`nshard_ >= 2` 时**所有** batch 都走 N-sliced 路径
+`moe_v2.hpp` 的选择顺序是:
+```cpp
+if constexpr (wt::kNParallel) {
+    if ((nshard_ >= 2) || (M*k <= GROUP_MIN_NASS)) { forward_many_nsliced(...); return; }
+    ...
+}
+if constexpr (wt::kNSliceSmallM) {
+    if (nslice_small && NASS <= 4*pool_.nthreads()) { forward_many_nsliced(...); return; }
+}
+// 只有到这里才是 legacy forward_many
+```
+本机 **8 个 NUMA node** ⇒ `nshard_ = max(1, nodes/world) = 4` ⇒ **`nshard_ >= 2` 恒真**,
+所以 ShareGPT 的 M≈227 **不是**走 legacy 路径,而是走 `forward_many_nsliced(chunk_hint=0)`。
+证据:`[setup-prof]`/`[NS-PROF]` 的锚点(`_suA..._suG`、`t_entry`、`pA0/pC`)全部位于
+**`forward_many_nsliced`**(函数体 952-1430),而 `forward_many` 是 623-904;
+两个 profiler 的 `setup` 逐项吻合(30.5 ↔ 36.3/39.5 µs 量级),只可能同源。
+⇒ §618(c) 的结论(优化对象是 legacy 路径)**作废**;`forward_many` 在本机是死代码。
+
+## §619c ❗`[cd-timing]` 是**每层**口径(不是 40 层合计)—— 自证
+`binding.cpp:858-887`:`period = t_cb - last_cb`(callback-entry→callback-entry),
+`every` 只是窗口长度。qlen=1893 时 `period=345.12 ms` × 40 层 = **13.80 s**,
+而 `probe_ttft.py` 实测 TTFT = **13.765 s**(LENS=2048 ⇒ prompt_tokens=1893)⇒ 逐位吻合。
+`[setup-prof]` 的 `per-call` 同为每层值,与 `[NS-PROF]` 同尺度。
+
+## §619d ⭐⭐ 真正的每层大头:按专家各自 resize 的 scratch ⇒ **每层 355 次真实扩容 / 搬 118 MB**
+### (a) 干净采样(TAG=moeprof,`XIAOTU_MOE_PROFILE=1`;`M>8` 桶 na=201.7/226.2 是真实 ShareGPT 规模)
+| 桶 | calls | na | setup(µs) | A(µs) | B(µs) | C(µs) | TOTAL(µs/层) |
+|---|---|---|---|---|---|---|---|
+| M<=2 | 2 | 6.0 | 60-309 | 447-497 | 224-264 | 24-30 | 800-1056 |
+| M3-8 | 3 | 6-9 | 650-1032 | 913-1032 | 462-524 | 39-43 | 2069-2612 |
+| M>8 | 5 | 226.2 | 63459 | 88178 | 45569 | 1331 | **198537** |
+
+### (b) `setup` 里 99% 是 `resize`,而且**不是**零填充
+`[setup-prof]` 同期同窗口:`resize=63015.8 pre_bookkeeping=882.0 gather=0.0 nc_sub=18.8`
+(另一次 `resize=133820.7`),与 `[NS-PROF].setup` 逐项对应 ⇒ 只有 `resize` 是量级。
+
+### (c) 拆开 `resize` 段(`[resize-prof]`,`SETUP_PROF_EVERY=1`,qlen≈1.9K/na≈232)
+```
+grow=79.3ms  row=0.10ms  realloc=355  bytes=118458068
+need(down,both,act,bf16,row)=71,71,71,71,71   reallocidx=71,71,71,71,71
+growcalls=355  me_max=1246  me_sum=11399 (=NASS ✓)
+```
+* `row`(rowmap 写入,~11K 次)只有 **0.10 ms** ⇒ 不是它;
+* **71 个专家 × 5 个缓冲 = 355 次真实扩容**,搬 118 MB,burn 掉 79 ms ⇒ 就是它;
+* 而且**连续 4 个请求都是这个量级**(永不收敛)。
+
+### (d) 为什么"只增不减 + 几何扩容"救不了
+按专家各存一套 scratch ⇒ 必须为**每个专家**记 me 的历史最大值。而 me 是长尾分布的
+**极值统计量**:换一个 prompt/换一层,总有专家刷新纪录。每次刷新都要 `operator new`
+一块新映射,写的时候逐页首次触碰 ⇒ 43-80 ms/层。这既不是"零填充"(§614/§619 那一类),
+也不是"拷贝旧内容"(几何扩容已解决那条),而是**新映射的首次触碰本身**。
+=> 结论:**只要尺寸由"每专家极值"决定,就必然反复扩容**。
+
+### (e) 修法:扁平 arena —— 尺寸只由 `NASS` 决定
+不变量:`sum_{e ∈ active} me_e == NASS`(每条 (token,rank) 指派恰好属于一个专家,
+活跃专家的指派并集就是全部指派)。所以整块 scratch 大小 **= NASS × 常数**,
+与路由形状无关 ⇒ 只在"见到最大 batch"时扩容一次,稳态 **0 次**。
+落地:
+* `forward_many_nsliced` 新增 `f_down_(NASS×hidden) / f_both_(NASS×2·inter) /
+  f_abf16_(NASS×inter) / f_rowmap_(NASS)` + `f_off_[nel]`(每专家行偏移);
+* 每层一次前缀和(与 rowmap 写入同一遍,0.10 ms),A/B/C 三相一律用
+  `f_*.data() + f_off_[eid]*宽度` 作为 per-expert 基址;
+* 原 `ExpBuf::down/both/act/abf16/xg/rowmap` 在 N-sliced 路径上**全部退役**
+  (顺带确认 `g.act`/`g.xg` 本来就无任何读取点);`ExpBuf::ai_list` 仍用于计数。
+* 额外省内存:`f_act_` 不再需要(act 本来就没被读过)⇒ 每行少 4·inter 字节。
+
+### (f) 门禁(重建 6 个 ISA 变体)
+```
+数值门禁 test_block23_equiv.py : OK=7 BAD=1(不变)
+性能门禁 bench_engine_ab.py    : DEDUP=12 0.70 ms/层 216 GB/s ; DEDUP=23 0.84 ms/层 300 GB/s
+                                 全部门禁通过(与 §570 基线一致)
+```

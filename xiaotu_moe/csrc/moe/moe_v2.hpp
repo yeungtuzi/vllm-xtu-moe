@@ -1020,64 +1020,47 @@ public:
         if (active_.empty()) return;
         auto _suB = std::chrono::steady_clock::now();
 
-        // Gather contiguous per-expert input rows and size the output buffers.
-        // resize() only grows capacity; steady state reuses it (no allocation).
-        // 【轮 73】gather 彻底删除:改为把"每行在去重输入里的行号"作为 rowmap 交给内核,
-        // gate/up 直接从 input 取数,不再先拷贝成每专家连续的 xg ⇒ 省掉一整段 memcpy
-        // **和一个完整的并行区**(轮 67-72 实测 setup ~52 µs,其中 gather 区约 40 µs)。
-        for (int e : active_) {
-            ExpBuf& g = exp_[e];
-            const size_t me = g.ai_list.size();
-            // 【轮 71】只增不减的 resize:消除 me 在 2/3 间振荡导致的反复零填充
-            // (实测 24-34 µs → 1.5 µs)。
-            const size_t nx = me * (size_t)hidden;
-            const size_t n2 = me * (size_t)2 * (size_t)inter;
-            const size_t ni = me * (size_t)inter;
-            // xg 已不再使用(保留成员仅为兼容);down 仍被阶段 B/C 使用,必须保证容量。
-            // 【§619】grow_scratch = 几何扩容 + 不零填充(两处浪费都去掉)。
-            // 【§619c 诊断】把这一段再拆细:`grow`(5 次 grow_scratch)vs `row`(rowmap 写)
-            // vs 实际发生扩容的次数/字节。§619/§619b 已证明"零填充"不是全部,
-            // 但剩下的 12-42 ms/层仍无归属 ⇒ 直接量,不再推断。
-            // **只在 XIAOTU_MOE_SETUP_PROF=1 时才计时**(否则热路径退化为原来的一行判断)。
+        // 【§619d】扁平 arena:整块只按 NASS 定尺(见成员区注释)。
+        // 每层就是"5 次 grow_scratch + 一遍前缀和 + 一遍 rowmap 写入",稳态 0 次扩容。
+        {
+            const size_t rows_total = NASS;   // == sum_e me_e(上界,恰好也是实际值)
             static const bool _rz = std::getenv("XIAOTU_MOE_SETUP_PROF") != nullptr;
             auto _g0 = _rz ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            const size_t _c_before[5] = {_rz ? g.down.capacity() : 0, _rz ? g.both.capacity() : 0,
-                                         _rz ? g.act.capacity() : 0, _rz ? g.abf16.capacity() : 0,
-                                         _rz ? g.rowmap.capacity() : 0};
-            if (_rz) {
-                const long long _n[5] = {(long long)nx, (long long)n2, (long long)ni, (long long)ni,
-                                         (long long)me};
-                for (int _i = 0; _i < 5; ++_i)
-                    if (_n[_i] > (long long)_c_before[_i]) { ++rsz_need_[_i]; ++rsz_growcalls_; }
-                if (me > rsz_me_max_) rsz_me_max_ = (long long)me;
-                rsz_me_sum_ += (long long)me;
-            }
-            grow_scratch(g.down,  nx);
-            grow_scratch(g.both,  n2);
-            grow_scratch(g.act,   ni);
-            grow_scratch(g.abf16, ni);
-            grow_scratch(g.rowmap, me);
+            const size_t _c_before[4] = {_rz ? f_down_.capacity() : 0, _rz ? f_both_.capacity() : 0,
+                                         _rz ? f_abf16_.capacity() : 0, _rz ? f_rowmap_.capacity() : 0};
+            grow_scratch(f_down_,   rows_total * (size_t)hidden);
+            grow_scratch(f_both_,   rows_total * (size_t)2 * (size_t)inter);
+            grow_scratch(f_abf16_,  rows_total * (size_t)inter);
+            grow_scratch(f_rowmap_, rows_total);
+            if (f_off_.size() < (size_t)nel) f_off_.resize((size_t)nel);
             auto _r0 = _rz ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (_rz) {
-                const size_t _c_after[5] = {g.down.capacity(), g.both.capacity(), g.act.capacity(),
-                                            g.abf16.capacity(), g.rowmap.capacity()};
+                const size_t _c_after[4] = {f_down_.capacity(), f_both_.capacity(),
+                                            f_abf16_.capacity(), f_rowmap_.capacity()};
+                const long long _esz[4] = {(long long)sizeof(float), (long long)sizeof(float),
+                                           (long long)sizeof(uint16_t), (long long)sizeof(uint32_t)};
                 rsz_grow_ += std::chrono::duration<double, std::milli>(_r0 - _g0).count();
-                for (int _i = 0; _i < 5; ++_i)
+                for (int _i = 0; _i < 4; ++_i)
                     if (_c_after[_i] != _c_before[_i]) {
-                        const long long _esz[5] = {(long long)sizeof(float), (long long)sizeof(float),
-                                                   (long long)sizeof(float), (long long)sizeof(uint16_t),
-                                                   (long long)sizeof(uint32_t)};
                         ++rsz_realloc_;
-                        ++rsz_realloc_idx_[_i];
                         rsz_bytes_ += (long long)(_c_after[_i] - _c_before[_i]) * _esz[_i];
                     }
+                rsz_me_max_ = (long long)rows_total;
             }
-            for (size_t m = 0; m < me; ++m)      // assignment ai 的激活行 = ai / k
-                g.rowmap[m] = (uint32_t)(g.ai_list[m] / (size_t)k);
+            size_t acc = 0;
+            for (int e : active_) {
+                f_off_[e] = acc;
+                const auto& al = exp_[e].ai_list;
+                uint32_t* rm = f_rowmap_.data() + acc;
+                for (size_t m = 0; m < al.size(); ++m)
+                    rm[m] = (uint32_t)(al[m] / (size_t)k);   // 激活行 = ai / k
+                acc += al.size();
+            }
+            ++rsz_experts_;
             if (_rz) {
                 rsz_row_ += std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - _r0).count();
-                ++rsz_experts_;
+                rsz_me_sum_ = (long long)acc;
             }
         }
         auto _suB2 = std::chrono::steady_clock::now();
@@ -1211,15 +1194,10 @@ public:
                             s_nc / s_n * 1e3, (s_pre + s_res + s_gath + s_nc) / s_n * 1e3);
                     // 【§619c】resize 段的细分:grow(5 次 grow_scratch)/ row(rowmap 写)/
                     // 实际扩容次数 / 扩容字节 / 活跃专家数
-                    fprintf(stderr, "[resize-prof] n=%d grow=%.1fus row=%.1fus "
-                            "realloc=%lld experts=%lld bytes=%lld | need(down,both,act,bf16,row)=%lld,%lld,%lld,%lld,%lld "
-                            "reallocidx=%lld,%lld,%lld,%lld,%lld growcalls=%lld me_max=%lld me_sum=%lld\n",
+                    fprintf(stderr, "[resize-prof] n=%d arena: grow=%.1fus row=%.1fus "
+                            "realloc=%lld bytes=%lld NASS=%lld sum_me=%lld\n",
                             s_n, rsz_grow_ / s_n * 1e3, rsz_row_ / s_n * 1e3,
-                            rsz_realloc_, rsz_experts_, rsz_bytes_,
-                            rsz_need_[0], rsz_need_[1], rsz_need_[2], rsz_need_[3], rsz_need_[4],
-                            rsz_realloc_idx_[0], rsz_realloc_idx_[1], rsz_realloc_idx_[2],
-                            rsz_realloc_idx_[3], rsz_realloc_idx_[4],
-                            rsz_growcalls_, rsz_me_max_, rsz_me_sum_);
+                            rsz_realloc_, rsz_bytes_, rsz_me_max_, rsz_me_sum_);
                     fflush(stderr);
                     s_pre = s_res = s_gath = s_nc = 0; s_n = 0;
                     rsz_grow_ = rsz_row_ = 0.0;
@@ -1285,6 +1263,9 @@ public:
                 ExpBuf& g = exp_[eid];
                 const size_t me = g.ai_list.size();
                 if (me == 0) return;
+                // 【§619d】该专家的 scratch 一律来自扁平 arena(用 f_off_ 定位)。
+                float* gu = f_both_.data() + f_off_[eid] * (size_t)2 * (size_t)inter;
+                const uint32_t* rmp = f_rowmap_.data() + f_off_[eid];
                 int n0 = (int)(n * inter / NS);
                 int n1 = (int)((n + 1) * inter / NS);
                 if (n1 > inter) n1 = inter;
@@ -1297,21 +1278,21 @@ public:
                 }
                 if (MOE_V2::diag_barrier()) {   // 诊断:XIAOTU_MOE_DIAG_BARRIER=1 时空转
                     for (size_t mi = 0; mi < me; ++mi) {
-                        float* bs = g.both.data() + mi * (size_t)2 * (size_t)inter;
+                        float* bs = gu + mi * (size_t)2 * (size_t)inter;
                         for (int i = n0; i < n1; ++i) { bs[i] = 1.f; bs[inter + i] = 1.f; }
                     }
                 } else
                 wt::gate_up_slice_batched((int)me, input, w13_shard_[n], w13_g_, w13_gs_,
-                                          g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1,
-                                          g.rowmap.data(),
+                                          gu, inter, hidden, (size_t)eid, groupN, groupK, n0, n1,
+                                          rmp,
                                           /*cstride=*/2 * gu_cbytes,
                                           /*row0=*/(long)((size_t)n * gu_crows),
                                           /*up_off=*/gu_cbytes);
                 // FUSED (lk does 3 barriers, we now do 3): gated-SiLU + f32->bf16
                 // applied inline on this node's chunk for every instance, replacing
                 // the former separate A2/B0 global barriers. Identical numerics.
-                const float* bc = g.both.data();
-                uint16_t* ab = g.abf16.data();
+                const float* bc = gu;
+                uint16_t* ab = f_abf16_.data() + f_off_[eid] * (size_t)inter;
                 for (size_t mi = 0; mi < me; ++mi) {
                     const float* bs = bc + mi * (size_t)2 * (size_t)inter;
                     uint16_t* abd = ab + mi * (size_t)inter;
@@ -1336,17 +1317,19 @@ public:
                 int eid = active_[e_idx];
                 ExpBuf& g = exp_[eid];
                 const size_t me = g.ai_list.size();
+                float* gu = f_both_.data() + f_off_[eid] * (size_t)2 * (size_t)inter;
+                const uint32_t* rmp = f_rowmap_.data() + f_off_[eid];
                 int n0 = c * inter / nc_gu;
                 int n1 = (c + 1) * inter / nc_gu;
                 if (n1 > inter) n1 = inter;
                 if (n0 >= n1) return;
                 const int s = xiaotu_moe::current_socket();   // worker's pinned socket
                 wt::gate_up_slice_batched((int)me, input, w13_for(s), w13g_for(s), w13_gs_,
-                                          g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1,
-                                          g.rowmap.data());
+                                          gu, inter, hidden, (size_t)eid, groupN, groupK, n0, n1,
+                                          rmp);
                 // FUSED gated-SiLU + f32->bf16 (lk-style single phase), replacing A2/B0.
-                const float* bc = g.both.data();
-                uint16_t* ab = g.abf16.data();
+                const float* bc = gu;
+                uint16_t* ab = f_abf16_.data() + f_off_[eid] * (size_t)inter;
                 for (size_t mi = 0; mi < me; ++mi) {
                     const float* bs = bc + mi * (size_t)2 * (size_t)inter;
                     uint16_t* abd = ab + mi * (size_t)inter;
@@ -1398,13 +1381,16 @@ public:
                     if (n0 >= n1) return;
                 }
                 if (MOE_V2::diag_barrier()) {   // 诊断:同上
+                    float* dv = f_down_.data() + f_off_[eid] * (size_t)hidden;
                     for (size_t mi = 0; mi < me; ++mi) {
-                        float* d = g.down.data() + mi * (size_t)hidden;
+                        float* d = dv + mi * (size_t)hidden;
                         for (int i = n0; i < n1; ++i) d[i] = 1.f;
                     }
                 } else
-                wt::down_slice_batched((int)me, g.abf16.data(), w2_shard_[n], w2_g_, w2_gs_,
-                                       g.down.data(), hidden, inter, (size_t)eid, groupN, groupK, n0, n1,
+                wt::down_slice_batched((int)me, f_abf16_.data() + f_off_[eid] * (size_t)inter,
+                                       w2_shard_[n], w2_g_, w2_gs_,
+                                       f_down_.data() + f_off_[eid] * (size_t)hidden,
+                                       hidden, inter, (size_t)eid, groupN, groupK, n0, n1,
                                        /*cstride=*/d_cbytes,
                                        /*row0=*/(long)((size_t)n * d_crows));
             });
@@ -1420,8 +1406,11 @@ public:
                 if (n1 > hidden) n1 = hidden;
                 if (n0 >= n1) return;
                 const int s = xiaotu_moe::current_socket();   // worker's pinned socket
-                wt::down_slice_batched((int)g.ai_list.size(), g.abf16.data(), w2_for(s), w2g_for(s), w2_gs_,
-                                       g.down.data(), hidden, inter, (size_t)eid, groupN, groupK, n0, n1);
+                wt::down_slice_batched((int)g.ai_list.size(),
+                                       f_abf16_.data() + f_off_[eid] * (size_t)inter,
+                                       w2_for(s), w2g_for(s), w2_gs_,
+                                       f_down_.data() + f_off_[eid] * (size_t)hidden,
+                                       hidden, inter, (size_t)eid, groupN, groupK, n0, n1);
             });
         }
         auto pB1 = clk::now();
@@ -1435,7 +1424,8 @@ public:
                 uint32_t eid = expert_ids[ai];
                 float w = weights[ai];
                 if (eid >= (uint32_t)nel || w == 0.f) continue;
-                const float* d = exp_[eid].down.data() + inst_idx_[ai] * (size_t)hidden;
+                const float* d = f_down_.data() + f_off_[eid] * (size_t)hidden
+                                 + inst_idx_[ai] * (size_t)hidden;
                 for (int h = 0; h < hidden; ++h) out_t[h] += w * d[h];
             }
         });
@@ -1841,6 +1831,24 @@ private:
     mutable std::vector<size_t> count_;     // per-expert instance counts
     mutable std::vector<size_t> inst_idx_;  // ai -> instance rank within its expert
     mutable std::vector<size_t> exp_off_;   // prefix sums for A2/B0 job mapping
+    // 【§619d】N-sliced 路径的**扁平 scratch arena**。
+    //
+    // 不变量:`sum_{e ∈ active} me_e == NASS`(me_e = 专家 e 的 (token,rank) 指派数,
+    // 每条指派恰好属于一个专家)。所以整块尺寸**只由 NASS 决定**,与路由形状无关 ——
+    // 扩容在"见到最大 batch"之后一次收敛。
+    //
+    // 为什么不能按专家各存一套 vector:那必须为**每个专家**记住各自 me 的历史最大值,
+    // 而那是长尾分布的**极值统计量**,会不断刷新。实测(`[resize-prof]`,
+    // `XIAOTU_MOE_SETUP_PROF_EVERY=1`,qlen≈1.9K,na≈232,NASS≈11376):
+    //     每层仍有 **71 个专家 × 5 个缓冲 = 355 次真实扩容、搬 118 MB、grow≈79 ms/层**,
+    //     且连续 4 个请求都是这个量级(永不收敛)。
+    // 每次扩容都要 `operator new` 一块新映射、写的时候逐页首次触碰 ⇒ 就是这 43-80 ms。
+    // 扁平 arena 让稳态扩容次数为 0。
+    ScratchVec<float>    f_down_;    // NASS × hidden
+    ScratchVec<float>    f_both_;    // NASS × 2*inter
+    ScratchVec<uint16_t> f_abf16_;   // NASS × inter
+    ScratchVec<uint32_t> f_rowmap_;  // NASS
+    std::vector<size_t>  f_off_;     // nel:每个专家的行偏移(仅 active 项有效)
     ScratchVec<float> act_scratch_;
     ScratchVec<float> down_scratch_;
     ScratchVec<float> both_scratch_;          // N-parallel gate+up (2*inter/assign)
