@@ -56,6 +56,13 @@ THINK_EFFORT="${THINK_EFFORT:-high}"  # 思考强度**默认值**(经 `--default
     # 也接受 1..100 的整数。留空 = 不传该 flag,则走 vLLM 内建默认(thinking=True, effort=high)。
     # ⚠️ `off` 要真正关思考**必须送 "none"**:什么都不送等于默认**开**思考。
     # 只在**非空**时拼参数,所以 `THINK_EFFORT= ...` 可一键回到 vLLM 内建默认。
+REASONING_PARSER="${REASONING_PARSER:-deepseek_v41}"  # 「思考内容」拆到 `reasoning_content` 的解析器。
+    # ⚠️ 实测(§620):**不加这个 flag,`reasoning_content` 恒为空**,思考文本会混在 `content` 里
+    # (服务起来后两种 effort 都量到 reasoning_content_len=0)。vLLM 对本 arch **不会自动选**
+    # (只有 gpt-oss 有 auto,见 model_executor/models/config.py:405)。
+    # 注册表键:`vllm/reasoning/__init__.py:35` 的 "deepseek_v41"
+    # → `vllm/reasoning/deepseek_v41_engine_reasoning_parser.py`。
+    # 留空 = 不传(= 不解析思考);DSH 要显示"思考过程"就必须开。
 GPF_V2="${GPF_V2:-0}"        # 1 = XIAOTU_GPF_V2=1:staging 分批版(DMA 全发完再组装/转置,§595)
 GPF_STAGE="${GPF_STAGE:-0}"  # 1 = XIAOTU_GPF_STAGE=1:staging **子相**计时(§594 dma/asm/tr)
 GP_SPLIT="${GP_SPLIT:-0}"    # 1 = XIAOTU_GP_SPLIT=1:每层打印 GPU 预填充的 **staging(asm)**
@@ -157,6 +164,7 @@ RUN_ENV="$RUN_ENV" READY_TIMEOUT="${READY_TIMEOUT:-2400}" \
   $( [ "$ITERDETAIL" = "1" ] && echo --enable-logging-iteration-details ) \
   $( [ "$TOK_DETAILS" = "1" ] && echo --enable-prompt-tokens-details ) \
   $( [ -n "$THINK_EFFORT" ] && printf -- "--default-chat-template-kwargs {\"reasoning_effort\":\"%s\"}" "$THINK_EFFORT" ) \
+  $( [ -n "$REASONING_PARSER" ] && printf -- "--reasoning-parser %s" "$REASONING_PARSER" ) \
   $( [ -n "$PROFILE_DIR" ] && printf -- "--profiler-config {\"profiler\":\"torch\",\"torch_profiler_dir\":\"%s\",\"torch_profiler_with_stack\":false}" "$PROFILE_DIR" ) \
   $( [ "$EAGER" = "1" ] && echo --enforce-eager ) \
   $( [ "$COMPILE" = "1" ] && echo --compilation-config "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"mode\":\"VLLM_COMPILE\"${JITCACHE_CC_EXTRA}}" ) \
