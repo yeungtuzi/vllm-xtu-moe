@@ -25,7 +25,7 @@
 ## 目标与愿景
 
 1. **任意 MoE 模型**:不绑死某一代架构。已跑通 DeepSeek-V4 / V4.1 系列,
-   已为 GLM-5.3-Flash 打通 CPU 专家路径(端到端受硬件限制,见支持矩阵)。
+   以及 **GLM-5.3-Flash**(含 A100 / SM80 的注意力后端,见支持矩阵)。
 2. **任意 x86 指令集**:`scalar → AVX2 → AVX-512(base/VNNI/BF16/VBMI)`,
    运行时按 `/proc/cpuinfo` 自动选最高可用变体。
 3. **显存优先级固定不变**:`1M 上下文 → GPU 预填充 → 投机解码 → 常驻`;
@@ -42,7 +42,7 @@
 |---|---|---|---|
 | **DeepSeek-V4.1-Flash** | 748B | MXFP4(E8M0 block-32) | ✅ 端到端(TP=2) |
 | **DeepSeek-V4-Flash**(0731) | 256 专家 / top-6 | MXFP4 | ✅ 端到端 |
-| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ⚠️ CPU 专家引擎已验证(真实权重层内 RMS 9.3e-5);**端到端需要 SM90+**,本机 A100(SM80)没有可用的注意力内核 |
+| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,需 `--kv-cache-dtype bfloat16`;贪心可复现,C=1 解码 ~22 tok/s(TPOT 45 ms) |
 | 其它即插即用 MoE | — | BF16 / FP8 | ✅ 走通用路径,未逐模型标定 |
 
 **实测硬件平台(下文所有性能数字都在这台机器上取得)**

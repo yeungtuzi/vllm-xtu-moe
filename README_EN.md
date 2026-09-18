@@ -46,7 +46,7 @@ which run fast on the GPU. So we split the model:
 |---|---|---|---|
 | **DeepSeek-V4.1-Flash** | 748B | MXFP4 (E8M0 block-32) | ✅ end to end (TP=2) |
 | **DeepSeek-V4-Flash** (0731) | 256 experts / top-6 | MXFP4 | ✅ end to end |
-| **GLM-5.3-Flash** | 321B / 18B active, 288 experts / top-8 | FP8 block-128 | ⚠️ CPU expert engine verified (in-layer RMS 9.3e-5 on real weights); **end-to-end needs SM90+** — this host's A100 (SM80) has no usable attention kernel |
+| **GLM-5.3-Flash** | 321B / 18B active, 288 experts / top-8 | FP8 block-128 | ✅ **end to end (TP=2, A100/SM80)** with `--kv-cache-dtype bfloat16`; greedy is reproducible, C=1 decode ~22 tok/s (TPOT 45 ms) |
 | Other plug-and-play MoE | — | BF16 / FP8 | ✅ generic path, no per-model calibration |
 
 **Measurement host (every number below was taken here)**

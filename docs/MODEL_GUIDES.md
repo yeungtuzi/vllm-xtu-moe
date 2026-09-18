@@ -184,9 +184,47 @@ CUDA_VISIBLE_DEVICES=0 TEST_MODEL=<DIR> CONCURRENCY=1 OUT_TOKENS=16 SKIP_TOK=0 \
 
 ---
 
-## 2. 目标 FP8 模型(暂不声明支持)
+## 2. GLM-5.3-Flash(A100 / SM80 端到端已支持)
 
-> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `内部交接 HANDOFF_v0.2pre.md` §5.1。
+### 2.1 与前代不同的地方
+
+* **45 层**语言塔:0–2 dense、3–44 稀疏 MoE、45 为 MTP;注意力是 **KDA 线性注意力 34 层
+  + NoPE 稀疏 MLA(DSA)11 层**(层号 3/7/…/43);
+* **288 路由专家 / top-8 + 1 共享专家**,`sigmoid + noaux_tc`,`routed_scaling_factor=2.5`,
+  `swiglu_limit=10`;
+* 检查点是**原生 FP8(e4m3,block 128×128)**:专家 ~**283.5 GiB**;`qk_rope_head_dim=0`(NoPE)
+  使 `qk_nope_head_dim=256 / v_head_dim=256 / kv_lora_rank=512`。
+
+### 2.2 启动
+
+```bash
+bash scripts/serve_glm53_mainline.sh        # 默认 TP=2、GPU 0/1、bf16 KV
+# 可覆盖:TAG PORT MAXLEN MBT SEQS THREADS COMPILE=1(smoke)→ python scripts/glm53_smoke.py --port <PORT>
+```
+
+> ⚠️ **必须 `--kv-cache-dtype bfloat16`**:本插件的 SM8x(Ampere/Ada)稀疏 MLA 后端
+> **只支持 bf16 KV**;fp8/fp4 KV 会 fail-closed(回到上游 SM90+ 候选池并报错)。脚本已默认设好。
+
+### 2.3 实测(2×A100-40GB,TP=2,真实 FP8 检查点,256-in / 128-out,`vllm bench serve`)
+
+| 并发 | out tok/s(**含 TTFT**) | TTFT 均值 | TPOT 均值 | 完成 |
+|---|---|---|---|---|
+| C=1 | **16.20** | 2185 ms | **45.03 ms** | 8/8 |
+| C=2 | 19.94 | 3254 ms | 75.35 ms | 8/8 |
+| C=4 | 20.27 | 12673 ms | 74.60 ms | 8/8 |
+
+* 纯解码 ≈ **22 tok/s**(C=1,`1/TPOT`);
+* 吞吐在 C≥2 就饱和,而 TPOT 升高 ⇒ 瓶颈是**每层引擎调用的延迟**(不是带宽,见 `dev-docs` 的 R8);
+* **TTFT 由 CPU 预填充主导**(`XIAOTU_*GPU_PREFILL_MIN_TOKENS=0`);GPU 预填充(R-VRAM 优先级 2)
+  尚未在 GLM 上开启,是下一个明确靶子。
+
+### 2.4 数值与稳定性
+
+* 层内数值(`GLM_MODEL=<ckpt> python scripts/test_glm53_fp8_layer.py <layer> 8`):
+  真实权重 RMS 相对误差 **3.6e-5 ~ 3.1e-4**(门限 1e-3);
+* 贪心同一 prompt 三次输出**逐字节相同**;连续 24 个请求 **24/24 成功**;运行日志无 CUDA 错误;
+* 主机内存 ~595 GB(引擎单份 NUMA 分片 + vLLM 源张量),GPU 每 rank 36.5 GiB(受
+  `gpu-memory-utilization` 的 KV 预留支配)。
 
 ---
 

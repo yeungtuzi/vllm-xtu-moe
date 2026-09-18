@@ -91,7 +91,7 @@
 | 检查 | 结果 |
 |---|---|
 | 引擎 vs torch 参考(MXFP4,真实 DeepSeek-V4 层权重) | RMS 相对误差 **5.6e-3** |
-| 引擎 vs numpy 参考(FP8 block-128,真实 GLM-5.3 专家权重) | RMS 相对误差 **9.3e-5** |
+| 引擎 vs numpy 参考(FP8 block-128,真实 GLM-5.3 专家权重;层 10/11/15/20/45) | RMS 相对误差 **3.6e-5 ~ 3.1e-4**(门限 1e-3) |
 | clamped SwiGLU(BF16 路径,5 组 limit/alpha/beta) | 相对 RMS ≤ 1.7e-3 |
 | clamped SwiGLU(MXFP4,真实 DeepSeek-V4 权重) | 最大相对误差 ≤ 6.8e-4 |
 | **CPU 专家 vs GPU 专家端到端**(微型 Mixtral,bf16) | greedy token **48/48 完全一致**;prompt-logprob 最大偏差 0.053(中位 0.016) |
@@ -164,9 +164,32 @@ GPTQ 检查点在引擎构造时一次性重排(`w13 [E, K/8, 2I] int32` → `[E
 
 > ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `内部交接 HANDOFF_v0.2pre.md` §5.1。
 
-## 4.1 FP8 端到端(2×A100-40GB)
+## 4.1 FP8 端到端 — GLM-5.3-Flash(2×A100-40GB,TP=2,SM80)
 
-> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `内部交接 HANDOFF_v0.2pre.md` §5.1。
+真实 `zai-org/GLM-5.3-Flash` **原生 FP8(block 128×128)** 检查点:专家常驻主机
+(283.5 GiB,**单份 NUMA 分片**),GPU 只放非专家权重 + bf16 KV。
+启动见 `scripts/serve_glm53_mainline.sh`;**必须 `--kv-cache-dtype bfloat16`**
+(SM8x 稀疏 MLA 后端只支持 bf16 KV;fp8/fp4 会 fail-closed)。
+
+`vllm bench serve`,随机数据、`--ignore-eos`。口径:**`out tok/s` 含 TTFT;三项独立公布**。
+
+| 并发 | prompt / output | out tok/s(含 TTFT) | TTFT 均值 | TPOT 均值 | 完成 |
+|---|---|---|---|---|---|
+| C=1 | 256 / 128 | **16.20**(峰值 23.00) | 2185 ms | **45.03 ms** | 8/8 |
+| C=2 | 256 / 128 | 19.94 | 3254 ms | 75.35 ms | 8/8 |
+| C=4 | 256 / 128 | 20.27 | 12673 ms | 74.60 ms | 8/8 |
+| C=1 | **4096 / 64** | 1.99 | **29320 ms** | 46.37 ms | 2/2 |
+
+读法:
+
+* **纯解码 ≈ 22 tok/s**(C=1,`1/TPOT`),且 **TPOT 与上下文长度基本无关**
+  (4096-token 的 TPOT 仍 46.4 ms);
+* 吞吐在 C≥2 就饱和、而 TPOT 反而升高 ⇒ 瓶颈是**每层引擎调用的延迟**,不是带宽;
+* **TTFT 由 CPU 预填充主导**(4096 token ≈ 29.3 s);GPU 预填充(R-VRAM 优先级 2)
+  尚未在 GLM 上开启,是下一步最明确的优化项。
+
+稳定性/数值:贪心同一 prompt 三次**逐字节相同**;连续 24 请求 **24/24 成功**;
+层内真实权重 RMS 相对误差 **3.6e-5 ~ 3.1e-4**(见 `MODEL_GUIDES.md` §2)。
 
 ## 4.2 使用指南与其它模型
 

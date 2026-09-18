@@ -7,28 +7,27 @@
 
 ## 1. 模型 / 硬件层面
 
-### GLM-5.3-Flash 需要 SM90+
+### GLM-5.3-Flash:SM80 上必须用 `--kv-cache-dtype bfloat16`
 
-`zai-org/GLM-5.3-Flash` 的 MLA 维度为 `qk_nope_head_dim=256 / qk_rope_head_dim=0 /
-v_head_dim=256`,在 vLLM 主线中**没有任何 attention 后端支持**:
+`zai-org/GLM-5.3-Flash` 的 MLA 维度是 `qk_nope_head_dim=256 / qk_rope_head_dim=0(NoPE)/
+v_head_dim=256`。**上游主线**的通用 sparse-MLA 后端全部要求 SM90+(或 Blackwell),
+所以 stock vLLM 在 A100 上会报 `No valid attention backend found`
+(`FLASH_ATTN_MLA_SPARSE` / `FLASHINFER_MLA_SPARSE_SM90` / `FLASHMLA_SPARSE` 均因
+compute capability 被拒),这也是早期文档写"需要 SM90+"的原因。
+
+本插件为此提供 **SM8x(Ampere/Ada)稀疏 MLA 后端**:它复用主线的 bf16 gather /
+logical→physical topk 机制,只把最后的 attention 核换成可移植 Triton
+`sparse_mla_fwd_with_sink`。该路线**只支持 bf16 KV cache**,因此启动时必须:
 
 ```
-sparse 打开(默认):
-  ValueError: No valid attention backend found ... FLASH_ATTN_MLA / FLASHMLA /
-  FLASHINFER_MLA / TRITON_MLA / FLASHINFER_MLA_SPARSE_SM90 / FLASH_ATTN_MLA_SPARSE /
-  FLASHMLA_SPARSE 全部因 compute capability 或 sparse 被拒绝
-
-sparse 关闭(--hf-overrides '{"index_topk": null}'):
-  ValueError: No valid MLA prefill backend found with
-  mla_dimensions=(qk_nope_head_dim=256, qk_rope_head_dim=0, v_head_dim=256).
-  Reasons: {FLASH_ATTN: [Model does not have supported MLA dimensions]}
-  (FLASH_ATTN 仅支持 (128,64,128)/(192,64,256)/(64,64,128);FLASHINFER 仅 Blackwell 且 (128,64,128))
+--kv-cache-dtype bfloat16     # fp8/fp4 KV 会 fail-closed(回到上游 SM90+ 候选池并报错)
 ```
 
-这与 MoE 后端无关:本插件对该模型**专家层**的数值已用真实权重验证
-(`scripts/test_glm53_fp8_layer.py`,RMS 相对误差 9.3e-5)。
-要在 A100 上端到端运行该模型,需要上游补充 256 维 MLA 的 attention 支持,
-或使用 SM90+ 硬件。
+实测(**2×A100-40GB / SM80 / TP=2 / 真实 FP8 检查点**):端到端跑通,贪心输出连贯
+且三次逐字节可复现;性能与启动命令见 `docs/RUNBOOK.md` 与 `docs/MODEL_GUIDES.md`。
+
+> 该后端由模型侧显式绑定(`glm5next` 的 DSA 层),**不改变其它模型的选路**;
+> 本插件的 CPU 专家路径对该模型早有验证(`scripts/test_glm53_fp8_layer.py`)。
 
 ## 2. 后端能力
 
