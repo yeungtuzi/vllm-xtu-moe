@@ -410,10 +410,21 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         const int kb_stride = (K + gk - 1) / gk;              // == group_count
         const uint8_t* Sbytes = static_cast<const uint8_t*>(S);
         const float* Sflt = static_cast<const float*>(S);
+        // 【§623】把 `e8m0_table()` 的指针**提到 lambda 外**。它是一个函数内 `static const
+        // float[256]`,每次调用都要读一次 **guard variable**(线程安全静态初始化的守卫);
+        // `perf annotate` 实测这条 `movzbl ...guard variable...` 单独占热点内核 **4.28%** 的周期,
+        // 而它只是取一个常量地址。取不到 E8M0 时给 nullptr,走 Sflt 分支。
+        const float* const e8tbl = [] {
+            if constexpr (E8M0) return e8m0_table();
+            return static_cast<const float*>(nullptr);
+        }();
         auto row_scale = [&](int srow, int gi) -> float {
-            if constexpr (E8M0) return e8m0_table()[Sbytes[srow + gi]];
+            if constexpr (E8M0) return e8tbl[Sbytes[srow + gi]];
             return Sflt[srow + gi];
         };
+        // 【§623】每组 scale 的行基址 `(j/gn)*kb_stride` 与 g 无关 ⇒ 每个 j0 块**只算一次**,
+        // 内层 g 循环里不再做整数除法(`perf annotate` 里那条 `cltd` 就是它)。
+        int srow_of[8];
         // PERMV 解码用的 fp32 LUT(16 项,恰好一个 zmm);见 XIAOTU_DECODE_GROUP_AVX512
         const __m512 permv_tbl_ = _mm512_loadu_ps(lut);
         const __m256i lut_lo256_ = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_lo));
@@ -534,6 +545,8 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                     __m512 acc[MR][8];
                     for (int r = 0; r < mr; ++r)
                         for (int jj = 0; jj < nj; ++jj) acc[r][jj] = _mm512_setzero_ps();
+                    // 【§623】scale 行基址每行只算一次(原来是每组 g 都做一次整数除法)
+                    for (int jj = 0; jj < nj; ++jj) srow_of[jj] = ((j0 + jj) / gn) * kb_stride;
                     for (int g = 0; g < group_count; ++g) {
                         const int base = g * 32;
                         __m512 av[MR][2];
@@ -546,8 +559,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                             const int j = j0 + jj;
                             const uint8_t* brow = W + (size_t)(j - rowshift) * (K / 2);
                             XIAOTU_DECODE_GROUP_AVX512(brow, g);
-                            const float sc = row_scale((j / gn) * kb_stride, g);
-                            const __m512 sv = _mm512_set1_ps(sc);
+                            const __m512 sv = _mm512_set1_ps(row_scale(srow_of[jj], g));
                             for (int r = 0; r < mr; ++r) {
                                 __m512 d = _mm512_mul_ps(wlo_, av[r][0]);
                                 d = _mm512_fmadd_ps(whi_, av[r][1], d);
