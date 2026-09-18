@@ -22395,3 +22395,33 @@ growcalls=355  me_max=1246  me_sum=11399 (=NASS ✓)
 性能门禁 bench_engine_ab.py    : DEDUP=12 0.70 ms/层 216 GB/s ; DEDUP=23 0.84 ms/层 300 GB/s
                                  全部门禁通过(与 §570 基线一致)
 ```
+
+### (g) §619d 验证(实测,不是推断)
+`[resize-prof]`(SETUP_PROF_EVERY=1,同一服务配置 TP=2/MAXLEN=8192/SEQS=4/MBT=8192/
+util 0.55/KV 4GiB/GP_MIN=4096/THREADS=60/SPEC=0):
+
+| | 修前(3236e53) | 修后(扁平 arena) |
+|---|---|---|
+| `resize` / 层(M≈1.9K) | **43-80 ms** | **56-78 µs** |
+| `realloc` / 层 | **355 次**(搬 118 MB) | **0** |
+| `grow` | 63-79 ms | **1.2-2.0 µs** |
+| 不变量 `sum_me` | — | **= NASS = 11330-11334** ✓ |
+
+TTFT(同配置,`probe_ttft.py UNIQUE=1` ⇒ 不命中前缀缓存,量的是真预填充):
+
+| prompt tokens | 修前 | 修后 | 变化 |
+|---|---|---|---|
+| 806-820 | 6.077 s(132.6 tok/s) | **4.688 s(174.9 tok/s)** | **−23% / +32%** |
+| 1889-1893 | 13.765 s(137.5 tok/s) | **10.558 s(178.9 tok/s)** | **−23% / +30%** |
+
+回归(硬约束):
+* 数值门 `test_block23_equiv.py`:**OK=7 BAD=1**(与修前逐项相同);
+* 性能门 `bench_engine_ab.py`:**DEDUP=12 0.70 ms/层 216 GB/s、DEDUP=23 0.84 ms/层 300 GB/s**(与 §570 基线一致);
+* 确定性 `test_engine_determinism.py 11`:**11 次运行 10/10 逐位相同**(不变)。
+
+### (h) ShareGPT 产品口径 A/B(同配置、同数据集、同客户端参数)
+两次服务都跑 `TP=2 / MAXLEN=1048576 / SEQS=8 / MBT=8192 / util 0.55 / KV_CACHE_BYTES=4GiB /
+GP_MIN=4096 / THREADS=60 / SPIN=300 / SPEC=0`,客户端 `vllm bench serve --backend openai
+--dataset-name sharegpt --sharegpt-output-len 128 --num-prompts 16 --max-concurrency 1/4/8`
+(引擎二进制分别取 git `3236e53` 与 `a9db957`,`vllm bench serve` 的 `output_throughput`
+**含 TTFT**,按用户裁定 TTFT 单列、不做折算):

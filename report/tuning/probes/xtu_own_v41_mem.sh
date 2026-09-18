@@ -44,6 +44,18 @@ CD_TIMING="${CD_TIMING:-0}"       # 1 = 打开**引擎侧**每层分相计时([c
                                    #   (Python 的 apply() 在 replay 时不执行 ⇒ LAYER_TIMING 量不到稳态解码)。
 LAYER_TIMING="${LAYER_TIMING:-0}"   # 1 = 打开每层分相计时(§515)      # 1 = 参考脚本的 --compilation-config {"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_DECODE_ONLY"}          # 1 = 开 DSpark 投机(draft=mtp,默认常驻 GPU)
 ITERDETAIL="${ITERDETAIL:-0}"  # 1 = --enable-logging-iteration-details(每步分解,§587)
+# 【§620】两个"给客户端用"的默认开关(用户 2026-09-18 裁定默认打开)
+TOK_DETAILS="${TOK_DETAILS:-1}"  # 1 = `--enable-prompt-tokens-details`(**默认开**)。
+    # 让 chat/completions 的 usage 带上 `prompt_tokens_details.cached_tokens` ⇒ DSH 等客户端
+    # 才能显示**前缀缓存命中率**。源码:`entrypoints/launchers/cli_args.py:132`
+    # ("If set to True, enable prompt_tokens_details in usage."),`vllm serve --help=all`
+    # 里确认为 `--enable-prompt-tokens-details / --no-enable-prompt-tokens-details`(v0.29.1rc1)。
+THINK_EFFORT="${THINK_EFFORT:-high}"  # 思考强度**默认值**(经 `--default-chat-template-kwargs` 传给 chat template)。
+    # 请求级的 `reasoning_effort` 会**覆盖**它(protocol.py:603 `merge_kwargs`,请求优先)。
+    # DeepSeek-V4.1 取值(`tokenizers/deepseek_v41.py`):`none` = 关思考;`low`/`high`/`xhigh`/`max`;
+    # 也接受 1..100 的整数。留空 = 不传该 flag,则走 vLLM 内建默认(thinking=True, effort=high)。
+    # ⚠️ `off` 要真正关思考**必须送 "none"**:什么都不送等于默认**开**思考。
+    # 只在**非空**时拼参数,所以 `THINK_EFFORT= ...` 可一键回到 vLLM 内建默认。
 GPF_V2="${GPF_V2:-0}"        # 1 = XIAOTU_GPF_V2=1:staging 分批版(DMA 全发完再组装/转置,§595)
 GPF_STAGE="${GPF_STAGE:-0}"  # 1 = XIAOTU_GPF_STAGE=1:staging **子相**计时(§594 dma/asm/tr)
 GP_SPLIT="${GP_SPLIT:-0}"    # 1 = XIAOTU_GP_SPLIT=1:每层打印 GPU 预填充的 **staging(asm)**
@@ -143,6 +155,8 @@ RUN_ENV="$RUN_ENV" READY_TIMEOUT="${READY_TIMEOUT:-2400}" \
   $( [ -n "$KV_CACHE_BYTES" ] && printf -- '--kv-cache-memory %s' "$KV_CACHE_BYTES" ) \
   $( [ "$KVSHARE" = "1" ] && echo --kv-sharing-fast-prefill ) \
   $( [ "$ITERDETAIL" = "1" ] && echo --enable-logging-iteration-details ) \
+  $( [ "$TOK_DETAILS" = "1" ] && echo --enable-prompt-tokens-details ) \
+  $( [ -n "$THINK_EFFORT" ] && printf -- "--default-chat-template-kwargs {\"reasoning_effort\":\"%s\"}" "$THINK_EFFORT" ) \
   $( [ -n "$PROFILE_DIR" ] && printf -- "--profiler-config {\"profiler\":\"torch\",\"torch_profiler_dir\":\"%s\",\"torch_profiler_with_stack\":false}" "$PROFILE_DIR" ) \
   $( [ "$EAGER" = "1" ] && echo --enforce-eager ) \
   $( [ "$COMPILE" = "1" ] && echo --compilation-config "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"mode\":\"VLLM_COMPILE\"${JITCACHE_CC_EXTRA}}" ) \

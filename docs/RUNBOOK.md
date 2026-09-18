@@ -544,3 +544,78 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 
 **最终性能验收口径(用户 2026-09-17 指定)**:所有问题收口后用 **官方 `vllm bench serve`**(非自研探针),
 `TP=2` + 充分预热,覆盖超短~32K prompt × C=1/2/4/8;详见 `report/tuning/FUTURE_PLAN.md`。
+
+### 5.10 ⭐ 两个"给客户端用"的服务端参数(2026-09-18 定稿;**默认都开**)
+
+两条都是**为了 DSH 这类客户端能显示/选择**才加的,已对着本机 vLLM 源码
+(`0.29.1rc1.dev95+gdabc4362b`)逐条确认,不是凭记忆。
+
+#### (a) `--enable-prompt-tokens-details` —— 让客户端显示**前缀缓存命中率**
+* 源码:`vllm/entrypoints/launchers/cli_args.py:132`
+  `enable_prompt_tokens_details: bool = False` — *"If set to True, enable
+  prompt_tokens_details in usage."*;`vllm serve --help=all` 里确认为
+  `--enable-prompt-tokens-details, --no-enable-prompt-tokens-details`。
+* 作用:chat/completions 的 `usage` 里出现
+  `"prompt_tokens_details": {"cached_tokens": N}` ⇒ DSH 才能算出**缓冲命中率**。
+  不打开时该字段缺失,客户端只能显示 0 或干脆不显示。
+* 我们的默认:`TOK_DETAILS=1`(在 `report/tuning/probes/xtu_own_v41_mem.sh` 里),
+  `TOK_DETAILS=0` 可关。
+
+#### (b) 思考强度(**reasoning effort**)
+* **不需要服务端 flag 就能被客户端选择**:`reasoning_effort` 是 OpenAI
+  chat-completions 的**一等字段**(`chat_completion/protocol.py:245`),vLLM 会把它
+  并进 chat template 的 kwargs(`protocol.py:589`)。
+* **但服务端要能定一个默认值**,这就是 `--default-chat-template-kwargs`
+  (`cli_args.py:93`,JSON;请求级值优先,见 `protocol.py:603` `merge_kwargs`)。
+* DeepSeek-V4.1 的取值(`vllm/tokenizers/deepseek_v41.py`):
+  `none`(关思考)/ `low` / `high` / `xhigh` / `max`,或 **1..100 的整数**;
+  非法值会直接报错。
+  ⚠️ **`off` 要真正关思考必须送 `"none"`** —— 什么都不送等于**默认开思考**
+  (tokenizer 里 `if "thinking" not in kwargs and "enable_thinking" not in kwargs: thinking = True`)。
+* 我们的默认:`THINK_EFFORT=high`(即 `--default-chat-template-kwargs
+  '{"reasoning_effort":"high"}'`);留空 `THINK_EFFORT=` 则回到 vLLM 内建默认
+  (thinking=True, effort=high)。
+
+**DSH 侧还要配这一小段**(否则选择器根本不出现 —— 能力是**客户端目录里声明的**,
+不会向网关查询;见 `packages/llm/llm-pi-ai/src/catalog.ts` 的 `reasoningEfforts` /
+`compat.supportsReasoningEffort`)。`~/.dsh/settings.yaml` 里给自建路由的 model 条目加:
+
+```yaml
+llm-pi-ai:
+  providers:
+    epyc-a100-server:
+      apiKeyEnv: EPYC_A100_SERVER_API_KEY
+      api: openai-completions
+      baseURL: http://127.0.0.1:8070/v1
+      models:
+        - id: DeepSeek-V4-Flash-0731
+          contextWindow: 1024000
+          maxTokens: 128000
+          # ① 声明"可选思考强度" ⇒ 选择器出现;键是 UI 档位,值是**线上拼写**
+          reasoningEfforts: { off: "none", low: "low", high: "high", xhigh: "xhigh", max: "max" }
+          compat:
+            # ② 这个端点接受 `reasoning_effort`(openai-completions)
+            supportsReasoningEffort: true
+```
+* 档位键只能取 `off|minimal|low|medium|high|xhigh|max`(`catalog.ts:74` 的 drift gate);
+  值必须是 **vLLM 认得的拼写**,否则 400。
+* `off` 的**值不能留空**:留空 = "支持,但不送参数",对 V4.1 等于**仍然开思考**。
+* 只声明 `reasoningEfforts` 而不开 `compat.supportsReasoningEffort`,选择器会出现但
+  请求里不带 `reasoning_effort`(`openai-completions` 下该开关才决定发送)。
+
+**自检命令**
+```bash
+# ① 缓存命中率字段
+curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"dsv41-xtu","messages":[{"role":"user","content":"hi"}],"max_tokens":8}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"])'
+# 期望能看到 "prompt_tokens_details": {"cached_tokens": 0} 这样的键
+
+# ② 思考强度(同一句话,low vs none)
+for e in low none; do
+  curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
+    -d "{\"model\":\"dsv41-xtu\",\"messages\":[{\"role\":\"user\",\"content\":\"9.11和9.9哪个大?\"}],\"max_tokens\":64,\"reasoning_effort\":\"$e\"}" \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d["choices"][0]["message"]; print("reasoning_effort='$e'", "reasoning_content_len=", len(m.get("reasoning_content") or ""), "content=", (m.get("content") or "")[:60])'
+done
+# 期望:low 有 reasoning_content;none 的 reasoning_content 为空/缺失
+```
