@@ -1072,7 +1072,14 @@ public:
                 s_res  += std::chrono::duration<double, std::milli>(_suB2 - _suB).count();
                 s_gath += std::chrono::duration<double, std::milli>(_suG - _suB2).count();
                 s_nc   += std::chrono::duration<double, std::milli>(_suC - _suG).count();
-                if (++s_n % 40 == 0) {
+                // 【§613c】打印间隔可配:`XIAOTU_MOE_SETUP_PROF_EVERY=1` ⇒ **逐调用**打印,
+                // 用来判定 setup 开销是"每步第一层的一次性扩容"还是"逐层重建"。
+                static const int _sp_every = [] {
+                    const char* e = std::getenv("XIAOTU_MOE_SETUP_PROF_EVERY");
+                    int v = e ? std::atoi(e) : 40;
+                    return v > 0 ? v : 40;
+                }();
+                if (++s_n % _sp_every == 0) {
                     fprintf(stderr, "[setup-prof] n=%d per-call(us): pre_bookkeeping=%.1f resize=%.1f "
                             "gather=%.1f nc_sub=%.1f total=%.1f\n",
                             s_n, s_pre / s_n * 1e3, s_res / s_n * 1e3, s_gath / s_n * 1e3,
