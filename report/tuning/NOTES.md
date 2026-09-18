@@ -22705,3 +22705,47 @@ xiaotu: cycles 2.211e12 | instructions 5.674e12 | IPC 2.57 | branch-miss 0.07%
 ⇒ 修法方向明确:**把 GEMM 内层从"沿 K 向量化"改成"沿输出列分块 + 寄存器复用"**,
 目标是让 `instructions/L1-load` 从 1.44 提到 4-6 的量级。这是**内核级改动**,
 必须同时过数值对拍(OK=7 BAD=1 / max_rel=1.873e-02)与确定性门(10/10)。
+
+## §623 ⭐⭐⭐ 逐指令定位:我们的内核只有 **8.5% 的周期在做数学**
+用户 2026-09-18 重设目标(集中攻引擎差距,追到 lk_moe 的 ≥90%),并要求"允许任何手段"。
+手段:`perf record` 拿热点地址 → `objdump` 反汇编 → `perf annotate` 拿**逐指令周期占比**。
+
+### (a) lk_moe 的内循环(反汇编,`_lk_moe_C_avx512_vnni.so` @ 0x1087f0-0x10898a)
+```
+vpmovzxbd (%rbx),%zmm15      ; 16B 打包 4bit -> 16 个 fp32 码
+vpmaxud   %zmm17,%zmm15,%zmm15
+vpslld    $0x17,%zmm15,%zmm15 ; <<23:直接拼出 fp32 位模式(零查表、零转换指令)
+vmulps    %zmm2,%zmm15,%zmm2  ; × E8M0 scale(vpermps 查表得到)
+movzwl    (%rsi,%rdx,2),%r12d ; 激活以 **bf16 标量** 载入(2 字节)
+shl       $0x10,%r12d         ; bf16->fp32 也用移位
+vbroadcastss %xmm4,%zmm4      ; 激活广播成向量
+vfmadd231ps %zmm2,%zmm4,%zmm13; 累加
+cmp $0x20,%rdx / jne          ; K 展开 32
+```
+⇒ 每 16B 权重载入产出 32 个权重、喂 16 条 FMA;解码共 ~6 条,且**没有整数除法、没有查表 guard**。
+
+### (b) 我们的内核(`matmul_packed4_group<true,true>`,占全程 83.9%)按指令类型聚合周期
+| 指令 | 占周期 | 含义 |
+|---|---|---|
+| **`vmovaps`** | **32.13%** | 64B **向量存回内存(寄存器溢出)** |
+| `cmp`+`test`+`add`+`sub`+`jle`+`cltd`+`rep` | **35.05%** | **循环簿记**(`cltd` = **整数除法**的符号扩展) |
+| `vpand`+`vpunpcklbw`+`movzbl`+`vpermps` | 16.46% | 4bit 解码 + `e8m0_table()` 的 static-guard 重读 |
+| **`vfmadd*`(真正计算)** | **8.49%** | FMA |
+
+### (c) 三个可直接下手的病灶
+1. **`cltd` ⇒ 内层循环里有整数除法**:`scale_at()` 的
+   `(n/gn)*((K+gk-1)/gk) + (kbase/gk)` 每次查 scale 都算两遍除法 + 一个
+   `e8m0_table()` 的 `static` guard(`movzbl ...guard variable` 占 4.28%)。
+   ⇒ **把 scale 的行基址提出内层循环、用递增计数器替代除法**,并缓存 `e8m0_table()` 指针。
+2. **32% 的 `vmovaps` 是寄存器溢出**:`__m512 acc[MR][8]`(MR=4 ⇒ 32 个累加器)+
+   `__m512 av[MR][2][4]`(32 个)远超 32 个 zmm。⇒ 改成**逐组处理激活**(`av[MR][2]`),
+   并把累加器控制在 16 个以内。
+3. 以上两条修完后 FMA 才可能成为主导项 —— 现在**只有 8.5%** 的周期在算。
+
+### (d) 本轮对照实验的两个**负结果**(记下,不要重复试)
+| 变体 | BS=227 | BS=1893 | 结论 |
+|---|---|---|---|
+| `XIAOTU_MOE_GEMM_NR=8`(默认) | **51.03** | **395.78** | 最优 |
+| `GEMM_NR=4` | 59.72 | 461.03 | 更差 |
+| `GEMM_NR=2` | 74.35 | 577.88 | 更差 |
+| `XIAOTU_MOE_VBMI_DECODE=1` | 66.81 | 522.87 | 更差(默认 0 = 51.44/396.80) |
