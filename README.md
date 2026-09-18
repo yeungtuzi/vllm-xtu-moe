@@ -99,7 +99,7 @@ VLLM_EXPERTS_LOAD_DEVICE=cpu python -m vllm_xiaotu_moe.mainline_shims
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py   # 后端选择探测,秒级
 ```
 
-> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `docs/HANDOFF_v0.2.md` §5.1。
+> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `docs/HANDOFF_v0.2pre.md` §5.1。
 
 DeepSeek-V4-Flash 的**推荐参数与实测数据**见
 **[`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md)**。
@@ -119,7 +119,7 @@ DeepSeek-V4-Flash 的**推荐参数与实测数据**见
 >
 > 原因:v0.2 改动了**所有模型都会走的路径**(执行模型 `XIAOTU_MOE_ASYNC=0`、
 > 小 batch 路径 `NSLICE_SMALL=0`、**EP 存储分片**)。**除 DeepSeek-V4-Flash 外均需复验**,
-> 复验清单与命令见 **[`docs/HANDOFF_v0.2.md`](docs/HANDOFF_v0.2.md)** §5.1。
+> 复验清单与命令见 **[`docs/HANDOFF_v0.2pre.md`](docs/HANDOFF_v0.2pre.md)** §5.1。
 
 ### 已验证模型
 

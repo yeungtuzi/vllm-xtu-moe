@@ -125,7 +125,7 @@ VLLM_EXPERTS_LOAD_DEVICE=cpu python -m vllm_xiaotu_moe.mainline_shims
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py   # backend selection probe
 ```
 
-> ⏸️ **Support not claimed at this time**: this model's measurements predate the v0.2 changes (execution model / small-batch path / EP storage sharding) and have **not been re-verified on the current code**. See `docs/HANDOFF_v0.2.md` §5.1 for the re-verification plan.
+> ⏸️ **Support not claimed at this time**: this model's measurements predate the v0.2 changes (execution model / small-batch path / EP storage sharding) and have **not been re-verified on the current code**. See `docs/HANDOFF_v0.2pre.md` §5.1 for the re-verification plan.
 
 Recommended parameters and measurements for DeepSeek-V4-Flash:
 **[`docs/TUNING_REPORT.md`](docs/TUNING_REPORT.md)**.

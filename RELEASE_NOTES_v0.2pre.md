@@ -1,4 +1,4 @@
-# vllm-xtu-moe v0.2.0 — 主线化
+# vllm-xtu-moe v0.2pre — 主线化(历史版本;原 `v0.2.0`)
 
 **主题:让 vllm-xtu-moe 在 vLLM 主线最新版上跑起来,并提供一条命令的安装方式。**
 

@@ -132,7 +132,7 @@ GPU KV cache size: 437,337 tokens, Maximum concurrency for 262,144 tokens per re
 
 ## 2. 目标 FP8 模型(暂不声明支持)
 
-> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `docs/HANDOFF_v0.2.md` §5.1。
+> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `docs/HANDOFF_v0.2pre.md` §5.1。
 
 ---
 

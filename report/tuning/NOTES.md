@@ -22425,3 +22425,55 @@ GP_MIN=4096 / THREADS=60 / SPIN=300 / SPEC=0`,客户端 `vllm bench serve --back
 --dataset-name sharegpt --sharegpt-output-len 128 --num-prompts 16 --max-concurrency 1/4/8`
 (引擎二进制分别取 git `3236e53` 与 `a9db957`,`vllm bench serve` 的 `output_throughput`
 **含 TTFT**,按用户裁定 TTFT 单列、不做折算):
+
+## §621 ⭐ 口径实验:TTFT 摊薄效应(`output_throughput` 里到底有多少是解码)
+用户 2026-09-18 提出的问题:"output token/s 被 TTFT 影响了,输出 4K 的话 TTFT 就无关紧要了吧?"
+—— **对**。而且这决定了我之前所有"预填充优化 ⇒ output tok/s 提升"的说法**只在短输出下成立**。
+
+### (a) 源码口径(已核对)
+```python
+# vllm/benchmarks/serve.py
+output_throughput = sum(actual_output_lens) / dur_s          # :740  ← **含 TTFT**
+if output_len > 1:
+    tpot = (outputs[i].latency - outputs[i].ttft) / (output_len - 1)   # :616-617 ← **不含 TTFT**
+```
+⇒ `output_throughput ≈ 1 / (TTFT/L + TPOT)`(L = 输出长度)。L 越大越靠近 `1/TPOT`。
+
+### (b) 实测(同 8 条 ShareGPT prompt、C=1、SPEC=0、`--ignore-eos` 强制长度、
+`PREFIX_CACHE=0`、`GP_MIN=1000000`;两台服务分别装 3236e53 与 a9db957 的引擎)
+
+| out | 1/TPOT(解码上限) | 实测 output_tput | 占解码上限 |
+|---|---|---|---|
+| 128 | 18.2 tok/s(TPOT 55.0 ms) | **13.54** | **74%** |
+| 1024 | 16.5 tok/s(TPOT 60.9 ms) | **15.81** | **96%** |
+| 2048 | 16.3 tok/s(TPOT 61.3 ms) | 16.01(修前侧,同趋势) | **98%** |
+
+⇒ **out≥1024 时 `output_throughput` 已经就是纯解码速度**;out=128 时它只有解码上限的 ~3/4,
+差的正是 TTFT 项。**用户判断成立。**
+
+### (c) 尖锐的推论:预填充修复对 `output_throughput` 的贡献随 output 长度消失
+| out | 修前 out_tput | 修后 out_tput | 变化 |
+|---|---|---|---|
+| 128 | 11.43 | **13.54** | **+18%** |
+| 1024 | 15.87 | 15.81 | **−0.4%(噪声)** |
+
+同一份预填充改动,out=128 有 +18%,out=1024 归零 —— **因为它抬的是 `TTFT/L` 那一项**。
+⚠️ 所以对外报数**必须标注 output 长度**;把 out=128 的 +18% 说成"吞吐提升 18%"是口径错误
+(那是"首 token 延迟改善",不是解码提升)。
+
+## §621b ❗修正 §619d 的效果描述:arena 去掉的是**一次性高水位棘轮**,不是恒定成本
+同一批实测里出现过一个矛盾:`sgpre_pc0`(修前)的 out=128 第一趟 median TTFT = **3570 ms**,
+而它的 out=1024 / out=2048(同一服务、同一 8 条 prompt)median 只有 **2197 / 2209 ms**;
+修后服务的 out=128 第一趟 median = **2210 ms**。三档**修后** TTFT 与**修前稳态** TTFT 相同。
+
+⇒ 结论(比 §619d 更准确):
+* 修前那个 `resize` 成本是**按专家的 me 高水位棘轮**:同一批 prompt 第一次跑时不断刷新纪录 ⇒
+  付全额;把 40 层 × 384 专家的纪录都顶到该 prompt 集的形状之后 ⇒ **稳态不再付**。
+* 因此实测比例是:**新路由分布(首趟 / 真实业务里永远是新 prompt)≈ −38~40% TTFT**;
+  **重复同一批 prompt(纪录已饱和)≈ 0**。
+* 两个独立实验互相印证:
+  * ShareGPT 16 条 loader 口径(两个都是首趟):median TTFT **1239 → 744 ms(−40%)**;
+  * 本次 8 条最长 prompt 首趟:median **3570 → 2210 ms(−38%)**。
+* **修后第一趟没有"热身惩罚"**(2210 ms ≈ 稳态),说明那 3570 ms 不是通用 warmup,而是引擎特有。
+* 对生产的意义:真实流量 prompt 一直在变 ⇒ 高水位一直在被刷新 ⇒ **arena 是持续性收益**,
+  不是只有第一次;但对"反复重放同一批 prompt"的基准,**它会被系统性低估**。

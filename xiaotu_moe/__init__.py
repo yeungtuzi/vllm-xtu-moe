@@ -34,5 +34,5 @@ MOE_WNA16 = _wrap(_load.MOE_WNA16, "WNA16")
 MOE_WNA16_FP16 = _wrap(_load.MOE_WNA16_FP16, "WNA16")
 MOE_NVFP4 = _wrap(_load.MOE_NVFP4, "NVFP4")
 MOE_NVFP4_FP16 = _wrap(_load.MOE_NVFP4_FP16, "NVFP4")
-__version__ = "0.2.0"
+__version__ = "0.2"
 __variant__ = loader._chosen
