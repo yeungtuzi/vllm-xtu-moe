@@ -235,3 +235,50 @@ output_throughput = sum(actual_output_lens) / dur_s     # dur_s = 整个 benchma
 
 **比较铁律**:与外部(如 lk 参考值 27 t/s)比较时,**必须确认对方是哪个口径**;
 若对方是端到端 output token/s,则我们的可比数字是 13.79/18.38(而非 23.4/34)。
+
+---
+
+## 9. ⭐ v0.2 更新(2026-09-18):三个会让数字被读错的口径问题
+
+### 9.1 口径问题一:`--backend openai` **不触发思考**(实测 + 源码)
+| 环节 | 事实 |
+|---|---|
+| `--backend openai` | 打 **`/v1/completions`** 且**原样发 prompt**(`endpoint_request_func.py:176` 校验 URL 含 `completions`) |
+| `--backend openai-chat` | `endpoint_request_func.py:906` → 把 prompt 包成 `messages`,**服务端**套 chat template |
+| ShareGPT 数据集 | `datasets.py:1393` 直接取 `conversations[0].value` 当 prompt,**从不套 template** |
+* V4.1 的"思考"只在 prompt encoder(`encode_messages`,`thinking_mode`/`reasoning_effort`)里渲染,
+  **只能经 chat template 到达** ⇒ **`--backend openai` 的所有的 ShareGPT 数字都是"非思考"负载**。
+* ⚠️ 反向陷阱:`--backend openai` **不加** `--skip-chat-template` 且用 `custom` 数据集时,
+  `CustomDataset.sample()` 会在**客户端**先套一次 template 再发成品串 ⇒ **这条路径也开思考**。
+  **判断依据是"template 有没有被套上",不是 backend 的名字。**
+* ⇒ 产品口径应以 **`--backend openai-chat`** 为准(DSH 就是这个),`--backend openai` 只用于与历史数字可比。
+
+### 9.2 口径问题二:`output_throughput` 里 TTFT 的占比由 **output 长度**决定
+`output_throughput = Σoutput_len / dur_s`(**含 TTFT**),`tpot = (latency−ttft)/(output_len−1)`(**不含**)
+⇒ `output_throughput ≈ 1/(TTFT/L + TPOT)`。实测(同 8 条 ShareGPT prompt、C=1、`--ignore-eos`):
+
+| L | 1/TPOT(解码上限) | 实测 output_tput | 占上限 | mean TPOT |
+|---|---|---|---|---|
+| 128 | 18.2 tok/s | **13.54** | **74%** | 55.0 ms |
+| 1024 | 16.5 tok/s | **15.81** | **96%** | 60.9 ms |
+| 2048 | 16.3 tok/s | 16.01 | **98%** | 61.3 ms |
+* **L≥1024 时 `output_throughput` 已等于纯解码速度**;L=128 时它只有上限的 3/4。
+* 推论:**预填充优化的收益随 L 消失** —— 同一份改动 out=128 值 +18%、out=1024 归零(−0.4%)。
+* ⇒ 公布 `output tok/s` **必须带 output 长度**,否则不可比。
+
+### 9.3 口径问题三:TPOT 随"生成内容/路由"移动,不只是随上下文
+* 同 config 下 mean TPOT 在 55-61 ms 之间随 L 缓升(**+9.5%**,且饱和;非线性于上下文)。
+* release notes 里那批 **30 多 ms**(Plain median 35.70 / dspark mean 36.75)是
+  **自然停止、短输出(16 条共 1193 token ≈ 75/条)、227-token prompt** 的口径,
+  与 §9.2 的 `--ignore-eos` 长输出口径**不可直接比**。
+* **不是回归**:同 prompt 同参数 A/B,mean TPOT **43.32 → 42.46 ms**(median 36.26 → 34.20)。
+* 机制线索:CPU MoE 引擎在解码关键路径上(解码桶 `[NS-PROF]` TOTAL **755-1056 µs/层** ×40
+  ≈ **30-42 ms**,占 TPOT 的 70-95%)⇒ 内容→路由→活跃专家数会直接搬动 TPOT。
+  **完整归因实验的原始数据见 `report/tuning/raw/attr_*.json` 与 `plen_*.json`。**
+
+### 9.4 v0.2 的 ShareGPT 数字(两列)
+| 口径 | 是否开思考 | C=1 out tok/s | C=1 TTFT | C=1 mean TPOT |
+|---|---|---|---|---|
+| `openai` 修前(0.2pre/0.21.0) | 否 | 13.75 | 2224 ms | 43.32 ms |
+| `openai` **v0.2** | 否 | **16.64** | **1339 ms** | 42.46 ms |
+| `openai-chat` **v0.2** | **是** | <!--PENDING:chat_c1--> | <!--PENDING:chat_ttft_c1--> | <!--PENDING:chat_tpot_c1--> |
