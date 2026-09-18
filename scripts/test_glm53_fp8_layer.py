@@ -19,8 +19,10 @@ GLM-5.3-Flash 在这台 A100(SM80)上**跑不起来**:主线没有支持它 MLA 
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
+import struct
 import sys
 
 import numpy as np
@@ -69,14 +71,37 @@ def expand_scale(scale: np.ndarray, N: int, K: int, block: int) -> np.ndarray:
     return np.repeat(np.repeat(scale, block, axis=0), block, axis=1)[:N, :K]
 
 
+def _weight_map(model: str) -> dict[str, str]:
+    """name -> shard file, from the index when present, else by scanning headers.
+
+    modelscope writes ``model.safetensors.index.json`` only late in the download,
+    but a safetensors shard's header is readable as soon as that shard lands, so
+    scanning headers lets the layer check run against a partial checkpoint.
+    """
+    idxp = os.path.join(model, "model.safetensors.index.json")
+    if os.path.exists(idxp):
+        with open(idxp) as fh:
+            return json.load(fh)["weight_map"]
+    wm: dict[str, str] = {}
+    for p in sorted(glob.glob(os.path.join(model, "*.safetensors"))):
+        with open(p, "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            hdr = json.loads(fh.read(n))
+        for k in hdr:
+            if k != "__metadata__":
+                wm[k] = os.path.basename(p)
+    print(f"[glm53-layer] index 缺失,扫描到 {len(wm)} 个张量 / "
+          f"{len(glob.glob(os.path.join(model, '*.safetensors')))} 个 shard")
+    return wm
+
+
 def main() -> int:
     layer = int(sys.argv[1]) if len(sys.argv) > 1 else 3
     nexp = int(sys.argv[2]) if len(sys.argv) > 2 else 8
 
     from safetensors import safe_open
 
-    idx = json.load(open(os.path.join(MODEL, "model.safetensors.index.json")))
-    wm = idx["weight_map"]
+    wm = _weight_map(MODEL)
     pre = f"model.language_model.layers.{layer}.mlp.experts."
     names = [
         "gate_proj.weight", "gate_proj.weight_scale_inv",
