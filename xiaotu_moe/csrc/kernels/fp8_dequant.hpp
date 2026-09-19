@@ -74,19 +74,35 @@ inline __m256 e4m3x8_to_fp32(const uint8_t* p) {
 // ---- gather-free arithmetic conversion ------------------------------------
 // Bit-exact equivalent of e4m3_to_fp32_scalar:
 //   normal  (e > 0): fp32 bits = sign<<31 | (e + 120)<<23 | m<<20
-//   subnormal(e == 0): fp32 bits = sign<<31 | 118<<23     | m<<20
+//   subnormal(e == 0): value = m * 2^-9, i.e. the e4m3 subnormal unit is
+//     2^(1-7)/8 = 2^-9 (NOT 2^-6, and NOT the 2^-9*(1+m/8) that the naive
+//     `118<<23 | m<<20` bit form produces). Looked up in `kE4M3Sub8` because the
+//     correct bit pattern is not a linear function of m: m=1..7 maps to
+//     2^-9,2^-8,3*2^-9,2^-7,5*2^-9,3*2^-8,7*2^-9. Getting this wrong makes 0x00
+//     decode to 2^-9 instead of 0 (a DC bias on every zero weight) and mis-scales
+//     0x01..0x07 by up to 3.7x. See scripts/test_fp8_decode_conformance.py.
 //   NaN encodings 0x7F/0xFF -> 0
+//
+// Lane m (0..7) holds m * 2^-9 as fp32; lanes 8..15 are never selected because
+// m = byte & 7.
+static const float kE4M3Sub8[8] = {
+    0.0f, 0x1p-9f, 2.0f * 0x1p-9f, 3.0f * 0x1p-9f,
+    4.0f * 0x1p-9f, 5.0f * 0x1p-9f, 6.0f * 0x1p-9f, 7.0f * 0x1p-9f,
+};
+
 inline __m256 e4m3x8_to_fp32_arith(const uint8_t* p) {
     __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
     __m256i v = _mm256_cvtepu8_epi32(b);
     __m256i sign = _mm256_slli_epi32(_mm256_and_si256(v, _mm256_set1_epi32(0x80)), 24);
     __m256i e = _mm256_and_si256(_mm256_srli_epi32(v, 3), _mm256_set1_epi32(0xF));
     __m256i m = _mm256_and_si256(v, _mm256_set1_epi32(0x7));
-    __m256i ee = _mm256_add_epi32(e, _mm256_set1_epi32(120));
-    __m256i is_sub = _mm256_cmpeq_epi32(e, _mm256_setzero_si256());
-    ee = _mm256_blendv_epi8(ee, _mm256_set1_epi32(118), is_sub);
     __m256i bits = _mm256_or_si256(
-        sign, _mm256_or_si256(_mm256_slli_epi32(ee, 23), _mm256_slli_epi32(m, 20)));
+        _mm256_slli_epi32(_mm256_add_epi32(e, _mm256_set1_epi32(120)), 23),
+        _mm256_slli_epi32(m, 20));
+    __m256i is_sub = _mm256_cmpeq_epi32(e, _mm256_setzero_si256());
+    __m256 sub = _mm256_permutevar8x32_ps(_mm256_loadu_ps(kE4M3Sub8), m);
+    bits = _mm256_blendv_epi8(bits, _mm256_castps_si256(sub), is_sub);
+    bits = _mm256_or_si256(sign, bits);
     __m256i is_nan = _mm256_or_si256(_mm256_cmpeq_epi32(v, _mm256_set1_epi32(0x7F)),
                                      _mm256_cmpeq_epi32(v, _mm256_set1_epi32(0xFF)));
     bits = _mm256_andnot_si256(is_nan, bits);
@@ -96,6 +112,9 @@ inline __m256 e4m3x8_to_fp32_arith(const uint8_t* p) {
 
 #if defined(__AVX512F__)
 // Dequantize 16 consecutive e4m3 bytes -> 16 fp32 lanes (AVX-512).
+// Subnormals use the exact `m * 2^-9` table (see kE4M3Sub8 above) instead of the
+// old `118<<23 | m<<20`, which decoded 0x00 as 2^-9 (not 0) and mis-scaled
+// 0x01..0x07 by up to 3.7x.
 inline __m512 e4m3x16_to_fp32(const uint8_t* p) {
     __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
     __m512i v = _mm512_cvtepu8_epi32(b);
@@ -103,10 +122,13 @@ inline __m512 e4m3x16_to_fp32(const uint8_t* p) {
     __m512i e = _mm512_and_si512(_mm512_srli_epi32(v, 3), _mm512_set1_epi32(0xF));
     __m512i m = _mm512_and_si512(v, _mm512_set1_epi32(0x7));
     __mmask16 sub = _mm512_cmpeq_epi32_mask(e, _mm512_setzero_si512());
-    __m512i ee = _mm512_mask_blend_epi32(
-        sub, _mm512_add_epi32(e, _mm512_set1_epi32(120)), _mm512_set1_epi32(118));
     __m512i bits = _mm512_or_si512(
-        sign, _mm512_or_si512(_mm512_slli_epi32(ee, 23), _mm512_slli_epi32(m, 20)));
+        _mm512_slli_epi32(_mm512_add_epi32(e, _mm512_set1_epi32(120)), 23),
+        _mm512_slli_epi32(m, 20));
+    __m512 subv = _mm512_permutexvar_ps(m, _mm512_castps256_ps512(
+        _mm256_loadu_ps(kE4M3Sub8)));
+    bits = _mm512_mask_blend_epi32(sub, bits, _mm512_castps_si512(subv));
+    bits = _mm512_or_si512(sign, bits);
     __mmask16 is_nan = _mm512_cmpeq_epi32_mask(v, _mm512_set1_epi32(0x7F)) |
                        _mm512_cmpeq_epi32_mask(v, _mm512_set1_epi32(0xFF));
     bits = _mm512_maskz_mov_epi32(~is_nan, bits);
