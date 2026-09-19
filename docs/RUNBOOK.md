@@ -496,6 +496,66 @@ GPU 0/1 各剩 45 MiB)。根因是 GPU 预填充的持久 staging 吃掉了 vLLM
 | 两路并发 14,084 + 15,423 token | ✅ 全部完成,零 OOM |
 | 4096/64 C=1 基准(对比旧 util 0.90) | ✅ 22,650 ms(vs 22,764),out 2.50 tok/s(vs 2.49) |
 
+### 4.4.1 日志在哪 / 怎么保证存活 / 死了怎么重启
+
+**① 日志**(两种启动方式,位置不同):
+
+| 启动方式 | 日志 | 就绪判定 |
+|---|---|---|
+| **手动后台**(`nohup`,当前 8070 就是这个) | `logs/$TAG.log`(现为 `logs/glm53_prod.log`)+ 启动器自己的 `nohup` 输出(我起的时候是 `/tmp/glm53_launch.log`) | `curl -sf http://127.0.0.1:8070/v1/models` |
+| **systemd 用户单元**(见下) | `journalctl --user -u glm53 -f`(前台模式,stdout 进 journal) | 同上 |
+
+⚠️ 手动模式的日志行是 `> "$LOG"` ⇒ **每次启动都截断旧日志**(11:10 那次崩溃的现场就是这么丢的:我 11:29
+重启后旧内容没了)。要留存历史就显式给带时间戳的 TAG:`TAG=glm53_$(date +%m%d_%H%M%S) bash scripts/serve_glm53_mainline.sh`。
+
+**一页纸状态**(端口/进程/显存/关键日志行,只读):
+
+```bash
+bash scripts/glm53_status.sh          # 退出码 0 = /v1/models 有响应
+```
+
+**② 现在怎么"存活"的(说实话:没有任何守护)**:
+
+* 它是 `nohup ... &` 起的,启动器退出后进程被 init 收养(实测 `PID 520307, PPID=1`)⇒ **能扛住终端关闭、tmux/DSH 退出**;
+* 但**不抗崩溃、不抗重启**:OOM 被杀就是死了(§601 那次就是这样);机器重启也不会自己起来;
+* 启动器脚本打印 `[glm53] READY` 后自己退出(它只是**启动+等待**,不是 supervisor);
+* 所以"存活"目前靠的是:① 显存契约不再让长 prefill OOM(§3.2);② 有人看着。
+
+**③ 死了怎么重启**(~5 min 才 READY,期间 `curl` 会失败是正常的):
+
+```bash
+cd /home/user/lvllm/vllm-xiaotu-moe
+# 1) 先确认死透了、显存已释放(不然端口冲突/显存不够,起不来)
+bash scripts/glm53_status.sh || true
+kill "$(cat logs/glm53_prod.pid)" 2>/dev/null; sleep 20; nvidia-smi    # GPU 0/1 应归零
+# 2) 起(推荐:带时间戳 TAG,日志留档)
+TAG=glm53_prod nohup bash scripts/serve_glm53_mainline.sh >/tmp/glm53_launch.log 2>&1 &
+sleep 300; curl -sf http://127.0.0.1:8070/v1/models && echo READY
+```
+
+**④ 想让"崩了自动起来 + 开机自起"就用 systemd 用户单元**(不需要 root;模板在
+`deploy/systemd/glm53.service`,安装脚本 `scripts/install_glm53_systemd.sh`):
+
+```bash
+bash scripts/install_glm53_systemd.sh            # 已在本机安装(未启用、未启动)
+sudo loginctl enable-linger "$USER"              # 开机自起才需要(需 sudo)
+# 切换:先停手动实例 → 再交给 systemd
+kill "$(cat logs/glm53_prod.pid)" && sleep 20 && nvidia-smi
+systemctl --user start glm53
+systemctl --user status glm53 ; journalctl --user -u glm53 -f
+```
+
+单元里的策略:`Restart=always` + `RestartSec=30`(OOM/异常退出 30 s 后自动拉起)、
+`StartLimitIntervalSec=600 / StartLimitBurst=3`(10 分钟内最多 3 次,避免启动即失败的死循环)、
+`TimeoutStartSec=1800`(加载 ~5 min,别被默认 90 s 判死)、`KillSignal=SIGINT`
+(走 vLLM 优雅关停,释放显存)。⚠️ systemd 档与手动档**共用 8070 和 GPU 0/1,不能同时开**。
+
+```bash
+# 起服务脚本还有两个给排错用的开关(不碰 GPU):
+DRYRUN=1 bash scripts/serve_glm53_mainline.sh        # 只打印最终命令行
+FOREGROUND=1 PORT=8099 bash scripts/serve_glm53_mainline.sh   # 前台跑(日志到终端,不写 pidfile)
+```
+
 
 > ⚠️ **8070 现在归 GLM-5.3-Flash**。DeepSeek 的生产脚本 `scripts/serve_prod_8070.sh` 默认也用
 > 8070,**两者不能同时起**(显存也只够一个 TP=2 服务)。要同时跑请显式换端口,例如

@@ -1,0 +1,36 @@
+[Unit]
+# vLLM GLM-5.3-Flash 生产服务(vllm-xiaotu-moe 插件 + 主线 vLLM,TP=2 占 GPU 0/1,端口 8070)
+#
+# 装载:~/.config/systemd/user/glm53.service(用 scripts/install_glm53_systemd.sh 安装)
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now glm53        # 立刻起 + 以后开机起(还需 loginctl enable-linger)
+#   journalctl --user -u glm53 -f              # 跟日志(前台模式,日志进 journal)
+#   systemctl --user stop glm53                # 停(SIGINT → vLLM 优雅关停,释放显存)
+#
+# ⚠️ 与手动模式**互斥**:两者都用 8070 与 GPU 0/1。切过来之前先
+#   kill "$(cat scripts/../logs/glm53_prod.pid)" 并确认 nvidia-smi 归零。
+Description=vLLM GLM-5.3-Flash production service (vllm-xiaotu-moe, TP=2, :8070)
+After=network-online.target
+# 崩溃即重启,但别陷入"启动就失败"的死循环:10 分钟内最多 3 次。
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=exec
+WorkingDirectory=%h/lvllm/vllm-xiaotu-moe
+# FOREGROUND=1 = 脚本不 fork、日志交给 journal、由本单元负责重启
+Environment=FOREGROUND=1
+Environment=PORT=8070
+Environment=TAG=glm53_prod
+ExecStart=/bin/bash %h/lvllm/vllm-xiaotu-moe/scripts/serve_glm53_mainline.sh
+# 加载几百 GB 专家权重 + JIT 一次要 ~5 min;别用默认 90 s 把它判死
+TimeoutStartSec=1800
+# 关停:给引擎时间释放 KV/显存,超时才强杀
+KillSignal=SIGINT
+TimeoutStopSec=120
+# OOM 被杀(kill -9)也算异常退出 ⇒ 自动拉起
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

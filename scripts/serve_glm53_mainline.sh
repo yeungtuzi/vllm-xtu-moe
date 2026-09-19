@@ -161,20 +161,41 @@ echo "[glm53] log=$LOG"
 # 37.90 GiB、另有 **695 MiB reserved-but-unallocated**",PyTorch 自己的 OOM 提示就是这一项。
 # 本服务没有 KV connector,所以 vLLM 那条 "kv connector 与 expandable_segments 不兼容" 的
 # 检查不适用。想要旧行为就显式 `PYTORCH_CUDA_ALLOC_CONF=` 传空。
-nohup env \
-  HF_HUB_OFFLINE=1 \
-  PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
-  VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}" \
-  VLLM_HANDSHAKE_TIMEOUT_MINS="${VLLM_HANDSHAKE_TIMEOUT_MINS:-60}" \
-  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-3600}" \
-  VLLM_USE_FLASHINFER_SAMPLER=0 \
-  FLASHINFER_DISABLE_VERSION_CHECK=1 \
-  VLLM_EXPERTS_LOAD_DEVICE=cpu \
-  XIAOTU_MOE_THREADS="$THREADS" \
-  VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$GPU_PREFILL_MIN" \
-  XIAOTU_MOE_SPIN_IDLE_US="${SPIN_IDLE_US:-300}" \
-  OMP_NUM_THREADS=1 \
-  "${NCTL[@]}" "$PY" -m vllm.entrypoints.openai.api_server "${ARGS[@]}" > "$LOG" 2>&1 &
+ENVPREFIX=(
+  HF_HUB_OFFLINE=1
+  PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+  VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
+  VLLM_HANDSHAKE_TIMEOUT_MINS="${VLLM_HANDSHAKE_TIMEOUT_MINS:-60}"
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-3600}"
+  VLLM_USE_FLASHINFER_SAMPLER=0
+  FLASHINFER_DISABLE_VERSION_CHECK=1
+  VLLM_EXPERTS_LOAD_DEVICE=cpu
+  XIAOTU_MOE_THREADS="$THREADS"
+  VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$GPU_PREFILL_MIN"
+  XIAOTU_MOE_SPIN_IDLE_US="${SPIN_IDLE_US:-300}"
+  OMP_NUM_THREADS=1
+)
+CMD=("${NCTL[@]}" "$PY" -m vllm.entrypoints.openai.api_server "${ARGS[@]}")
+
+# `DRYRUN=1` 只打印最终命令行(给 systemd 单元/排错用),不碰 GPU。
+if [ "${DRYRUN:-0}" = "1" ]; then
+  printf '[glm53] DRYRUN port=%s gpus=%s\n  ' "$PORT" "$GPUS"
+  printf '%q ' env "${ENVPREFIX[@]}" "${CMD[@]}"
+  printf '\n'
+  exit 0
+fi
+
+# `FOREGROUND=1` 不 fork、不写 pidfile、不轮询就绪,直接把进程交给调用者
+# (systemd 单元用这一档:进程即服务,日志进 journal,崩溃由 Restart= 拉起)。
+# 手动后台模式(默认)才是 nohup + 日志文件 + 就绪轮询。
+if [ "${FOREGROUND:-0}" = "1" ]; then
+  echo "[glm53] FOREGROUND: exec 服务进程(日志由调用者/supervisor 接管,本脚本不再轮询就绪)"
+  exec env "${ENVPREFIX[@]}" "${CMD[@]}"
+fi
+
+# ⚠️ 这一行是 `>` ⇒ **每次启动都会截断旧日志**。要保留历史请显式给带时间戳的 TAG
+# (`TAG=glm53_$(date +%m%d_%H%M%S)`),或用 systemd 档(journal 自动留存)。
+nohup env "${ENVPREFIX[@]}" "${CMD[@]}" > "$LOG" 2>&1 &
 echo $! > "$OUTDIR/$TAG.pid"
 echo "[glm53] pid=$(cat "$OUTDIR/$TAG.pid")"
 
