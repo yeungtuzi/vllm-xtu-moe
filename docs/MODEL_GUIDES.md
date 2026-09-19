@@ -263,6 +263,13 @@ GLM 的模型上限是 1M,但本机可行上限约 **61.5 万 token**。要上 1
 ⇒ 对没有 state 分页的模型(如 DeepSeek-V4 系列)同一个后端能吃满 MBT,收益是 1.5-2×;
 对 GLM-5.3 想要更多,需要把装配与 attention 重叠(把 207 ms 压向 135 ms 的 1D DMA 地板)。
 
+**CPU 内核有个更划算的开关**:`XIAOTU_MOE_FP8_BF16_MMA=1` 让 FP8 CPU tile 改走
+AVX512-BF16 `vdpbf16ps`(32 个 bf16/指令、激活无需转换)。GLM 形状 M-curve:
+**M≥6 快 1.17-1.20×**(M=1 反而慢 13%,所以闸门只在 `M>4` 生效,单流解码仍走精确路)。
+端到端(全 CPU 预填充,3862-token):**TTFT 26.60 → 23.72 s = 1.12×**,needle 检索仍完全命中。
+代价:权重被舍入到 bf16(两路 rms_rel 3.63e-3),**因此默认关闭**。
+注意在 GLM-5.3 上这个开关比 GPU 预填充更值(chunk 被 KDA 限制在 2176 ⇒ 预填充本来大多走 CPU)。
+
 ### 2.6 数值与稳定性
 
 * 层内数值(`GLM_MODEL=<ckpt> python scripts/test_glm53_fp8_layer.py <layer> 8`):
