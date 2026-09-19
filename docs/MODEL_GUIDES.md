@@ -418,6 +418,49 @@ CPU 引擎里是多一次逐层调用,若放 GPU 则需要 ~1.7 GiB/rank 的 FP8
    TPOT 降 >15% 且贪心输出语义不变;
 4. 若 TPOT 反而变差或 draft 掉回 CPU,就**保持关闭**(当前状态)。
 
+#### 2.6.1 GLM 能不能照 MiMo-2.5 那样"补成 3 层 MTP"来提高接受长度?—— **不能**,但有一条自己的路
+
+> 背景:MiMo-2.5 的调研发现,**检查点里带了 3 层 MTP 权重**,而 vLLM 用两处硬编码常量
+> (`_MIMO_V2_*_NUM_MTP_LAYERS = 1`)只跑第 1 层 ⇒ "改常量即可解锁 3 层链"(详见
+> `dev-docs/MIMO25_ANALYSIS.md` §9)。**GLM-5.3-Flash 不是这个情况**:
+
+| | MiMo-2.5 | **GLM-5.3-Flash** |
+|---|---|---|
+| 检查点里的 MTP 层数 | **3**(`model.mtp.layers.{0,1,2}`,各 16 个张量) | **1**(只有 `model.language_model.layers.45.*`;层索引实测 0..45,1760 个张量,`eh_proj`/`enorm`/`hnorm`/`shared_head` 各 1) |
+| vLLM 侧挡在哪 | **两处常量**硬编码只跑第 1 层 ⇒ 改代码就能解锁 | **代码本来就是 N 层通用的**(`Glm5NextMultiTokenPredictor` 用 `spec_step_idx % num_mtp_layers` 建 `range(...)`),但**没有第 2/3 层的权重可加载** |
+| 想"3 层链"的代价 | 改 2 处常量 + 实测 | **只能自己训/蒸馏 MTP 头**(需数据与算力,不在本项目范围) |
+
+**但有两点让 GLM 的"单层多步"不是纯将就**:
+
+1. **vLLM 的单模块路径就是多步回收**:`Glm5NextMultiTokenPredictor.forward/compute_logits` 里
+   `current_step_idx = spec_step_idx % num_mtp_layers` ⇒ 1 层会被**反复复用**做 k>1 步草稿;
+   `use_multi_module_mtp()` 的判据是 `min(num_mtp_layers, num_speculative_tokens) > 1`,
+   GLM 是 `min(1, k) = 1` ⇒ 走**单模块**(回收)而不是 MiMo 那条多模块链。
+2. **GLM 的检查点显式开了 `index_share_for_mtp_iteration = True`** ⇒ `MTPSpeculator` 会走
+   "step 0 自算 top-k、step 1+ 复用索引"(`spec_decode/mtp/speculator.py:48`)——即
+   **单层多步是模型设计内的用法**,draft 步骤本身也更便宜。
+
+**收益预期(借用 MiMo 修正后的模型,别重复它的第一轮错误)**:CPU 路径上被验证的 token 数 T 越大,
+访问的**不同专家数**越大(`na(T)=256·(1−(31/32)^T)`:8 → 15.8 → 30.4 @T=1/2/4),每 token 权重流量
+只降 ~10% ⇒ **投机主要买的是"摊销每层 0.5–0.8 ms 的固定 dispatch",不是带宽**。
+MiMo 的结论是"**1 个模块 k=3 的净收益≈0,3 个模块在同一验证成本下才有 1.6–1.9×**";
+GLM 只有 1 层(回收),因此**预期介于两者之间**:比 MiMo 的 1 模块略好(因为有 index sharing),
+但**不要期待 +100%**;同机锚点仍然是 DSpark 3 层只 +20%。
+
+**该做的实验(与 §2.6 同一套,只是把 k 扫开)**:
+
+1. 先解决 draft 判定(见上面第 1 条),否则 draft 落 CPU ⇒ 实测 **−34%**,什么都没意义;
+2. 只量**接受长度**:`--num-speculative-tokens`(vLLM)取 **1 / 2 / 3 / 4**,看 accept 的边际;
+   判据沿用 MiMo 的表:k=3 时 accept ≥2.5 ⇒ 不值得继续;≈1.5–1.8 ⇒ 值得;k=1 已 ≥1.6 ⇒ 先只上 k=1;
+3. 只有当 k=3 的 accept 明显高于 k=1 时才做 TPOT/吞吐 A/B;注意 **ITL 会脉冲化**
+   (MiMo 报告实测中位 22.4 → 159.6 ms),交互式流式体验会变差。
+
+**外部信号(仅标题级,未深读)**:社区把 GLM-5.3-Flash 的 MTP 就当作"**第 45 层**"处理
+([HF 讨论:某 NVFP4 repack 丢了 layer 45 的 MTP 权重](https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4/discussions/1)、
+[带 MTP 的 MLX 量化](https://huggingface.co/Vontra/GLM-5.3-Flash-MLX-oQ2-MTP));SGLang 侧把它叫 NextN,
+并有 [TP8 下 draft forward 越界的 issue](https://github.com/sgl-project/sglang/issues/37548)。
+⇒ **没有任何来源显示 GLM-5.3-Flash 存在第 2/3 层 MTP 权重。**
+
 ### 2.7 数值与稳定性
 
 * 层内数值(`GLM_MODEL=<ckpt> python scripts/test_glm53_fp8_layer.py <layer> 8`):
