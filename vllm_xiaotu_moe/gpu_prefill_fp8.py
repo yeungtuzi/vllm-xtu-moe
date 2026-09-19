@@ -171,12 +171,17 @@ def down_kernel_fp8(
 
 
 def fp8_staging_bytes(n_experts: int, hidden: int, inter: int, ns: int = 2) -> int:
-    """Peak device bytes one layer's FP8 streaming path needs.
+    """Peak device bytes the FP8 streaming path holds for one layer's weights.
 
-    Same three-part accounting as ``gpu_prefill.staging_bytes`` (2 ring slots +
-    the assembly target + one node's DMA staging), but with FP8 widths: 1 byte
-    per weight element and a [N/128, K/128] fp32 block scale. That makes it ~2x
-    the MXFP4 number for the weights, which matters for the VRAM preflight.
+    This is **not** the MXFP4 three-part accounting, because the FP8 assembler
+    keeps different things alive: it fills persistent named buffers (``_buf``) for
+    the raw *and* the K-major copy of BOTH matrices, and never frees ``raw13``
+    before allocating w2. So the peak is
+
+        raw13 + km13 + raw2 + km2 + scales + (one node's DMA staging per block)
+
+    which for GLM-5.3 at TP=2 (E=144, H=4096, I=1024) is ~3.7 GiB -- comfortably
+    inside the post-weights VRAM, unlike a 2-rings-of-full-size figure.
     """
     E, H, I = int(n_experts), int(hidden), int(inter)
     b = FP8_BLOCK
@@ -185,10 +190,8 @@ def fp8_staging_bytes(n_experts: int, hidden: int, inter: int, ns: int = 2) -> i
     s13d = E * ((2 * I) // b) * (H // b) * 4
     s2d = E * (H // b) * (I // b) * 4
     n = max(1, int(ns))
-    slots = 2 * (w13d + w2d + s13d + s2d)
-    raw = w13d + w2d
-    tmp = (w13d + w2d + s13d + s2d) / n
-    return int(slots + raw + tmp)
+    dma = (w13d + w2d) // n          # one node's staging buffer, per weight block
+    return int(2 * w13d + 2 * w2d + s13d + s2d + dma)
 
 
 def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
@@ -302,3 +305,45 @@ def gpu_moe_layer_fp8_from_engine(x, topk_ids, topk_weights, engine,
         return None
     return gpu_moe_layer_fp8(x, topk_ids, topk_weights, *built, H, I, K,
                              device=device, swiglu_limit=swiglu_limit, **kw)
+
+
+# ---------------------------------------------------------------------------
+# Backend facade
+# ---------------------------------------------------------------------------
+# `mixed_experts._gpu_prefill_mod()` picks this module or `gpu_prefill` purely by
+# the engine class, so the two must expose the same names with the same
+# signatures. The MXFP4-specific `group_k` is accepted and ignored here: the FP8
+# block is a fixed 128x128, and the staging/compute sizes do not depend on it.
+
+
+def staging_bytes(n_experts: int, hidden: int, inter: int, group_k: int = 128,
+                  ns: int = 2) -> int:
+    """``gpu_prefill.staging_bytes``-compatible entry point (see fp8_staging_bytes)."""
+    del group_k                      # fp8 block is fixed at 128x128
+    return fp8_staging_bytes(n_experts, hidden, inter, ns)
+
+
+def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
+                              n_experts: int, group_k: int = 128, dst=None):
+    """``gpu_prefill.kmajor_from_engine_shards``-compatible entry point.
+
+    ``group_k`` is ignored (fixed 128) and ``dst`` is unused: the assembly writes
+    into the module's own persistent named buffers (see ``_buf``), which is what
+    keeps the per-layer allocator churn away.
+    """
+    del group_k, dst
+    return kmajor_from_engine_shards_fp8(engine, device, hidden, inter, n_experts)
+
+
+def gpu_moe_layer(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
+                  H: int, I: int, K: int, *, device, slot=None,
+                  swiglu_limit: float = 0.0, **kw):
+    """``gpu_prefill.gpu_moe_layer``-compatible entry point.
+
+    ``slot`` is accepted for interface parity but unused -- the kernels are fed by
+    persistent named buffers, so there is nothing per-layer to prefetch into.
+    Returns fp32 (the caller casts once), unlike the MXFP4 path's bf16 output.
+    """
+    del slot
+    return gpu_moe_layer_fp8(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
+                             H, I, K, device=device, swiglu_limit=swiglu_limit, **kw)

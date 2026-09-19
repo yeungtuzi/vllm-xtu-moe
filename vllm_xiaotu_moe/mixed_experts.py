@@ -184,6 +184,27 @@ def _release_source_enabled() -> bool:
         return False
 
 
+# GPU-prefill backends: engine class -> module exposing
+#   staging_bytes / kmajor_from_engine_shards / gpu_moe_layer / fits_device
+# with identical signatures, so the streaming branch in `apply()` is
+# format-agnostic. TP=2 halves the staging (the engine shards are already split
+# across NUMA nodes), which is why the 2x-larger FP8 staging still fits.
+_GP_BACKENDS = {
+    "MOE_MXFP4": "vllm_xiaotu_moe.gpu_prefill",
+    "MOE_FP8": "vllm_xiaotu_moe.gpu_prefill_fp8",
+}
+
+
+def _gpu_prefill_mod(engine_attr: str):
+    """Return the GPU-prefill backend module for this engine, or None."""
+    name = _GP_BACKENDS.get(engine_attr or "")
+    if name is None:
+        return None
+    import importlib
+
+    return importlib.import_module(name)
+
+
 class _XiaotuExpertsMixin:
     """Shared behaviour: build the xiaotu engine from the layer's raw CPU weights.
 
@@ -1165,13 +1186,19 @@ class _XiaotuExpertsMixin:
         # 因此它只在 batch 足够大、能把这次**固定 DMA** 摊薄时才划算 ⇒ 必须阈值门控;
         # 阈值怎么按 PCIe 带宽/显卡能力选,见 dev-docs/GPU_PREFILL.md。
         # 三个硬性前提(任一不满足就留在 CPU):
-        #   * 只是 MXFP4 后端 —— gpu_moe_layer 的 Triton 内核只实现了 fp4+e8m0;
+        #   * 后端必须是流式内核支持的那两种之一(见 _GP_BACKENDS);
         #   * 不能在图捕获里(V4.1 走图,捕获期开新 H2D 会作废捕获);
         #   * 源权重必须还在(见下面 storage 校验)。
         _gp_min = 0
         _gp_on = False          # 本模块是否启用了 GPU prefill(与本次 qlen 无关)
         _gpu_pf = False         # 本次调用是否真的走 GPU
-        if getattr(self, "_engine_attr", "") == "MOE_MXFP4" and not _resident:
+        # GPU 预填充后端按**引擎类别**选:MXFP4 走 gpu_prefill(nibble + e8m0 block-32),
+        # FP8 走 gpu_prefill_fp8(e4m3 单字节 + fp32 block-128)。两个模块暴露同名同签名
+        # 的入口(staging_bytes / kmajor_from_engine_shards / gpu_moe_layer),所以下面的
+        # 流式分支不需要再关心量化格式。
+        _gp_mod = None if _resident else _gpu_prefill_mod(
+            getattr(self, "_engine_attr", ""))
+        if _gp_mod is not None:
             from vllm_xiaotu_moe.gpu_prefill import (
                 gpu_prefill_min_tokens,
                 in_profile_run,
@@ -1270,9 +1297,7 @@ class _XiaotuExpertsMixin:
             # 主机专家内存 522 -> 253 GiB(实测保留源张量会让 EngineCore 在加载完成前
             # 就到 1073 GB、每 node 只剩 ~3 GB)。分片不存在(如 NOSHARD)时才退回源张量。
             from vllm_xiaotu_moe.gpu_prefill import (
-                PrefetchSlot,
-                gpu_moe_layer,
-                kmajor_from_engine_shards,
+                PrefetchSlot,  # noqa: F401  (kept for interface parity)
                 slot_for_shapes,
             )
 
@@ -1283,16 +1308,23 @@ class _XiaotuExpertsMixin:
                 if _w2live is None:
                     _w2live = layer.w2_weight
                 _shp = tuple(_w2live.shape)
-            _E, _I = int(_shp[0]), 2 * int(_shp[2])
+            # `w2` is [E, H, I/2] for the 4-bit engines and [E, H, I] for FP8/BF16, so
+            # the packing factor must come from the engine class: assuming `*2`
+            # unconditionally made FP8 report I = 2*I, i.e. a 2x-oversized staging
+            # figure and a wrong `I` for the kernels.
+            _pack = 2 if getattr(self, "_engine_attr", "") in (
+                "MOE_MXFP4", "MOE_WNA16") else 1
+            _E, _I = int(_shp[0]), _pack * int(_shp[2])
             _dev = h_bf16.device
             # 运行时预检:腾不出 staging 就**优雅放弃**(慢但能跑),并给用户选择。
-            from vllm_xiaotu_moe.gpu_prefill import fits_device, staging_bytes
+            from vllm_xiaotu_moe.gpu_prefill import fits_device
 
             try:
                 _ns = int(engine.shard_geometry()["ns"]) or 2
             except Exception:  # noqa: BLE001
                 _ns = 2
-            _need = staging_bytes(_E, hidden_size, _I, int(self._group_k), _ns)
+            _is_fp8 = getattr(self, "_engine_attr", "") == "MOE_FP8"
+            _need = _gp_mod.staging_bytes(_E, hidden_size, _I, int(self._group_k), _ns)
             # 判定**每个模块只做一次**:预检看的是瞬时空闲显存,逐次判定会让同一层
             # 在 GPU/CPU 之间来回跳(实测一次 forward 内 24 层走分片、16 层退回源张量,
             # 另一半 forward 全部 SKIPPED,NOTES §464),行为不可复现。
@@ -1323,7 +1355,23 @@ class _XiaotuExpertsMixin:
                 _gpu_pf = False
             _km = None
             _pf_reason = "engine shards"
-            if _gpu_pf:
+            if _gpu_pf and _is_fp8:
+                # ---- FP8: 自己装配 + 自己算(持久命名缓冲,不走 slot) ----------
+                # `group_k` 对 FP8 无意义(块固定 128x128),而装配目标用的是模块内
+                # `_buf` 的持久命名缓冲,所以没有 slot 需要填,也就没有 ready 事件。
+                try:
+                    _km = _gp_mod.kmajor_from_engine_shards(
+                        engine, _dev, hidden_size, _I, _E, int(self._group_k)
+                    )
+                except torch.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    _km = None
+                if _km is None:
+                    # 引擎没有分片(如 NOSHARD)⇒ 优雅退回 CPU(FP8 没有源张量兜底:
+                    # 源张量此时可能已被释放,而分片是唯一保证在的副本)。
+                    _gpu_pf = False
+                    _pf_reason = "engine has no shards (fp8)"
+            elif _gpu_pf:
                 try:
                     import time as _time
 
@@ -1339,7 +1387,7 @@ class _XiaotuExpertsMixin:
                         (_E, _I // 2, hidden_size),
                         (_E, _I // _gk, hidden_size),
                     ), _dev, nslots=1)   # 【§601】同步路径单槽即安全(同流有序),省 3.59 GiB
-                    _km = kmajor_from_engine_shards(
+                    _km = _gp_mod.kmajor_from_engine_shards(
                         engine, _dev, hidden_size, _I, _E, _gk, dst=_slot.bufs
                     )
                     if _t_split:
@@ -1370,14 +1418,23 @@ class _XiaotuExpertsMixin:
                             "lower --gpu-memory-utilization.",
                             flush=True,
                         )
-            if _km is not None:
+            if _is_fp8 and _km is not None:
+                # FP8:已经在上面的分支里装配好了,直接算(输出 fp32,调用方转 dtype)。
+                _limit = float(getattr(self, "swiglu_limit", 0.0) or 0.0)
+                out = _gp_mod.gpu_moe_layer(
+                    h_bf16, ids_i32, wts_f32, _km[0], _km[1], _km[2], _km[3],
+                    H=hidden_size, I=_I,
+                    K=int(self.moe_config.experts_per_token),
+                    device=_dev, swiglu_limit=_limit,
+                )
+            elif _km is not None:
                 # 槽来自 `slot_for_shapes`(环形复用);这里只补 ready 事件。
                 _slot.ready = torch.cuda.Event()
                 _slot.ready.record(torch.cuda.current_stream(_dev))
                 _t1 = _time.perf_counter() if _t_split else 0.0
                 _a_before = torch.cuda.memory_allocated(_dev) if (
                     os.environ.get("XIAOTU_GPF_STAGE") == "1") else 0
-                out = gpu_moe_layer(
+                out = _gp_mod.gpu_moe_layer(
                     h_bf16, ids_i32, wts_f32, _km[0], _km[1], _km[2], _km[3],
                     H=hidden_size, I=_I,
                     K=int(self.moe_config.experts_per_token),
@@ -1422,7 +1479,7 @@ class _XiaotuExpertsMixin:
                             f"(need {_need} bytes, storage {_have} bytes, "
                             f"shape={tuple(_t.shape)})"
                         )
-                out = gpu_moe_layer(
+                out = _gp_mod.gpu_moe_layer(
                     h_bf16, ids_i32, wts_f32, w13h, s13h, w2h, s2h,
                     H=hidden_size, I=int(w13h.shape[1]) // 2,
                     K=int(self.moe_config.experts_per_token),
