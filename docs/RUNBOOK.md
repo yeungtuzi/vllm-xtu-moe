@@ -1026,3 +1026,91 @@ for e in low none; do
 done
 # 期望:low 有 reasoning_content;none 的 reasoning_content 为空/缺失
 ```
+
+---
+
+## 6. 跟进上游 vLLM(2026-09-19 预演数据)
+
+**先纠正一个常见误解:我们这个栈已经在 Model Runner V2 上了。** 服务启动日志里就有
+`[gpu_worker.py:441] Using V2 Model Runner`;V2 的实现是 **`vllm/v1/worker/gpu/` 这个包**
+(`model_runner.py`),V1 是旧的单体 `vllm/v1/worker/gpu_model_runner.py`,只在上游判定
+"V2 不支持该组合"时才回退(`config/vllm.py:_get_v2_model_runner_unsupported_features`:
+ngram/ngram_gpu 投机、EAGLE 的 parallel drafting、stock torch.compile、UBatching、
+mamba_cache_mode=all、自定义 logits processor …)。插件打的正是 V2 的命名空间
+(`vllm.v1.worker.gpu.model_runner`、`vllm.v1.worker.gpu.spec_decode.speculator`)。
+上游 MRv2 仍在按模型族扩默认(见 [MRv2 博客](https://vllm.ai/blog/2026-03-24-mrv2)、
+[pooling 默认 MRv2 #48290](https://github.com/vllm-project/vllm/pull/48290)、
+[Llama/Mistral #43458](https://github.com/vllm-project/vllm/pull/43458)),
+**所以"跟进 V2"这件事我们已经跟上了,问题是继续往前跟。**
+
+**我们与上游的距离(实测)**
+
+| 项 | 值 |
+|---|---|
+| 我们补丁栈的上游 base | `dabc4362b4`(2026-09-14,= `origin/main~311`) |
+| 本地补丁 | **10 个提交 / 39 个文件**(9 个特性补丁 + 1 个 30 文件的 snapshot),全是模型/注意力/kernel 层,不碰 runner 架构 |
+| 上游今天 | `41c4a3ed4e`(2026-09-19),**311 个提交 / 5 天**(≈62 提交/天) |
+
+**rebase 预演(在 `/tmp` 的临时 worktree 里 `cherry-pick`,不碰工作树、不碰 8070)**
+
+* 10 个提交整体 cherry-pick:首个(snapshot)提交冲突 **2 个文件**;
+* 只挑 9 个特性补丁:第 1 个(mHC)**冲突 1 个文件**——上游只对它做过 `ruff/pydocstyle`
+  格式化(#52136)⇒ **纯格式冲突**;继续往下,DeepSeek-V4.1 的 fp8e4nv 移除补丁冲突
+  **2 个文件**(`deepseek_v41/common/ops/{cache_utils,fused_compress_quant_cache}.py`,
+  上游对这两个文件有 6/3 次改动);
+* 其余大部分**自动合并**,包括 `envs.py`、`v1/engine/core.py`、`sparse_swa.py`、
+  `oracle/{unquantized,int_wna16}.py`;
+* **唯一需要"重指"的**:补丁 `a93931f11a` 改的 `vllm/models/glm5next/nvidia/attention.py`
+  在上游已**被搬走**(现在注意力层在 `vllm/model_executor/layers/attention/sparse_mla_attention.py`
+  这一带)⇒ 1 个文件重新接线;我们新增的 `flashmla_sparse_sm8x.py` / `sparse_mla_kernels.py`
+  是新文件,不冲突。
+* **结论:约 4-5 个文件需要手工解冲突 / 重指,不需要重构。**
+
+**插件挂点健在性(逐条核对 upstream HEAD)**
+
+| 挂点 | 现状 |
+|---|---|
+| `FusedMoEFactory` | 还在(`fused_moe/layer.py:88`,是**函数**不是类——`git grep "class FusedMoEFactory"` 会误判为"没了") |
+| `oracle/{fp8,mxfp4,int_wna16,unquantized}.py` | 都在(新增了 `mxfp8/nvfp4/int8/w4a8`) |
+| `experts/cpu_moe.py` | 在 |
+| `profile_run` / `compile_or_warm_up_model` / `init_attn_backend` / `_initialize_kv_caches` | 都在(命名空间未变) |
+
+**上游这 5 天在我们耦合面上的改动量(= 长期维护成本排序)**
+
+```
+vllm/model_executor/layers/fused_moe      26 次   ← 最勤:量化/MoE API 是我们的主要 shim 面
+vllm/v1/attention                         23 次   ← 我们的 SM8x 补丁都在这里
+vllm/v1/core                              16 次   ← KV 定容/调度:GPU 预填充放行时序依赖它
+vllm/model_executor/layers/quantization   10 次
+vllm/v1/worker/gpu/model_runner.py         9 次   ← V2 runner 本体(profile_run 挂点)
+vllm/models/glm5next                       8 次
+vllm/v1/worker/gpu_worker.py + gpu_model_runner.py  6+6 次
+vllm/v1/worker/gpu/spec_decode             5 次
+```
+
+**性能优化要不要重做?——设计不用,标定和验收必须重跑**
+
+* **可以原样复用**(与 runner 语义无关):CPU 引擎内核(引擎侧)、FP8 流式装配/DMA/side-stream、
+  GPU 常驻层、ping/pong 预取、以及服务级的 parser / 前缀缓存开关;
+* **必须重标定**(都是经验数):`--gpu-memory-utilization 0.85`、`XIAOTU_GP_ACT_RESERVE_GIB=3.0`
+  (基准是启动日志里上游给的 `peak activation`)、`XIAOTU_GP_ACT_RESERVE_GIB`/GPU 预填充阈值
+  1500、KV 池与并发;上游这 5 天就有 `FULL CUDA graph capture for microbatched steps (DBO)`
+  (#51700)、MRv2 fast-prefill(#56145)、共享 token→request 映射(#57102)等**会改变激活/时序**的改动;
+* **必须重跑的门禁**:`test_block23_equiv.py`、determinism 11/11、fp8 conformance、
+  `check_engine_aligned.sh`、`test_gpu_prefill_fp8_assembly/vs_cpu`、以及服务验收(32K 崩溃复现、
+  4096/64 TTFT、256/128 TPOT);
+* **工作量**:rebase + 门禁 ≈ 半天;重标定 + 验收 ≈ 半天到一天(每次服务启动 ~5 min,要起 2-3 次)。
+
+**跟进流程(推荐)**
+
+```bash
+cd /home/user/lvllm/process_data/ref/repos/vllm-mainline
+git fetch origin main                              # 已完成:origin/main = 41c4a3ed4e
+git worktree add --detach /tmp/vllm-up origin/main # 隔离预演,不动当前工作树(editable 安装正在被 8070 用)
+cd /tmp/vllm-up && git cherry-pick <我们的 10 个提交>   # 解那 4-5 个冲突
+# 通过后再跑门禁;起服务用**临时端口**(8071/8072)做新老对照;最后才决定是否替换 8070
+```
+
+⚠️ 两个坑:① `vllm.__version__` 报的是**构建时**的 base(`0.29.1rc1.dev95+gdabc4362b`),
+不是当前 HEAD(`git describe` = `v0.29.1rc0-105-gaf3e7c14d7`)——判断代码版本看 `git describe`;
+② 直接在当前目录 rebase 会改到正在被 8070 加载的代码(editable install),**必须用 worktree/分支隔离**。
