@@ -238,6 +238,108 @@ def gp_side_stream_enabled() -> bool:
     return os.environ.get("XIAOTU_GP_ASM_SIDE_STREAM", "1") != "0"
 
 
+# --- ping/pong K-major + cross-layer prefetch -------------------------------
+# WHY (and its cost): the assembly of layer L is 135-200 ms of pure H2D while the
+# compute it can hide behind *within* layer L is only its attention (~80 ms) plus
+# its MoE kernels (~23 ms). Assembling L+1 while L runs therefore hides the rest,
+# turning the per-layer cost from (attn + asm + kernels) into
+# max(asm, attn + kernels) + kernels.
+#
+# The price is a SECOND K-major buffer set: km13 [E,H,2I] + km2 [E,I,H] = 3.35 GiB
+# for GLM-5.3 at TP=2. It only pays for itself while the streaming path is
+# DMA-bound (asm > attention + kernels), which is the case for FP8 here. Because
+# VRAM is the binding constraint on a 40 GB card, this is opt-in and the preflight
+# charges for the extra slot (see gpu_prefill_fp8.fp8_staging_bytes).
+#
+# Runtime switch is a FILE, not an env var: the flag must be flip-able inside one
+# server process to A/B it honestly (`XIAOTU_GP_ASM_PREFETCH_FILE`), matching how
+# the prefill threshold is switched.
+_GP_PREFETCH_ON: dict = {}
+_GP_READY: dict = {}       # (dev_key, layer_index) -> (km, ready_event, slot)
+_GP_SLOT: dict = {}        # dev_key -> next slot to assemble into
+_GP_SLOT_FREE: dict = {}   # dev_key -> {slot: event after the GEMM that read it}
+_GP_BUF2: dict = {}        # dev_key -> {slot: (km13, km2)}
+_GP_LAYERS: dict = {}      # layer_index -> module (first registration wins)
+_GP_BUF2_BYTES: dict = {}
+_GP_BUF2_DENIED: dict = {}  # dev_key -> sticky "no room"
+_GP_PF_WARNED: dict = {}   # dev_key -> the reason was already reported
+
+
+def gp_prefetch_enabled() -> bool:
+    """Ping/pong cross-layer prefetch switch (file first, then env; default OFF)."""
+    f = (os.environ.get("XIAOTU_GP_ASM_PREFETCH_FILE")
+         or os.environ.get("VLLM_XIAOTU_GP_ASM_PREFETCH_FILE"))
+    if f:
+        try:
+            with open(f) as fh:
+                return int(fh.read().strip()) != 0
+        except (OSError, ValueError):
+            pass
+    return os.environ.get("XIAOTU_GP_ASM_PREFETCH", "0") == "1"
+
+
+def _gp_layer_index(prefix_or_name) -> "int | None":
+    m = _LAYER_IDX_RE.search(prefix_or_name or "")
+    return int(m.group(1)) if m else None
+
+
+def _gp_slot_buffers(backend, dev, n_experts, hidden, inter, slot):
+    """The extra K-major set (lazily allocated once per device).
+
+    REFUSES to allocate unless the free VRAM covers the slot AND a workspace
+    reserve. Measured the hard way: at --gpu-memory-utilization 0.88 with the KV
+    pool already sized to fill the budget, the extra 3.38 GiB/rank left no room
+    for the activation workspace and the engine died with a CUDA OOM on a later
+    request (EngineDeadError, 38.02 of 39.49 GiB allocated). A prefetch that can
+    kill the server is worse than no prefetch, so the reservation is checked here
+    -- once, after which the denial is sticky and the path silently keeps the
+    (VRAM-free) in-layer overlap.
+    """
+    k = _gp_dev_key(dev)
+    if _GP_BUF2_DENIED.get(k):
+        raise RuntimeError("prefetch denied: not enough free VRAM (cached)")
+    slots = _GP_BUF2.get(k)
+    if slots is None:
+        slots = {}
+        _GP_BUF2[k] = slots
+    if slot not in slots:
+        E, H, I = int(n_experts), int(hidden), int(inter)
+        need = E * H * 2 * I + E * I * H
+        # 4 GiB, not 2: at util 0.88 a 2 GiB reserve let the slot allocate and a
+        # LATER request still died (38.02/39.49 GiB allocated, 30 MiB request
+        # failed) -- the demand is transient activation, not the steady state.
+        reserve = 4 << 30                      # workspace headroom
+        try:
+            free, _tot = torch.cuda.mem_get_info(torch.device(dev))
+        except Exception:  # noqa: BLE001
+            free = -1
+        if 0 <= free < need + reserve:
+            _GP_BUF2_DENIED[k] = True
+            print(f"[vllm-xtu-moe] GPU prefill ping/pong DISABLED: needs "
+                  f"{(need + reserve) / 2**30:.2f} GiB free (slot "
+                  f"{need / 2**30:.2f} + {reserve / 2**30:.1f} reserve), only "
+                  f"{free / 2**30:.2f} GiB free. Lower --gpu-memory-utilization "
+                  f"(or --kv-cache-memory) by ~{need / 2**30:.1f} GiB to enable; "
+                  f"staying on the in-layer overlap.", flush=True)
+            raise RuntimeError("prefetch denied: insufficient free VRAM")
+        km13 = torch.empty((E, H, 2 * I), dtype=torch.uint8, device=dev)
+        km2 = torch.empty((E, I, H), dtype=torch.uint8, device=dev)
+        slots[slot] = (km13, km2)
+        _GP_BUF2_BYTES[k] = km13.numel() + km2.numel()
+        print(f"[vllm-xtu-moe] GPU prefill ping/pong: allocated K-major slot {slot} "
+              f"({(km13.numel() + km2.numel()) / 2**30:.2f} GiB extra VRAM)", flush=True)
+    return slots[slot]
+
+
+def gp_prefetch_extra_bytes(dev_key=None) -> int:
+    """Extra VRAM the prefetch holds, for the preflight (0 if never allocated)."""
+    if not gp_prefetch_enabled():
+        return 0
+    if dev_key is not None:
+        return int(_GP_BUF2_BYTES.get(dev_key, 0))
+    return int(sum(_GP_BUF2_BYTES.values()))
+
+
 class _XiaotuExpertsMixin:
     """Shared behaviour: build the xiaotu engine from the layer's raw CPU weights.
 
@@ -986,6 +1088,16 @@ class _XiaotuExpertsMixin:
             f"swiglu={'clamp@' + str(limit) if clamped else 'plain'}",
             flush=True,
         )
+        # Geometry for the ping/pong prefetch, plus the layer-index registry the
+        # next layer looks itself up in. First registration wins (a draft model
+        # would otherwise overwrite the target model's layers, the same trap
+        # hybrid_model's registry documents).
+        self._E_eng = int(cfg.expert_num)
+        self._I_eng = int(cfg.intermediate_size)
+        self._H_eng = int(cfg.hidden_size)
+        _li = _gp_layer_index(getattr(layer, "layer_name", "") or "")
+        if _li is not None and _li not in _GP_LAYERS:
+            _GP_LAYERS[_li] = self
         return self._xiaotu_engine
 
     # ---- optional in-process self-verification -------------------------
@@ -1358,6 +1470,11 @@ class _XiaotuExpertsMixin:
                 _ns = 2
             _is_fp8 = getattr(self, "_engine_attr", "") == "MOE_FP8"
             _need = _gp_mod.staging_bytes(_E, hidden_size, _I, int(self._group_k), _ns)
+            if gp_prefetch_enabled():
+                # The ping/pong prefetch holds a second K-major set; charge it so
+                # the preflight cannot pass and then OOM into a sticky CPU
+                # fallback (which would be slower than never enabling it).
+                _need += 2 * (_E * hidden_size * 2 * _I + _E * _I * hidden_size)
             # 判定**每个模块只做一次**:预检看的是瞬时空闲显存,逐次判定会让同一层
             # 在 GPU/CPU 之间来回跳(实测一次 forward 内 24 层走分片、16 层退回源张量,
             # 另一半 forward 全部 SKIPPED,NOTES §464),行为不可复现。
@@ -1412,25 +1529,66 @@ class _XiaotuExpertsMixin:
                         _gp_mod.prealloc_fp8_buffers(_dev, _E, hidden_size, _I)
                     except Exception:  # noqa: BLE001  (older backend module)
                         _side_ok = False
-                if _side_ok:
+                _prefetch = gp_prefetch_enabled() and _side_ok
+                _dk = _gp_dev_key(_dev)
+                _idx = _gp_layer_index(getattr(layer, "layer_name", ""))
+                _km = None
+                _slot = None
+                if _prefetch and _idx is not None:
+                    # Consume the assembly the PREVIOUS layer produced for us.
+                    _pf = _GP_READY.pop((_dk, _idx), None)
+                    if _pf is not None:
+                        _km, _ev_ready, _slot = _pf
+                        torch.cuda.current_stream(_dev).wait_event(_ev_ready)
+                if _km is None and _side_ok:
                     _side = _gp_side_stream(_dev)
-                    _dk = _gp_dev_key(_dev)
-                    _ev_prev = _GP_EVENTS.get(_dk)
-                    if _ev_prev is not None:
-                        # Do not overwrite buffers the previous layer's GEMM may
-                        # still be reading (it was enqueued on the main stream).
-                        _side.wait_event(_ev_prev)
+                    _dst = None
+                    if _prefetch and _idx is not None:
+                        # No prefetch ready (first MoE layer of this forward, or the
+                        # prefetch for us failed): assemble now, into the slot the
+                        # previous layer left free. If the extra slot does not fit,
+                        # fall back to the shared single slot rather than failing
+                        # the forward.
+                        _slot_try = _GP_SLOT.get(_dk, 0)
+                        try:
+                            _dst = list(_gp_slot_buffers(_gp_mod, _dev, _E, hidden_size,
+                                                         _I, _slot_try))
+                            _slot = _slot_try
+                        except Exception as _exc:  # noqa: BLE001  (denied / OOM)
+                            torch.cuda.empty_cache()
+                            _dst = None
+                            _slot = None
+                            if not _GP_PF_WARNED.get(_dk):
+                                _GP_PF_WARNED[_dk] = True
+                                try:
+                                    _fr, _ = torch.cuda.mem_get_info(_dev)
+                                except Exception:  # noqa: BLE001
+                                    _fr = -1
+                                print(f"[vllm-xtu-moe] GPU prefill ping/pong NOT active "
+                                      f"({type(_exc).__name__}: {_exc}); free="
+                                      f"{_fr / 2**30:.2f} GiB. Staying on the in-layer "
+                                      f"overlap (no extra VRAM).", flush=True)
+                    if _dst is not None:
+                        _ev_free = _GP_SLOT_FREE.get(_dk, {}).get(_slot)
+                    else:
+                        # Shared set: wait for the previous layer's GEMM, which read
+                        # exactly these buffers.
+                        _ev_free = _GP_EVENTS.get(_dk)
+                    if _ev_free is not None:
+                        _side.wait_event(_ev_free)
                     with torch.cuda.stream(_side):
                         try:
                             _km = _gp_mod.kmajor_from_engine_shards(
-                                engine, _dev, hidden_size, _I, _E, int(self._group_k))
+                                engine, _dev, hidden_size, _I, _E, int(self._group_k),
+                                dst=_dst)
                         except torch.OutOfMemoryError:
                             torch.cuda.empty_cache()
                             _km = None
-                    _ev_ready = torch.cuda.Event()
-                    _ev_ready.record(_side)
-                    torch.cuda.current_stream(_dev).wait_event(_ev_ready)
-                else:
+                    if _km is not None:
+                        _ev_ready = torch.cuda.Event()
+                        _ev_ready.record(_side)
+                        torch.cuda.current_stream(_dev).wait_event(_ev_ready)
+                elif _km is None:
                     try:
                         _km = _gp_mod.kmajor_from_engine_shards(
                             engine, _dev, hidden_size, _I, _E, int(self._group_k)
@@ -1514,6 +1672,37 @@ class _XiaotuExpertsMixin:
                     _ev = torch.cuda.Event()
                     _ev.record(torch.cuda.current_stream(_dev))
                     _GP_EVENTS[_gp_dev_key(_dev)] = _ev
+
+                    # ---- ping/pong: assemble the NEXT layer while this one computes
+                    if _prefetch and _idx is not None and _slot is not None:
+                        _GP_SLOT_FREE.setdefault(_dk, {})[_slot] = _ev
+                        _GP_SLOT[_dk] = 1 - _slot
+                        _nxt_idx = _idx + 1
+                        _nxt = _GP_LAYERS.get(_nxt_idx)
+                        if _nxt is not None and getattr(_nxt, "engine", None) is not None:
+                            try:
+                                _nE, _nI, _nH = _nxt.gp_shapes()
+                                if (_nE, _nI, _nH) == (_E, _I, hidden_size):
+                                    _s2 = _GP_SLOT[_dk]
+                                    _dst2 = list(_gp_slot_buffers(
+                                        _gp_mod, _dev, _E, hidden_size, _I, _s2))
+                                    _ev_free2 = _GP_SLOT_FREE.get(_dk, {}).get(_s2)
+                                    if _ev_free2 is not None:
+                                        _side.wait_event(_ev_free2)
+                                    with torch.cuda.stream(_side):
+                                        _km2 = _gp_mod.kmajor_from_engine_shards(
+                                            _nxt.engine, _dev, _nH, _nI, _nE,
+                                            int(getattr(_nxt, "_group_k", 128)), dst=_dst2)
+                                    _ev2 = torch.cuda.Event()
+                                    _ev2.record(_side)
+                                    _GP_READY[(_dk, _nxt_idx)] = (_km2, _ev2, _s2)
+                            except Exception as _exc:  # noqa: BLE001
+                                # A failed prefetch is never fatal: drop it and the
+                                # next layer assembles synchronously instead.
+                                _GP_READY.pop((_dk, _nxt_idx), None)
+                                if os.environ.get("XIAOTU_GPF_STAGE") == "1":
+                                    print(f"[gp-pf] prefetch skipped: "
+                                          f"{type(_exc).__name__}: {_exc}", flush=True)
                 if _t_split:
                     torch.cuda.synchronize(_dev)
                     print(f"[gp-fp8] layer={getattr(layer, 'layer_name', '?')} "
@@ -1651,6 +1840,17 @@ class XiaotuCPUExpertsFp8(_XiaotuExpertsMixin, CPUExpertsFp8):
     _group_n, _group_k = 128, 128
     _expect_dtype = torch.float8_e4m3fn
     _scale_dtype = torch.float32
+
+    def gp_shapes(self):
+        """(E, I, H) this module's engine was built with, or (0, 0, 0).
+
+        Used by the ping/pong prefetch to decide whether the next layer can be
+        assembled with this layer's buffer geometry. `_released_shapes` covers the
+        released-source case, exactly like the main FP8 branch's `_E`/`_I` probe.
+        """
+        return (int(getattr(self, "_E_eng", 0) or 0),
+                int(getattr(self, "_I_eng", 0) or 0),
+                int(getattr(self, "_H_eng", 0) or 0))
 
 
 class XiaotuCPUExpertsInt4(_XiaotuExpertsMixin, CPUExpertsInt4):

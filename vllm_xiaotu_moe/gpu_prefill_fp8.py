@@ -436,8 +436,12 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
     into the module's own persistent named buffers (see ``_buf``), which is what
     keeps the per-layer allocator churn away.
     """
-    del group_k, dst
-    return kmajor_from_engine_shards_fp8(engine, device, hidden, inter, n_experts)
+    del group_k
+    # `dst` MUST be forwarded: the ping/pong prefetch passes its own K-major slot
+    # here, and dropping it would silently write into the shared single-slot
+    # buffers that another layer's GEMM may still be reading.
+    return kmajor_from_engine_shards_fp8(engine, device, hidden, inter, n_experts,
+                                         dst=dst)
 
 
 def gpu_moe_layer(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
