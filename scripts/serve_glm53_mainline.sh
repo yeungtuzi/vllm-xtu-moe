@@ -42,7 +42,12 @@ GPU_UTIL="${GPU_UTIL:-0.90}"
 # safe default; raise it deliberately.
 MAXLEN="${MAXLEN:-262144}"
 MBT="${MBT:-8192}"
-SEQS="${SEQS:-4}"
+# Admission limit. 256K context x 2 concurrent sequences = 524,288 tokens, and the
+# KV pool at this maxlen is 919,520 tokens (measured, util 0.88) => two full-length
+# sequences are guaranteed by construction, with ~40% of the pool left as headroom
+# for the activation workspace. (The pool itself reports 3.51x concurrency for
+# 262,144-token requests, so 3 would also be admitted; 2 is the deliberate choice.)
+SEQS="${SEQS:-2}"
 THREADS="${THREADS:-60}"
 KV_DTYPE="${KV_DTYPE:-bfloat16}"
 # GPU-prefill threshold. The plugin's own default is 4096, which is *above*
