@@ -185,6 +185,22 @@ def down_kernel_fp8(
 # ---------------------------------------------------------------------------
 
 
+def prealloc_fp8_buffers(device, n_experts: int, hidden: int, inter: int) -> None:
+    """Allocate this layer's persistent named buffers on the CURRENT stream.
+
+    Call this before switching to a side stream for the assembly. The buffers are
+    cached by name and outlive every layer, so allocating them under the side
+    stream would tie them to a stream they are later read from only through
+    events; allocating up front on the main stream keeps the caching allocator's
+    stream association simple.
+    """
+    E, H, I = int(n_experts), int(hidden), int(inter)
+    _buf("raw13", (E, 2 * I, H), device)
+    _buf("raw2", (E, H, I), device)
+    _buf("km13", (E, H, 2 * I), device)
+    _buf("km2", (E, I, H), device)
+
+
 def fp8_staging_bytes(n_experts: int, hidden: int, inter: int, ns: int = 2) -> int:
     """Peak device bytes the FP8 streaming path holds for one layer's weights.
 
@@ -256,6 +272,20 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
     c2 = int(geo["w2_cbytes"])
     cr2 = int(geo["w2_crows"])
     _dma2d = _dma2d_available(engine)
+    # Phase timing with CUDA events (no syncs, so it cannot perturb what it
+    # measures). `XIAOTU_GPF_STAGE=1` prints one line per layer.
+    import os as _os
+
+    _trace = _os.environ.get("XIAOTU_GPF_STAGE") == "1"
+    _ev = {}
+
+    def _hit(name):
+        if _trace:
+            e = torch.cuda.Event(enable_timing=True)
+            e.record(torch.cuda.current_stream(device))
+            _ev[name] = e
+
+    _hit("start")
     if _dma2d:
         stream = torch.cuda.current_stream(device).cuda_stream
         p13 = w13_raw.data_ptr()
@@ -277,6 +307,7 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
                     raise RuntimeError(
                         f"gpu-prefill: 2-D shard DMA failed (w13 node={n} off={_off}: "
                         f"{got}/{cr13 * H * E} bytes)")
+        _hit("w13")
         for n in range(ns):
             c0 = n * cr2
             got = engine.copy_hostbuf_to_device_2d(
@@ -285,6 +316,7 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
                 raise RuntimeError(
                     f"gpu-prefill: 2-D shard DMA failed (w2 node={n}: "
                     f"{got}/{cr2 * I * E} bytes)")
+        _hit("w2")
     else:
         for n in range(ns):
             buf = _dma_hostbuf(engine, 0, n, int(geo["w13_node_bytes"]), device)
@@ -304,6 +336,7 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
                .view(torch.float32).view(E, (2 * I) // b, H // b))
     s2_raw = (_dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device)
               .view(torch.float32).view(E, H // b, I // b))
+    _hit("scales")
     # Up to here the DMA launches and the strided assembly copies are all queued on
     # one stream, so a single sync closes them out together; time the K-major
     # transpose separately (it is GPU-only, no DMA).
@@ -321,6 +354,15 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
         w13t = _kmajor_bytes(w13_raw, _buf("km13", (E, H, 2 * I), device))
         w2t = _kmajor_bytes(w2_raw, _buf("km2", (E, I, H), device))
     _stage_mark(_t_dma_end, "tr")
+    if _trace:
+        _hit("done")
+        torch.cuda.synchronize(device)
+
+        def _ms(a, b):
+            return _ev[a].elapsed_time(_ev[b]) if a in _ev and b in _ev else -1.0
+        print(f"[fp8-asm] w13={_ms('start', 'w13'):6.1f} w2={_ms('w13', 'w2'):6.1f} "
+              f"scales={_ms('w2', 'scales'):6.2f} tr={_ms('scales', 'done'):6.1f} "
+              f"total={_ms('start', 'done'):6.1f} ms", flush=True)
     return w13t, s13t, w2t, s2t
 
 

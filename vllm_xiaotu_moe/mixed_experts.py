@@ -205,6 +205,39 @@ def _gpu_prefill_mod(engine_attr: str):
     return importlib.import_module(name)
 
 
+# --- FP8 assembly on a side stream ------------------------------------------
+# WHY: the assembly is pure host->device DMA (135-200 ms/layer/rank for 3.62 GB)
+# and is *longer* than everything it could hide behind (this layer's attention
+# ~80 ms + the MoE kernels ~23 ms). On the current stream it therefore serializes
+# behind attention, which is pure waste: the DMA touches only the staging buffers
+# and the host shards, neither of which attention reads. Running it on a side
+# stream lets it overlap this layer's attention.
+#
+# Buffer safety: the weight buffers are persistent and shared across layers, so
+# the side stream must not overwrite them until the previous layer's GEMM (which
+# reads them, on the main stream) has finished. One event after each GEMM does
+# that; the main stream waits for the assembly's event before its GEMM.
+_GP_SIDE: dict = {}
+_GP_EVENTS: dict = {}
+
+
+def _gp_dev_key(dev):
+    return getattr(dev, "index", None) or str(dev)
+
+
+def _gp_side_stream(dev):
+    k = _gp_dev_key(dev)
+    s = _GP_SIDE.get(k)
+    if s is None:
+        s = torch.cuda.Stream(device=dev)
+        _GP_SIDE[k] = s
+    return s
+
+
+def gp_side_stream_enabled() -> bool:
+    return os.environ.get("XIAOTU_GP_ASM_SIDE_STREAM", "1") != "0"
+
+
 class _XiaotuExpertsMixin:
     """Shared behaviour: build the xiaotu engine from the layer's raw CPU weights.
 
@@ -1360,14 +1393,51 @@ class _XiaotuExpertsMixin:
                 # `group_k` 对 FP8 无意义(块固定 128x128),而装配目标用的是模块内
                 # `_buf` 的持久命名缓冲,所以没有 slot 需要填,也就没有 ready 事件。
                 _t_split = os.environ.get("XIAOTU_GP_SPLIT") == "1"
+                # Sync BEFORE starting the clock when only explaining cost: the
+                # assembly's DMA is enqueued on the current stream, i.e. behind
+                # this layer's attention kernels, so an unsynced timer charges the
+                # attention tail to "asm". `XIAOTU_GP_SPLIT_PRESYNC=0` restores the
+                # old (attention-inclusive) reading.
+                if _t_split and os.environ.get("XIAOTU_GP_SPLIT_PRESYNC", "1") == "1":
+                    torch.cuda.synchronize(_dev)
                 _t0 = time.perf_counter() if _t_split else 0.0
-                try:
-                    _km = _gp_mod.kmajor_from_engine_shards(
-                        engine, _dev, hidden_size, _I, _E, int(self._group_k)
-                    )
-                except torch.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    _km = None
+                _side_ok = gp_side_stream_enabled()
+                if _side_ok:
+                    # Pre-allocate the persistent buffers on the MAIN stream, then
+                    # assemble on the side stream: the buffers outlive every layer
+                    # (they are cached by name in the backend), so allocating them
+                    # under the side stream would associate them with a stream they
+                    # are later read from only via events.
+                    try:
+                        _gp_mod.prealloc_fp8_buffers(_dev, _E, hidden_size, _I)
+                    except Exception:  # noqa: BLE001  (older backend module)
+                        _side_ok = False
+                if _side_ok:
+                    _side = _gp_side_stream(_dev)
+                    _dk = _gp_dev_key(_dev)
+                    _ev_prev = _GP_EVENTS.get(_dk)
+                    if _ev_prev is not None:
+                        # Do not overwrite buffers the previous layer's GEMM may
+                        # still be reading (it was enqueued on the main stream).
+                        _side.wait_event(_ev_prev)
+                    with torch.cuda.stream(_side):
+                        try:
+                            _km = _gp_mod.kmajor_from_engine_shards(
+                                engine, _dev, hidden_size, _I, _E, int(self._group_k))
+                        except torch.OutOfMemoryError:
+                            torch.cuda.empty_cache()
+                            _km = None
+                    _ev_ready = torch.cuda.Event()
+                    _ev_ready.record(_side)
+                    torch.cuda.current_stream(_dev).wait_event(_ev_ready)
+                else:
+                    try:
+                        _km = _gp_mod.kmajor_from_engine_shards(
+                            engine, _dev, hidden_size, _I, _E, int(self._group_k)
+                        )
+                    except torch.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        _km = None
                 if _km is None:
                     # 引擎没有分片(如 NOSHARD)⇒ 优雅退回 CPU(FP8 没有源张量兜底:
                     # 源张量此时可能已被释放,而分片是唯一保证在的副本)。
@@ -1438,6 +1508,12 @@ class _XiaotuExpertsMixin:
                     K=int(self.moe_config.experts_per_token),
                     device=_dev, swiglu_limit=_limit,
                 )
+                if _side_ok:
+                    # Publish "these buffers are free to be overwritten" for the
+                    # next layer's side-stream assembly.
+                    _ev = torch.cuda.Event()
+                    _ev.record(torch.cuda.current_stream(_dev))
+                    _GP_EVENTS[_gp_dev_key(_dev)] = _ev
                 if _t_split:
                     torch.cuda.synchronize(_dev)
                     print(f"[gp-fp8] layer={getattr(layer, 'layer_name', '?')} "
