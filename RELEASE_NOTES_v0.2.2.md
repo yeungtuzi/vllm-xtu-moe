@@ -152,7 +152,28 @@ M≥6 稳定快 17-20%,但 M=1 反而慢 13% ⇒ 分发时用 `M > 4` 闸门,**�
 * **主机内存**:FP8 GPU 路径复用引擎自有分片,**没有**第二份专家副本。
 * **显存**:GPU 侧缓冲为显存开销(装配缓冲 ~6.75 GiB,首层长 prefill 时惰性分配)。
 
-## 6. 复现
+## 6. 安装
+
+**v0.2.2 起首次附带 whl**(此前的版本只有源码):
+
+```
+vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl        # 4.65 MB
+sha256 aa07fc5d8a0b213bc5c20deb3bd302a12f6bc04d428a5cebb0ced809545affe2
+```
+
+```bash
+pip install ./vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl   # 需先装好 vLLM
+```
+
+* wheel **自带 6 个 ISA 变体**(scalar / avx2 / avx512_base / avx512_vnni / avx512_bf16 /
+  avx512_bf16_vbmi,g++-16 构建),导入时按 CPU 自动选最高可用 —— **不需要本地编译器,
+  也不再需要跑 `build_engine_variants.sh`**;
+* 约束:Python **3.12** + Linux **x86-64**(glibc ≥ 2.34);`.so` 依赖 `libcudart.so.12` 与
+  驱动(装了 vLLM/torch 的环境天然满足);vLLM 插件入口
+  `vllm.general_plugins → vllm_xiaotu_moe.hybrid_model:register` 已在 wheel 里注册;
+* 需要自定义内核开关或换编译器时,仍走源码路径(见 `docs/RUNBOOK.md` §2 方式 B)。
+
+## 7. 复现
 
 ```bash
 CXX=g++-16 PYTHON=$(which python) bash scripts/build_engine_variants.sh && pip install -e .

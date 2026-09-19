@@ -45,6 +45,25 @@ VLLM_USE_PRECOMPILED=1 pip install -e .  # 复用预编译算子,避免长时间
 
 ## 2. 安装 vllm-xtu-moe
 
+**方式 A(推荐,v0.2.2 起):直接装 whl,不需要本地编译器** —— GitHub Release 页面
+([`v0.2.2`](https://github.com/yeungtuzi/vllm-xtu-moe/releases/tag/v0.2.2))附带
+
+```
+vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl
+```
+
+```bash
+pip install ./vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl   # vLLM 需已安装
+```
+
+* wheel 里**已经打包好 6 个 ISA 变体**(`scalar/avx2/avx512_base/avx512_vnni/avx512_bf16/
+  avx512_bf16_vbmi`,g++-16 构建),运行时按 `/proc/cpuinfo` 自动选,所以省掉 2a/2a' 的构建;
+* 约束:**Python 3.12 + Linux x86-64**(glibc ≥ 2.34),且环境里要有 `libcudart.so.12`
+  (装了 vLLM/torch 的环境天然满足;`.so` 只依赖 CUDA runtime 与驱动);
+* 想改内核开关(2a' 里那些)或换编译器时,再走下面的源码方式。
+
+**方式 B:源码安装(需要构建引擎)**
+
 ```bash
 git clone https://github.com/yeungtuzi/vllm-xtu-moe.git
 cd vllm-xtu-moe
