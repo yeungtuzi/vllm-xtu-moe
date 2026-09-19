@@ -154,25 +154,20 @@ M≥6 稳定快 17-20%,但 M=1 反而慢 13% ⇒ 分发时用 `M > 4` 闸门,**�
 
 ## 6. 安装
 
-**PyPI**:`pip install xiaotu-moe`(= 0.2.2;该发行名沿用自引擎-only 的 0.1.0/0.11/0.12,
-本版起同一个发行里同时包含**插件包 `vllm_xiaotu_moe` + 引擎包 `xiaotu_moe`**)。
-> GitHub 仓库名是 `vllm-xtu-moe`,**PyPI 发行名是 `xiaotu-moe`**,两者不同名。
-> 旧版 0.11/0.12 已 **yank**(否则 pip 会因为 `0.12 > 0.2.2` 继续解析到旧版)。
+**本项目(发行名 `vllm-xtu-moe`)不发布到 PyPI。** 两种装法:
 
-**GitHub Release 也附带同一个 whl**:
+**(a) GitHub Release 附件**(推荐,不需要本地编译器):
 
 ```
-xiaotu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl          # 4.65 MB
+vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl        # 4.65 MB
 ```
-
-> 校验和见 Release 页面的 asset 摘要。**wheel 构建不是逐字节可复现的**(zip 里带时间戳),
-> 所以这里不固定 sha256 —— 换了构建机/时间就会变,但内容(6 个变体 + 包代码)一致。
 
 ```bash
-pip install xiaotu-moe                                                   # 从 PyPI
-# 或
-pip install ./xiaotu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl     # 从 Release 附件
+pip install ./vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl   # 需先装好 vLLM
 ```
+
+**(b) 源码安装**:`CXX=g++-16 PYTHON=$(which python) bash scripts/build_engine_variants.sh
+&& pip install -e .`(见 `docs/RUNBOOK.md` §2 方式 B)。
 
 * wheel **自带 6 个 ISA 变体**(scalar / avx2 / avx512_base / avx512_vnni / avx512_bf16 /
   avx512_bf16_vbmi,g++-16 构建),导入时按 CPU 自动选最高可用 —— **不需要本地编译器,
@@ -180,7 +175,14 @@ pip install ./xiaotu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl     # 从 R
 * 约束:Python **3.12** + Linux **x86-64**(glibc ≥ 2.34);`.so` 依赖 `libcudart.so.12` 与
   驱动(装了 vLLM/torch 的环境天然满足);vLLM 插件入口
   `vllm.general_plugins → vllm_xiaotu_moe.hybrid_model:register` 已在 wheel 里注册;
-* 需要自定义内核开关或换编译器时,仍走源码路径(见 `docs/RUNBOOK.md` §2 方式 B)。
+* **引擎包 `xiaotu_moe` 另有独立的 PyPI 发行名
+  [`xiaotu-moe`](https://pypi.org/project/xiaotu-moe/)**(engine-only,由引擎自身源码发布,
+  当前线 0.1.0/0.11/0.12)。本插件的 wheel **已把引擎一起打进去**,所以装本插件不需要它,
+  也**没有**在本版对它做任何上传或 yank;
+* 需要自定义内核开关或换编译器时,走源码路径。
+
+> 校验和见 Release 页面的 asset 摘要。**wheel 构建不是逐字节可复现的**(zip 里带时间戳),
+> 所以这里不固定 sha256。
 
 ## 7. 复现
 

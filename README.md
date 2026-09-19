@@ -154,9 +154,10 @@ bf16(两路 rms_rel 3.6e-3),**因此默认关闭**;`M=1` 的单流解码仍走�
 # 1) 主线 vLLM(本插件是插件,不需要 fork)
 pip install vllm==2.5.0
 
-# 2) 本插件 —— 二选一
-pip install xiaotu-moe            # (a) 从 PyPI 装:wheel 里已含 6 个 ISA 变体,无需编译器
-# 或者源码安装(需要本地编译器):
+# 2) 本插件(发行名 vllm-xtu-moe,**不发 PyPI**;二选一)
+# (a) 从 GitHub Release 附件装:wheel 里已含 6 个 ISA 变体,无需本地编译器
+pip install ./vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl
+# (b) 源码安装(需要本地编译器):
 # CXX=g++-16 PYTHON=$(which python) bash scripts/build_engine_variants.sh && pip install -e .
 
 # 3) 跑一个专家权重放不进显存的 MoE 模型

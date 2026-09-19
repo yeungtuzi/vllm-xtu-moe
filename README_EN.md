@@ -153,9 +153,10 @@ recipe are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 # 1) upstream vLLM (this project is a plugin, no fork needed)
 pip install vllm==2.5.0
 
-# 2) this plugin -- pick one
-pip install xiaotu-moe            # (a) from PyPI: the wheel already bundles all 6 ISA variants
-# or install from source (needs a local compiler):
+# 2) this plugin (distribution name vllm-xtu-moe, NOT on PyPI) -- pick one
+# (a) install the wheel attached to the GitHub Release (all 6 ISA variants included):
+pip install ./vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl
+# (b) or install from source (needs a local compiler):
 # CXX=g++-16 PYTHON=$(which python) bash scripts/build_engine_variants.sh && pip install -e .
 
 # 3) serve a MoE model whose experts do not fit in VRAM

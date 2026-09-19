@@ -106,8 +106,10 @@ PYTHON=$(which python) bash scripts/build_engine_variants.sh
 
 # 2b) 安装插件
 pip install -e .
-#    也可以 pip install xiaotu-moe(发布包已内含预编译引擎 .so,无需 2a)
-#    注意:PyPI 发行名是 **xiaotu-moe**,而 GitHub 仓库名是 vllm-xtu-moe —— 两者不同名。
+#    也可以直接装 GitHub Release 附件里的 whl(已内含预编译引擎 .so,无需 2a);
+#    本项目(发行名 vllm-xtu-moe)**不发布到 PyPI**。
+#    引擎包 xiaotu_moe 另有独立的 PyPI 发行名 `xiaotu-moe`(engine-only,由引擎自身源码
+#    发布);本插件的 wheel 已把引擎一起打进去,所以装本插件**不需要**再装它。
 ```
 
 **自检**:
