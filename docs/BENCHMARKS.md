@@ -185,8 +185,29 @@ GPTQ 检查点在引擎构造时一次性重排(`w13 [E, K/8, 2I] int32` → `[E
 * **纯解码 ≈ 22 tok/s**(C=1,`1/TPOT`),且 **TPOT 与上下文长度基本无关**
   (4096-token 的 TPOT 仍 46.4 ms);
 * 吞吐在 C≥2 就饱和、而 TPOT 反而升高 ⇒ 瓶颈是**每层引擎调用的延迟**,不是带宽;
-* **TTFT 由 CPU 预填充主导**(4096 token ≈ 29.3 s);GPU 预填充(R-VRAM 优先级 2)
-  尚未在 GLM 上开启,是下一步最明确的优化项。
+* **TTFT 由预填充主导**(4096 token ≈ 29.3 s,CPU 引擎)。
+
+**GPU 流式预填充(FP8)已接线并实测**(`gpu_prefill_fp8.py`,按引擎类别自动选择,
+无需开关)。同进程内切阈值、唯一 prompt(`scripts/probe_ttft.py`,UNIQUE=1):
+
+| chunk 口径 | CPU TTFT | GPU(FP8)TTFT | 加速 |
+|---|---|---|---|
+| 3860-token prompt(被切成 2176 + 1684) | 26.60 s | **25.38 s** | 0.95× |
+
+每层分项:`asm=207 ms`(权重 H2D 3.62 GB/rank)+ `kernels=23 ms`(GPU MoE,
+比 CPU 引擎快约 10×)。
+
+**为什么只有 5%**:GLM-5.3 的 KDA(mamba-like)state 只在 **block_size = 2176**
+边界上写,调度器因此把预填充 chunk 钉死在 2176 token
+(`v1/core/sched/scheduler.py` 的 `aligned_end = end // block_size * block_size`),
+而 GPU 路径的每层权重 DMA 是**固定成本**,盈亏平衡点约 **1.9k token/chunk**。
+⇒ 同一个后端在没有 state 分页的模型上(DeepSeek-V4.1:§3 表 ~7K chunk)是 **2.8×**;
+GLM-5.3 想拿到更多,需要把装配与 attention 重叠(目标:207 → 135 ms 的 1D DMA 地板)。
+
+正确性:GPU 装配**逐字节相同**(`scripts/test_gpu_prefill_fp8_assembly.py`)、
+层输出 vs CPU 引擎 rms_rel **4.43e-3**(`test_gpu_prefill_fp8_vs_cpu.py`)、
+真实服务 4835-token needle 检索**完全命中**。
+
 
 稳定性/数值:贪心同一 prompt 三次**逐字节相同**;连续 24 请求 **24/24 成功**;
 层内真实权重 RMS 相对误差 **3.6e-5 ~ 3.1e-4**(见 `MODEL_GUIDES.md` §2)。

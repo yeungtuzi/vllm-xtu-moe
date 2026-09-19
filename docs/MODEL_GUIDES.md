@@ -244,9 +244,24 @@ GLM 的模型上限是 1M,但本机可行上限约 **61.5 万 token**。要上 1
 **读法**:M≥28 后每层的"专家-token 吞吐"饱和在 **~33k/s** ⇒ 预填充是**吞吐受限**,
 与并发无关。`M = B/36`,所以 4096-token 的 chunk 每层 M≈114 ⇒ 42 层约 40 s 量级,
 与实测 **TTFT 29.3 s**(4096-in)同量级。
-⇒ 想把长 prompt 的 TTFT 压下来,**必须让预填充走 GPU**:而现有的 GPU 预填充路径
-(`vllm_xiaotu_moe/gpu_prefill.py`)只实现了 **MXFP4** 流式内核,GLM 的 **FP8** 需要新的
-GPU 内核 —— 这是下一轮最大的一块工作。
+
+**GPU 流式预填充(GLM 的 FP8 版本已接线)**:`gpu_prefill_fp8.py` 是 `gpu_prefill.py`
+的 FP8 孪生(e4m3 单字节 + fp32 block-128),按引擎类别自动选择后端,无需开关。
+实测(GLM-5.3-Flash,TP=2,`MBT=8192`):
+
+| | 每层 | 说明 |
+|---|---|---|
+| 权重装配(H2D 3.62 GB/rank) | **207 ms** | 占预填充 wall time 的 ~90% |
+| GPU MoE 内核(gate_up + down) | **23 ms** | 比 CPU 引擎快约 10× |
+| 非 MoE(attention/dense/采样) | — | 反推 ~4.4 s / 2k token |
+
+端到端(3860-token prompt,同进程切阈值):**CPU 26.60 s → GPU 25.38 s(0.95×)**。
+**收益之所以小,是 GLM-5.3 的结构决定的**:它的 KDA(mamba-like)state 只在
+**block_size = 2176** 的边界上写,调度器因此把预填充 chunk 钉在 2176 token
+(`scheduler.py` 的 `aligned_end = end // block_size * block_size`),
+而 GPU 路径每层的权重 DMA 是**固定成本**,盈亏平衡点约 1.9k token/chunk。
+⇒ 对没有 state 分页的模型(如 DeepSeek-V4 系列)同一个后端能吃满 MBT,收益是 1.5-2×;
+对 GLM-5.3 想要更多,需要把装配与 attention 重叠(把 207 ms 压向 135 ms 的 1D DMA 地板)。
 
 ### 2.6 数值与稳定性
 
