@@ -158,8 +158,10 @@ M≥6 稳定快 17-20%,但 M=1 反而慢 13% ⇒ 分发时用 `M > 4` 闸门,**�
 
 ```
 vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl        # 4.65 MB
-sha256 aa07fc5d8a0b213bc5c20deb3bd302a12f6bc04d428a5cebb0ced809545affe2
 ```
+
+> 校验和见 Release 页面的 asset 摘要。**wheel 构建不是逐字节可复现的**(zip 里带时间戳),
+> 所以这里不固定 sha256 —— 换了构建机/时间就会变,但内容(6 个变体 + 包代码)一致。
 
 ```bash
 pip install ./vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl   # 需先装好 vLLM
