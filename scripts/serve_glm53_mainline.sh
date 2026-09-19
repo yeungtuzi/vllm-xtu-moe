@@ -28,7 +28,16 @@ TAG="${TAG:-glm53_$(date +%m%d_%H%M%S)}"
 PORT="${PORT:-8070}"          # 生产服务端口(2026-09-19 起从 8073 迁到 8070)
 GPUS="${GPUS:-0,1}"
 TP="${TP:-2}"
-GPU_UTIL="${GPU_UTIL:-0.90}"
+# 【§601,2026-09-19】0.90 → **0.85**。原因是一次真实生产事故:util 0.90 时启动后只剩
+# ~6.8 GiB 空闲,而 GPU 预填充的 FP8 staging 缓冲是**进程级持久**的(~4.2 GiB/rank),
+# 它吃掉的是 vLLM 拿来定 KV 的那份"激活峰预留"(启动日志 `peak activation: 2.9 GiB`)
+# ⇒ 28,553-token 的真实请求在 `chunk_kda_with_fused_gate` 里只差 52 MiB 就把
+# **整个服务打崩**(GPU 0/1 各剩 45 MiB,见 logs/glm53_prod.log 11:10:56)。
+# 0.85 让"staging + 激活预留"有 ~1 GiB 余量;预填充预检(见 gpu_prefill.fits_device)
+# 现在也把这份激活预留算进去,腾不出来就**优雅退回 CPU 预填充**而不是崩服务。
+# 代价:KV 池 988,081 → ~814,000 token(2 路 256K 仍占 64%,3.1x 并发)。
+# 要换回更大的 KV 池,先量 `GPU prefill ACTIVE ... slack` 那行的余量再动。
+GPU_UTIL="${GPU_UTIL:-0.85}"
 # Context length. The 4096 this script used to default to was a *test* setting, not a
 # hardware limit: measured on 2xA100-40GB at util 0.88 (bf16 KV, TP=2), the KV pool and
 # the largest max-model-len that starts are
@@ -148,8 +157,13 @@ echo "[glm53] tool-call-parser=${TOOL_PARSER:-off} reasoning-parser=${REASONING_
 echo "[glm53] prompt-tokens-details=${PROMPT_TOKENS_DETAILS} (cached_tokens reporting)"
 echo "[glm53] log=$LOG"
 
+# 【§601】PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True —— 事故现场是"PyTorch 已分配
+# 37.90 GiB、另有 **695 MiB reserved-but-unallocated**",PyTorch 自己的 OOM 提示就是这一项。
+# 本服务没有 KV connector,所以 vLLM 那条 "kv connector 与 expandable_segments 不兼容" 的
+# 检查不适用。想要旧行为就显式 `PYTORCH_CUDA_ALLOC_CONF=` 传空。
 nohup env \
   HF_HUB_OFFLINE=1 \
+  PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
   VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}" \
   VLLM_HANDSHAKE_TIMEOUT_MINS="${VLLM_HANDSHAKE_TIMEOUT_MINS:-60}" \
   VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-3600}" \

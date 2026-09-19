@@ -863,18 +863,54 @@ def staging_bytes(n_experts: int, hidden: int, inter: int, group_k: int = 32,
     return slots + raw + tmp
 
 
-def fits_device(need_bytes: int, device, margin: float = 1.10):
+def activation_reserve_bytes() -> int:
+    """VRAM the streaming path must **leave for vLLM's own activation peak**.
+
+    【§601,2026-09-19 生产事故】staging 缓冲是**进程级持久**的(`_buf`/`_BUF_CACHE` 按名字
+    缓存,永不释放),而 vLLM 是拿"weights + 2.9 GiB 激活峰 + CUDA graph"去**定 KV 大小**的:
+    一次性吃掉 staging 之后,那份激活峰就没了 —— 于是长 prefill 的 attention/KDA 工作区
+    必然 OOM。实测(8070 生产服务,util 0.90,GLM-5.3-Flash,28,553-token prompt):
+    `GPU prefill` 的预检放行、4 GiB 级 staging 分配成功,随后 `chunk_kda_with_fused_gate`
+    申请 52 MiB 失败,GPU 0/1 各只剩 45 MiB 空闲(PyTorch 已分配 37.90 GiB、另有
+    695 MiB reserved-unallocated),**服务整进程崩溃**。
+
+    ⇒ 预检必须比"staging 峰值 × margin"更严:还要额外留出这份激活预算。默认 3.0 GiB
+    (与启动日志里 `peak activation: 2.9 GiB` 同量级),可用
+    `XIAOTU_GP_ACT_RESERVE_GIB` 覆盖;置 0 恢复旧行为(只比 staging,不建议)。
+    """
+    try:
+        gib = float(os.environ.get("XIAOTU_GP_ACT_RESERVE_GIB", "3.0"))
+    except (TypeError, ValueError):
+        gib = 3.0
+    return int(max(0.0, gib) * 2**30)
+
+
+def required_bytes(need_bytes: int, margin: float = 1.10,
+                   reserve_bytes: int | None = None) -> int:
+    """Free VRAM the preflight demands for `need_bytes` of staging."""
+    if reserve_bytes is None:
+        reserve_bytes = activation_reserve_bytes()
+    return int(int(need_bytes) * margin) + int(reserve_bytes)
+
+
+def fits_device(need_bytes: int, device, margin: float = 1.10,
+                reserve_bytes: int | None = None):
     """(ok, free_bytes). 把 staging 的**真实峰值**与**空闲**显存比。
 
     【§600】margin 从 1.25 收到 **1.10**:`need_bytes` 现在是诚实口径
     (槽 + raw + 单份暂存 = ~10.8 GiB,原来只有槽的 6.72),再乘 1.25 会把
-    "实测能跑"的配置(如 free=12.95)误判为不够。1.10 覆盖碎片/激活抖动。
+    "实测能跑"的配置(如 free=12.95)误判为不够。1.10 覆盖碎片抖动。
+
+    【§601】但 1.10 仍然**不够**:它只覆盖"分配 staging 的瞬间够",没覆盖"分配完之后
+    还要跑完这次 forward"。持久 staging 会把 vLLM 预留的激活峰吃掉 ⇒ 再加一份显式的
+    {@link activation_reserve_bytes}(默认 3.0 GiB)。预检不通过时优雅退回 CPU 预填充
+    (慢但绝不会崩服务),这也是为什么这里的口径要偏保守。
     """
     try:
         free, _total = torch.cuda.mem_get_info(torch.device(device))
     except Exception:  # noqa: BLE001
         return True, -1        # cannot tell -> let it try (still guarded by try/except)
-    return (free >= int(need_bytes * margin)), int(free)
+    return (free >= required_bytes(need_bytes, margin, reserve_bytes)), int(free)
 
 
 # 复用中间缓冲:实测一次性函数 789 ms/层,而各段相加只有 424 ms —— 差额 ~365 ms

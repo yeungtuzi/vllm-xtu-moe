@@ -157,6 +157,9 @@ _LAYER_IDX_RE = __import__("re").compile(r"layers\.(\d+)\.")
 
 # 【§597】设备级 GPU 预填充判定(第一个模块的决定即为全局,防混合模式)
 _GPF_OK: dict = {}
+# 【§601】判定时的数字(staging / 要求空闲 / 实际空闲),用于把预检结果打进 ACTIVE 日志:
+# "GPU prefill ACTIVE" 只说结论,事故复盘时最需要的恰好是它距离阈值有多远。
+_GPF_INFO: dict = {}
 _RELEASE_MISSES = 0   # 见 _release_source_weights:静默失败的可观测性
 _RELEASE_FILE = "/tmp/xiaotu_release_source"
 
@@ -1487,17 +1490,25 @@ class _XiaotuExpertsMixin:
             if _ok is None:
                 _ok, _free = fits_device(_need, _dev)
                 _GPF_OK[_dev.index if hasattr(_dev, "index") else None] = bool(_ok)
+                _GPF_INFO[_dev.index if hasattr(_dev, "index") else None] = (
+                    int(_need), int(_free))
                 if not _ok:
+                    from vllm_xiaotu_moe.gpu_prefill import (
+                        activation_reserve_bytes, required_bytes)
                     print(
-                        f"[vllm-xtu-moe] GPU prefill DISABLED for this layer -> staying "
+                        f"[vllm-xtu-moe] GPU prefill DISABLED for this process -> staying "
                         f"on CPU (slower but correct).\n"
                         f"    per-layer staging ~{_need / 2**30:.1f} GiB; preflight wants "
-                        f"~{_need * 1.25 / 2**30:.1f} GiB free VRAM (25% margin), "
-                        f"only {_free / 2**30:.1f} GiB is free.\n"
-                        f"    Options: --tensor-parallel-size 2 together with "
-                        f"XIAOTU_MOE_RANK_SPLIT=0 (halves staging AND keeps the shard "
-                        f"path), a larger-VRAM GPU, or a lower "
-                        f"--gpu-memory-utilization.\n"
+                        f"~{required_bytes(_need) / 2**30:.1f} GiB free VRAM "
+                        f"(staging x1.10 + {activation_reserve_bytes() / 2**30:.1f} GiB "
+                        f"activation reserve), only {_free / 2**30:.1f} GiB is free.\n"
+                        f"    The reserve protects vLLM's own activation peak: the staging "
+                        f"buffers are process-persistent, so spending that peak makes a "
+                        f"long prefill OOM *after* a passing preflight (NOTES §601).\n"
+                        f"    Options: a lower --gpu-memory-utilization "
+                        f"(scripts/serve_glm53_mainline.sh defaults to 0.85 for this), "
+                        f"XIAOTU_GP_ACT_RESERVE_GIB=<smaller> to trade safety for reach, "
+                        f"or a larger-VRAM GPU.\n"
                         f"    VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0 silences this.",
                         flush=True,
                     )
@@ -1767,9 +1778,20 @@ class _XiaotuExpertsMixin:
                 )
             if not getattr(self, "_gpu_pf_dbg", False):
                 self._gpu_pf_dbg = True
+                _info = _GPF_INFO.get(_dev.index if hasattr(_dev, "index") else None)
+                _tail = ""
+                if _info is not None:
+                    from vllm_xiaotu_moe.gpu_prefill import required_bytes
+                    _need_i, _free_i = _info
+                    _req = required_bytes(_need_i)
+                    _tail = (
+                        f"; preflight: staging ~{_need_i / 2**30:.2f} GiB, "
+                        f"required >= {_req / 2**30:.2f} GiB free, "
+                        f"had {_free_i / 2**30:.2f} GiB "
+                        f"(slack {(_free_i - _req) / 2**30:+.2f} GiB)")
                 print(
                     f"[vllm-xtu-moe] GPU prefill ACTIVE: first {qlen} tokens >= "
-                    f"threshold {_gp_min}; weights from {_pf_reason}",
+                    f"threshold {_gp_min}; weights from {_pf_reason}{_tail}",
                     flush=True,
                 )
         _lt_t1 = time.perf_counter() if _LT_ON else 0.0
