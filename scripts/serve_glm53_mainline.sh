@@ -70,6 +70,21 @@ XTU_ENV_FILE="${XTU_ENV_FILE_OVERRIDE:-$OUTDIR/$TAG.envfile}"
   [ -n "${XIAOTU_MOE_NOSHARD:-}" ] && echo "XIAOTU_MOE_NOSHARD=$XIAOTU_MOE_NOSHARD"
   [ -n "${XIAOTU_MOE_GEMM_FP8_SCALE:-}" ] && echo "XIAOTU_MOE_GEMM_FP8_SCALE=$XIAOTU_MOE_GEMM_FP8_SCALE"
 } > "$XTU_ENV_FILE"
+# Pass through every other XIAOTU_*/VLLM_XIAOTU_* variable from the caller's
+# environment. `XIAOTU_ENV_FILE` is set explicitly below, so the plugin takes the
+# file as authoritative and *overwrites* os.environ with it -- anything not listed
+# above is therefore dropped on the floor for the EngineCore child. That silently
+# broke runtime A/Bs: exporting VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE here and
+# expecting the worker to see it measured the same path twice (the same class of
+# bug the plugin's own comment at `gpu_prefill_min_tokens` warns about).
+while IFS='=' read -r _k _v; do
+  case "$_k" in
+    XIAOTU_ENV_FILE) continue ;;
+    XIAOTU_*|VLLM_XIAOTU_*) ;;
+    *) continue ;;
+  esac
+  grep -q "^${_k}=" "$XTU_ENV_FILE" 2>/dev/null || echo "${_k}=${_v}"
+done < <(env) >> "$XTU_ENV_FILE"
 export XIAOTU_ENV_FILE="$XTU_ENV_FILE"
 echo "[glm53] env-bridge -> $XTU_ENV_FILE"
 

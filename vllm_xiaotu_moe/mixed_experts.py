@@ -1359,6 +1359,8 @@ class _XiaotuExpertsMixin:
                 # ---- FP8: 自己装配 + 自己算(持久命名缓冲,不走 slot) ----------
                 # `group_k` 对 FP8 无意义(块固定 128x128),而装配目标用的是模块内
                 # `_buf` 的持久命名缓冲,所以没有 slot 需要填,也就没有 ready 事件。
+                _t_split = os.environ.get("XIAOTU_GP_SPLIT") == "1"
+                _t0 = time.perf_counter() if _t_split else 0.0
                 try:
                     _km = _gp_mod.kmajor_from_engine_shards(
                         engine, _dev, hidden_size, _I, _E, int(self._group_k)
@@ -1371,6 +1373,14 @@ class _XiaotuExpertsMixin:
                     # 源张量此时可能已被释放,而分片是唯一保证在的副本)。
                     _gpu_pf = False
                     _pf_reason = "engine has no shards (fp8)"
+                elif _t_split:
+                    # 装配(DMA + copy + K-major 转置)与内核分开计时:预填充加速是否
+                    # 成立,取决于"装配能否与上一层的内核重叠",所以这两半必须可观测。
+                    torch.cuda.synchronize(_dev)
+                    print(f"[gp-fp8] layer={getattr(layer, 'layer_name', '?')} "
+                          f"qlen={qlen} asm={(time.perf_counter() - _t0) * 1e3:.1f}ms "
+                          f"free={torch.cuda.mem_get_info(_dev)[0] / 2**30:.2f}GiB",
+                          flush=True)
             elif _gpu_pf:
                 try:
                     import time as _time
@@ -1421,12 +1431,17 @@ class _XiaotuExpertsMixin:
             if _is_fp8 and _km is not None:
                 # FP8:已经在上面的分支里装配好了,直接算(输出 fp32,调用方转 dtype)。
                 _limit = float(getattr(self, "swiglu_limit", 0.0) or 0.0)
+                _tk = time.perf_counter() if _t_split else 0.0
                 out = _gp_mod.gpu_moe_layer(
                     h_bf16, ids_i32, wts_f32, _km[0], _km[1], _km[2], _km[3],
                     H=hidden_size, I=_I,
                     K=int(self.moe_config.experts_per_token),
                     device=_dev, swiglu_limit=_limit,
                 )
+                if _t_split:
+                    torch.cuda.synchronize(_dev)
+                    print(f"[gp-fp8] layer={getattr(layer, 'layer_name', '?')} "
+                          f"kernels={(time.perf_counter() - _tk) * 1e3:.1f}ms", flush=True)
             elif _km is not None:
                 # 槽来自 `slot_for_shapes`(环形复用);这里只补 ready 事件。
                 _slot.ready = torch.cuda.Event()

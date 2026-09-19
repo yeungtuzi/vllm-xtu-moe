@@ -970,6 +970,35 @@ static void bind_moe_class(py::module& m, const char* name) {
             }
             return n;
         }, py::arg("which"), py::arg("node"), py::arg("dst"), py::arg("stream"))
+        // Pitched (2-D) variant: one node's shard is a contiguous run of `height`
+        // rows of `width` bytes, and the target holds the same rows at a larger
+        // pitch -- exactly `cudaMemcpy2DAsync`. Host-side assembly can then DMA the
+        // weights **straight into** their strided destination instead of bouncing
+        // through a reused staging buffer and doing a strided device copy after.
+        // Two measured reasons that matters for prefill: the strided copy reaches
+        // only ~84 GB/s vs ~1361 GB/s contiguous, and one staging buffer per weight
+        // block serializes every DMA in the layer behind the previous copy.
+        // `src_off` selects the gate vs up half of the w13 shard.
+        .def("copy_hostbuf_to_device_2d",
+             [](MOE& self, int which, int node, size_t src_off, uintptr_t dst,
+                size_t dpitch, size_t spitch, size_t width, size_t height,
+                uintptr_t stream) -> size_t {
+            const void* src = self.host_wbuf(which, node);
+            if (!src || !height || !width) return 0;
+            const char* s = static_cast<const char*>(src) + src_off;
+            cudaError_t rc = cudaMemcpy2DAsync(
+                reinterpret_cast<void*>(dst), dpitch, s, spitch, width, height,
+                cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream));
+            if (rc != cudaSuccess) {
+                fprintf(stderr, "[shard-dma2d] cudaMemcpy2DAsync failed: %s "
+                                "(which=%d node=%d dp=%zu sp=%zu w=%zu h=%zu)\n",
+                        cudaGetErrorString(rc), which, node, dpitch, spitch, width, height);
+                return 0;
+            }
+            return width * height;
+        }, py::arg("which"), py::arg("node"), py::arg("src_off"), py::arg("dst"),
+           py::arg("dpitch"), py::arg("spitch"), py::arg("width"), py::arg("height"),
+           py::arg("stream"))
         .def("cpu_prefill", [](MOE& self,
                               int qlen, int top_k,
                               py::object expert_ids, py::object weights,

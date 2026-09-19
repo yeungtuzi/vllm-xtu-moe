@@ -22,6 +22,8 @@ engine does: gate clamped on the upper side only, up clamped on both sides.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -34,6 +36,8 @@ from vllm_xiaotu_moe.gpu_prefill import (
     _build_segmentation,
     _dma_hostbuf,
     _kmajor_bytes,
+    _pin_engine_hostbufs,
+    _stage_mark,
 )
 
 FP8_BLOCK = 128
@@ -45,6 +49,17 @@ FP8_BLOCK = 128
 # in-place transpose that corrupts itself. (w2 escaped it only because
 # [E, H, I] != [E, I, H].) Names keep the buffers distinct.
 _FP8_BUF: dict = {}
+
+
+def _dma2d_available(engine) -> bool:
+    """Whether the engine exposes the pitched 2-D shard DMA (binding >= 2026-09-19).
+
+    Cached per engine class because an installed .so built before that commit would
+    otherwise make every layer take the slow staging path silently.
+    """
+    if not hasattr(engine, "copy_hostbuf_to_device_2d"):
+        return False
+    return os.environ.get("XIAOTU_GPF_DMA2D", "1") != "0"
 
 
 def _buf(name: str, shape, device, dtype=torch.uint8):
@@ -215,37 +230,77 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
     ns = int(geo["ns"])
     if ns < 2 or not geo["w13_node_bytes"] or not geo["w2_node_bytes"]:
         return None
+    # Page-lock the engine's shards in place before the first DMA. They are
+    # mmap'd/numa_alloc_onnode memory, i.e. pageable, and pageable H2D measured
+    # 16.5 GB/s here vs 26.85 GB/s pinned -- the assembly is 91% of the FP8
+    # prefill wall time, so this is the single biggest lever. Idempotent; it
+    # locks existing pages and copies nothing.
+    _pin_engine_hostbufs(engine)
     H, I, E = int(hidden), int(inter), int(n_experts)
     b = FP8_BLOCK
 
-    # Assemble the canonical [E, 2I, H] / [E, H, I] row layout; each node's gate
-    # (resp. up) block is a contiguous cbytes run that maps to a contiguous row
-    # range, so each is a plain copy_ (see the MXFP4 version's NOTES §466).
+    # Assemble the canonical [E, 2I, H] / [E, H, I] row layout. Each node's shard is
+    # a contiguous run of crows rows of `H` (resp. `I`) bytes that maps onto a row
+    # range of the canonical layout at a larger pitch, i.e. a plain 2-D copy. We do
+    # it with `cudaMemcpy2DAsync` **straight into the destination** rather than
+    # DMA-to-staging + strided `copy_`: the strided form measured ~84 GB/s against
+    # ~1361 GB/s contiguous, and (worse) one staging buffer per weight block forced
+    # every DMA in the layer to wait for the previous copy.
+    import time as _time
+
+    _t_dma = _time.perf_counter()
     w13_raw = _buf("raw13", (E, 2 * I, H), device)
     c13 = int(geo["w13_cbytes"])
     cr13 = int(geo["w13_crows"])
-    for n in range(ns):
-        buf = _dma_hostbuf(engine, 0, n, int(geo["w13_node_bytes"]), device)
-        blk = buf.view(E, 2, c13)
-        c0 = n * cr13
-        w13_raw[:, c0:c0 + cr13, :].copy_(blk[:, 0, :].reshape(E, cr13, H))
-        w13_raw[:, I + c0:I + c0 + cr13, :].copy_(blk[:, 1, :].reshape(E, cr13, H))
-        del buf, blk
-
     w2_raw = _buf("raw2", (E, H, I), device)
     c2 = int(geo["w2_cbytes"])
     cr2 = int(geo["w2_crows"])
-    for n in range(ns):
-        buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
-        c0 = n * cr2
-        w2_raw[:, c0:c0 + cr2, :].copy_(buf.view(E, cr2, I))
-        del buf
+    _dma2d = _dma2d_available(engine)
+    if _dma2d:
+        stream = torch.cuda.current_stream(device).cuda_stream
+        p13 = w13_raw.data_ptr()
+        p2 = w2_raw.data_ptr()
+        for n in range(ns):
+            c0 = n * cr13
+            # gate rows [c0, c0+cr13) then up rows [I+c0, I+c0+cr13) of [E, 2I, H].
+            for _off, _row in ((0, c0), (c13, I + c0)):
+                got = engine.copy_hostbuf_to_device_2d(
+                    0, n, _off, p13 + _row * H, 2 * I * H, cr13 * H, cr13 * H, E, stream)
+                if int(got) != cr13 * H * E:
+                    raise RuntimeError(
+                        f"gpu-prefill: 2-D shard DMA failed (w13 node={n} off={_off}: "
+                        f"{got}/{cr13 * H * E} bytes)")
+        for n in range(ns):
+            c0 = n * cr2
+            got = engine.copy_hostbuf_to_device_2d(
+                1, n, 0, p2 + c0 * I, H * I, cr2 * I, cr2 * I, E, stream)
+            if int(got) != cr2 * I * E:
+                raise RuntimeError(
+                    f"gpu-prefill: 2-D shard DMA failed (w2 node={n}: "
+                    f"{got}/{cr2 * I * E} bytes)")
+    else:
+        for n in range(ns):
+            buf = _dma_hostbuf(engine, 0, n, int(geo["w13_node_bytes"]), device)
+            blk = buf.view(E, 2, c13)
+            c0 = n * cr13
+            w13_raw[:, c0:c0 + cr13, :].copy_(blk[:, 0, :].reshape(E, cr13, H))
+            w13_raw[:, I + c0:I + c0 + cr13, :].copy_(blk[:, 1, :].reshape(E, cr13, H))
+            del buf, blk
+        for n in range(ns):
+            buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
+            c0 = n * cr2
+            w2_raw[:, c0:c0 + cr2, :].copy_(buf.view(E, cr2, I))
+            del buf
 
     # Scales are a single full host copy (not sharded): [E, N/128, K/128] fp32.
     s13_raw = (_dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device)
                .view(torch.float32).view(E, (2 * I) // b, H // b))
     s2_raw = (_dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device)
               .view(torch.float32).view(E, H // b, I // b))
+    # Up to here the DMA launches and the strided assembly copies are all queued on
+    # one stream, so a single sync closes them out together; time the K-major
+    # transpose separately (it is GPU-only, no DMA).
+    _t_dma_end = _stage_mark(_t_dma, "dma")
     s13t = s13_raw.transpose(1, 2).contiguous()      # [E, H/128, 2I/128]
     s2t = s2_raw.transpose(1, 2).contiguous()        # [E, I/128, H/128]
 
@@ -258,6 +313,7 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
         # safe here because assembly and GEMM are strictly ordered on one stream.
         w13t = _kmajor_bytes(w13_raw, _buf("km13", (E, H, 2 * I), device))
         w2t = _kmajor_bytes(w2_raw, _buf("km2", (E, I, H), device))
+    _stage_mark(_t_dma_end, "tr")
     return w13t, s13t, w2t, s2t
 
 
