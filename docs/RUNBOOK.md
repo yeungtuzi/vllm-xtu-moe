@@ -166,23 +166,29 @@ xiaotu_moe variant = _avx512_bf16
 要求空闲显存  >=  staging 峰值 × 1.10  +  XIAOTU_GP_ACT_RESERVE_GIB(默认 3.0 GiB)
 ```
 
-* **staging 有多大**:FP8 路径(GLM-5.3、TP=2、每 rank)=
-  `2×(w13+w2+s13+s2) + raw + 单份 DMA 暂存` ≈ **4.2 GiB**;这些 `_buf` **按名字缓存、进程内永不释放**。
+* **staging 有多大**:FP8 路径(GLM-5.3、TP=2、每 rank、`ns=4`)=
+  `2×(w13+w2+s13+s2) + raw + 单份 DMA 暂存` = **7.59 GiB**(启动日志里的权威数字:
+  `GPU prefill ACTIVE ... preflight: staging ~7.59 GiB`);这些 `_buf` **按名字缓存、进程内永不释放**。
+  注意 `E` 是**每 rank 的 288 个专家**(不是 144):`fp8_staging_bytes(288,4096,1024,ns=4)`;
+  按 144 算是 3.7 GiB,**少一倍**。
 * **为什么要那 3.0 GiB**:vLLM 是拿 `util×总显存 − (权重 + **激活峰** + CUDA graph)` 去**定 KV 大小**的
   (启动日志里 `peak activation: 2.9 GiB`)—— staging 一进场,吃的正是这份激活峰。只比
   "分配 staging 的瞬间够不够",就是**预检通过、跑起来 OOM**。
 * **事故现场(2026-09-19 11:10:56,util 0.90,28,553-token 的真实 DSH 请求)**:
-  旧口径只要求 `staging×1.10 = 4.64 GiB` 空闲即放行;4.2 GiB staging 进场后只剩 ~2.5 GiB 给激活,
-  `chunk_kda_with_fused_gate` 申请 52 MiB 失败,GPU 0/1 各剩 45 MiB(另一份报错现场是
+  `chunk_kda_with_fused_gate` 申请 52 MiB 失败,GPU 0/1 各剩 45 MiB(现场还有
   PyTorch 已分配 37.90 GiB + **695 MiB reserved-unallocated**),**两个 worker 一起崩、服务退出**
-  (`logs/glm53_prod.log`)。请求本身只有 6528 token 的 prefill chunk,别无异常。
+  (`logs/glm53_prod.log`)。请求本身只有 6528 token 的 prefill chunk,别无异常 ——
+  7.59 GiB 持久 staging + 激活峰在 util 0.90 下本来就**装不下**。
 * **现在会怎样**:预检不过 ⇒ 打印 `GPU prefill DISABLED ...` 并**优雅退回 CPU 预填充**(慢,但绝不崩);
   通过时 `GPU prefill ACTIVE ...` 会带上四个数:
   `staging ~X GiB, required >= Y GiB free, had Z GiB (slack +W GiB)`
   —— **以后调 util 就看这一行的 slack**,不要凭感觉。
-* **生产默认因此从 util 0.90 降到 0.85**(KV 池 988,081 → 814,336 token;2 路 256K 仍只占 64%),
-  并加 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 治那份 695 MiB 碎片
+* **生产默认因此从 util 0.90 降到 0.85**(实测 KV 池 988,081 → **971,949** token,只掉 1.6%;
+  2 路 256K 占 54%),并加 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 治那份 695 MiB 碎片
   (本服务没有 KV connector,不触发 vLLM 对该 env 的兼容性报错)。要回 0.90 请先确认 slack 够。
+* **验收(已在 8070 实跑)**:32,077-token 真实长请求(**TTFT 108.4 s**)、两路并发
+  (14,084 + 15,423 token)全部跑通、零 OOM;4096/64 C=1 基准 22,650 ms / 2.50 tok/s
+  (旧 util 0.90:22,764 ms / 2.49)—— 换配置**没有性能回退**。
 
 ### 3.3 观测 / 调试(默认关闭)
 
