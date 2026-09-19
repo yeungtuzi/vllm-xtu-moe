@@ -225,22 +225,71 @@ REASONING_PARSER=glm47   -> --reasoning-parser glm47
 `reasoning_effort`** 合并进 `chat_template_kwargs` 再渲染模板(模板不认识的变量会被
 `resolve_chat_template_kwargs` 过滤掉),所以服务端**只需上面两个 parser 开关**,不需要别的参数。
 
-**客户端侧(以 DSH 为例)**:UI 里的思考等级来自客户端自己的模型能力声明,服务端无法替代。
-DSH(`~/.dsh/settings.yaml`)的模型条目需要声明:
+**客户端侧(以 DSH 为例)**:UI 里的思考等级来自**客户端自己的模型能力声明**,服务端无法替代。
+为什么连官方 API 都不用配、我们这条 route 却必须显式声明(2026-09-19 逐行核实):
+
+| 路径 | 能力从哪来 | 要不要写配置 |
+|---|---|---|
+| 官方 DeepSeek(`llm-deepseek`) | 插件里**写死**:`modelInfoFor()` 直接返回 `reasoning:{efforts:[off,low,high,max]}` | 不用 |
+| pi-ai 目录里的 provider(如 `zai`) | pi-ai 自带目录:`providers/data/zai.json` 的 `glm-5.3-flash` 就带 `reasoning:true` + `thinkingLevelMap {off:null,low:low,high:high,max:max}` | 不用 |
+| **我们的 `epyc-a100-server`** | 自定义 route:**pi-ai 目录里没有这条 route,也不存在任何"探测端点能力"的逻辑** ⇒ `base?.reasoning ?? false` = **false** | **必须写** |
+
+DSH 里这个字段叫 **`reasoningEfforts`**(`~/.dsh/settings.yaml`,`llm-pi-ai.providers.<route>.models[]`):
 
 ```yaml
 models:
   - id: GLM-5.3-Flash
+    name: GLM-5.3-Flash
     contextWindow: 262144
-    reasoning: true
-    thinkingLevelMap:
-      { "off": null, minimal: null, low: low, medium: null, high: high, xhigh: null, max: max }
+    # key = UI 里可选档位;value = 真正发给 API 的拼写;只有 off 允许留空。
+    reasoningEfforts: { low: low, high: high, max: max }
+    # ⚠️ 必须一起钉住这两项,理由见下面两条。
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: openai }
 ```
 
-* 只把 `low/high/max` 映射成非 null ⇒ UI 只给这三档(与模型能力一致);
-* **`off` 必须写成带引号的 `"off"`** —— 裸 `off` 会被 YAML 解析成布尔 `false`,DSH 就找不到这一档
-  (踩过一次:解析出来是 `{"false": null}`);
-* 该文件改完需要**重启 DSH** 才生效。
+⚠️ **`supportsDeveloperRole: false` 不是可选项**(2026-09-19 实测发现):自定义 route 的 baseURL
+检测会给 `supportsDeveloperRole: true`,而 pi-ai 只在 **reasoning 模型**上用它
+(`openai-completions.js:910` `useDeveloperRole = model.reasoning && compat.supportsDeveloperRole`)
+⇒ **一旦开了思考等级,system 消息的 role 就变成 `developer`**。GLM 的 `chat_template.jinja`
+只认 `user/assistant/tool/system`(system 在 255 行),`developer` 分支不存在 ⇒
+**整段 system prompt 被静默丢弃**,实测:
+
+```python
+tok.apply_chat_template([{"role":"system","content":"SYS-PROMPT-MARKER"},{"role":"user","content":"hi"}], tokenize=False)
+# -> '[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>SYS-PROMPT-MARKER<|user|>hi'
+# 把 role 换成 developer:
+# -> '[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi'   ← MARKER 消失
+```
+
+* ⚠️ **不要写 `reasoning: true` / `thinkingLevelMap`** —— 那是 pi-ai 的**内部**字段名,不是
+  `llm-pi-ai` 的 profile 字段名;写了会被 schema **静默丢弃**(实测:重启后依旧没有档位可选)。
+  正确名字是 `reasoningEfforts`,可用
+  `node -e "import('<…>/dsh-llm-pi-ai/lib/index.js').then(m=>console.log(m.Config(yaml.load(fs.readFileSync(process.env.HOME+'/.dsh/settings.yaml','utf8'))['llm-pi-ai'])))"`
+  就地校验字段有没有被吃掉。
+* 未声明的档位会被解析成 `null`(= 不提供),所以上面的字典解析出来与官方目录里 `glm-5.3-flash`
+  的那份 **逐档完全一致**:`{off:null,minimal:null,low:low,medium:null,high:high,xhigh:null,max:max}`
+  ⇒ UI 只给 **Low / High / Max**(`getSupportedThinkingLevels()` 会丢掉所有 `null` 档)。
+* 不要写裸 `off:`(YAML 会解析成布尔 `false`,键变成 `"false"`);要留空必须写带引号的 `"off"`。
+* **实际发出去的线格式**:自定义 route 的 baseURL 检测结果是 `thinkingFormat:"openai"` +
+  `supportsReasoningEffort:true` ⇒ 只是**请求顶层的 `reasoning_effort: low|high|max`**,
+  不选档位时**该字段不出现** ⇒ 模板落到默认档 `Max`(想要别的默认值,可在 route 级加
+  `reasoning: high`,它是 profile 的默认档字段)。
+* **整条链路可以离线验证**(不需要 GPU / 不需要真服务):起一个假 endpoint 收
+  `/v1/chat/completions` 并回一段最小 SSE,再用 pi-ai 自己的 `createModels()`+`createProvider()`
+  发一次请求,把 body 打出来。实测(DSH 走的就是这条路径:适配器把等级作为 pi-ai 的
+  **`options.reasoning`** 传下去,`dsh-llm-pi-ai/lib/index.js:1664`):
+
+  | `options.reasoning` | 请求体里的 `reasoning_effort` | system 消息 role |
+  |---|---|---|
+  | `low` / `high` / `max` | `"low"` / `"high"` / `"max"` | `system` |
+  | 不传 | **字段不出现**(模板按 `Max` 渲染) | `system` |
+
+  同一个探测在 `supportsDeveloperRole: true` 下打出的是 `developer,user` —— 也就是上面那个坑。
+  脚本存在 `dev-docs/dsh_wire_probe.mjs`(不进仓库,随 dev-docs 一起被 gitignore)。
+* **生效方式**:DSH 用 chokidar 监听 `settings.yaml`,改完**热重载**;前端刷新一次页面(拉模型目录)
+  就会出现档位。若仍没有,说明运行中的 DSH 用它启动时的旧内存文档把文件**回写覆盖**了
+  (踩过一次,11:10 的文件改动被抹掉)—— 先确认文件里 `reasoningEfforts` 还在,不在就重写,
+  再**完全停掉 DSH 后启动**。
 
 ### 3.6 前缀缓存命中率上报(默认已开)与 **2176 块粒度**
 
@@ -376,7 +425,7 @@ TOOL_PARSER= REASONING_PARSER= bash scripts/serve_glm53_mainline.sh   # 关掉�
 实测(2026-09-19,2×A100-40GB / TP=2):`tools` + `tool_choice:"auto"` → 200 且正确返回
 `tool_calls`;`reasoning_effort` **low/high/max** 三档生效(思考长度 0 / 22 / 917 字符);
 KV 池 988,081 token(两路 256K 占 53%)。**客户端的思考等级需要客户端自己声明**
-(DSH 见 §3.5 的 `thinkingLevelMap`),服务端只需上面两个 parser 开关。
+(DSH 见 §3.5 的 `reasoningEfforts` + `compat.supportsDeveloperRole: false`),服务端只需上面两个 parser 开关。
 
 > ⚠️ **8070 现在归 GLM-5.3-Flash**。DeepSeek 的生产脚本 `scripts/serve_prod_8070.sh` 默认也用
 > 8070,**两者不能同时起**(显存也只够一个 TP=2 服务)。要同时跑请显式换端口,例如
