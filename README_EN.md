@@ -7,10 +7,15 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.2.1** (2026-09-18) — **major CPU-engine performance work**:
+> **📌 Current release: v0.2.2** (2026-09-19) — **GLM-5.3-Flash support**: the FP8 GPU
+> prefill path is wired up (4K-prompt TTFT **29.3 s → 22.8 s**) and the delivered service
+> config is **256K context × 2 concurrent sequences**. This release also fixes a **real
+> e4m3 subnormal-decode defect** in the engine and adds an all-codeword gate for it.
+>
+> Previous, **v0.2.1** (2026-09-18) — **major CPU-engine performance work**:
 > the CPU MoE engine now **beats the reference `lk_moe` implementation on every real shape**;
 > DeepSeek-V4-Flash benefits as well.
-> Release notes: [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md)
+> Release notes: [`RELEASE_NOTES_v0.2.2.md`](RELEASE_NOTES_v0.2.2.md) · [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md)
 
 ---
 
@@ -28,8 +33,8 @@ which run fast on the GPU. So we split the model:
 ## Goals
 
 1. **Any MoE model.** Not tied to one architecture generation. DeepSeek-V4 / V4.1 work
-   end to end; GLM-5.3-Flash's CPU expert path is in place (end-to-end is hardware-limited,
-   see the support matrix).
+   end to end; GLM-5.3-Flash runs end to end too, with an FP8 GPU prefill path and a
+   delivered **256K × 2-concurrent** service config (see the support matrix).
 2. **Any x86 ISA.** `scalar → AVX2 → AVX-512 (base/VNNI/BF16/VBMI)`, selected at import
    time from `/proc/cpuinfo`.
 3. **A fixed VRAM priority order.** `1M context → GPU prefill → speculative decoding → residency`.
@@ -46,7 +51,7 @@ which run fast on the GPU. So we split the model:
 |---|---|---|---|
 | **DeepSeek-V4.1-Flash** | 748B | MXFP4 (E8M0 block-32) | ✅ end to end (TP=2) |
 | **DeepSeek-V4-Flash** (0731) | 256 experts / top-6 | MXFP4 | ✅ end to end |
-| **GLM-5.3-Flash** | 321B / 18B active, 288 experts / top-8 | FP8 block-128 | ✅ **end to end (TP=2, A100/SM80)** with `--kv-cache-dtype bfloat16`; greedy is reproducible, C=1 decode ~22 tok/s (TPOT 45 ms) |
+| **GLM-5.3-Flash** | 321B / 18B active, 288 experts / top-8 | FP8 block-128 | ✅ **end to end (TP=2, A100/SM80)**, delivered as **256K context × 2 concurrent sequences** (KV pool 988,081 tokens), needs `--kv-cache-dtype bfloat16`; C=1 decode ~22 tok/s (TPOT 46 ms); 4K-prompt TTFT **29.3 s (CPU) → 22.8 s (FP8 GPU prefill, 1.29×)** |
 | Other plug-and-play MoE | — | BF16 / FP8 | ✅ generic path, no per-model calibration |
 
 **Measurement host (every number below was taken here)**
@@ -60,13 +65,39 @@ which run fast on the GPU. So we split the model:
 
 ---
 
-## Performance (latest release **v0.2.1**)
+## Performance (latest release **v0.2.2**)
 
 > **How to read these tables.** Every number is **elapsed time in ms/layer — lower is better**,
 > i.e. "the same work done faster". The baseline is `lk_moe` (Lvllm's CPU MoE engine), measured
 > on the same machine, same real layer weights and same thread count, with the **`lk_moe`
 > denominator re-measured in the same session** to avoid cross-session drift.
 > **A ratio below 1.0 means we are faster.**
+
+### GLM-5.3-Flash (2×A100-40GB, TP=2, SM80; delivered config: 256K × 2 concurrent)
+
+Official `vllm bench serve`, random dataset + `--ignore-eos`, a distinct seed per cell.
+
+| Concurrency | prompt / output | out tok/s (incl. TTFT) | mean TTFT | mean TPOT | completed |
+|---|---|---|---|---|---|
+| C=1 | 256 / 128 | **16.18** | 2022 ms | **46.37 ms** | 8/8 |
+| C=2 | 256 / 128 | 19.36 | 3287 ms | 78.13 ms | 8/8 |
+| **C=1** | **4096 / 64** | 2.49 | **22764 ms** | 46.95 ms | 2/2 |
+
+* **Long-prompt prefill**: 4096-in TTFT drops from **29.3 s (v0.2.1, CPU prefill) to 22.8 s
+  (1.29×)** — the FP8 GPU prefill streams each layer's 3.62 GB/rank of expert weights onto the
+  GPU and **overlaps** that transfer with attention;
+* **Decode is unchanged**: C=1 TPOT 46 ms (~22 tok/s), as in v0.2.1 (the GPU path only affects
+  prefill);
+* **Context**: 256K × 2 concurrent (KV pool 988,081 tokens; 512K and 704K also start, 704K with
+  only 1.06× concurrency, ceiling ≈733K; 1M needs an fp8 KV cache — see
+  [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md));
+* **Correctness**: engine determinism gate 11/11; layer gate rms_rel 4.4e-3; a 29,746-token
+  needle retrieval is exact; three concurrent ~8K requests (two-way admission) all retrieve
+  their own secret; 0 OOM.
+
+> The FP8 CPU inner loop has a **default-off** acceleration switch, `XIAOTU_MOE_FP8_BF16_MMA=1`
+> (AVX512-BF16 `vdpbf16ps`; 1.17-1.20× for M≥6, at the cost of rounding weights to bf16:
+> rms_rel 3.6e-3 between the two paths).
 
 ### DeepSeek-V4.1-Flash (real routing shape `na≈226`, 60 threads, ms/layer)
 
@@ -105,12 +136,13 @@ converted into one another** — `output tok/s` is the average decode rate for t
 
 ### GPU prefill (long prefill handed to the GPU)
 
-On DeepSeek-V4.1-Flash, streaming expert compute layer by layer onto the GPU makes client-side
-TTFT **2.0-2.8× faster** (worth it above a threshold of 4096 tokens). Configuration and the VRAM
+Streaming expert compute layer by layer onto the GPU makes client-side TTFT **2.0-2.8× faster**
+on DeepSeek-V4.1-Flash (worth it above a 4096-token threshold) and **1.29×** on GLM-5.3-Flash
+(FP8, 4096-in: 29.3 → 22.8 s). Configuration and the VRAM
 recipe are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
 **Full service-level comparison, methodology and reproduction commands:**
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) · [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md).
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) · [`RELEASE_NOTES_v0.2.2.md`](RELEASE_NOTES_v0.2.2.md) · [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md).
 
 ---
 
@@ -139,12 +171,13 @@ Per-model recipes, memory budgeting, self-checks and troubleshooting →
 
 | Version | Theme |
 |---|---|
+| **v0.2.2** | **GLM-5.3-Flash support** — FP8 GPU prefill wired up (4K-prompt TTFT 29.3 → 22.8 s), delivered as 256K × 2 concurrent; fixes an e4m3 subnormal-decode defect and adds an all-codeword gate |
 | **v0.2.1** | **Major CPU-engine performance work** — the CPU MoE engine now **beats `lk_moe` on every real shape**; DeepSeek-V4-Flash benefits too |
 | v0.2 | DeepSeek-V4.1-Flash end-to-end (1M context + GPU prefill + speculative decoding) plus CPU-prefill path optimisation |
 | v0.1.0 | First public release: hybrid mode (CPU experts + GPU rest), AVX2 / AVX-512 multi-ISA, DeepSeek-V4 family |
 
 Details, performance comparisons and parameter changes:
-[**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
+[**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
 (archived: [v0.2pre](RELEASE_NOTES_v0.2pre.md))
 
 ---
