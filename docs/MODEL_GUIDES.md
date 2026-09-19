@@ -231,6 +231,29 @@ bash scripts/serve_glm53_mainline.sh        # 默认 TP=2、GPU 0/1、bf16 KV
 GLM 的模型上限是 1M,但本机可行上限约 **61.5 万 token**。要上 1M 需要更大的卡,
 或 fp8 KV —— 而 **SM8x 稀疏 MLA 后端只支持 bf16 KV**,所以当前无解,属硬件/KV 约束。
 
+### 2.4b 上下文长度能开多大(2×A100-40GB / TP=2 实测)
+
+`--max-model-len` 实测启动阶梯(util 0.88、bf16 KV):
+
+| `--max-model-len` | 启动 | KV 池 | 该长度下的并发 |
+|---|---|---|---|
+| 256K | ✅ | 919,520 tok | **3.51×**(推荐) |
+| 512K | ✅ | 843,055 tok | 1.61× |
+| 704K | ✅ | 763,177 tok | 1.06×(**零余量**) |
+| 768K | ❌ | vLLM 自报上限 733,312 | — |
+| 1M | ❌ | 需 11.57 GiB,只有 6.87 GiB | 需 fp8 KV |
+
+* KV 成本 **~11.9-12.3 KB/token**(只有 11 层 NoPE 稀疏 MLA 带 per-token KV;
+  每层 512 维 latent × 2 B = 1024 B)。注意这个数**不是** V4.1 的 ~40 KB/token。
+* **池子会随 maxlen 变小**(KDA 线性注意力的 state 池随序列长度增长)⇒ 单请求上限与总
+  容量互相挤,自洽天花板 ≈ **733K**。
+* 长文可用性已验:704K 配置下 **29,746 token** 的 prompt、密钥埋在文末,
+  **检索完全命中**;速率 ≈ **3.5 ms/token**(512K 单请求约 30 min)。
+* 脚本默认已改为 `MAXLEN=262144 / MBT=8192`。
+* **要 1M 只有一条路:fp8 KV**(SM8x 稀疏 MLA 的 fp8 变体 + NoPE 感知的 528 B blob;
+  现成的 656 B blob 只到 ~948K)。`--mamba-ssm-cache-dtype` 对容量**无**帮助,
+  TP>2 对 MLA 的 KV **无**帮助(每 rank 复制),TP=3 不整除、SM8x 无 DCP。
+
 ### 2.5 预填充成本模型(为什么长 prompt 的 TTFT 是秒级)
 
 引擎侧微基准(`scripts/bench_fp8_mcurve.py`,E=288 / H=4096 / I=2048,60 线程;
