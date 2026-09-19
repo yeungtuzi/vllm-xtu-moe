@@ -461,6 +461,15 @@ GLM 只有 1 层(回收),因此**预期介于两者之间**:比 MiMo 的 1 模�
 并有 [TP8 下 draft forward 越界的 issue](https://github.com/sgl-project/sglang/issues/37548)。
 ⇒ **没有任何来源显示 GLM-5.3-Flash 存在第 2/3 层 MTP 权重。**
 
+**顺带解释"上游为什么只跑第 0 层"**(这对 GLM 有直接含义:说明"单层多步"是**受支持的路径**而非降级方案):
+vLLM 的多模块 MTP 是 **2026-07-30** 才合并的([PR #48892](https://github.com/vllm-project/vllm/pull/48892),为 **Inkling** 的 8 模块做的);
+其 body 写明**最大难点**是:第 2..N 个 MTP 模块会吃到前一个模块产出的、**可能被 target 拒绝**的草稿 token,
+一旦被拒,这些层的 KV 里就残留**脏值**,必须让 scheduler 支持**对上一 decode 步的 token 做 re-prefill**
+(要同时改 scheduler / KV cache manager / coordinator);而**复用第 0 层没有这个问题**——第 0 层的 KV 只依赖已接受的 prefix。
+MiMo 那边对应的多层 MTP PR([#31180](https://github.com/vllm-project/vllm/pull/31180))至今仍是 **draft**,
+作者自述 "produces acceptance rate of 0"。⇒ 我们给 GLM 开 MTP 时走 `min(1,k)=1` 的单模块回收 + `index_share_for_mtp_iteration`,
+是与上游实现现状一致的用法。
+
 ### 2.7 数值与稳定性
 
 * 层内数值(`GLM_MODEL=<ckpt> python scripts/test_glm53_fp8_layer.py <layer> 8`):
