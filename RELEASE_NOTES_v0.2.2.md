@@ -1,4 +1,4 @@
-# v0.2.2 — 支持 GLM-5.3-Flash
+# vllm-xtu-moe v0.2.2 — 支持 GLM-5.3-Flash
 
 **发布日期**:2026-09-19
 **主题**:在 2×A100-40GB(SM80,TP=2)上把 **GLM-5.3-Flash(321B / 18B active,原生 FP8 block-128)**
