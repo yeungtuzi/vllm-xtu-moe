@@ -42,7 +42,7 @@
 |---|---|---|---|
 | **DeepSeek-V4.1-Flash** | 748B | MXFP4(E8M0 block-32) | ✅ 端到端(TP=2) |
 | **DeepSeek-V4-Flash**(0731) | 256 专家 / top-6 | MXFP4 | ✅ 端到端 |
-| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,需 `--kv-cache-dtype bfloat16`;贪心可复现,C=1 解码 ~22 tok/s(TPOT 45 ms) |
+| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,需 `--kv-cache-dtype bfloat16`;贪心可复现,C=1 解码 ~22 tok/s(TPOT 45 ms);4K prompt TTFT **29.3 s(CPU)→ 22.0-22.6 s(FP8 GPU 预填充)** |
 | 其它即插即用 MoE | — | BF16 / FP8 | ✅ 走通用路径,未逐模型标定 |
 
 **实测硬件平台(下文所有性能数字都在这台机器上取得)**
@@ -99,8 +99,23 @@ TTFT 与 TPOT(**不含 TTFT**)各自单独公布。
 
 ### GPU 预填充(把长 prefill 交给 GPU)
 
-DeepSeek-V4.1-Flash 上,把长 prefill 的专家计算逐层流式搬上 GPU:客户端 TTFT 实测
-**快 2.0-2.8×**(阈值 ≥4096 才划算)。开启方式与显存配方见 [`docs/RUNBOOK.md`](docs/RUNBOOK.md)。
+把长 prefill 的专家计算逐层流式搬上 GPU,支持两种专家格式:
+
+* **MXFP4**(DeepSeek-V4.1-Flash 等):客户端 TTFT 实测 **快 2.0-2.8×**(阈值 ≥4096 才划算);
+* **FP8 e4m3 block-128**(GLM-5.3-Flash):µbench 一样把长 prompt 的 TTFT 从
+  **29.3 s 压到 22.0-22.6 s(1.3×)**。两点值得注意:
+  1. 权重装配是 **3.62 GB/rank 的纯 H2D 固定成本**,已到本机 26.86 GB/s 的 H2D 天花板
+     (1-D 与 pitched 2-D 同速,锁页/NUMA 交错/两 rank 并发都不改变),所以优化点是
+     **把装配与 attention 重叠**(默认开启的 side stream),不是"搬得更快";
+  2. GLM-5.3 的预填充 chunk 被 KDA state 的 `block_size=2176` 钉死,因此
+     **插件默认阈值 4096 对 GLM 永远不会触发** —— `scripts/serve_glm53_mainline.sh`
+     已把 GLM 专用默认改为 `GPU_PREFILL_MIN=1500`(实测盈亏平衡 ~1300)。
+
+CPU 侧另有一个可选开关 `XIAOTU_MOE_FP8_BF16_MMA=1`:FP8 内层改走 AVX512-BF16
+`vdpbf16ps`,**M≥6 快 1.17-1.20×**(全 CPU 预填充端到端 TTFT 1.12×),代价是权重被舍入到
+bf16(两路 rms_rel 3.6e-3),**因此默认关闭**;`M=1` 的单流解码仍走精确 fp32 路。
+
+开启方式与显存配方见 [`docs/RUNBOOK.md`](docs/RUNBOOK.md);
 
 **完整的服务级对照、口径说明与复现命令**:[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)、
 [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md)。
