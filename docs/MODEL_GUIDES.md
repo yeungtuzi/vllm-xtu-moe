@@ -366,23 +366,44 @@ AVX512-BF16 `vdpbf16ps`(32 个 bf16/指令、激活无需转换)。GLM 形状 M-
 |---|---|
 | 检查点自带 **1 层 MTP** | `config.json: num_nextn_predict_layers = 1`;权重在 `model.language_model.layers.45.*`(1760 个张量:`eh_proj`/`enorm`/`hnorm`/`shared_head.norm` + **288 专家的 MoE**(1728 个)+ DSA/MLA attention(indexer/kv_a_proj…)) |
 | vLLM 主线支持该 draft | `registry.py`:`"Glm5NextMTPModel": ("vllm.models.glm5next","Glm5NextMTP")`;`speculative.py` 的 `MTPModelTypes`/`SpeculativeMethod` 接受 `method="mtp"` |
-| 同机有正收益先例 | DeepSeek-V4.1 的 DSpark(本插件自己那条路):**16.64 vs 13.85 t/s(+20%)**,TPOT 36.75 vs 42.86 ms,贪心输出逐字节一致(RUNBOOK §5.4) |
+| 同机有正收益先例 | DeepSeek-V4.1 的 **DSpark**(**另一条** speculative method,见下):**16.64 vs 13.85 t/s(+20%)**,TPOT 36.75 vs 42.86 ms,贪心输出逐字节一致(RUNBOOK §5.4) |
+
+> ⚠️ **DSpark ≠ MTP,别把两者的结论互相套用**。这个 vLLM 里是两条独立实现:
+> * `dspark`(`DSparkModelTypes`):DeepSeek-V4.1 专属,上游 commit `e77daef89e
+>   [Model] Support DeepSeek-V4.1-Flash (#56214)` 引入;draft = `mtp.0/1/2` **3 层**、
+>   block=5、自带 parallel drafting;**只在 V2 GPU model runner 实现**
+>   (`vllm/config/vllm.py:_get_v1_model_runner_unsupported_features` 明确把 `dspark` 列为 V1 不支持)。
+> * `mtp`(`MTPModelTypes` ⊂ `EagleModelTypes`):通用 MTP,**跑在我们这条 V1 runner 上**
+>   (`vllm/v1/worker/gpu/model_runner.py`),GLM-5.3-Flash 的 draft 就是 `layers.45` 这 1 层。
+> 插件里那套 draft 逻辑(按 prefix 第二次出现判定、`XIAOTU_DRAFT_LAYERS` 默认 3)是**为 DSpark 写的**。
 
 启用方式(要重启服务):
 `--speculative-config '{"method":"mtp","model":"<同一 ckpt>","num_speculative_tokens":1..3}'`
 (单层 MTP 通过复用 hidden state 支持 k>1)。
 
-**但现在开的两个硬前提都不满足**:
+**但现在开的硬前提没满足,而且 CUDA graph 这一条要说清楚(2026-09-19 复核)**:
 
 1. **draft 必须常驻 GPU,而插件的 draft 识别不认 GLM 的形态**。插件是按 DSpark 写的:
-   靠"同一个 prefix 第二次出现"判断 draft 层,并**强制其 GPU 常驻**
+   靠"同一个 prefix 第二次出现"判断 draft 层(`_instance_index(prefix) > 0`),并**强制其 GPU 常驻**
    (`hybrid_model.py:_is_draft`,默认 `XIAOTU_MOE_RESIDENT_DRAFT=1`);理由是实测
    **draft 走 CPU 时投机净负(7.11 vs 不开 10.76 t/s)**。GLM 的 MTP 层 prefix
-   (`model.language_model.layers.45`)在整个模型里**只出现一次**(主模型是 0..44),
-   ⇒ 它会被当成普通层按 `XIAOTU_MOE_GPU_RESIDENT_LAYERS` 决定去留,默认**落 CPU**
-   ⇒ 按插件自己的实测口径,收益会变负。
-2. **CUDA graph 与 draft 的已知冲突**:DSpark 的注释写明"CUDA graph 下草稿模型捕获会崩",
-   本服务是开着 CUDA graph 的;真要做实验得先确定是否必须 `--enforce-eager`(那会牺牲一部分解码)。
+   (`Glm5NextMultiTokenPredictor` 用 `f"{prefix}.layers.{idx}"`,`idx = num_hidden_layers = 45`)
+   在整个模型里**只出现一次**(主模型是 0..44)⇒ 它会被当成普通层,按
+   `XIAOTU_MOE_GPU_RESIDENT_LAYERS` 决定去留,默认**落 CPU** ⇒ 按插件自己的实测口径收益变负。
+   **不改代码的临时办法**:`XIAOTU_SPEC_DECODE=1` + `XIAOTU_MOE_GPU_RESIDENT_LAYERS=45`
+   (该 env 支持 `0-4,10` 这种写法 ⇒ 单值 `45` 合法)。
+2. **CUDA graph:对 `mtp` 是"能用、待实测",不是"不能用"**。
+   * 那句"CUDA graph 下草稿模型捕获会崩 ⇒ 强制 eager"是 **DSpark 专属**:
+     `scripts/serve_prod_8070.sh` 在开 SPEC 时固定 `EAGER=1`,注释写明"换来单路延迟 ~+43%"。
+   * 通用 MTP 路线**有图捕获代码**:`vllm/v1/worker/gpu/spec_decode/speculator.py` 里的
+     `init_cudagraph_manager(cudagraph_mode)` / `capture()`,`MTPSpeculator` 继承
+     `AutoRegressiveSpeculator` 走同一套;vLLM 的 V1 兼容性黑名单里只列了 `dspark`、
+     `adaptive draft verification`,**没有禁 `mtp` 的 CG**。
+   * 而且**当前 8070 本身就在跑 CUDA graph**(启动日志 `Capturing CUDA graphs (PIECEWISE): 3`
+     + `(FULL): 2`),target 层的 CPU 专家路径在图下已经证明是安全的 ⇒ 我们的 MoE 路径不怕图。
+   * **仍未验证的只有一件事**:draft 层(第 45 层)在我们的插件路径下捕获图是否干净。
+     历史上 DSpark 那次崩过但**没有留下归因**,所以实验第一步(启动捕获阶段)就能确定:
+     崩了就当 CG 不可用(DSpark 那样退 `--enforce-eager`),没崩就保持 CG。
 
 **另外两个代价**:MTP 层也是 DSA/MLA,会多一个 KV 组(略吃 KV 池);它的 288 个专家在
 CPU 引擎里是多一次逐层调用,若放 GPU 则需要 ~1.7 GiB/rank 的 FP8 专家常驻(`w13 1.13 + w2 0.56`)。
