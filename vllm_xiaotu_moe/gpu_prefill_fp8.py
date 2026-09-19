@@ -211,8 +211,12 @@ def fp8_staging_bytes(n_experts: int, hidden: int, inter: int, ns: int = 2) -> i
 
         raw13 + km13 + raw2 + km2 + scales + (one node's DMA staging per block)
 
-    which for GLM-5.3 at TP=2 (E=144, H=4096, I=1024) is ~3.7 GiB -- comfortably
-    inside the post-weights VRAM, unlike a 2-rings-of-full-size figure.
+    which for GLM-5.3 at TP=2 is **7.59 GiB** -- the caller passes the engine's
+    per-rank geometry (E=288 experts, H=4096, I=2048/TP=1024; measured at runtime
+    by the `GPU prefill ACTIVE ... preflight: staging ~7.59 GiB` line). The
+    earlier "~3.7 GiB for E=144" figure here was an arithmetic slip: 144 is not
+    the expert count the buffers are allocated with, and being 2x low is exactly
+    the kind of error that lets a preflight pass and the forward OOM (§601).
     """
     E, H, I = int(n_experts), int(hidden), int(inter)
     b = FP8_BLOCK

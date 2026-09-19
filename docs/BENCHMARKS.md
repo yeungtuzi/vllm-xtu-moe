@@ -172,7 +172,9 @@ GPTQ 检查点在引擎构造时一次性重排(`w13 [E, K/8, 2I] int32` → `[E
 (SM8x 稀疏 MLA 后端只支持 bf16 KV;fp8/fp4 会 fail-closed)。
 
 **交付配置(v0.2.2 默认)**:`--max-model-len 262144 --max-num-seqs 2 --max-num-batched-tokens 8192
---kv-cache-dtype bfloat16 --gpu-memory-utilization 0.90` + GPU 预填充阈值 1500。
+--kv-cache-dtype bfloat16 --gpu-memory-utilization 0.85` + GPU 预填充阈值 1500。
+(util 0.90 → 0.85 是 §601 崩溃修复的一部分:GPU 预填充的 staging 是进程级持久的
+7.59 GiB/rank,必须从 KV 里让出来;KV 池只从 988,081 掉到 **971,949** token。)
 
 `vllm bench serve`,随机数据、`--ignore-eos`,**每格不同 seed**(避免 prefix-cache 假性命中)。
 口径:**`out tok/s` 含 TTFT;三项独立公布**。
@@ -182,7 +184,12 @@ GPTQ 检查点在引擎构造时一次性重排(`w13 [E, K/8, 2I] int32` → `[E
 | C=1 | 256 / 128 | **16.18** | 2022 ms | **46.37 ms** | 8/8 |
 | C=2 | 256 / 128 | 19.36 | 3287 ms | 78.13 ms | 8/8 |
 | **C=1** | **4096 / 64** | 2.49 | **22764 ms** | 46.95 ms | 2/2 |
+| **C=1**(util 0.85 复测,2026-09-19) | **4096 / 64** | 2.50 | **22650 ms** | 46.50 ms | 2/2 |
 | C=2 | 4096 / 64 | 2.59 | 34162 ms | 243.21 ms | 4/4 |
+
+**长上下文崩溃复现(§601 验收)**:同一服务,util 0.90 时 **32,077-token** 请求崩掉进程;
+util 0.85 + `expandable_segments` + 新预检口径下,同量级请求 **TTFT 108.4 s / 无 OOM**,
+两路并发 14,084 + 15,423 token 也全部通过(预检余量 `slack +3.85 GiB`)。
 
 **与 v0.2.1 的配置(4096 上下文 / MBT=1024 / 阈值 4096 ⇒ 全 CPU 预填充)对照**:
 
@@ -194,7 +201,7 @@ GPTQ 检查点在引擎构造时一次性重排(`w13 [E, K/8, 2I] int32` → `[E
 | 上下文×并发 | 4096 × 4 | **262144 × 2** |
 
 * C=4 那一档不再公布:交付配置把并发限到 2(`--max-num-seqs 2`),换成"两路 **256K**"的
-  上下文保证 —— 两路 256K 需 524,288 token,而池子是 **988,081 token**;
+  上下文保证 —— 两路 256K 需 524,288 token,而池子是 **971,949 token**;
 * **4096/64 的 C=2 TPOT 243 ms** 是 chunked prefill 的正常代价(长 prompt 的 chunk 与
   decode 步交错);长 prompt 场景建议"一路长 + 一路短"。
 

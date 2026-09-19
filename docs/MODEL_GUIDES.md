@@ -208,13 +208,19 @@ bash scripts/serve_glm53_mainline.sh        # 默认 TP=2、GPU 0/1、bf16 KV
 ### 2.3 实测(2×A100-40GB,TP=2,真实 FP8 检查点,`vllm bench serve`,随机数据 + `--ignore-eos`)
 
 **交付配置**(脚本默认):`--max-model-len 262144 --max-num-seqs 2 --max-num-batched-tokens 8192
---kv-cache-dtype bfloat16 --gpu-memory-utilization 0.90`,GPU 预填充阈值 1500。
+--kv-cache-dtype bfloat16 --gpu-memory-utilization 0.85`,GPU 预填充阈值 1500。
+> ⚠️ util 从 **0.90 降到 0.85**(2026-09-19,§601 事故):GPU 预填充的 FP8 staging 是
+> **进程级持久**的 ~7.59 GiB/rank,它必须从 KV 里让出来,否则长 prefill 的 attention
+> 工作区会把服务 OOM 打崩(实测 util 0.90 下 28,553-token 请求崩掉整个进程)。
+> 代价极小:KV 池 988,081 → **971,949** token(-1.6%,两路 256K 仍只占 54%),
+> 4096/64 C=1 TTFT 22,764 → **22,650 ms**(无回退)。细节见 [RUNBOOK §3.2](RUNBOOK.md)。
 
 | 并发 | prompt/output | out tok/s(**含 TTFT**) | TTFT 均值 | TPOT 均值 | 完成 |
 |---|---|---|---|---|---|
 | C=1 | 256 / 128 | **16.18** | 2022 ms | **46.37 ms** | 8/8 |
 | C=2 | 256 / 128 | 19.36 | 3287 ms | 78.13 ms | 8/8 |
 | **C=1** | **4096 / 64** | 2.49 | **22764 ms** | 46.95 ms | 2/2 |
+| **C=1** | **4096 / 64**(util 0.85 复测) | **2.50** | **22650 ms** | 46.50 ms | 2/2 |
 | C=2 | 4096 / 64 | 2.59 | 34162 ms | 243.21 ms | 4/4 |
 
 与上一版(4096 上下文 / MBT=1024 / 阈值 4096 ⇒ 全 CPU 预填充)对照:
@@ -233,13 +239,20 @@ bash scripts/serve_glm53_mainline.sh        # 默认 TP=2、GPU 0/1、bf16 KV
 
 ### 2.4 上下文 / 显存预算(TP=2,单卡 A100-40GB,交付配置)
 
-| 项 | 实测 |
+| 项 | 实测(util 0.85,2026-09-19 复测) |
 |---|---|
 | 每 rank 非专家权重 | **~15.1 GiB**(self_attn 10.39 + embed/lm_head 2.36 + dense_mlp 1.08 + shared 1.01,检查点口径) |
-| Available KV | **11.55 GiB** |
-| **GPU KV cache size** | **988,081 tokens** |
-| 该长度(256K)下的 KV 并发 | **3.77×**(两路 256K 只占 53%) |
+| Available KV | **11.38 GiB** |
+| **GPU KV cache size** | **971,949 tokens** |
+| 该长度(256K)下的 KV 并发 | **3.71×**(两路 256K 只占 54%) |
+| GPU 预填充 staging(RAM 里让出来的) | **7.59 GiB / rank**(进程级持久,见 RUNBOOK §3.2) |
+| 预检余量(`GPU prefill ACTIVE ... slack`) | **+3.85 GiB** |
 | 主机内存 | ~595 GB(引擎单份 NUMA 分片 + vLLM 源张量) |
+
+**崩溃复现与验收(§601)**:同一台机器上,util 0.90 时 **32,077-token** 的真实请求
+在 `chunk_kda_with_fused_gate` 里差 52 MiB 崩掉整个服务;改用 util 0.85 + `expandable_segments`
++ 新的预检口径后,同一量级的请求(**32,077 token,TTFT 108.4 s**)与
+**两路并发 14,084 + 15,423 token** 请求全部跑通、零 OOM。
 
 `--max-model-len` 实测阶梯(util 0.90、bf16 KV):
 

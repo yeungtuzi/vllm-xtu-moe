@@ -158,6 +158,32 @@ xiaotu_moe variant = _avx512_bf16
 阈值推荐与实测见 [`BENCHMARKS.md`](BENCHMARKS.md);机制见
 `GPU_PREFILL.md`。
 
+#### ⚠️ 显存契约:staging 是**进程级持久**的,必须从 KV 里让出来(§601,真实生产事故)
+
+预检口径(`vllm_xiaotu_moe/gpu_prefill.py:fits_device`)是
+
+```
+要求空闲显存  >=  staging 峰值 × 1.10  +  XIAOTU_GP_ACT_RESERVE_GIB(默认 3.0 GiB)
+```
+
+* **staging 有多大**:FP8 路径(GLM-5.3、TP=2、每 rank)=
+  `2×(w13+w2+s13+s2) + raw + 单份 DMA 暂存` ≈ **4.2 GiB**;这些 `_buf` **按名字缓存、进程内永不释放**。
+* **为什么要那 3.0 GiB**:vLLM 是拿 `util×总显存 − (权重 + **激活峰** + CUDA graph)` 去**定 KV 大小**的
+  (启动日志里 `peak activation: 2.9 GiB`)—— staging 一进场,吃的正是这份激活峰。只比
+  "分配 staging 的瞬间够不够",就是**预检通过、跑起来 OOM**。
+* **事故现场(2026-09-19 11:10:56,util 0.90,28,553-token 的真实 DSH 请求)**:
+  旧口径只要求 `staging×1.10 = 4.64 GiB` 空闲即放行;4.2 GiB staging 进场后只剩 ~2.5 GiB 给激活,
+  `chunk_kda_with_fused_gate` 申请 52 MiB 失败,GPU 0/1 各剩 45 MiB(另一份报错现场是
+  PyTorch 已分配 37.90 GiB + **695 MiB reserved-unallocated**),**两个 worker 一起崩、服务退出**
+  (`logs/glm53_prod.log`)。请求本身只有 6528 token 的 prefill chunk,别无异常。
+* **现在会怎样**:预检不过 ⇒ 打印 `GPU prefill DISABLED ...` 并**优雅退回 CPU 预填充**(慢,但绝不崩);
+  通过时 `GPU prefill ACTIVE ...` 会带上四个数:
+  `staging ~X GiB, required >= Y GiB free, had Z GiB (slack +W GiB)`
+  —— **以后调 util 就看这一行的 slack**,不要凭感觉。
+* **生产默认因此从 util 0.90 降到 0.85**(KV 池 988,081 → 814,336 token;2 路 256K 仍只占 64%),
+  并加 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 治那份 695 MiB 碎片
+  (本服务没有 KV connector,不触发 vLLM 对该 env 的兼容性报错)。要回 0.90 请先确认 slack 够。
+
 ### 3.3 观测 / 调试(默认关闭)
 
 | 变量 | 作用 |
@@ -424,8 +450,21 @@ TOOL_PARSER= REASONING_PARSER= bash scripts/serve_glm53_mainline.sh   # 关掉�
 
 实测(2026-09-19,2×A100-40GB / TP=2):`tools` + `tool_choice:"auto"` → 200 且正确返回
 `tool_calls`;`reasoning_effort` **low/high/max** 三档生效(思考长度 0 / 22 / 917 字符);
-KV 池 988,081 token(两路 256K 占 53%)。**客户端的思考等级需要客户端自己声明**
+KV 池 **971,949** token(两路 256K 占 54%,util 0.85)。**客户端的思考等级需要客户端自己声明**
 (DSH 见 §3.5 的 `reasoningEfforts` + `compat.supportsDeveloperRole: false`),服务端只需上面两个 parser 开关。
+
+**事故与恢复(2026-09-19,必读)**:上一版默认 util 0.90 的服务在 **11:10:56 被一个
+28,553-token 的真实请求 OOM 打死**(`chunk_kda_with_fused_gate` 申请 52 MiB 失败,
+GPU 0/1 各剩 45 MiB)。根因是 GPU 预填充的持久 staging 吃掉了 vLLM 的激活预留,
+详见 §3.2 的显存契约。修复后需验收的两件事(已跑过,数字如下):
+
+| 验收项 | 结果 |
+|---|---|
+| util 0.85 启动 | KV 池 **971,949 token**(3.71×)/ 预检余量 `slack +3.85 GiB` |
+| 32,077-token 真实长请求(崩溃复现) | ✅ **TTFT 108.4 s,零 OOM** |
+| 两路并发 14,084 + 15,423 token | ✅ 全部完成,零 OOM |
+| 4096/64 C=1 基准(对比旧 util 0.90) | ✅ 22,650 ms(vs 22,764),out 2.50 tok/s(vs 2.49) |
+
 
 > ⚠️ **8070 现在归 GLM-5.3-Flash**。DeepSeek 的生产脚本 `scripts/serve_prod_8070.sh` 默认也用
 > 8070,**两者不能同时起**(显存也只够一个 TP=2 服务)。要同时跑请显式换端口,例如
