@@ -219,6 +219,160 @@ inline void fp8_tile_avx512(const uint16_t* A, const uint8_t* W, const float* S,
             C[(size_t)(m0 + r) * N + j0 + jj] = vhsum(acc[r][jj]);
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in BF16-MMA tile (AVX512-BF16 `vdpbf16ps`), enabled by
+// XIAOTU_MOE_FP8_BF16_MMA=1.
+//
+// WHY: the fp32 tile above spends most of its uops on the *activation* side --
+// `load_bf16_as_f32` is 2 uops per 16 values and runs MR times per k-chunk -- and
+// on a 1-vector (16-element) FMA. Measured uop mix per 16 weights at (6,2):
+// fp8 decode 19+1, activation convert/load 6*2*2 = 24, FMA 12 => 56, of which
+// only ~30% is real arithmetic (see dev-docs/GLM53_SM80_PLAN.md §14).
+//
+// `vdpbf16ps` consumes **32 bf16** per operand and does 32 MACs into 16 fp32
+// lanes, so it halves the MAC instruction count and needs NO activation
+// conversion at all (the activations are already bf16 in memory). Per 32 weights
+// at (6,2): decode+cvt+scale 2*(19+1+1) = 42, activation loads 6*2 = 12,
+// dpbf16ps 12 => 66 uops, vs 112 for the fp32 tile over the same 32 weights.
+//
+// COST, and why this is opt-in: both operands must be bf16, so the weights are
+// rounded to bf16 (`_mm512_cvtneps_pbh`) where the fp32 tile keeps
+// `e4m3 * scale` in fp32. That is a ~0.2-0.4% perturbation of the expert weights
+// -- documented in §18.5, deliberately NOT the default because the FP8 CPU path
+// is otherwise exact.
+//
+// Numerics otherwise stay close: the e4m3 decode is the same (already-correct)
+// `e4m3x16_to_fp32`, the products of two bf16 values are exact in fp32, and the
+// accumulator is fp32; only the summation order changes (pairwise within 32).
+// The scale is applied per k-group as before (groupK = 128 covers whole 32-wide
+// steps), so no group accumulator is needed.
+//
+// Requires K % 32 == 0 and groupK % 32 == 0 (the k loop steps 32); the dispatch
+// falls back to the fp32 tile otherwise.
+// ---------------------------------------------------------------------------
+#if defined(__AVX512F__) && defined(__AVX512BF16__)
+inline bool fp8_bf16_mma_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("XIAOTU_MOE_FP8_BF16_MMA");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+template <int MRT, int NRT>
+inline void fp8_tile_bf16_avx512(const uint16_t* A, const uint8_t* W, const float* S,
+                                 float* C, int N, int K, int gn, int gk,
+                                 int group_count, int kb_stride, int j0, int rowshift,
+                                 const uint32_t* rowmap, int m0) {
+    __m512 acc[MRT][NRT];
+    for (int r = 0; r < MRT; ++r)
+        for (int jj = 0; jj < NRT; ++jj) acc[r][jj] = _mm512_setzero_ps();
+
+    const uint8_t* wrow[NRT];
+    for (int jj = 0; jj < NRT; ++jj)
+        wrow[jj] = W + (size_t)(j0 + jj - rowshift) * (size_t)K;
+
+    for (int g = 0; g < group_count; ++g) {
+        const int kbase = g * gk;
+        const int kend = (kbase + gk < K) ? (kbase + gk) : K;
+        __m512 sv[NRT];
+        for (int jj = 0; jj < NRT; ++jj)
+            sv[jj] = _mm512_set1_ps(S[(size_t)((j0 + jj) / gn) * kb_stride + g]);
+        int k = kbase;
+        for (; k + 32 <= kend; k += 32) {
+            // Activations: already bf16 in memory -- a plain 64-byte load, no
+            // conversion. Loaded once and reused by every column.
+            __m512bh av[MRT];
+            for (int r = 0; r < MRT; ++r) {
+                const uint16_t* ap =
+                    A + (size_t)(rowmap ? rowmap[m0 + r] : (uint32_t)(m0 + r)) *
+                            (size_t)K + k;
+                av[r] = (__m512bh)_mm512_loadu_si512(reinterpret_cast<const void*>(ap));
+            }
+            for (int jj = 0; jj < NRT; ++jj) {
+                // e4m3 -> fp32 (exact) -> * scale -> bf16, two 16-wide vectors
+                // concatenated into the 32-bf16 operand `vdpbf16ps` wants.
+                __m512 w0 = _mm512_mul_ps(fp8::e4m3x16_to_fp32(wrow[jj] + k), sv[jj]);
+                __m512 w1 = _mm512_mul_ps(fp8::e4m3x16_to_fp32(wrow[jj] + k + 16), sv[jj]);
+                __m512i wb = _mm512_castsi256_si512(
+                    reinterpret_cast<__m256i>(_mm512_cvtneps_pbh(w0)));
+                wb = _mm512_inserti64x4(
+                    wb, reinterpret_cast<__m256i>(_mm512_cvtneps_pbh(w1)), 1);
+                const __m512bh wbh = (__m512bh)wb;
+                for (int r = 0; r < MRT; ++r)
+                    acc[r][jj] = _mm512_dpbf16_ps(acc[r][jj], av[r], wbh);
+            }
+        }
+        // Tail inside the group: unreachable under the dispatch guard (which
+        // requires K % 32 == 0 and groupK % 32 == 0), but computed correctly
+        // rather than skipped -- a silently short accumulator is far worse than
+        // a slow one.
+        for (; k < kend; ++k) {
+            for (int jj = 0; jj < NRT; ++jj) {
+                const float w = fp8::e4m3_to_fp32_scalar(wrow[jj][k]) *
+                                S[(size_t)((j0 + jj) / gn) * kb_stride + g];
+                const __m512 wv = _mm512_set1_ps(w);
+                for (int r = 0; r < MRT; ++r) {
+                    const uint16_t* ap =
+                        A + (size_t)(rowmap ? rowmap[m0 + r]
+                                            : (uint32_t)(m0 + r)) * (size_t)K + k;
+                    acc[r][jj] = _mm512_fmadd_ps(
+                        wv, _mm512_set1_ps(bf16::bf16_to_fp32(*ap)), acc[r][jj]);
+                }
+            }
+        }
+    }
+    for (int r = 0; r < MRT; ++r)
+        for (int jj = 0; jj < NRT; ++jj)
+            C[(size_t)(m0 + r) * N + j0 + jj] = vhsum(acc[r][jj]);
+}
+
+// The tile geometry is compile time on BOTH axes, and it must equal the actual
+// block size -- not merely bound it. A tile taller/wider than the block reads
+// `rowmap[]` past this expert's instance list (a wild row index => segfault) and
+// writes C out of range. This mirrors the fp32 path's fp8_emit_mr/fp8_emit_nj.
+template <int MR, int NR, int MRT, int NRT>
+inline void fp8_bf16_emit(const uint16_t* A, const uint8_t* W, const float* S,
+                          float* C, int N, int K, int gn, int gk,
+                          int group_count, int kb_stride, int j0, int rowshift,
+                          const uint32_t* rowmap, int m0, int mr, int nj) {
+    if (mr == MRT) {
+        if (nj == NRT) {
+            fp8_tile_bf16_avx512<MRT, NRT>(A, W, S, C, N, K, gn, gk, group_count,
+                                           kb_stride, j0, rowshift, rowmap, m0);
+            return;
+        }
+        if constexpr (NRT > 1)
+            fp8_bf16_emit<MR, NR, MRT, NRT - 1>(A, W, S, C, N, K, gn, gk,
+                                                group_count, kb_stride, j0, rowshift,
+                                                rowmap, m0, mr, nj);
+        return;
+    }
+    if constexpr (MRT > 1)
+        fp8_bf16_emit<MR, NR, MRT - 1, NRT>(A, W, S, C, N, K, gn, gk, group_count,
+                                            kb_stride, j0, rowshift, rowmap, m0,
+                                            mr, nj);
+}
+
+template <int MRT, int NRT>
+inline void fp8_bf16_sweep(const uint16_t* A, const uint8_t* W, const float* S,
+                           float* C, int M, int N, int K, int gn, int gk,
+                           int n0, int n1, int rowshift, const uint32_t* rowmap) {
+    const int group_count = (K + gk - 1) / gk;
+    const int kb_stride = group_count;
+    for (int m0 = 0; m0 < M; m0 += MRT) {
+        const int mr = (M - m0 < MRT) ? (M - m0) : MRT;
+        for (int j0 = n0; j0 < n1; j0 += NRT) {
+            const int rem = n1 - j0;
+            const int nj = (rem < NRT) ? rem : NRT;
+            fp8_bf16_emit<MRT, NRT, MRT, NRT>(A, W, S, C, N, K, gn, gk, group_count,
+                                              kb_stride, j0, rowshift, rowmap, m0,
+                                              mr, nj);
+        }
+    }
+}
+#endif  // __AVX512F__ && __AVX512BF16__
+
 // nj is always in [1, NR]; pick the matching compile-time column width.
 template <int MRT, int NR>
 inline void fp8_emit_nj(const uint16_t* A, const uint8_t* W, const float* S,
@@ -304,6 +458,21 @@ inline void matmul_fp8_tiled_range(const uint16_t* A, const uint8_t* W, const fl
     const int gn = groupN > 0 ? groupN : 1;
     constexpr int MR = XIAOTU_MOE_FP8_MR;
     constexpr int NR = XIAOTU_MOE_FP8_NR;
+#if defined(__AVX512BF16__)
+    // Opt-in BF16-MMA tile (see the block above `fp8_tile_bf16_avx512`). Needs
+    // 32-element k steps on both the K and the scale-group grid, and it is gated
+    // to the large-M regime: measured at the GLM shape it is 1.17-1.20x faster
+    // for M >= 6 but 0.87x SLOWER at M = 1 (the weight decode dominates there and
+    // the tile adds a `vcvtneps2bf16` + a 256->512 insert per 32 weights), and M
+    // = 1 is exactly the latency-critical single-stream decode case (IRON_RULE
+    // R8). So the exact fp32 path keeps small-M and the faster bf16 path serves
+    // prefill / batched decode.
+    if (fp8_bf16_mma_enabled() && M > XIAOTU_MOE_FP8_SMALL_HI &&
+        (K % 32) == 0 && (gk % 32) == 0) {
+        fp8_bf16_sweep<MR, NR>(A, W, S, C, M, N, K, gn, gk, n0, n1, rowshift, rowmap);
+        return;
+    }
+#endif
 #if XIAOTU_MOE_FP8_ADAPT
     // Measured M-curve (dev-docs/GLM53_SM80_PLAN.md §7.4-7.5, GLM shape, 60
     // threads). Three plans, chosen per call (per expert):
