@@ -854,20 +854,54 @@ class _XiaotuExpertsMixin:
 
     # ---- GPU 常驻层(V4.1 模块化路径;NOTES §417)---------------------------
     def _is_resident_layer(self, layer: torch.nn.Module) -> bool:
-        """本层是否在 `XIAOTU_MOE_GPU_RESIDENT_LAYERS` 里。
+        """本层是否常驻 GPU(两类)。
+
+        1. 用户显式列在 `XIAOTU_MOE_GPU_RESIDENT_LAYERS` 里的层(`0-4,10` 语法)。
+        2. **投机起草层**(MTP/speculator):GLM-5.3-Flash 的 `layers.45` 就是这种
+           —— 它在整个模型里只构造一次,所以 DSpark 那套"同一 prefix 第二次出现"
+           的判定认不出它;而实测 CPU draft 会让投机**净负**
+           (7.11 vs 不开 10.76 t/s,NOTES §245)⇒ 默认强制常驻。
+           只有显式 `XIAOTU_MOE_RESIDENT_DRAFT=0` 才关(会告警)。
 
         ⚠️ 这条功能原先只存在于 `hybrid_model.py`(DeepSeek-**V4** 的 OOT 路径),
-        V4.1 走的模块化路径**根本没有实现** —— 这正是 §414/§416 两轮排查的收敛点。
-        默认空集合 ⇒ 恒为 False ⇒ 非常驻路径逐字不变。
+        V4.1/GLM 走的模块化路径**根本没有实现** —— 这正是 §414/§416 两轮排查的收敛点。
+        默认空集合 + 不开投机 ⇒ 恒为 False ⇒ 非常驻路径逐字不变。
         """
         try:
-            from vllm_xiaotu_moe.hybrid_model import gpu_resident_layers
+            from vllm_xiaotu_moe.hybrid_model import (
+                gpu_resident_layers,
+                is_spec_draft_layer_index,
+            )
 
-            spec = gpu_resident_layers()
-            if not spec:
-                return False
             m = _LAYER_IDX_RE.search(getattr(layer, "layer_name", "") or "")
-            return bool(m) and int(m.group(1)) in spec
+            if not m:
+                return False
+            idx = int(m.group(1))
+            if idx in gpu_resident_layers():
+                return True
+            if not is_spec_draft_layer_index(idx):
+                return False
+            if os.environ.get("XIAOTU_MOE_RESIDENT_DRAFT", "1") == "0":
+                if not getattr(self, "_draft_cpu_warned", False):
+                    self._draft_cpu_warned = True
+                    print(
+                        f"[vllm-xtu-moe] WARNING: spec draft layer "
+                        f"{getattr(layer, 'layer_name', '?')} forced onto CPU by "
+                        f"XIAOTU_MOE_RESIDENT_DRAFT=0. Speculative decoding is "
+                        f"net-negative with a CPU draft (7.11 vs 10.76 t/s); drop "
+                        f"--speculative-config or unset that variable.",
+                        flush=True,
+                    )
+                return False
+            if not getattr(self, "_draft_resident_logged", False):
+                self._draft_resident_logged = True
+                print(
+                    f"[vllm-xtu-moe] spec draft layer "
+                    f"{getattr(layer, 'layer_name', '?')} (idx={idx}) kept "
+                    f"GPU-resident (MTP/speculator; a CPU draft is net-negative)",
+                    flush=True,
+                )
+            return True
         except Exception:  # noqa: BLE001
             return False
 

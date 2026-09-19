@@ -59,6 +59,16 @@ MBT="${MBT:-8192}"
 SEQS="${SEQS:-2}"
 THREADS="${THREADS:-60}"
 KV_DTYPE="${KV_DTYPE:-bfloat16}"
+# 投机解码(MTP,2026-09-20)。GLM-5.3-Flash 的检查点自带 **1 层 MTP**
+# (`model.language_model.layers.45`,见 docs/MODEL_GUIDES.md §2.6)。
+#   SPEC_K=0(默认)= 关;SPEC_K=1..4 = 开 MTP 并取 num_speculative_tokens=K。
+# 单层 MTP 通过复用 hidden state 支持 K>1(`index_share_for_mtp_iteration=True`)。
+# 注意:开投机时插件会把第 45 层**强制常驻 GPU**(CPU draft 实测净负),
+# 代价约 1.7 GiB/rank;实际以启动日志的 `spec draft layer ... kept GPU-resident` 为准。
+SPEC_K="${SPEC_K:-0}"
+SPEC_MODEL="${SPEC_MODEL:-$CKPT}"
+# EAGER=1 ⇒ --enforce-eager。MTP 的 draft 图捕获若在插件路径下有问题,退这一档。
+EAGER="${EAGER:-0}"
 # GPU-prefill threshold. The plugin's own default is 4096, which is *above*
 # GLM-5.3's prefill chunk size: the KDA (mamba-like) state is only written at
 # `block_size = 2176` boundaries, so the scheduler trims every chunk to a
@@ -67,6 +77,15 @@ KV_DTYPE="${KV_DTYPE:-bfloat16}"
 # (1580 tokens: CPU 10.9 s vs GPU 10.2 s; 2176 tokens: 1.2x; ~4.1k: 1.26x), so
 # 1500 is the right default here. Lower it further only if you measure it.
 GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-1500}"
+# GPU_PREFILL=0 彻底关掉 GPU 流式预填充(走 CPU 引擎)。
+# 为什么需要这个开关(2026-09-20 实测):staging 是**进程级持久**的 ~7.59 GiB/rank,
+# 会把 vLLM 的激活峰挤掉;而开 MTP 后第 45 层 draft 又要额外 3.38 GiB/rank ⇒
+# 32k 预填充 / 两路并发会 OOM 并把整个引擎打死。关掉它只损失长 prompt 的 TTFT,
+# 换来稳定(见 docs/KNOWN_LIMITATIONS.md)。
+GP_PREFILL="${GP_PREFILL:-1}"
+if [ "$GP_PREFILL" = "0" ]; then
+  export XIAOTU_GP_ACT_RESERVE_GIB=99
+fi
 # 工具调用 + 思考解析。不加这两项时:
 #   * 客户端带 tools + tool_choice="auto" 会被 vLLM 直接 400:
 #     '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set'
@@ -107,6 +126,11 @@ ARGS=(
 [ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
 # 让客户端能读到前缀缓存命中数(usage.prompt_tokens_details.cached_tokens)
 [ "$PROMPT_TOKENS_DETAILS" = "1" ] && ARGS+=(--enable-prompt-tokens-details)
+if [ "$SPEC_K" != "0" ]; then
+  ARGS+=(--speculative-config \
+    "{\"method\":\"mtp\",\"model\":\"$SPEC_MODEL\",\"num_speculative_tokens\":$SPEC_K}")
+fi
+[ "$EAGER" = "1" ] && ARGS+=(--enforce-eager)
 if [ "$COMPILE" = "1" ]; then
   ARGS+=(--compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_DECODE_ONLY"}')
 fi
@@ -125,6 +149,8 @@ XTU_ENV_FILE="${XTU_ENV_FILE_OVERRIDE:-$OUTDIR/$TAG.envfile}"
   [ -n "${XIAOTU_MOE_RANK_SPLIT:-}" ] && echo "XIAOTU_MOE_RANK_SPLIT=$XIAOTU_MOE_RANK_SPLIT"
   [ -n "${XIAOTU_MOE_NOSHARD:-}" ] && echo "XIAOTU_MOE_NOSHARD=$XIAOTU_MOE_NOSHARD"
   [ -n "${XIAOTU_MOE_GEMM_FP8_SCALE:-}" ] && echo "XIAOTU_MOE_GEMM_FP8_SCALE=$XIAOTU_MOE_GEMM_FP8_SCALE"
+  # 引擎子进程可能丢 --speculative-config;显式钉进 env 文件(文件是权威)。
+  [ "$SPEC_K" != "0" ] && echo "XIAOTU_SPEC_DECODE=1"
 } > "$XTU_ENV_FILE"
 # Pass through every other XIAOTU_*/VLLM_XIAOTU_* variable from the caller's
 # environment. `XIAOTU_ENV_FILE` is set explicitly below, so the plugin takes the
@@ -155,6 +181,7 @@ echo "[glm53] tag=$TAG port=$PORT gpus=$GPUS tp=$TP maxlen=$MAXLEN mbt=$MBT seqs
 echo "[glm53] kv-cache-dtype=$KV_DTYPE (SM8x sparse-MLA is bf16-only)"
 echo "[glm53] tool-call-parser=${TOOL_PARSER:-off} reasoning-parser=${REASONING_PARSER:-off}"
 echo "[glm53] prompt-tokens-details=${PROMPT_TOKENS_DETAILS} (cached_tokens reporting)"
+echo "[glm53] speculative=${SPEC_K} (0=off; MTP method=mtp, draft=layers.45) eager=${EAGER}"
 echo "[glm53] log=$LOG"
 
 # 【§601】PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True —— 事故现场是"PyTorch 已分配

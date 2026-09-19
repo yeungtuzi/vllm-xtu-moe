@@ -355,10 +355,48 @@ AVX512-BF16 `vdpbf16ps`(32 个 bf16/指令、激活无需转换)。GLM 形状 M-
 代价:权重被舍入到 bf16(两路 rms_rel 3.63e-3),**因此默认关闭**。
 注意在 GLM-5.3 上这个开关比 GPU 预填充更值(chunk 被 KDA 限制在 2176 ⇒ 预填充本来大多走 CPU)。
 
-### 2.6 投机解码(MTP):**现在没开,也建议先别开**(2026-09-19 评估)
+### 2.6 投机解码(MTP):**已实现并能开,但实测净负 ⇒ 默认关**(2026-09-20 实验完成)
 
-**现状**:8070 的启动命令行**没有** `--speculative-config`,`/metrics` 里也没有任何
-`spec_decode_*` 系列 ⇒ 投机解码是**关的**。
+> **结论先行**(2×A100-40GB / TP=2 / util 0.82 + 关 GPU 预填充,官方 `vllm bench serve`):
+> GLM-5.3-Flash 的单层 MTP **接受长度到 k=4 才 ~1.63**,而每步成本涨得更快 ⇒
+> **吞吐反而下降**。因此**默认保持关闭**(`SPEC_K=0`)。
+>
+> | k | accept(random) | accept(ShareGPT) | ShareGPT out tok/s | TPOT |
+> |---|---|---|---|---|
+> | 0(关) | 1.000 | 1.000 | **16.83** | **46.15 ms** |
+> | 1 | 1.452 | 1.400 | 16.04 | 47.82 ms |
+> | 2 | 1.584 | 1.539 | — | — |
+> | 3 | 1.614 | 1.595 | — | — |
+> | 4 | 1.619 | 1.626 | 11.24 | 75.35 ms |
+>
+> * k=2/3 的 accept 是**用一次 k=4 运行的 `num_accepted_tokens_per_pos` 反推**的
+>   (k=1 的直接实测 1.400 与反推 1.452 吻合 ⇒ 方法可信);
+> * 逐位接受率衰减很快(ShareGPT:p0=0.400、p1=0.139、p2=0.056、p3=0.031)⇒
+>   **单层回收在 k≈4 就饱和**;与 §2.6.1 的预期一致;
+> * **为什么 accept 1.6 仍然净负**:CPU 专家路径下,被验证 token 数 T=1+k 越大,
+>   访问的**不同专家数**越多(修正模型 `na(T)=256·(1−(31/32)^T)`)⇒ 每 step 的权重流量
+>   并不免费;MTP 买的是"摊销每层固定 dispatch",而 GLM 只有 1 层 draft、还要回收使用,
+>   摊销量不足;
+> * **ITL 脉冲化**:中位 46 ms → 122-132 ms,交互式流式体验明显变差。
+>
+> 复现:`SPEC_K=1|2|3|4 GPU_UTIL=0.82 GP_PREFILL=0 bash scripts/serve_glm53_mainline.sh`。
+
+**实现(2026-09-20 落地)**:插件补上了 GLM 的 **draft 层判定** —— `layers.45` 在模型里只
+构造一次,DSpark 那套"同 prefix 第二次出现"认不出它;现在按"**层号 ≥ 目标模型
+`num_hidden_layers`**"识别(`hybrid_model.is_spec_draft_layer_index`),命中即**强制 GPU 常驻**
+(实测 **3.38 GiB/rank**),不再落 CPU。启动日志会打印:
+
+```
+[vllm-xtu-moe] spec draft layer model.layers.45.mlp.experts (idx=45) kept GPU-resident
+[vllm-xtu-moe] GPU-resident(V4.1) model.layers.45.mlp.experts: 3.38 GiB on cuda:0
+```
+
+**⚠️ MTP 的显存契约(必看)**:开 MTP 后启动 profile 报的 `peak activation` 从 2.9 GiB 掉到
+**0.84 GiB**(draft 只在 decode 跑,profile 量不到),vLLM 因此定出**更大的 KV 池**;叠加
+draft 的 3.38 GiB ⇒ **util 0.85 下 32k 预填充会 OOM 打死引擎**。要么 `GPU_UTIL=0.82`,
+要么 `GP_PREFILL=0`。详见 `KNOWN_LIMITATIONS.md` §8。
+
+**以下为 2026-09-19 的原始评估(保留备查)**:
 
 **它其实"能开"**(三条都已经在机器上核实过):
 

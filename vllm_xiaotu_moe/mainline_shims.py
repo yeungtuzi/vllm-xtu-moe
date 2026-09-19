@@ -967,6 +967,26 @@ def _install_input_ids_shim() -> list[str]:
 _ROUTER_EXTRAS = ("hash_indices_table", "bias_vl", "image_sentinel_lo")
 
 
+def _record_spec_layer_floor() -> None:
+    """记下目标模型的 `num_hidden_layers`,供 MTP 起草层判定用。
+
+    每一次 `FusedMoEFactory` 调用都处在**有效的 vLLM config 上下文**里(主线自己在
+    factory 内部就调 `get_current_vllm_config()`),所以这是最省事的学习点。
+    纯尽力而为的标注 ⇒ 绝不抛异常。
+    """
+    try:
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        from vllm_xiaotu_moe.hybrid_model import register_spec_layer_floor
+
+        register_spec_layer_floor(
+            getattr(vllm_config.model_config.hf_config, "num_hidden_layers", None)
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _install_router_extras_shim() -> list[str]:
     import sys
 
@@ -978,6 +998,7 @@ def _install_router_extras_shim() -> list[str]:
 
     @functools.wraps(orig)
     def FusedMoEFactory(*a, **kw):
+        _record_spec_layer_floor()
         mod = orig(*a, **kw)
         if mixed_mode_enabled():
             extras = {n: kw.get(n) for n in _ROUTER_EXTRAS if kw.get(n) is not None}

@@ -139,6 +139,53 @@ def _draft_layer_count() -> int:
         return 3
 
 
+def register_spec_layer_floor(num_hidden_layers: int | None) -> None:
+    """记录**目标模型**的层数(进程级),用来认出 MTP 起草层。
+
+    背景:GLM-5.3-Flash 的 MTP 起草层是 `layers.45`(目标模型 0..44),它在整个
+    模型里**只构造一次** ⇒ DSpark 那套"同一 prefix 第二次出现"的判定
+    (`_instance_index(prefix) > 0`)**认不出它**,于是它被当普通层、默认落 CPU,
+    而实测 CPU draft 会让投机净负(7.11 vs 10.76 t/s,NOTES §245)。
+
+    这里记下目标模型的 `num_hidden_layers`(取值取**最大**:起草模型的 config 可能
+    把 `num_hidden_layers` 设成 0,见 MiMo MTP),任何 index ≥ 它的层就是起草层。
+    """
+    import builtins
+
+    try:
+        n = int(num_hidden_layers or 0)
+    except (TypeError, ValueError):
+        return
+    if n <= 0:
+        return
+    cur = getattr(builtins, "_xiaotu_spec_layer_floor", None)
+    if cur is None or n > cur:
+        builtins._xiaotu_spec_layer_floor = n
+
+
+def spec_layer_floor() -> int | None:
+    """目标模型的层数(未捕获时 None)。"""
+    return getattr(__import__("builtins"), "_xiaotu_spec_layer_floor", None)
+
+
+def is_spec_draft_layer_index(layer_idx: int) -> bool:
+    """`layer_idx` 是否落在目标模型之外(⇒ MTP/speculator 起草层)。
+
+    只在**请求了投机解码**时有意义:不开投机时根本不会构造起草层,这里恒 False,
+    行为逐字不变。GLM-5.3-Flash 是 `idx >= 45`;MiMo-V2.5 的 `model.mtp.layers.*`
+    也会被这个下界覆盖(它的起草模块层号同样是接在目标层之后)。
+    """
+    if not _spec_decode_requested():
+        return False
+    floor = spec_layer_floor()
+    if floor is None:
+        return False
+    try:
+        return int(layer_idx) >= int(floor)
+    except (TypeError, ValueError):
+        return False
+
+
 def reserve_draft_bytes(per_layer_bytes: int) -> None:
     """把 draft 层要占的显存**先从预算里预留出来**(只做一次)。
 

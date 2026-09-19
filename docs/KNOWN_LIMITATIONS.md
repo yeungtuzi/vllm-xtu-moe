@@ -99,7 +99,7 @@ per-engine 的可变字段;pinned 缓冲仍由引擎复用,其读写受 stream �
 | **GPU 预填充的显存是"借"来的** | staging 缓冲**进程级持久**(GLM-5.3/TP=2 实测 **7.59 GiB/rank**),吃的是 vLLM 用来定 KV 的那份激活预留 ⇒ 必须让出 KV(util ≤ 0.85)。预检不过时会**优雅退回 CPU 预填充**(慢但正确);若在 util 0.90 这种紧配置下强行开,长 prefill 会 OOM 崩服务(§601 事故,见 RUNBOOK §3.2) |
 | **`expandable_segments` 的物理占用只增不减** | 开着它时进程会随碎片把已保留段一直留着,`nvidia-smi` 在空闲时也可能显示 ~98% 占用(实测 40,265/40,960 MiB)。这些段**可被本进程复用**,不是泄漏;但它意味着"nvidia-smi 剩余"不等于"还能新分配多少" |
 | **AMX** | 未接线;Intel AMX 机器目前会使用主线自带 CPU 内核(需自行验证) |
-| **投机解码(MTP)未开** | GLM-5.3-Flash 自带 1 层 MTP(`layers.45`,含 288 专家 MoE),vLLM 也注册了 `Glm5NextMTPModel` ⇒ 结构上可开;但插件的 draft 判定是为 DeepSeek DSpark 写的("同一 prefix 出现两次"),GLM 的 `layers.45` 只出现一次会被放 CPU,而实测 **CPU draft 时投机净负** ⇒ 当前关闭(分析见 `MODEL_GUIDES.md` §2.6) |
+| **投机解码(MTP)默认关(已实现但净负)** | 插件现在能正确识别并常驻 GLM 的第 45 层 draft(3.38 GiB/rank,CUDA graph 捕获正常),`SPEC_K=1..4` 即可开,接受长度 k=1 **1.40** / k=4 **1.63**;但实测**吞吐反而下降**(ShareGPT 16.83→16.04 @k=1、11.24 @k=4)且 **ITL 脉冲化**(46→122 ms)⇒ **默认关**。开的话必须配 `GPU_UTIL=0.82` 或 `GP_PREFILL=0`(见 §8.2)。数据见 `MODEL_GUIDES.md` §2.6 |
 | **多 ISA 打包** | `scripts/build_engine_variants.sh` 可编出 5 个变体,但发布 wheel 目前默认只带单一变体 |
 
 ## 5. 运行注意事项
@@ -147,5 +147,46 @@ python scripts/tiny_moe_equiv.py         # CPU/GPU 专家端到端等价性
 * 上游 vLLM 只有通用 `kv_sharing_fast_prefill`,对 V4.1 零接线;omlx PR#3607 已做同类功能
   (声称 prefill 快 74-79%,**长上下文精度仍在评估**)。
 * 我们已实现,全部 env 门控(`XIAOTU_CED_FASTPREFILL=1`):eligible=19 层(21..39)、
-  attention metadata 窗口改写、**层循环级隐藏状态切片**、返回前零填充回全长。
+  attention metadata 窗口改写、**层循环级隐藏状态切片**、返回零填充回全长。
 * **⚠️ 未取得验收数据(生成等价性 + 预填充提速)之前不要开启。**
+
+---
+
+## 8. 更新(2026-09-20):上游 rebase 到 `133b71e0b` 的**内存回归**(必读)
+
+> 背景:0.2.3 把 10 个本地补丁 rebase 到 wheel-backed 的 `133b71e0b`(上游 5 天 300+ 提交)。
+> 补丁本身没改内核,但**上游改了 KV 定容/激活估计** ⇒ 同一组参数下显存契约变了。
+> 下面三条都是**实测**,不是推测。
+
+### 8.1 回归 1:同 util 下 KV 池变大 ⇒ 激活余量变少
+
+| 配置(2×A100-40GB,TP=2,GLM-5.3-Flash) | KV 池 | 32k 单请求 | 两路 14k+15k |
+|---|---|---|---|
+| v0.2.2 生产(util 0.85) | 971,949 | OK(CPU,108 s) | OK |
+| rebase(util 0.85) | 1,018,328 | OK(CPU,110 s) | **OOM,引擎整进程死亡** |
+| rebase(**util 0.82**) | 915,487 | OK(109 s) | OK(65/97 s) |
+
+⇒ **rebase 后 GLM 生产必须把 `GPU_UTIL` 从 0.85 降到 0.82**(或用 `--kv-cache-memory` 显式
+让出 ~1.1 GiB)。这是 handoff 里预告过的"性能优化必须重标定"。
+
+### 8.2 回归 2:开 MTP 会**低估激活峰**并叠加 draft 常驻
+
+* 开 MTP 后启动 profile 的 `peak activation` 从 **2.9 GiB → 0.84 GiB**(draft 只在 decode 跑),
+  vLLM 据此定出**更大**的 KV 池;
+* 同时第 45 层 draft 常驻又要 **3.38 GiB/rank**;
+* ⇒ util 0.85 + MTP:k=1 KV 758,416、GPU prefill slack **+0.92 GiB**、**32k 预填充 OOM 打死引擎**;
+  k=4 KV 只剩 508,519。
+* 稳定组合:`GPU_UTIL=0.82` + (`GP_PREFILL=0` 或把 `XIAOTU_GP_ACT_RESERVE_GIB` 提到 6.0)。
+
+### 8.3 回归 3:GPU 流式预填充**偶发** `illegal memory access`(未修,最高优先)
+
+* 现象:util 0.82 下 GPU prefill 被放行后,`vllm_xiaotu_moe/byte_transpose.py:71
+  _ktranspose_bytes_kernel` 报 `Triton Error [CUDA]: an illegal memory access was encountered`,
+  随后 `EngineDeadError`。**同配置另一次 32k+并发却跑过了 ⇒ 非确定**。
+* 报错点通常在**前一个内核已经越界**之后才由 Triton 的 `load_binary` 暴露;崩前最后两个
+  JIT 警告是 `_kpool_tail_seed_kernel` → `_ktranspose_bytes_kernel` ⇒ 优先怀疑
+  kpool / prefetch / resident-slot 路径的越界。
+* **规避**:`GP_PREFILL=0`(关 GPU 预填充,长 prompt 退 CPU,慢但稳)。
+* 复现配方:util 0.82 + GPU prefill 开 + `vllm bench serve` 4096/64。
+  定位建议:`CUDA_LAUNCH_BLOCKING=1` 找到真正的越界内核。
+

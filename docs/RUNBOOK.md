@@ -189,6 +189,17 @@ xiaotu_moe variant = _avx512_bf16
 * **验收(已在 8070 实跑)**:32,077-token 真实长请求(**TTFT 108.4 s**)、两路并发
   (14,084 + 15,423 token)全部跑通、零 OOM;4096/64 C=1 基准 22,650 ms / 2.50 tok/s
   (旧 util 0.90:22,764 ms / 2.49)—— 换配置**没有性能回退**。
+* **【0.2.3 rebase 后,2026-09-20 重标定】GLM 生产 util 必须降到 `0.82`**:rebase 到上游
+  `133b71e0b` 后,上游改了激活/KV 定容 ⇒ 同 util 下 KV 池从 971,949 涨到 **1,018,328**,
+  激活余量少 ~1.1 GiB ⇒ **util 0.85 下两路 14k+15k 并发 OOM、引擎整进程死亡**(实测两次)。
+  `0.82` 下 32k + 并发全部通过(KV 915,487)。权威判据仍是启动日志那一行 `slack`。
+* **【0.2.3】开 MTP(`SPEC_K>0`)另有一份显存账单**:启动 profile 的 `peak activation`
+  从 2.9 GiB 掉到 **0.84 GiB**(draft 只在 decode 跑),vLLM 据此把 KV 池定得**更大**;
+  再叠加第 45 层 draft 常驻 **3.38 GiB/rank** ⇒ **必须 `GPU_UTIL=0.82` 或 `GP_PREFILL=0`**,
+  否则 32k 预填充 OOM。完整表格见 `KNOWN_LIMITATIONS.md` §8.2。
+* **【0.2.3 已知问题,未修】GPU 预填充偶发 `Triton Error [CUDA]: illegal memory access`**
+  (报错点 `byte_transpose._ktranspose_bytes_kernel`,非确定;同配置另一次能跑过)。
+  规避:`GP_PREFILL=0`(长 prompt 退 CPU,慢但稳)。定位建议见 `KNOWN_LIMITATIONS.md` §8.3。
 
 ### 3.3 观测 / 调试(默认关闭)
 
@@ -208,7 +219,9 @@ xiaotu_moe variant = _avx512_bf16
 |---|---|---|
 | `--tensor-parallel-size` | `1`(单卡)或 `2` | 目前**不支持 expert_map(EP)**,TP>1 走权重分片 |
 | `--max-model-len` | GLM-5.3:**交付默认 262144(256K)**,实测可起 512K/704K;DeepSeek-V4 系列先 `4096`–`8192` 再放大 | KV 单价差异极大:**GLM-5.3 ≈ 11.9-12.3 KB/token**,DeepSeek-V4.1 ≈ 40 KB/token |
-| `--gpu-memory-utilization` | `0.85` | 非专家权重 + KV cache 在显存 |
+| `--gpu-memory-utilization` | GLM-5.3:`0.85`(v0.2.2 及以前)/ **`0.82`(0.2.3 rebase 后)**;开 MTP 时必须 `0.82` 或 `GP_PREFILL=0` | 非专家权重 + KV cache 在显存;见 §3.2 的 slack |
+| `SPEC_K`(env,`serve_glm53_mainline.sh`) | **默认 `0`(关)** | `1..4` ⇒ `--speculative-config method=mtp`;实测净负,保持关闭(数据见 `MODEL_GUIDES.md` §2.6) |
+| `GP_PREFILL`(env,`serve_glm53_mainline.sh`) | 默认 `1`(开);**不稳时置 `0`** | `0` ⇒ 把 `XIAOTU_GP_ACT_RESERVE_GIB` 拉到 99 ⇒ GPU 流式预填充永不放行(长 prompt 退 CPU,慢但稳) |
 | `--enforce-eager` | 建议先开 | 避免 CUDA graph 与 CPU 引擎 host 回调的额外变量;稳定后可尝试关闭 |
 | `--kernel-config.enable_jit_warmup=false` | 建议 | 跳过 JIT 预热,加快启动 |
 | `--enable-auto-tool-choice` + `--tool-call-parser` | **GLM-5.3 必开:`glm47`** | 客户端带 `tools` 且 `tool_choice:"auto"` 时,缺这两项 vLLM 直接 **400**;合法值里 GLM 系是 `glm45` / `glm47`(实现是 `glm47_moe_tool_parser`) |
