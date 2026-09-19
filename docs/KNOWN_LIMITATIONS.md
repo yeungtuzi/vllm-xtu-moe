@@ -99,6 +99,7 @@ per-engine 的可变字段;pinned 缓冲仍由引擎复用,其读写受 stream �
 | **GPU 预填充的显存是"借"来的** | staging 缓冲**进程级持久**(GLM-5.3/TP=2 实测 **7.59 GiB/rank**),吃的是 vLLM 用来定 KV 的那份激活预留 ⇒ 必须让出 KV(util ≤ 0.85)。预检不过时会**优雅退回 CPU 预填充**(慢但正确);若在 util 0.90 这种紧配置下强行开,长 prefill 会 OOM 崩服务(§601 事故,见 RUNBOOK §3.2) |
 | **`expandable_segments` 的物理占用只增不减** | 开着它时进程会随碎片把已保留段一直留着,`nvidia-smi` 在空闲时也可能显示 ~98% 占用(实测 40,265/40,960 MiB)。这些段**可被本进程复用**,不是泄漏;但它意味着"nvidia-smi 剩余"不等于"还能新分配多少" |
 | **AMX** | 未接线;Intel AMX 机器目前会使用主线自带 CPU 内核(需自行验证) |
+| **投机解码(MTP)未开** | GLM-5.3-Flash 自带 1 层 MTP(`layers.45`,含 288 专家 MoE),vLLM 也注册了 `Glm5NextMTPModel` ⇒ 结构上可开;但插件的 draft 判定是为 DeepSeek DSpark 写的("同一 prefix 出现两次"),GLM 的 `layers.45` 只出现一次会被放 CPU,而实测 **CPU draft 时投机净负** ⇒ 当前关闭(分析见 `MODEL_GUIDES.md` §2.6) |
 | **多 ISA 打包** | `scripts/build_engine_variants.sh` 可编出 5 个变体,但发布 wheel 目前默认只带单一变体 |
 
 ## 5. 运行注意事项

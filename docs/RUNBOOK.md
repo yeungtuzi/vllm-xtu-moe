@@ -556,6 +556,51 @@ DRYRUN=1 bash scripts/serve_glm53_mainline.sh        # 只打印最终命令行
 FOREGROUND=1 PORT=8099 bash scripts/serve_glm53_mainline.sh   # 前台跑(日志到终端,不写 pidfile)
 ```
 
+### 4.4.2 性能统计怎么取(**不用重启服务**)
+
+| 来源 | 命令 | 能给什么 |
+|---|---|---|
+| **Prometheus `/metrics`** | `curl -s http://127.0.0.1:8070/metrics` | 90 个系列:TTFT / ITL 直方图、prefix cache 命中、KV 使用率、preemptions、请求结束原因、cache_config(KV 池大小/block=2176/util) |
+| 日志里的 10 s 统计行 | `grep "Engine 000:" logs/glm53_prod.log` | prompt/generation 吞吐、Running/Waiting、GPU KV 使用率、**前缀缓存命中率**(逐窗口) |
+| 单请求 | 响应里的 `usage.prompt_tokens_details` | `cached_tokens` / `created_cache_tokens`(要 `--enable-prompt-tokens-details`,已开) |
+| 逐层预填充耗时 | `XIAOTU_GP_SPLIT=1`(**需重启**) | 每层 `asm/kernel` 毫秒数(`[gp-split]` 行) |
+
+**按"一次运行"取增量**(累计量做差即可,不必重启):
+
+```bash
+curl -s localhost:8070/metrics > /tmp/m0          # 跑之前
+# ... 客户端跑一轮 ...
+curl -s localhost:8070/metrics > /tmp/m1          # 跑之后
+python3 - <<'PY'
+import re
+def load(p):
+    out={}
+    for line in open(p):
+        if line.startswith('#'): continue
+        parts=line.split()
+        if len(parts)<2: continue
+        key=parts[0].split('{')[0]
+        try: out[key]=out.get(key,0.0)+float(parts[1])
+        except ValueError: pass
+    return out
+a,b=load('/tmp/m0'),load('/tmp/m1')
+for k in ['vllm:time_to_first_token_seconds_sum','vllm:time_to_first_token_seconds_count',
+          'vllm:inter_token_latency_seconds_sum','vllm:inter_token_latency_seconds_count',
+          'vllm:prompt_tokens_total','vllm:generation_tokens_total',
+          'vllm:prefix_cache_queries_total','vllm:prefix_cache_hits_total']:
+    print(f"{k:52s} +{b.get(k,0)-a.get(k,0):,.1f}")
+PY
+```
+
+> 实测参考(2026-09-19 11:29–14:34,15 次请求累计):平均 **TTFT 39.45 s**、平均 **ITL 83 ms
+> (≈12 tok/s)**、平均端到端 48.6 s、**前缀缓存命中 26.5%**(50,048/188,653 token)、
+> **preemptions=0 / error=0**;请求结束原因 5 `stop` + 10 `length`(后者是我用
+> `max_tokens=8/16/64` 的探针与 `--ignore-eos` 基准确认,不是异常)。
+
+**`/metrics` 里的 KV 池自证**:`vllm:cache_config_info{...}` 带
+`block_size="2176"`、`kv_cache_size_tokens="971949"`、`kv_cache_max_concurrency="3.708"`、
+`gpu_memory_utilization="0.85"` —— 和我写在 §4.4 的验收数字一致。
+
 
 > ⚠️ **8070 现在归 GLM-5.3-Flash**。DeepSeek 的生产脚本 `scripts/serve_prod_8070.sh` 默认也用
 > 8070,**两者不能同时起**(显存也只够一个 TP=2 服务)。要同时跑请显式换端口,例如

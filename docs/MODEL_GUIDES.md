@@ -355,7 +355,49 @@ AVX512-BF16 `vdpbf16ps`(32 个 bf16/指令、激活无需转换)。GLM 形状 M-
 代价:权重被舍入到 bf16(两路 rms_rel 3.63e-3),**因此默认关闭**。
 注意在 GLM-5.3 上这个开关比 GPU 预填充更值(chunk 被 KDA 限制在 2176 ⇒ 预填充本来大多走 CPU)。
 
-### 2.6 数值与稳定性
+### 2.6 投机解码(MTP):**现在没开,也建议先别开**(2026-09-19 评估)
+
+**现状**:8070 的启动命令行**没有** `--speculative-config`,`/metrics` 里也没有任何
+`spec_decode_*` 系列 ⇒ 投机解码是**关的**。
+
+**它其实"能开"**(三条都已经在机器上核实过):
+
+| 事实 | 证据 |
+|---|---|
+| 检查点自带 **1 层 MTP** | `config.json: num_nextn_predict_layers = 1`;权重在 `model.language_model.layers.45.*`(1760 个张量:`eh_proj`/`enorm`/`hnorm`/`shared_head.norm` + **288 专家的 MoE**(1728 个)+ DSA/MLA attention(indexer/kv_a_proj…)) |
+| vLLM 主线支持该 draft | `registry.py`:`"Glm5NextMTPModel": ("vllm.models.glm5next","Glm5NextMTP")`;`speculative.py` 的 `MTPModelTypes`/`SpeculativeMethod` 接受 `method="mtp"` |
+| 同机有正收益先例 | DeepSeek-V4.1 的 DSpark(本插件自己那条路):**16.64 vs 13.85 t/s(+20%)**,TPOT 36.75 vs 42.86 ms,贪心输出逐字节一致(RUNBOOK §5.4) |
+
+启用方式(要重启服务):
+`--speculative-config '{"method":"mtp","model":"<同一 ckpt>","num_speculative_tokens":1..3}'`
+(单层 MTP 通过复用 hidden state 支持 k>1)。
+
+**但现在开的两个硬前提都不满足**:
+
+1. **draft 必须常驻 GPU,而插件的 draft 识别不认 GLM 的形态**。插件是按 DSpark 写的:
+   靠"同一个 prefix 第二次出现"判断 draft 层,并**强制其 GPU 常驻**
+   (`hybrid_model.py:_is_draft`,默认 `XIAOTU_MOE_RESIDENT_DRAFT=1`);理由是实测
+   **draft 走 CPU 时投机净负(7.11 vs 不开 10.76 t/s)**。GLM 的 MTP 层 prefix
+   (`model.language_model.layers.45`)在整个模型里**只出现一次**(主模型是 0..44),
+   ⇒ 它会被当成普通层按 `XIAOTU_MOE_GPU_RESIDENT_LAYERS` 决定去留,默认**落 CPU**
+   ⇒ 按插件自己的实测口径,收益会变负。
+2. **CUDA graph 与 draft 的已知冲突**:DSpark 的注释写明"CUDA graph 下草稿模型捕获会崩",
+   本服务是开着 CUDA graph 的;真要做实验得先确定是否必须 `--enforce-eager`(那会牺牲一部分解码)。
+
+**另外两个代价**:MTP 层也是 DSA/MLA,会多一个 KV 组(略吃 KV 池);它的 288 个专家在
+CPU 引擎里是多一次逐层调用,若放 GPU 则需要 ~1.7 GiB/rank 的 FP8 专家常驻(`w13 1.13 + w2 0.56`)。
+
+**结论**:结构上可行、值得做一次实验,但**不是把开关一开就行**。实验清单(需 1 次重启 ≈ 5 min + 约半小时跑数):
+
+1. 先让 draft 认得出:临时 `XIAOTU_SPEC_DECODE=1` + 把第 45 层纳入常驻
+   (`XIAOTU_MOE_GPU_RESIDENT_LAYERS=45` 或给插件加 GLM 的 draft 判定),确认日志无
+   `draft layer ... forced onto CPU` 告警;
+2. 量**接受率**(`/metrics` 的 spec_decode 系列,或 vLLM 日志的 acceptance rate);
+3. 同进程 A/B:`256/128 C=1` 与 `4096/64 C=1` 的 TPOT/out tok/s;目标是像 DSpark 那样
+   TPOT 降 >15% 且贪心输出语义不变;
+4. 若 TPOT 反而变差或 draft 掉回 CPU,就**保持关闭**(当前状态)。
+
+### 2.7 数值与稳定性
 
 * 层内数值(`GLM_MODEL=<ckpt> python scripts/test_glm53_fp8_layer.py <layer> 8`):
   真实权重 RMS 相对误差 **3.6e-5 ~ 3.1e-4**(门限 1e-3);
