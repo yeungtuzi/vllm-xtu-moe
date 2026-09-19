@@ -29,8 +29,19 @@ PORT="${PORT:-8073}"
 GPUS="${GPUS:-0,1}"
 TP="${TP:-2}"
 GPU_UTIL="${GPU_UTIL:-0.90}"
-MAXLEN="${MAXLEN:-4096}"
-MBT="${MBT:-1024}"
+# Context length. The 4096 this script used to default to was a *test* setting, not a
+# hardware limit: measured on 2xA100-40GB at util 0.88 (bf16 KV, TP=2), the KV pool and
+# the largest max-model-len that starts are
+#     256K -> 919,520 tok pool, 3.51x concurrency   (comfortable)
+#     512K -> 843,055 tok pool, 1.61x concurrency
+#     704K -> 763,177 tok pool, 1.06x concurrency   (single sequence, no margin)
+#     768K -> does not start (vLLM reports a 733,312 ceiling); 1M needs 11.57 GiB of KV
+#             against 6.87 GiB available -> needs an fp8 KV cache, see MODEL_GUIDES 2.5
+# The pool SHRINKS as maxlen grows because the KDA state pools scale with it, so the
+# per-request limit and the total token capacity trade against each other. 256K is the
+# safe default; raise it deliberately.
+MAXLEN="${MAXLEN:-262144}"
+MBT="${MBT:-8192}"
 SEQS="${SEQS:-4}"
 THREADS="${THREADS:-60}"
 KV_DTYPE="${KV_DTYPE:-bfloat16}"
