@@ -22,12 +22,39 @@ engine does: gate clamped on the upper side only, up clamped on both sides.
 
 from __future__ import annotations
 
+import torch
 import triton
 import triton.language as tl
 
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _e4m3_uint8_to_f32,
 )
+
+from vllm_xiaotu_moe.gpu_prefill import (
+    _build_segmentation,
+    _dma_hostbuf,
+    _kmajor_bytes,
+)
+
+FP8_BLOCK = 128
+
+# Dedicated named buffers. NOTE: we deliberately do NOT use gpu_prefill._reuse
+# here -- its cache key is (device, shape) and ignores the logical `key`, so for
+# GLM-5.3 (H == 2I == 4096) the w13 row layout [E, 2I, H] and its K-major target
+# [E, H, 2I] have the SAME shape and would hand back the same tensor, i.e. an
+# in-place transpose that corrupts itself. (w2 escaped it only because
+# [E, H, I] != [E, I, H].) Names keep the buffers distinct.
+_FP8_BUF: dict = {}
+
+
+def _buf(name: str, shape, device, dtype=torch.uint8):
+    sh = tuple(int(v) for v in shape)
+    k = (str(device), str(name), sh, dtype)
+    t = _FP8_BUF.get(k)
+    if t is None:
+        t = torch.empty(sh, dtype=dtype, device=device)
+        _FP8_BUF[k] = t
+    return t
 
 
 @triton.jit
@@ -136,3 +163,142 @@ def down_kernel_fp8(
             out_ptr + toks[:, None] * out_ld + h[None, :],
             acc * wts[:, None], mask=rmask[:, None], sem="relaxed")
         mt += 1
+
+
+# ---------------------------------------------------------------------------
+# Host-side assembly + staging (FP8 twins of gpu_prefill's MXFP4 versions)
+# ---------------------------------------------------------------------------
+
+
+def fp8_staging_bytes(n_experts: int, hidden: int, inter: int, ns: int = 2) -> int:
+    """Peak device bytes one layer's FP8 streaming path needs.
+
+    Same three-part accounting as ``gpu_prefill.staging_bytes`` (2 ring slots +
+    the assembly target + one node's DMA staging), but with FP8 widths: 1 byte
+    per weight element and a [N/128, K/128] fp32 block scale. That makes it ~2x
+    the MXFP4 number for the weights, which matters for the VRAM preflight.
+    """
+    E, H, I = int(n_experts), int(hidden), int(inter)
+    b = FP8_BLOCK
+    w13d = E * (2 * I) * H
+    w2d = E * H * I
+    s13d = E * ((2 * I) // b) * (H // b) * 4
+    s2d = E * (H // b) * (I // b) * 4
+    n = max(1, int(ns))
+    slots = 2 * (w13d + w2d + s13d + s2d)
+    raw = w13d + w2d
+    tmp = (w13d + w2d + s13d + s2d) / n
+    return int(slots + raw + tmp)
+
+
+def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
+                                  n_experts: int, dst=None):
+    """K-major FP8 device weights built from the engine's own NUMA shards.
+
+    FP8 twin of ``gpu_prefill.kmajor_from_engine_shards``. Two differences from
+    the MXFP4 version, both structural (not just widths):
+
+    * a shard row is ``H`` (gate/up) / ``I`` (down) **bytes**, not ``H/2``/``I/2``
+      -- but the reassembly is byte-identical, and the K-major transpose is the
+      same plain uint8 ``ktranspose_bytes``;
+    * the block scale is ``[E, N/128, K/128]`` fp32 (groupN = groupK = 128),
+      whereas MXFP4 is ``[E, N, K/32]`` e8m0. So the scale is read as fp32 and
+      transposed to K-major with torch (it is ~1 MB/layer -- negligible).
+
+    Returns ``(w13t, s13t, w2t, s2t)`` with the *weights* K-major and ready for
+    the kernels, or ``None`` when the engine has no shards (caller falls back).
+    """
+    geo = engine.shard_geometry()
+    ns = int(geo["ns"])
+    if ns < 2 or not geo["w13_node_bytes"] or not geo["w2_node_bytes"]:
+        return None
+    H, I, E = int(hidden), int(inter), int(n_experts)
+    b = FP8_BLOCK
+
+    # Assemble the canonical [E, 2I, H] / [E, H, I] row layout; each node's gate
+    # (resp. up) block is a contiguous cbytes run that maps to a contiguous row
+    # range, so each is a plain copy_ (see the MXFP4 version's NOTES §466).
+    w13_raw = _buf("raw13", (E, 2 * I, H), device)
+    c13 = int(geo["w13_cbytes"])
+    cr13 = int(geo["w13_crows"])
+    for n in range(ns):
+        buf = _dma_hostbuf(engine, 0, n, int(geo["w13_node_bytes"]), device)
+        blk = buf.view(E, 2, c13)
+        c0 = n * cr13
+        w13_raw[:, c0:c0 + cr13, :].copy_(blk[:, 0, :].reshape(E, cr13, H))
+        w13_raw[:, I + c0:I + c0 + cr13, :].copy_(blk[:, 1, :].reshape(E, cr13, H))
+        del buf, blk
+
+    w2_raw = _buf("raw2", (E, H, I), device)
+    c2 = int(geo["w2_cbytes"])
+    cr2 = int(geo["w2_crows"])
+    for n in range(ns):
+        buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
+        c0 = n * cr2
+        w2_raw[:, c0:c0 + cr2, :].copy_(buf.view(E, cr2, I))
+        del buf
+
+    # Scales are a single full host copy (not sharded): [E, N/128, K/128] fp32.
+    s13_raw = (_dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device)
+               .view(torch.float32).view(E, (2 * I) // b, H // b))
+    s2_raw = (_dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device)
+              .view(torch.float32).view(E, H // b, I // b))
+    s13t = s13_raw.transpose(1, 2).contiguous()      # [E, H/128, 2I/128]
+    s2t = s2_raw.transpose(1, 2).contiguous()        # [E, I/128, H/128]
+
+    if dst is not None:
+        w13t = _kmajor_bytes(w13_raw, dst[0])
+        w2t = _kmajor_bytes(w2_raw, dst[1])
+    else:
+        # Reuse the K-major targets too: fresh-per-layer allocation is the
+        # documented ~365 ms/layer allocator churn (NOTES §466). One slot is
+        # safe here because assembly and GEMM are strictly ordered on one stream.
+        w13t = _kmajor_bytes(w13_raw, _buf("km13", (E, H, 2 * I), device))
+        w2t = _kmajor_bytes(w2_raw, _buf("km2", (E, I, H), device))
+    return w13t, s13t, w2t, s2t
+
+
+def gpu_moe_layer_fp8(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
+                      H: int, I: int, K: int, *, device,
+                      swiglu_limit: float = 0.0,
+                      bm: int = 64, bn: int = 64, bk: int = 64, bh: int = 64,
+                      ns: int = 2, warps: int = 4):
+    """One layer's routed MoE on GPU from K-major FP8 weights.
+
+    Returns an **fp32** tensor: accumulating the top_k partial sums into a bf16
+    output (what the MXFP4 path does, since its `out` is bf16) costs ~2-4e-3 rms
+    relative error; fp32 accumulation measures ~5e-7. The caller casts once.
+    """
+    T = x.shape[0]
+    E = int(w13t.shape[0])
+    tok, wts, seg_start, A = _build_segmentation(topk_ids, topk_weights, E, device)
+    out = torch.zeros((T, H), dtype=torch.float32, device=device)
+    if T == 0 or K == 0:
+        return out
+    inter = _buf("inter", (A, 2 * I), device, torch.bfloat16)
+    gate_up_kernel_fp8[(E, triton.cdiv(2 * I, bn))](
+        x, x.stride(0), tok, seg_start,
+        w13t, w13t.stride(1), s13t, s13t.stride(1),
+        inter, inter.stride(0), w13t.stride(0), s13t.stride(0),
+        H=H, BM=bm, BN=bn, BK=bk, NS=ns, num_warps=warps,
+    )
+    down_kernel_fp8[(E, triton.cdiv(H, bh))](
+        inter, inter.stride(0), tok, wts, seg_start,
+        w2t, w2t.stride(1), s2t, s2t.stride(1),
+        out, out.stride(0), w2t.stride(0), s2t.stride(0),
+        H=H, I=I, BM=bm, BH=bh, BK=bk, NS=ns, LIMIT=float(swiglu_limit),
+        num_warps=warps,
+    )
+    return out
+
+
+def gpu_moe_layer_fp8_from_engine(x, topk_ids, topk_weights, engine,
+                                  H: int, I: int, K: int, *, device,
+                                  swiglu_limit: float = 0.0, n_experts: int,
+                                  **kw):
+    """Assemble this layer's K-major FP8 weights from the engine and run it."""
+    built = kmajor_from_engine_shards_fp8(engine, device, H, I, n_experts)
+    if built is None:
+        return None
+    return gpu_moe_layer_fp8(x, topk_ids, topk_weights, *built, H, I, K,
+                             device=device, swiglu_limit=swiglu_limit, **kw)
