@@ -41,8 +41,11 @@ logical→physical topk 机制,只把最后的 attention 核换成可移植 Trit
 > **DeepSeek-V4.1-Flash 才是 ~40 KB/token(23 GiB ↔ 615,660 token)**。
 
 要上 1M 只有一条路:**fp8 KV**(SM8x 稀疏 MLA 的 fp8 变体 + NoPE 感知的 528 B blob;
-现成的 `fp8_ds_mla` 656 B blob 只到 ~948K)。**当前未实现**,评估见内部
-`dev-docs/GLM53_FP8_KV_SM8X_EVAL.md`。
+现成的 `fp8_ds_mla` 656 B blob 只到 ~948K)。
+
+> **决定(2026-09-19,项目方)**:GLM-5.3-Flash 在本硬件上**以 256K × 2 路为交付目标**,
+> **不做 fp8 KV、不追 1M**;512K/704K 的「能起」只作为能力记录,不作为交付目标,也不再补
+> 端到端长文验证。上表保留是为了说明硬件边界在哪,不代表待办。
 
 **长 prompt 的 TTFT**:CPU 引擎预填充吞吐饱和在 ~33k 专家-token/s(`MODEL_GUIDES.md` §2.5)。
 **FP8 GPU 预填充已实现**(`vllm_xiaotu_moe/gpu_prefill_fp8.py`,按引擎类别自动选后端),

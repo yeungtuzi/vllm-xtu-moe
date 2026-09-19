@@ -113,7 +113,9 @@ M≥6 稳定快 17-20%,但 M=1 反而慢 13% ⇒ 分发时用 `M > 4` 闸门,**�
 
 * **1M 上下文不可达**(bf16 KV):768K 起不来(vLLM 自报上限 733,312),1M 需要 11.57 GiB 的
   注意力 KV,而该 maxlen 下只有 6.87 GiB。唯一出路是 **fp8 KV**(SM8x 稀疏 MLA 的 fp8 变体 +
-  NoPE 感知的 528 B blob;现成的 `fp8_ds_mla` 656 B blob 只到 ~948K),**尚未实现**。
+  NoPE 感知的 528 B blob;现成的 `fp8_ds_mla` 656 B blob 只到 ~948K)。
+  **决定:本硬件上以 256K × 2 路交付,不做 fp8 KV、不追 1M**;512K/704K 的「能起」只是
+  能力记录(704K 仅 1.06× 并发),不作为目标。
 * `--mamba-ssm-cache-dtype` 对容量**无**帮助;TP>2 对 MLA 的 KV **无**帮助(每 rank 复制),
   TP=3 不整除 64 头,SM8x 不支持 DCP。
 * 同一 prompt 重复请求的贪心输出**会**偶发 token 级抖动(near-tie 翻转,与 batching /

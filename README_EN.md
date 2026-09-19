@@ -88,9 +88,10 @@ Official `vllm bench serve`, random dataset + `--ignore-eos`, a distinct seed pe
   GPU and **overlaps** that transfer with attention;
 * **Decode is unchanged**: C=1 TPOT 46 ms (~22 tok/s), as in v0.2.1 (the GPU path only affects
   prefill);
-* **Context**: 256K × 2 concurrent (KV pool 988,081 tokens; 512K and 704K also start, 704K with
-  only 1.06× concurrency, ceiling ≈733K; 1M needs an fp8 KV cache — see
-  [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md));
+* **Context**: 256K × 2 concurrent (KV pool 988,081 tokens) is the **delivered target for this
+  hardware**; 512K/704K merely start (704K with only 1.06× concurrency, ceiling ≈733K) and are
+  recorded as capability, not targets; **1M is out of scope** (needs an fp8 KV cache, decided
+  against — see [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md));
 * **Correctness**: engine determinism gate 11/11; layer gate rms_rel 4.4e-3; a 29,746-token
   needle retrieval is exact; three concurrent ~8K requests (two-way admission) all retrieve
   their own secret; 0 OOM.

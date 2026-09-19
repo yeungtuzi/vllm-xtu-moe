@@ -80,8 +80,9 @@
 * **长 prompt 预填充**:4096-in 的 TTFT 从 **29.3 s(v0.2.1 全 CPU 预填充)降到 22.8 s(1.29×)** ——
   FP8 GPU 预填充把每层 3.62 GB/rank 的专家权重逐层流式搬上 GPU,并与 attention **重叠**;
 * **解码不变**:C=1 TPOT 46 ms(≈22 tok/s),与 v0.2.1 持平(GPU 预填充只作用于 prefill);
-* **上下文**:256K × 2 路并发(KV 池 988,081 token;实测 512K 可起、704K 可起但只剩 1.06× 并发,
-  上限约 733K;1M 需要 fp8 KV,见 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md));
+* **上下文**:256K × 2 路并发(KV 池 988,081 token)是**本硬件的交付目标**;
+  512K/704K 实测「能起」但只作能力记录(704K 仅 1.06× 并发,上限约 733K),
+  **1M 不在目标内**(需 fp8 KV,已决定不做;见 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md));
 * **正确性**:引擎确定性门禁 11/11;层门禁 rms_rel 4.4e-3;29,746-token 长文密钥检索完全命中;
   3 路 ~8K 并发(限两路)三个密钥全部正确;0 OOM。
 
