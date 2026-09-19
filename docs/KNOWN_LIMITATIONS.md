@@ -29,14 +29,26 @@ logical→physical topk 机制,只把最后的 attention 核换成可移植 Trit
 > 该后端由模型侧显式绑定(`glm5next` 的 DSA 层),**不改变其它模型的选路**;
 > 本插件的 CPU 专家路径对该模型早有验证(`scripts/test_glm53_fp8_layer.py`)。
 
-**上下文上限(硬件约束)**:在 2×A100-40GB / TP=2 上,bf16 KV 只能提供
-**615,660 token** 的 KV 容量(23.0 GiB/rank)。GLM 的模型上限是 1M,但
-**本机无法同时满足 1M 上下文与 bf16 KV**(需要约 40 GiB/rank);
-而 SM8x 稀疏 MLA 后端**只支持 bf16 KV**,所以 1M 在当前硬件上不可达。
+**上下文上限(硬件约束,2026-09-19 实测)**:2×A100-40GB / TP=2 / bf16 KV 下,
+`--max-model-len` 的启动阶梯是:256K ✅(KV 池 **988,081 token**,3.77× 并发)、512K ✅(843,055)、
+**704K ✅(763,177,但只剩 1.06× 并发)**、768K ❌(vLLM 自报上限 733,312)、
+**1M ❌**(需 11.57 GiB 注意力 KV,只有 6.87 GiB)。
+⇒ GLM 的模型上限是 1M,本机 bf16 KV 下的**可行上限约 733K**;交付配置取 **256K × 2 路**
+(两路 256K 只占池子 53%)。
 
-**长 prompt 的 TTFT 是秒级(CPU 预填充)**:引擎预填充吞吐饱和在 ~33k 专家-token/s
-(见 `MODEL_GUIDES.md` §2.5),4096-token 的 TTFT 实测 **29.3 s**。
-现有 GPU 预填充实现只覆盖 MXFP4,GLM 的 FP8 走 GPU 需要新的内核(未实现)。
+> ⚠️ **别把两个模型的 KV 单价搞混**(公开文档此前写错过):**GLM-5.3-Flash 是
+> ~11.9-12.3 KB/token**(只有 11 层 NoPE 稀疏 MLA 带 per-token KV,每层 512 维 latent × 2 B);
+> **DeepSeek-V4.1-Flash 才是 ~40 KB/token(23 GiB ↔ 615,660 token)**。
+
+要上 1M 只有一条路:**fp8 KV**(SM8x 稀疏 MLA 的 fp8 变体 + NoPE 感知的 528 B blob;
+现成的 `fp8_ds_mla` 656 B blob 只到 ~948K)。**当前未实现**,评估见内部
+`dev-docs/GLM53_FP8_KV_SM8X_EVAL.md`。
+
+**长 prompt 的 TTFT**:CPU 引擎预填充吞吐饱和在 ~33k 专家-token/s(`MODEL_GUIDES.md` §2.5)。
+**FP8 GPU 预填充已实现**(`vllm_xiaotu_moe/gpu_prefill_fp8.py`,按引擎类别自动选后端),
+4096-in / 64-out 的 TTFT 从 **29.3 s 降到 22.8 s(1.29×)**。装配是 3.62 GB/rank 的纯 H2D
+固定成本(本机 H2D 天花板 26.86 GB/s,实测 1-D 与 pitched 2-D 同速),所以优化点是
+**把它与 attention 重叠**(默认开启的 side stream),而不是"搬得更快"。
 
 ## 2. 后端能力
 

@@ -171,21 +171,39 @@ GPTQ 检查点在引擎构造时一次性重排(`w13 [E, K/8, 2I] int32` → `[E
 启动见 `scripts/serve_glm53_mainline.sh`;**必须 `--kv-cache-dtype bfloat16`**
 (SM8x 稀疏 MLA 后端只支持 bf16 KV;fp8/fp4 会 fail-closed)。
 
-`vllm bench serve`,随机数据、`--ignore-eos`。口径:**`out tok/s` 含 TTFT;三项独立公布**。
+**交付配置(v0.2.2 默认)**:`--max-model-len 262144 --max-num-seqs 2 --max-num-batched-tokens 8192
+--kv-cache-dtype bfloat16 --gpu-memory-utilization 0.90` + GPU 预填充阈值 1500。
+
+`vllm bench serve`,随机数据、`--ignore-eos`,**每格不同 seed**(避免 prefix-cache 假性命中)。
+口径:**`out tok/s` 含 TTFT;三项独立公布**。
 
 | 并发 | prompt / output | out tok/s(含 TTFT) | TTFT 均值 | TPOT 均值 | 完成 |
 |---|---|---|---|---|---|
-| C=1 | 256 / 128 | **16.20**(峰值 23.00) | 2185 ms | **45.03 ms** | 8/8 |
-| C=2 | 256 / 128 | 19.94 | 3254 ms | 75.35 ms | 8/8 |
-| C=4 | 256 / 128 | 20.27 | 12673 ms | 74.60 ms | 8/8 |
-| C=1 | **4096 / 64** | 1.99 | **29320 ms** | 46.37 ms | 2/2 |
+| C=1 | 256 / 128 | **16.18** | 2022 ms | **46.37 ms** | 8/8 |
+| C=2 | 256 / 128 | 19.36 | 3287 ms | 78.13 ms | 8/8 |
+| **C=1** | **4096 / 64** | 2.49 | **22764 ms** | 46.95 ms | 2/2 |
+| C=2 | 4096 / 64 | 2.59 | 34162 ms | 243.21 ms | 4/4 |
+
+**与 v0.2.1 的配置(4096 上下文 / MBT=1024 / 阈值 4096 ⇒ 全 CPU 预填充)对照**:
+
+| 口径 | v0.2.1 配置 | **v0.2.2 交付配置** |
+|---|---|---|
+| 4096-in / 64-out C=1 TTFT | 29320 ms | **22764 ms(1.29×)** |
+| 256-in / 128-out C=1 out tok/s | 16.20 | 16.18(**解码不变**) |
+| 256-in / 128-out C=1 TPOT | 45.03 ms | 46.37 ms |
+| 上下文×并发 | 4096 × 4 | **262144 × 2** |
+
+* C=4 那一档不再公布:交付配置把并发限到 2(`--max-num-seqs 2`),换成"两路 **256K**"的
+  上下文保证 —— 两路 256K 需 524,288 token,而池子是 **988,081 token**;
+* **4096/64 的 C=2 TPOT 243 ms** 是 chunked prefill 的正常代价(长 prompt 的 chunk 与
+  decode 步交错);长 prompt 场景建议"一路长 + 一路短"。
 
 读法:
 
 * **纯解码 ≈ 22 tok/s**(C=1,`1/TPOT`),且 **TPOT 与上下文长度基本无关**
   (4096-token 的 TPOT 仍 46.4 ms);
 * 吞吐在 C≥2 就饱和、而 TPOT 反而升高 ⇒ 瓶颈是**每层引擎调用的延迟**,不是带宽;
-* **TTFT 由预填充主导**(4096 token ≈ 29.3 s,CPU 引擎)。
+* **TTFT 由预填充主导**(4096 token:全 CPU 为 29.3 s,交付的 GPU 预填充为 **22.8 s**)。
 
 **GPU 流式预填充(FP8)已接线并实测**(`gpu_prefill_fp8.py`,按引擎类别自动选择,
 无需开关)。同进程内切阈值、唯一 prompt(`scripts/probe_ttft.py`,UNIQUE=1):

@@ -153,7 +153,7 @@ xiaotu_moe variant = _avx512_bf16
 | 参数 | 建议 | 说明 |
 |---|---|---|
 | `--tensor-parallel-size` | `1`(单卡)或 `2` | 目前**不支持 expert_map(EP)**,TP>1 走权重分片 |
-| `--max-model-len` | 先 `4096`–`8192`,再按 KV 容量放大 | KV 占用随模型不同(DeepSeek-V4 约 400 KiB/token) |
+| `--max-model-len` | GLM-5.3:**交付默认 262144(256K)**,实测可起 512K/704K;DeepSeek-V4 系列先 `4096`–`8192` 再放大 | KV 单价差异极大:**GLM-5.3 ≈ 11.9-12.3 KB/token**,DeepSeek-V4.1 ≈ 40 KB/token |
 | `--gpu-memory-utilization` | `0.85` | 非专家权重 + KV cache 在显存 |
 | `--enforce-eager` | 建议先开 | 避免 CUDA graph 与 CPU 引擎 host 回调的额外变量;稳定后可尝试关闭 |
 | `--kernel-config.enable_jit_warmup=false` | 建议 | 跳过 JIT 预热,加快启动 |
@@ -247,7 +247,7 @@ export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384     # 0 = 全部 CPU
 ### 4.3 其它 MoE 模型
 
 任何使用 `FusedMoEFactory` 的 MoE 模型(BF16 / FP8 / MXFP4 / INT4)都可以用同样
-方式启动,只需把 `--max-model-len`、`--max-num-seqs` 按显存与 KV 需求调整。
+方式启动,只需把 `--max-model-len`、`--max-num-seqs` 按显存与 KV 需求调整(GLM-5.3-Flash 见 `scripts/serve_glm53_mainline.sh`:默认 **256K × 2 路** + GPU 预填充)。
 后端是否被正确选中,用 `scripts/probe_oracle.py` 或启动日志中的
 `Using CPU ... MoE backend` 行确认。
 

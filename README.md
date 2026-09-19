@@ -6,7 +6,11 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 当前版本:v0.2.1**(2026-09-18)—— **针对引擎的显著性能优化**:
+> **📌 当前版本:v0.2.2**(2026-09-19)—— **支持 GLM-5.3-Flash**:FP8 GPU 预填充接线
+> (4K prompt 的 TTFT **29.3 s → 22.8 s**)、交付配置 **256K 上下文 × 2 路并发**,
+> 并修掉一个**真实的 e4m3 次正规数解码缺陷**(引擎 + 新增全码字门禁)。
+>
+> 上一版 **v0.2.1**(2026-09-18)—— **针对引擎的显著性能优化**:
 > CPU MoE 引擎在全部真实形状上**反超参考实现 `lk_moe`**,DeepSeek-V4-Flash 同步受益。
 > 发行说明:[`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md)
 
@@ -42,7 +46,7 @@
 |---|---|---|---|
 | **DeepSeek-V4.1-Flash** | 748B | MXFP4(E8M0 block-32) | ✅ 端到端(TP=2) |
 | **DeepSeek-V4-Flash**(0731) | 256 专家 / top-6 | MXFP4 | ✅ 端到端 |
-| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,需 `--kv-cache-dtype bfloat16`;贪心可复现,C=1 解码 ~22 tok/s(TPOT 45 ms);4K prompt TTFT **29.3 s(CPU)→ 22.0-22.6 s(FP8 GPU 预填充)** |
+| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,交付配置 **256K 上下文 × 2 路并发**(KV 池 988,081 token),需 `--kv-cache-dtype bfloat16`;C=1 解码 ~22 tok/s(TPOT 46 ms);4K prompt TTFT **29.3 s(CPU)→ 22.8 s(FP8 GPU 预填充,1.29×)** |
 | 其它即插即用 MoE | — | BF16 / FP8 | ✅ 走通用路径,未逐模型标定 |
 
 **实测硬件平台(下文所有性能数字都在这台机器上取得)**
@@ -56,12 +60,33 @@
 
 ---
 
-## 性能(最新版本 **v0.2.1**)
+## 性能(最新版本 **v0.2.2**)
 
 > **怎么读** —— 表里的数字都是**耗时(ms/层),越小越好**,即"同样的活干得更快"。
 > 对照方是 `lk_moe`(Lvllm 的 CPU MoE 引擎):同一台机器、同一份真实层权重、同一线程数,
 > 且**每个 arm 的 `lk_moe` 分母都在同一个 session 里现量**,避免跨时段漂移。
 > **比值 < 1.0 表示我们更快。**
+
+### GLM-5.3-Flash(2×A100-40GB,TP=2,SM80;交付配置 256K × 2 路)
+
+官方 `vllm bench serve`,随机数据 + `--ignore-eos`,每格不同 seed。
+
+| 并发 | prompt / output | out tok/s(含 TTFT) | TTFT 均值 | TPOT 均值 | 完成 |
+|---|---|---|---|---|---|
+| C=1 | 256 / 128 | **16.18** | 2022 ms | **46.37 ms** | 8/8 |
+| C=2 | 256 / 128 | 19.36 | 3287 ms | 78.13 ms | 8/8 |
+| **C=1** | **4096 / 64** | 2.49 | **22764 ms** | 46.95 ms | 2/2 |
+
+* **长 prompt 预填充**:4096-in 的 TTFT 从 **29.3 s(v0.2.1 全 CPU 预填充)降到 22.8 s(1.29×)** ——
+  FP8 GPU 预填充把每层 3.62 GB/rank 的专家权重逐层流式搬上 GPU,并与 attention **重叠**;
+* **解码不变**:C=1 TPOT 46 ms(≈22 tok/s),与 v0.2.1 持平(GPU 预填充只作用于 prefill);
+* **上下文**:256K × 2 路并发(KV 池 988,081 token;实测 512K 可起、704K 可起但只剩 1.06× 并发,
+  上限约 733K;1M 需要 fp8 KV,见 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md));
+* **正确性**:引擎确定性门禁 11/11;层门禁 rms_rel 4.4e-3;29,746-token 长文密钥检索完全命中;
+  3 路 ~8K 并发(限两路)三个密钥全部正确;0 OOM。
+
+> FP8 引擎内层另有一个**默认关闭**的加速开关 `XIAOTU_MOE_FP8_BF16_MMA=1`
+> (AVX512-BF16 `vdpbf16ps`,M≥6 快 1.17-1.20×,代价是权重舍入 bf16:两路 rms_rel 3.6e-3)。
 
 ### DeepSeek-V4.1-Flash(真实路由形状 `na≈226`,60 线程,单位 ms/层)
 
@@ -103,7 +128,7 @@ TTFT 与 TPOT(**不含 TTFT**)各自单独公布。
 
 * **MXFP4**(DeepSeek-V4.1-Flash 等):客户端 TTFT 实测 **快 2.0-2.8×**(阈值 ≥4096 才划算);
 * **FP8 e4m3 block-128**(GLM-5.3-Flash):µbench 一样把长 prompt 的 TTFT 从
-  **29.3 s 压到 22.0-22.6 s(1.3×)**。两点值得注意:
+  **29.3 s 压到 22.8 s(1.29×,4096-in)。两点值得注意:
   1. 权重装配是 **3.62 GB/rank 的纯 H2D 固定成本**,已到本机 26.86 GB/s 的 H2D 天花板
      (1-D 与 pitched 2-D 同速,锁页/NUMA 交错/两 rank 并发都不改变),所以优化点是
      **把装配与 attention 重叠**(默认开启的 side stream),不是"搬得更快";
@@ -147,12 +172,13 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 
 | 版本 | 主题 |
 |---|---|
+| **v0.2.2** | **支持 GLM-5.3-Flash** —— FP8 GPU 预填充接线(4K prompt TTFT 29.3 → 22.8 s)、256K × 2 路并发交付配置;修掉 e4m3 次正规数解码缺陷 + 新增全码字门禁 |
 | **v0.2.1** | **针对引擎的显著性能优化** —— CPU MoE 引擎在全部真实形状上**反超 `lk_moe`**;DeepSeek-V4-Flash 同步受益 |
 | v0.2 | DeepSeek-V4.1-Flash 全链路可用(1M 上下文 + GPU 预填充 + 投机解码)+ CPU 预填充路径优化 |
 | v0.1.0 | 首个公开版:混合模式(CPU 专家 + GPU 其余)、AVX2 / AVX-512 多 ISA、DeepSeek-V4 系列 |
 
 改动清单、性能对照与运行参数变更:
-[**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
+[**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
 (归档:[v0.2pre](RELEASE_NOTES_v0.2pre.md))
 
 ---

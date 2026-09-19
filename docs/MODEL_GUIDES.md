@@ -205,31 +205,59 @@ bash scripts/serve_glm53_mainline.sh        # 默认 TP=2、GPU 0/1、bf16 KV
 > ⚠️ **必须 `--kv-cache-dtype bfloat16`**:本插件的 SM8x(Ampere/Ada)稀疏 MLA 后端
 > **只支持 bf16 KV**;fp8/fp4 KV 会 fail-closed(回到上游 SM90+ 候选池并报错)。脚本已默认设好。
 
-### 2.3 实测(2×A100-40GB,TP=2,真实 FP8 检查点,256-in / 128-out,`vllm bench serve`)
+### 2.3 实测(2×A100-40GB,TP=2,真实 FP8 检查点,`vllm bench serve`,随机数据 + `--ignore-eos`)
 
-| 并发 | out tok/s(**含 TTFT**) | TTFT 均值 | TPOT 均值 | 完成 |
-|---|---|---|---|---|
-| C=1 | **16.20** | 2185 ms | **45.03 ms** | 8/8 |
-| C=2 | 19.94 | 3254 ms | 75.35 ms | 8/8 |
-| C=4 | 20.27 | 12673 ms | 74.60 ms | 8/8 |
+**交付配置**(脚本默认):`--max-model-len 262144 --max-num-seqs 2 --max-num-batched-tokens 8192
+--kv-cache-dtype bfloat16 --gpu-memory-utilization 0.90`,GPU 预填充阈值 1500。
 
-* 纯解码 ≈ **22 tok/s**(C=1,`1/TPOT`);
-* 吞吐在 C≥2 就饱和,而 TPOT 升高 ⇒ 瓶颈是**每层引擎调用的延迟**(不是带宽,见 `dev-docs` 的 R8);
-* **TTFT 由 CPU 预填充主导**(`XIAOTU_*GPU_PREFILL_MIN_TOKENS=0`);GPU 预填充(R-VRAM 优先级 2)
-  尚未在 GLM 上开启,是下一个明确靶子。
+| 并发 | prompt/output | out tok/s(**含 TTFT**) | TTFT 均值 | TPOT 均值 | 完成 |
+|---|---|---|---|---|---|
+| C=1 | 256 / 128 | **16.18** | 2022 ms | **46.37 ms** | 8/8 |
+| C=2 | 256 / 128 | 19.36 | 3287 ms | 78.13 ms | 8/8 |
+| **C=1** | **4096 / 64** | 2.49 | **22764 ms** | 46.95 ms | 2/2 |
+| C=2 | 4096 / 64 | 2.59 | 34162 ms | 243.21 ms | 4/4 |
 
-### 2.4 上下文 / 显存预算(TP=2,单卡 A100-40GB)
+与上一版(4096 上下文 / MBT=1024 / 阈值 4096 ⇒ 全 CPU 预填充)对照:
+
+| | 旧配置 | **交付配置** |
+|---|---|---|
+| 4096/64 C=1 TTFT | 29320 ms | **22764 ms(1.29×)** |
+| 256/128 C=1 TPOT | 45.03 ms | 46.37 ms(**解码不变**,GPU 预填充只作用于 prefill) |
+
+* 纯解码 ≈ **22 tok/s**(C=1,`1/TPOT`),且**与上下文长度基本无关**;
+* 吞吐在 C≥2 就饱和、TPOT 升高 ⇒ 瓶颈是**每层引擎调用的延迟**(不是带宽,见 `dev-docs` 的 R8);
+* **4096/64 的 C=2 那一格 TPOT 243 ms** 是 chunked prefill 的正常代价:两个长 prompt 的
+  chunk 与 decode 步交错,长 prompt 场景建议按"单路长 + 单路短"使用。
+* 交付配置下 **3 个 ~8K token 请求并发**:2 个 35.9 s + 1 个 47.0 s(两路并行 + 一个排队),
+  三个不同密钥**全部检索正确** ⇒ 并发下无跨序列 KV/state 串扰。
+
+### 2.4 上下文 / 显存预算(TP=2,单卡 A100-40GB,交付配置)
 
 | 项 | 实测 |
 |---|---|
-| 每 rank 模型权重 | **8.75 GiB** |
-| KV cache 可用 | **23.0 GiB**(`gpu-memory-utilization 0.90`)|
-| **KV 容量** | **615,660 tokens**(bf16)|
-| 主机内存 | ~595 GB(引擎单份 NUMA 分片 + vLLM 源张量)|
+| 每 rank 非专家权重 | **~15.1 GiB**(self_attn 10.39 + embed/lm_head 2.36 + dense_mlp 1.08 + shared 1.01,检查点口径) |
+| Available KV | **11.55 GiB** |
+| **GPU KV cache size** | **988,081 tokens** |
+| 该长度(256K)下的 KV 并发 | **3.77×**(两路 256K 只占 53%) |
+| 主机内存 | ~595 GB(引擎单份 NUMA 分片 + vLLM 源张量) |
 
-⇒ **40 GB 卡上无法同时满足 1M 上下文与 bf16 KV**(1M 需要约 40 GiB/rank 的 KV)。
-GLM 的模型上限是 1M,但本机可行上限约 **61.5 万 token**。要上 1M 需要更大的卡,
-或 fp8 KV —— 而 **SM8x 稀疏 MLA 后端只支持 bf16 KV**,所以当前无解,属硬件/KV 约束。
+`--max-model-len` 实测阶梯(util 0.90、bf16 KV):
+
+| maxlen | 启动 | KV 池 | 该长度下并发 |
+|---|---|---|---|
+| 256K | ✅ | 988,081 token | **3.77×** ← 交付 |
+| 512K | ✅ | 843,055 | 1.61× |
+| 704K | ✅ | 763,177 | 1.06×(零余量) |
+| 768K | ❌ | vLLM 自报上限 733,312 | — |
+| 1M | ❌ | 需 11.57 GiB,只有 6.87 GiB | 需 fp8 KV |
+
+* **KV 单价 ~11.9-12.3 KB/token**(不是 V4.1 的 ~40 KB/token):只有 11 层 NoPE 稀疏 MLA
+  带 per-token KV,每层 512 维 latent × 2 B = 1024 B。
+* 池子会随 maxlen **变小**(KDA state 池随序列长度增长)⇒ 单请求上限与总容量互相挤,
+  自洽天花板 ≈ **733K**;而把并发从 4 限到 2 反而让池子**变大**(919,520 → 988,081),
+  因为 state 池按序列槽位分配。
+* 长文可用性已验:29,746-token prompt 密钥埋文末,**检索完全命中**,约 3.5 ms/token。
+* **要 1M 只有一条路:fp8 KV**(NoPE 感知 528 B blob;现成 656 B blob 只到 ~948K)—— 未实现。
 
 ### 2.4b 上下文长度能开多大(2×A100-40GB / TP=2 实测)
 
@@ -270,7 +298,7 @@ GLM 的模型上限是 1M,但本机可行上限约 **61.5 万 token**。要上 1
 
 **读法**:M≥28 后每层的"专家-token 吞吐"饱和在 **~33k/s** ⇒ 预填充是**吞吐受限**,
 与并发无关。`M = B/36`,所以 4096-token 的 chunk 每层 M≈114 ⇒ 42 层约 40 s 量级,
-与实测 **TTFT 29.3 s**(4096-in)同量级。
+与实测 **TTFT 22.8 s**(4096-in,GPU 预填充;旧配置全 CPU 时是 29.3 s)同量级。
 
 **GPU 流式预填充(GLM 的 FP8 版本已接线)**:`gpu_prefill_fp8.py` 是 `gpu_prefill.py`
 的 FP8 孪生(e4m3 单字节 + fp32 block-128),按引擎类别自动选择后端,无需开关。
@@ -315,7 +343,11 @@ AVX512-BF16 `vdpbf16ps`(32 个 bf16/指令、激活无需转换)。GLM 形状 M-
 
 * 层内数值(`GLM_MODEL=<ckpt> python scripts/test_glm53_fp8_layer.py <layer> 8`):
   真实权重 RMS 相对误差 **3.6e-5 ~ 3.1e-4**(门限 1e-3);
-* 贪心同一 prompt 三次输出**逐字节相同**;连续 24 个请求 **24/24 成功**;运行日志无 CUDA 错误;
+* 引擎确定性门禁 **11/11 逐位一致**;跨层预取开/关输出**逐字节相同**(语义透明);
+* 服务级:`vllm bench serve` 各档 **8/8、8/8、2/2、4/4 全部成功**,
+  3 路 ~8K 并发(限两路)全部正确,全程 **0 OOM / 0 CUDA 错误**;
+  ⚠️ 同一 prompt 重复请求的贪心输出**会**偶发 token 级抖动(near-tie 翻转,与
+  batching/prefix-cache 命中有关),这是服务栈既有现象,不作为验收项;
 * 主机内存 ~595 GB(引擎单份 NUMA 分片 + vLLM 源张量),GPU 每 rank 36.5 GiB(受
   `gpu-memory-utilization` 的 KV 预留支配)。
 
