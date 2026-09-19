@@ -263,9 +263,16 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
         for n in range(ns):
             c0 = n * cr13
             # gate rows [c0, c0+cr13) then up rows [I+c0, I+c0+cr13) of [E, 2I, H].
+            # The shard is `[E][gate cbytes][up cbytes]` -- i.e. per expert the gate
+            # run is followed by the up run -- so the *source* run stride is
+            # `2*c13`, NOT `cr13*H`. Each run is `cr13*H` contiguous bytes (the
+            # node's gate rows for one expert), and the destination rows for
+            # consecutive experts are `2*I*H` apart. Getting the source stride
+            # wrong silently reads the up rows as gate rows for the next expert
+            # (caught by scripts/test_gpu_prefill_fp8_assembly.py).
             for _off, _row in ((0, c0), (c13, I + c0)):
                 got = engine.copy_hostbuf_to_device_2d(
-                    0, n, _off, p13 + _row * H, 2 * I * H, cr13 * H, cr13 * H, E, stream)
+                    0, n, _off, p13 + _row * H, 2 * I * H, 2 * c13, cr13 * H, E, stream)
                 if int(got) != cr13 * H * E:
                     raise RuntimeError(
                         f"gpu-prefill: 2-D shard DMA failed (w13 node={n} off={_off}: "
