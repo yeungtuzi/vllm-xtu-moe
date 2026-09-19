@@ -190,9 +190,19 @@ GPTQ 检查点在引擎构造时一次性重排(`w13 [E, K/8, 2I] int32` → `[E
 **GPU 流式预填充(FP8)已接线并实测**(`gpu_prefill_fp8.py`,按引擎类别自动选择,
 无需开关)。同进程内切阈值、唯一 prompt(`scripts/probe_ttft.py`,UNIQUE=1):
 
-| chunk 口径 | CPU TTFT | GPU(FP8)TTFT | 加速 |
-|---|---|---|---|
-| 3860-token prompt(被切成 2176 + 1684) | 26.60 s | **25.38 s** | 0.95× |
+| 口径(3860-token prompt,切 2176 + 1680) | TTFT |
+|---|---|
+| 纯 CPU 预填充 | 26.60 s |
+| GPU 预填充 + **串行装配** | 26.63 s |
+| GPU 预填充 + **装配与 attention 重叠(side stream,默认)** | **22.0-22.2 s** |
+| 目标基线(CPU,MBT=1024 四段) | 29.3 s |
+
+⇒ **端到端 29.3 s → 22.0 s(1.33×)**。装配是 3.62 GB/rank 的纯 H2D(M 无关的固定成本),
+在空闲 GPU 上实测 134.9 ms = **26.86 GB/s**,即本机 H2D 天花板(1-D 与 pitched 2-D 同速,
+`numactl --interleave` 与两 rank 并发都不影响)。所以优化点不是"搬得更快",而是
+**不再让搬运排在 attention 后面**:DMA 只碰暂存缓冲与主机分片,attention 不读它们。
+服务里装配实测 164-204 ms(高于隔离值),差额是与 vLLM 自己每层 PCIe 流量
+(TP=2 的 all-reduce;GPU0/GPU1 之间无 NVLink)的争用,属于既有开销。
 
 每层分项:`asm=207 ms`(权重 H2D 3.62 GB/rank)+ `kernels=23 ms`(GPU MoE,
 比 CPU 引擎快约 10×)。
