@@ -66,6 +66,10 @@ GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-1500}"
 #     客户端拿不到 reasoning_content、也无法按思考等级区分。
 # GLM 系在 vLLM 里的注册名是 glm47_moe(别名 glm47);本检查点模板消费 reasoning_effort,
 # 只区分 low / high,其余取值一律按 max 处理(见 chat_template.jinja)。
+# 前缀缓存命中率上报。vLLM 默认 **不上报** `usage.prompt_tokens_details`
+# (`enable_prompt_tokens_details` 默认 False,不开时 `_make_prompt_tokens_details()` 直接返回 None
+# ⇒ 客户端只能看到 `cached_tokens: null`)。前端(DSH 等)要显示命中率就必须开这一项。
+PROMPT_TOKENS_DETAILS="${PROMPT_TOKENS_DETAILS:-1}"
 TOOL_PARSER="${TOOL_PARSER:-glm47}"     # vLLM 注册名:glm45 / glm47(实现是 glm47_moe_tool_parser)
 REASONING_PARSER="${REASONING_PARSER:-glm47}"
 INTERLEAVE="${INTERLEAVE:-1}"
@@ -92,6 +96,8 @@ ARGS=(
 # 客户端发 tool_choice="auto" 会 400(见上面注释)。
 [ -n "$TOOL_PARSER" ] && ARGS+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
 [ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
+# 让客户端能读到前缀缓存命中数(usage.prompt_tokens_details.cached_tokens)
+[ "$PROMPT_TOKENS_DETAILS" = "1" ] && ARGS+=(--enable-prompt-tokens-details)
 if [ "$COMPILE" = "1" ]; then
   ARGS+=(--compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_DECODE_ONLY"}')
 fi
@@ -139,6 +145,7 @@ export CUDA_VISIBLE_DEVICES="$GPUS"
 echo "[glm53] tag=$TAG port=$PORT gpus=$GPUS tp=$TP maxlen=$MAXLEN mbt=$MBT seqs=$SEQS"
 echo "[glm53] kv-cache-dtype=$KV_DTYPE (SM8x sparse-MLA is bf16-only)"
 echo "[glm53] tool-call-parser=${TOOL_PARSER:-off} reasoning-parser=${REASONING_PARSER:-off}"
+echo "[glm53] prompt-tokens-details=${PROMPT_TOKENS_DETAILS} (cached_tokens reporting)"
 echo "[glm53] log=$LOG"
 
 nohup env \

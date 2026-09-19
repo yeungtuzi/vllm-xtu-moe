@@ -180,9 +180,10 @@ xiaotu_moe variant = _avx512_bf16
 | `--enforce-eager` | 建议先开 | 避免 CUDA graph 与 CPU 引擎 host 回调的额外变量;稳定后可尝试关闭 |
 | `--kernel-config.enable_jit_warmup=false` | 建议 | 跳过 JIT 预热,加快启动 |
 | `--enable-auto-tool-choice` + `--tool-call-parser` | **GLM-5.3 必开:`glm47`** | 客户端带 `tools` 且 `tool_choice:"auto"` 时,缺这两项 vLLM 直接 **400**;合法值里 GLM 系是 `glm45` / `glm47`(实现是 `glm47_moe_tool_parser`) |
+| `--enable-prompt-tokens-details` | **默认已开**(`PROMPT_TOKENS_DETAILS=1`) | 让客户端能读到**前缀缓存命中率**;vLLM 默认**不上报**,不开时客户端只看到 `cached_tokens: null`(见 §3.6) |
 | `--reasoning-parser` | **GLM-5.3 必开:`glm47`** | 把思考内容从 `content` 里拆出来,单独返回(**本树字段名是 `reasoning`**,不是旧的 `reasoning_content`) |
 | `--trust-remote-code` | 通常不需要 | 主流模型配置已进入主线 |
-| `JITCACHE=1`(env,默认) | **保持开启** | 把编译缓存钉到固定目录,见 §3.6 |
+| `JITCACHE=1`(env,默认) | **保持开启** | 把编译缓存钉到固定目录,见 §3.7 |
 
 ### 3.5 工具调用与思考等级(GLM-5.3-Flash,**生产默认已开**)
 
@@ -241,7 +242,37 @@ models:
   (踩过一次:解析出来是 `{"false": null}`);
 * 该文件改完需要**重启 DSH** 才生效。
 
-### 3.6 JIT 固定缓存目录(`JITCACHE`)
+### 3.6 前缀缓存命中率上报(默认已开)与 **2176 块粒度**
+
+`scripts/serve_glm53_mainline.sh` 默认带 `PROMPT_TOKENS_DETAILS=1`,即
+`--enable-prompt-tokens-details`(置 `PROMPT_TOKENS_DETAILS=0` 关闭)。
+
+**为什么必须显式开**:vLLM 里 `FrontendArgs.enable_prompt_tokens_details` **默认 `False`**
+("If set to True, enable prompt_tokens_details in usage"),且
+`_make_prompt_tokens_details()` 在该开关为假时**直接返回 `None`** ⇒ 客户端在 `usage` 里
+**看不到任何缓存信息**(表现为 `cached_tokens: null`)。开了之后每个响应都带:
+
+```json
+"usage": {"prompt_tokens": 5117,
+          "prompt_tokens_details": {"cached_tokens": 4352, "created_cache_tokens": 0}}
+```
+
+* 流式请求要带 `"stream_options": {"include_usage": true}`,`usage` 才会出现在最后一个 chunk 里
+  (**DSH 走的就是这条路径**,已实测);
+* `cached_tokens` 单位是 token,不是请求数;命中率 = `cached_tokens / prompt_tokens`。
+
+⚠️ **命中按 `block_size = 2176` 的整块计算**(该值由 KDA/线性注意力的 mamba page 反推,见
+`platforms/interface.py`)。实测(同一段共享前缀、只换末尾提问):
+
+| 共享前缀 token | 第 1 次 | 第 2 次起 |
+|---|---|---|
+| **5117** | `cached_tokens=0`,`created_cache_tokens=4352` | **`cached_tokens=4352`**(= 2 × 2176) |
+| 1715(< 1 块) | `cached_tokens=0` | **`cached_tokens=0`** |
+
+⇒ **共享前缀不足 2176 token 时永远显示 0 命中**,这是块粒度的必然结果,不是缓存坏了;
+每次命中至少 2176 token。看 DSH 命中率时按这个粒度解读。
+
+### 3.7 JIT 固定缓存目录(`JITCACHE`)
 
 > **背景(v0.1 起)**:每次启动都重新 JIT 太慢,所以把编译缓存固定到一个目录,跨重启复用。
 
