@@ -25,7 +25,7 @@ PY="$ENV/bin/python"
 CKPT="${CKPT:-/home/user/.cache/modelscope/models/ZhipuAI--GLM-5.3-Flash/snapshots/master}"
 
 TAG="${TAG:-glm53_$(date +%m%d_%H%M%S)}"
-PORT="${PORT:-8073}"
+PORT="${PORT:-8070}"          # 生产服务端口(2026-09-19 起从 8073 迁到 8070)
 GPUS="${GPUS:-0,1}"
 TP="${TP:-2}"
 GPU_UTIL="${GPU_UTIL:-0.90}"
@@ -58,6 +58,16 @@ KV_DTYPE="${KV_DTYPE:-bfloat16}"
 # (1580 tokens: CPU 10.9 s vs GPU 10.2 s; 2176 tokens: 1.2x; ~4.1k: 1.26x), so
 # 1500 is the right default here. Lower it further only if you measure it.
 GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-1500}"
+# 工具调用 + 思考解析。不加这两项时:
+#   * 客户端带 tools + tool_choice="auto" 会被 vLLM 直接 400:
+#     '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set'
+#     (DSH 等 agent 框架默认就会发 tools,所以生产服务必须开);
+#   * 不开 reasoning parser 时,思考内容会混在 content 里(模型模板会输出思考块),
+#     客户端拿不到 reasoning_content、也无法按思考等级区分。
+# GLM 系在 vLLM 里的注册名是 glm47_moe(别名 glm47);本检查点模板消费 reasoning_effort,
+# 只区分 low / high,其余取值一律按 max 处理(见 chat_template.jinja)。
+TOOL_PARSER="${TOOL_PARSER:-glm47}"     # vLLM 注册名:glm45 / glm47(实现是 glm47_moe_tool_parser)
+REASONING_PARSER="${REASONING_PARSER:-glm47}"
 INTERLEAVE="${INTERLEAVE:-1}"
 COMPILE="${COMPILE:-0}"
 OUTDIR="${OUTDIR:-$ROOT/logs}"
@@ -78,6 +88,10 @@ ARGS=(
   --enable-chunked-prefill
   --disable-custom-all-reduce
 )
+# 工具调用:必须同时给 --enable-auto-tool-choice 与 --tool-call-parser,否则
+# 客户端发 tool_choice="auto" 会 400(见上面注释)。
+[ -n "$TOOL_PARSER" ] && ARGS+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
+[ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
 if [ "$COMPILE" = "1" ]; then
   ARGS+=(--compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_DECODE_ONLY"}')
 fi
@@ -124,6 +138,7 @@ export CUDA_VISIBLE_DEVICES="$GPUS"
 
 echo "[glm53] tag=$TAG port=$PORT gpus=$GPUS tp=$TP maxlen=$MAXLEN mbt=$MBT seqs=$SEQS"
 echo "[glm53] kv-cache-dtype=$KV_DTYPE (SM8x sparse-MLA is bf16-only)"
+echo "[glm53] tool-call-parser=${TOOL_PARSER:-off} reasoning-parser=${REASONING_PARSER:-off}"
 echo "[glm53] log=$LOG"
 
 nohup env \

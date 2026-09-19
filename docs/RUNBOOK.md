@@ -179,10 +179,69 @@ xiaotu_moe variant = _avx512_bf16
 | `--gpu-memory-utilization` | `0.85` | 非专家权重 + KV cache 在显存 |
 | `--enforce-eager` | 建议先开 | 避免 CUDA graph 与 CPU 引擎 host 回调的额外变量;稳定后可尝试关闭 |
 | `--kernel-config.enable_jit_warmup=false` | 建议 | 跳过 JIT 预热,加快启动 |
+| `--enable-auto-tool-choice` + `--tool-call-parser` | **GLM-5.3 必开:`glm47`** | 客户端带 `tools` 且 `tool_choice:"auto"` 时,缺这两项 vLLM 直接 **400**;合法值里 GLM 系是 `glm45` / `glm47`(实现是 `glm47_moe_tool_parser`) |
+| `--reasoning-parser` | **GLM-5.3 必开:`glm47`** | 把思考内容从 `content` 里拆出来,单独返回(**本树字段名是 `reasoning`**,不是旧的 `reasoning_content`) |
 | `--trust-remote-code` | 通常不需要 | 主流模型配置已进入主线 |
-| `JITCACHE=1`(env,默认) | **保持开启** | 把编译缓存钉到固定目录,见 §3.5 |
+| `JITCACHE=1`(env,默认) | **保持开启** | 把编译缓存钉到固定目录,见 §3.6 |
 
-### 3.5 JIT 固定缓存目录(`JITCACHE`)
+### 3.5 工具调用与思考等级(GLM-5.3-Flash,**生产默认已开**)
+
+`scripts/serve_glm53_mainline.sh` 的默认参数里现在包含(可用同名环境变量覆盖,置空即关闭):
+
+```
+TOOL_PARSER=glm47        -> --enable-auto-tool-choice --tool-call-parser glm47
+REASONING_PARSER=glm47   -> --reasoning-parser glm47
+```
+
+**为什么要开**:
+
+* **缺 `--enable-auto-tool-choice` / `--tool-call-parser` 会 400** —— agent 框架(DSH 等)默认就发
+  `tools` + `tool_choice:"auto"`,服务端会直接拒:
+  `"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set`。
+  实测开启后:`tools=[get_weather]` + `tool_choice:"auto"` → 200 且返回
+  `tool_calls=[get_weather({"city": "Tokyo"})]`。
+* **缺 `--reasoning-parser` 时思考内容混在 `content` 里**,客户端拿不到独立的思考字段。
+  实测开启后同一道题:`reasoning_effort=low` → 思考 0 字 / `high` → 22 字 / `max` → **917 字**。
+
+**思考等级的语义(来自检查点 `chat_template.jinja` 第 2 行,已离线渲染核实)**:
+
+```jinja
+{%- set effective_reasoning_effort = reasoning_effort
+      if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}
+```
+
+| 客户端传的 `reasoning_effort` | 模板实际渲染 |
+|---|---|
+| 不传 / `max` | `Reasoning Effort: Max`(**默认档**) |
+| `low` | `Reasoning Effort: Low` |
+| `high` | `Reasoning Effort: High` |
+| `medium` / `none` / 其它 | **`Max`**(模板不区分 —— 也就是说 **无法借此关闭思考**) |
+
+⇒ 模型真正区分的只有 **low / high / max 三档**。另有 `clear_thinking`(默认 `false`,
+控制是否清掉历史里的思考)可用 `chat_template_kwargs` 传入。
+
+**客户端怎么打通**:vLLM 侧由 `ChatCompletionRequest.build_chat_params()` 把**请求顶层的
+`reasoning_effort`** 合并进 `chat_template_kwargs` 再渲染模板(模板不认识的变量会被
+`resolve_chat_template_kwargs` 过滤掉),所以服务端**只需上面两个 parser 开关**,不需要别的参数。
+
+**客户端侧(以 DSH 为例)**:UI 里的思考等级来自客户端自己的模型能力声明,服务端无法替代。
+DSH(`~/.dsh/settings.yaml`)的模型条目需要声明:
+
+```yaml
+models:
+  - id: GLM-5.3-Flash
+    contextWindow: 262144
+    reasoning: true
+    thinkingLevelMap:
+      { "off": null, minimal: null, low: low, medium: null, high: high, xhigh: null, max: max }
+```
+
+* 只把 `low/high/max` 映射成非 null ⇒ UI 只给这三档(与模型能力一致);
+* **`off` 必须写成带引号的 `"off"`** —— 裸 `off` 会被 YAML 解析成布尔 `false`,DSH 就找不到这一档
+  (踩过一次:解析出来是 `{"false": null}`);
+* 该文件改完需要**重启 DSH** 才生效。
+
+### 3.6 JIT 固定缓存目录(`JITCACHE`)
 
 > **背景(v0.1 起)**:每次启动都重新 JIT 太慢,所以把编译缓存固定到一个目录,跨重启复用。
 
@@ -269,13 +328,32 @@ export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384     # 0 = 全部 CPU
 ### 4.3 其它 MoE 模型
 
 任何使用 `FusedMoEFactory` 的 MoE 模型(BF16 / FP8 / MXFP4 / INT4)都可以用同样
-方式启动,只需把 `--max-model-len`、`--max-num-seqs` 按显存与 KV 需求调整(GLM-5.3-Flash 见 `scripts/serve_glm53_mainline.sh`:默认 **256K × 2 路** + GPU 预填充)。
+方式启动,只需把 `--max-model-len`、`--max-num-seqs` 按显存与 KV 需求调整(GLM-5.3-Flash 见 `scripts/serve_glm53_mainline.sh`:默认 **256K × 2 路** + GPU 预填充 + 工具调用/思考解析 `glm47`,端口默认 **8070**,见 §3.5 与 §4.4)。
 后端是否被正确选中,用 `scripts/probe_oracle.py` 或启动日志中的
 `Using CPU ... MoE backend` 行确认。
 
 ---
 
-## 4b. 生产服务(8070)—— 两种模式,按"能不能交互"选
+## 4.4 GLM-5.3-Flash 生产服务(8070)—— 当前占用 8070 的服务
+
+```bash
+bash scripts/serve_glm53_mainline.sh          # 默认 PORT=8070,256K × 2 路 + GPU 预填充 + glm47 解析
+PORT=8080 bash scripts/serve_glm53_mainline.sh   # 换端口
+TOOL_PARSER= REASONING_PARSER= bash scripts/serve_glm53_mainline.sh   # 关掉工具调用/思考解析
+```
+
+实测(2026-09-19,2×A100-40GB / TP=2):`tools` + `tool_choice:"auto"` → 200 且正确返回
+`tool_calls`;`reasoning_effort` **low/high/max** 三档生效(思考长度 0 / 22 / 917 字符);
+KV 池 988,081 token(两路 256K 占 53%)。**客户端的思考等级需要客户端自己声明**
+(DSH 见 §3.5 的 `thinkingLevelMap`),服务端只需上面两个 parser 开关。
+
+> ⚠️ **8070 现在归 GLM-5.3-Flash**。DeepSeek 的生产脚本 `scripts/serve_prod_8070.sh` 默认也用
+> 8070,**两者不能同时起**(显存也只够一个 TP=2 服务)。要同时跑请显式换端口,例如
+> `PORT=8090 bash scripts/serve_prod_8070.sh`(见 §4b)。
+
+## 4b. DeepSeek 生产服务(两种模式,按"能不能交互"选)
+
+> ⚠️ **端口**:该脚本默认 `PORT=8070`,而 **8070 现在归 GLM-5.3-Flash**(见 §4.4)⇒ 两者不能同时起,请显式换端口,例如 `PORT=8090 bash scripts/serve_prod_8070.sh`。
 
 ```bash
 bash scripts/serve_prod_8070.sh                       # MODE=1m :TP=2 + 1M 上下文 + DSpark(默认)
