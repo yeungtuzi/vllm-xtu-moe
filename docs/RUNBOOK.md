@@ -323,6 +323,31 @@ tok.apply_chat_template([{"role":"system","content":"SYS-PROMPT-MARKER"},{"role"
   (踩过一次,11:10 的文件改动被抹掉)—— 先确认文件里 `reasoningEfforts` 还在,不在就重写,
   再**完全停掉 DSH 后启动**。
 
+**DSH 的自动压缩 ≠ 万能:阈值必须排在"真上限"之前(2026-09-19 踩坑,DSH 侧配置)**
+
+DSH(`dsh-compaction-basic`)有两层保护,**都会真的触发**,但都要靠配置对齐:
+
+1. **压力压缩**(`agent/pre-step`):DSH 自己的 token 计量 ≥ `contextWindow × thresholdRatio`
+   (默认 `0.8`)时,摘要 + 保留尾部(默认占 16%);
+2. **超限恢复**(`agent/request-error` 且 code = `CONTEXT_WINDOW_EXCEEDED`):剪枝 + 摘要 + **自动重试**
+   (默认 `maxOverflowRetries: 1`)。
+
+⚠️ **但服务商把 `max_tokens` 也算进上下文**(DeepSeek 报错原文:
+`maximum context length is 1048576 tokens. However, you requested 1050282 tokens
+(794282 in the messages, 256000 in the completion)`),而 `dsh-llm-deepseek` 的默认
+`maxTokens` 是 **256000** ⇒ 真正的输入上限 = `1048576 − 256000 = 792,576`,**低于** 0.8 阈值
+`800,000` ⇒ 会话可以涨到 794K 仍不触发压缩、却已经超限,**必然失败**。更糟的是超限恢复要再调一次
+模型做摘要,而那次输入同样超限 ⇒ 恢复也失败(`compaction/end` 里记
+`DeepSeek API stream from https://api.deepseek.com failed`),整轮报错;要等**下一轮**才压得下去。
+
+**修法**(`~/.dsh/settings.yaml`,热重载,无需重启):
+`llm-deepseek` 路由级加 `maxTokens: 131072` ⇒ 输入上限 `917,504` > 阈值 `800,000`(余量 117K)。
+想保留 256K 输出就换成把 `models[].contextWindow` 降到 ~`800000`(阈值随之 640K),或给
+`dsh web` 加 profile patch 把 `compaction-basic` 的 `thresholdRatio` 改成 `0.7`(该插件没走
+settings,只能走 `~/.dsh/profiles/web/cordis.patch.yml`)。
+本插件自身的 GLM route 是 pi-ai 侧,默认只发 `max_completion_tokens: 8192`,阈值 209,715,
+余量 44K,暂时不用动(**注意 `contextWindow` 与 `maxTokens` 相加不能超过服务端 `--max-model-len`**)。
+
 ### 3.6 前缀缓存命中率上报(默认已开)与 **2176 块粒度**
 
 `scripts/serve_glm53_mainline.sh` 默认带 `PROMPT_TOKENS_DETAILS=1`,即
