@@ -34,6 +34,14 @@ MBT="${MBT:-1024}"
 SEQS="${SEQS:-4}"
 THREADS="${THREADS:-60}"
 KV_DTYPE="${KV_DTYPE:-bfloat16}"
+# GPU-prefill threshold. The plugin's own default is 4096, which is *above*
+# GLM-5.3's prefill chunk size: the KDA (mamba-like) state is only written at
+# `block_size = 2176` boundaries, so the scheduler trims every chunk to a
+# multiple of 2176 no matter how large --max-num-batched-tokens is. With the
+# side-stream assembly overlap the measured break-even is ~1300 tokens/chunk
+# (1580 tokens: CPU 10.9 s vs GPU 10.2 s; 2176 tokens: 1.2x; ~4.1k: 1.26x), so
+# 1500 is the right default here. Lower it further only if you measure it.
+GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-1500}"
 INTERLEAVE="${INTERLEAVE:-1}"
 COMPILE="${COMPILE:-0}"
 OUTDIR="${OUTDIR:-$ROOT/logs}"
@@ -64,6 +72,9 @@ XTU_ENV_FILE="${XTU_ENV_FILE_OVERRIDE:-$OUTDIR/$TAG.envfile}"
 {
   echo "XIAOTU_MOE_THREADS=$THREADS"
   echo "XIAOTU_MOE_SPIN_IDLE_US=${SPIN_IDLE_US:-300}"
+  # Only the FILE is authoritative (XIAOTU_ENV_FILE is set explicitly below),
+  # so the threshold has to be written here to reach the EngineCore child.
+  echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=$GPU_PREFILL_MIN"
   [ -n "${XIAOTU_MOE_NSLICE_SMALL:-}" ] && echo "XIAOTU_MOE_NSLICE_SMALL=$XIAOTU_MOE_NSLICE_SMALL"
   [ -n "${XIAOTU_MOE_ASYNC:-}" ] && echo "XIAOTU_MOE_ASYNC=$XIAOTU_MOE_ASYNC"
   [ -n "${XIAOTU_MOE_RANK_SPLIT:-}" ] && echo "XIAOTU_MOE_RANK_SPLIT=$XIAOTU_MOE_RANK_SPLIT"
@@ -108,6 +119,7 @@ nohup env \
   FLASHINFER_DISABLE_VERSION_CHECK=1 \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
   XIAOTU_MOE_THREADS="$THREADS" \
+  VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$GPU_PREFILL_MIN" \
   XIAOTU_MOE_SPIN_IDLE_US="${SPIN_IDLE_US:-300}" \
   OMP_NUM_THREADS=1 \
   "${NCTL[@]}" "$PY" -m vllm.entrypoints.openai.api_server "${ARGS[@]}" > "$LOG" 2>&1 &
