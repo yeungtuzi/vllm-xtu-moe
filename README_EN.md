@@ -73,15 +73,10 @@ Every performance number below was taken on this machine:
 
 ---
 
-## Performance (latest release **v0.2.3**)
+## Performance
 
-> **Metric definitions (uniform across this README)**: `prefill (tok/s) = prompt_tokens / TTFT`
-> (the prefill rate before the first token) and `decode (tok/s) = 1000 / TPOT` (the decode rate
-> after it, **prefill excluded**); both are converted from the TTFT/TPOT of the same
-> `vllm bench serve` run. **`output tok/s` (which mixes in TTFT), TPOT and ITL are no longer
-> reported.** ⚠️ **A short prompt depresses prefill (tok/s)** because of fixed overhead, so read
-> that column on long prompts (see the notes below). C=1 and C=2 rates are **per-stream**, not
-> aggregate throughput.
+* Metric: `prefill (tok/s) = prompt_tokens / TTFT`, `decode (tok/s) = 1000 / TPOT` (both converted from the same `vllm bench serve` run).
+* Dataset: real ShareGPT conversations, filtered into a "short" and a "long" band; **prefix caching on**; C=1 and C=4 use **disjoint prompt slices** (otherwise C=4 reads the cache the C=1 run left behind); every cell is warmed up first.
 
 | Model (optimal config) | prompt | actual tokens | conc. | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
@@ -90,159 +85,13 @@ Every performance number below was taken on this machine:
 | | long | 4,538 | 1 | **178.3** | 21.3 |
 | | long | 4,518 | 4 | **92.9** | 2.2 |
 | **MiMo-V2.5**<br>1×A100 · maxlen 16K · KV capped 4 GiB<br>MTP k=1 · GPU prefill | short | 153 | 1 | 70.9 | **18.0** |
-| | short | 153 | 4 | 59.9 | 6.0 |
+| | short | 153 | 4 | measuring | measuring |
 | | long | 4,148 | 1 | 179.1 | 17.4 |
-| | long | 4,148 | 4 | **1,844.8** | 6.4 |
+| | long | 4,148 | 4 | measuring | measuring |
 | **DeepSeek-V4.1-Flash**<br>TP=2 · dspark k=5 · GPU prefill<br>KV capped 0.5 GiB · MBT 8192 | short | 84 | 1 | **217.7** | **21.3** |
-| | short | 84 | 4 | 83.7 | 10.7 |
+| | short | 84 | 4 | measuring | measuring |
 | | **long** | 4,796 | 1 | **330.3** | **24.7** |
-| | **long** | 4,796 | 4 | **2,595.2** | 10.6 |
-
-> ### ⚠️ 2026-09-20 correction: the C=4 column carried a **prefix-cache artifact**
-> The earlier C=4 figures (C=1 and C=4 run against the **same prompts** with prefix caching on)
-> showed **MiMo 1,845 / DeepSeek-V4.1 2,595 tok/s**. Those were **cache hits left behind by the
-> C=1 run** — no prefill happened. A cold/hot control measured **31,896 ms cold vs 838 ms hot**
-> on the same prompts (38×). The table is being re-measured with **disjoint prompt slices**
-> (the GLM rows above are already corrected; MiMo/V4.1 pending).
-> **Hard rule: any C=1 vs C>1 comparison must use non-overlapping prompt slices.**
-
-> **Dataset = ShareGPT real conversations**, filtered into a "short" (~150 tok) and a "long"
-> (~4.5K tok) band and fed via `--dataset-name custom` to bypass the **1024-token hard cap in
-> vLLM's ShareGPT loader** (which silently degrades every "long prompt" back to a short one).
-> **Prefix caching on** (product behaviour); each cell is preceded by a discarded warm-up on a
-> disjoint slice. `--backend openai-chat` (V4.1 has no chat_template, so it uses `openai`).
->
-> ⚠️ **Two counter-intuitive readings**:
-> (1) **A short prompt depresses prefill** — GLM gets 110 at 126 tok but 207 at 4,918 tok;
-> (2) **Batching lifts prefill by an order of magnitude** — for the same MiMo prompt, going from
-> C=1 to C=4 takes prefill from 179 to **1,845 tok/s** (four streams batch 16,592 tokens, so one
-> weight transfer serves 4× the tokens). **This is the project's only service-level measurement
-> above 1000 tok/s** (the other is the engine-side 1725 tok/s @13.8K chunk in the GPU prefill
-> section below).
-
-**Per-row configuration and sample size**
-
-| Model | Serving config | Sample / notes |
-|---|---|---|
-| GLM-5.3-Flash | `GPU_UTIL=0.82`, **speculation OFF by default** (since 2026-09-20; rationale in [`docs/RUNBOOK.md`](docs/RUNBOOK.md) §3.6b), GPU prefill ON (threshold 1500), **KV capped at 2 GiB + MBT 4096** (required for long prompts; without the cap it OOMs) | short cells N=16, long N=8, all warmed up. KV pool: spec off **915,487** / on **666,366** (−27%); delivered as **256K × 2 concurrent** |
-| MiMo-V2.5 | single card TP=1, Hybrid SWA-128 + DiffKV (`TRITON_ATTN_DIFFKV`), MTP k=1, GPU prefill ON, `maxlen 16384` + KV capped 4 GiB | short N=16, long N=8. **MTP k=3 is unusable** (accept 1.016 ⇒ 2.4× slower); greedy output is **byte-identical** to spec-off; load takes 25–30 min |
-| DeepSeek-V4.1-Flash | TP=2 · MBT=8192 · dspark k=5 · GPU prefill ON · KV capped 0.5 GiB | ⚠️ this snapshot has **no `chat_template`** ⇒ the bench must use `--backend openai --skip-chat-template`, otherwise the client throws and sends nothing (see [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) §9.1) |
-
-**Speculation flips sign with concurrency (pays at C=1, loses at C≥4)** — DeepSeek-V4.1's dspark,
-ShareGPT:
-
-| Conc. | spec off (output tok/s) | spec on (output tok/s) |
-|---|---|---|
-| C=1 | 13.79 | **18.38 (+33%)** |
-| C=4 | **41.62** | 31.03 (**−25%**) |
-| C=8 | **48.56** | 41.26 (−15%) |
-
-⇒ the draft competes with the target for the same CPU expert compute. GLM's MTP manages only
-**+2–3%** even at C=1 (a single recycled layer, acceptance 1.46), hence **off by default**.
-
-**How to read prefill** — two non-obvious rules:
-
-1. **Longer prompt ⇒ higher rate** (the fixed cost amortises): GLM **110 → 207** (126 → 4,918 tok),
-   MiMo **71 → 179** (153 → 4,148 tok), DeepSeek-V4.1 **218 → 330** (84 → 4,796 tok);
-2. ⚠️ **Higher concurrency makes per-request prefill SLOWER** (prefill is a **shared serial
-   resource**): DeepSeek-V4.1 long prompt **C=1 330 → C=4 131 tok/s**, GLM **178 → 93**.
-   **~~"batching lifts it an order of magnitude"~~ was wrong and is retracted** (see the
-   correction note below). Short prompts look "slow" because at 84–153 tok the fixed overhead
-   dominates.
-3. **Decode is the opposite**: it falls as concurrency rises (GLM long: C=1 21.6 → C=4 **2.8**),
-   because prefill and decode contend for the same CPU expert compute.
-
-**Other points**
-
-* **GLM delivery = 256K context × 2 concurrent**; since 0.2.3 `GPU_UTIL` **must be `0.82`**
-  (the upstream KV sizing changed, and 0.85 OOMs at two-way concurrency): KV pool 915,487
-  (spec off) / 666,366 (spec on), i.e. **MTP's real cost is KV −27%**
-  (256K concurrency 3.49× → 2.54×) plus **pulsing inter-token spacing** (1–2 tokens per step,
-  which hurts streaming). 1M is out of scope (needs an fp8 KV cache, decided against).
-* **Correctness**: engine determinism gate 11/11; layer gate rms_rel 4.4e-3; a 29,746-token
-  needle retrieval is exact; three concurrent ~8K requests (two-way admission) all retrieve their
-  own secret; 0 OOM.
-* **MiMo with GPU streaming prefill** needs a lower `GPU_UTIL` (measured 0.65) because staging is
-  **12.75 GiB/rank** (larger than GLM's 7.59 — `E=256×I=2048` is wider); at 8K context 5.8×
-  concurrency still fits.
-* The FP8 CPU inner loop has a **default-off** switch, `XIAOTU_MOE_FP8_BF16_MMA=1`
-  (AVX512-BF16 `vdpbf16ps`; 1.17–1.20× for M≥6, at the cost of rounding weights to bf16:
-  rms_rel 3.6e-3 between the two paths).
-
-### DeepSeek-V4.1-Flash, service level: same-parameter A/B against `lk_moe`
-
-Both arms run in the **same conda env**; the only variable is the CPU MoE engine. Prompts are
-byte-identical and both arms use 60 threads. Ratios are **ours / `lk_moe`**, so
-**> 1.0 means we are faster**.
-
-| prompt / output | `lk_moe` prefill (tok/s) | ours prefill (tok/s) | ratio | `lk_moe` decode (tok/s) | ours decode (tok/s) | ratio |
-|---|---|---|---|---|---|---|
-| 256 / 32 | 118.9 | 107.1 | **0.900×** | 44.7 | 31.1 | **0.695×** |
-| 256 / 1024 | 118.6 | 105.1 | **0.886×** | 44.9 | 33.5 | **0.746×** |
-| 8192 / 32 | 127.5 | 115.0 | **0.902×** | 45.4 | 34.3 | **0.756×** |
-| 8192 / 1024 | 127.6 | 120.9 | **0.948×** | 44.8 | 34.7 | **0.775×** |
-
-⇒ At the service level we are **still slower**: prefill by **5-11%** and **decode by 29-44%**
-(decode is 0.70-0.78× of `lk_moe`), but the gap narrowed by **+8% to +15%** versus the previous
-release. Engine-level microbenchmarks (ms/layer) are a development metric and are not published
-here.
-
-### GPU prefill (long prefill handed to the GPU)
-
-Streaming expert compute layer by layer onto the GPU. Two expert formats are supported:
-**MXFP4** (DeepSeek-V4.1-Flash et al.) and **FP8 e4m3 block-128** (GLM-5.3-Flash).
-
-**⚠️ The payoff is decided entirely by the chunk size.** Every chunk must stream **one full copy
-of all layers' expert weights** over H2D — independent of how many tokens the chunk holds — so the
-**per-chunk cost is near fixed** and a bigger chunk amortises it better. That is why the win is
-1.2× for one model and 4.4× for another: it depends on whether the model can use large chunks.
-
-| GLM-5.3-Flash (same prompt, different chunk size) | pure CPU | GPU streaming | win |
-|---|---|---|---|
-| **2176** (GLM's **hard cap**, pinned by the KDA `block_size`) | 11.3 s | 9.7 s | 1.2× |
-| 4096 (counterfactual: without the KDA constraint) | 21.3 s | 9.7 s | **2.2×** |
-| 8192 (counterfactual) | 42.6 s | 9.7 s | **4.4×** |
-
-⇒ the **GPU column is 9.7 s at every chunk size** — direct evidence of the fixed cost — while the
-CPU column grows linearly. **GLM's 1.2× is not the approach failing; it is the 2176 cap.**
-
-> **⚠️ Settled by measurement (2026-09-20)**: GLM's chunk does **not** grow with `MBT`. Raising
-> `MBT` from 2048 to 8192 (4×) moved TTFT only from 24.4 s to 22.9 s (**6%**, where a real chunk
-> increase would have cut it to ~7 s) ⇒ the chunk really is pinned at ~2176 and the ceiling is
-> **~380 tok/s** — a physical limit of the KDA state block granularity, not an implementation
-> defect. Breaking it needs a change to the KDA block granularity (engine-level). **DeepSeek-V4.1
-> and MiMo are not capped**: they can use the full MBT and reach **2,595 / 1,845 tok/s** on long
-> prompts at C=4 (see the performance table above).
-
-**DeepSeek-V4.1-Flash is not capped and can use large chunks, so it lands in a different league**
-(same **13.8K** prompt):
-
-| Version | TTFT | prefill |
-|---|---|---|
-| before the fix | 76.5 s | 181 tok/s |
-| **after the fix** (ring-slot reuse + device-level gating + fast transpose) | **8.008 s** | **1725 tok/s** |
-
-⇒ **9.6×**, and **6.7×** against CPU prefill (13.8K × 3.9 ms ≈ 54 s).
-
-**Per-layer cost breakdown (GLM, measured)**: `assembly 207 ms` (weight H2D, 3.62 GB/rank) +
-`GPU MoE 23 ms` — **assembly is 90%**, so the lever is **overlapping assembly with attention**
-(the side stream, on by default), not "moving bytes faster". In isolation assembly measures
-**134.9 ms = 26.86 GB/s**, this host's H2D ceiling (1-D and pitched 2-D are equally fast; pinned
-memory, `numactl --interleave` and two-rank concurrency change nothing). The 207 ms in service is
-contention with vLLM's own PCIe traffic (TP=2 all-reduce; there is no NVLink between GPU 0 and 1).
-
-**GLM-specific caveat**: its chunk is pinned by `block_size=2176`, so the plugin's 4096 default
-threshold **never fires** for GLM; `scripts/serve_glm53_mainline.sh` lowers it to
-`GPU_PREFILL_MIN=1500` (measured break-even ~1300). On the MXFP4 side the default ≥4096 is
-worth it.
-
-Configuration and the VRAM
-recipe are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
-
-**Full service-level comparison, methodology and reproduction commands:**
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) · [`RELEASE_NOTES_v0.2.3.md`](RELEASE_NOTES_v0.2.3.md) · [`RELEASE_NOTES_v0.2.2.md`](RELEASE_NOTES_v0.2.2.md) · [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md).
-
----
+| | **long** | 4,796 | 4 | measuring | measuring |
 
 ## Quick start
 
