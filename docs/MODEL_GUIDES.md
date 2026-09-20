@@ -522,7 +522,7 @@ MiMo 那边对应的多层 MTP PR([#31180](https://github.com/vllm-project/vllm/
 
 ---
 
-## 3. MiMo-V2.5(A100 / SM80:骨架与后端已通,性能待测)
+## 3. MiMo-V2.5(A100 / SM80:单卡端到端已支持;MTP 用 k=1)
 
 > 命名:`MiMo-2.5` 是 **`XiaomiMiMo/MiMo-V2.5`**(310B / 15B active,48 层,256 专家 top-8,
 > Hybrid SWA-128 + DiffKV,官方只有 FP8 block-128)。完整调研见内部
@@ -561,10 +561,28 @@ python -m vllm.entrypoints.openai.api_server \
   实权重还要先读 282 GB;Dummy 加载用于**只验后端**时可用 `--load-format dummy`。
 * GPU 流式预填充暂不可用(沿用 `KNOWN_LIMITATIONS.md` §8.3 的 `GP_PREFILL=0` 规避)。
 
-**MTP**:检查点带 **3 层** dense MTP(`model.mtp.layers.{0,1,2}`);主线原来只建第 1 层,
-本项目已改成 `min(checkpoint_layers, num_speculative_tokens)`(照 Inkling 模板)⇒
-k=1 只建 1 层、k=3 解锁全链。**接受长度与净收益待实测**(MiMo-V2-Flash 报告 3 层 accept 3.6,
-但那是另一代模型;本项目自己的判据见 §2.6)。
+**MTP(2026-09-20 实测,TP=1 / GPU 2 / 单请求)**:检查点带 **3 层** dense MTP
+(`model.mtp.layers.{0,1,2}`);主线原来只建第 1 层,本项目已改成
+`min(checkpoint_layers, num_speculative_tokens)`(照 Inkling 模板)⇒ k=1 只建 1 层、
+k=3 走多模块链。实测**结论明确:k=1 可用,k=3 不可用**:
+
+| 方案 | 接受长度 | p0 | 128-token 生成耗时 | vs 不开 |
+|---|---|---|---|---|
+| 不开 MTP | 1.000 | — | **8.72 s** | 1.00× |
+| **MTP k=1(单模块)** | **1.83~1.87** | 0.83~0.87 | **7.33 s** | **1.19×** |
+| MTP k=3(多模块) | 1.016 | **0.016** | 21.4 s | 0.41× |
+
+* **k=1 是 MiMo 的正解**:83% 的首位接受率、解码 **+19%**,与 §2.6 对"1 模块 k=1"的
+  预期(1.5-1.7 accept、+20-40%)一致;draft 是 dense(不需要插件常驻逻辑)。
+* **k=3 多模块路径在当前上游实现下是坏的**:p0 从 0.83 掉到 **0.016**(比随机还差),
+  接受长度 1.016 ⇒ 反而慢 2.4×。这正是分析与上游 PR
+  [#31180](https://github.com/vllm-project/vllm/pull/31180) 说的 *"Load the weights but
+  produces acceptance rate of 0"*,也与 §9.9 的解释吻合:多模块链的第 2..N 个模块会吃到
+  可能被拒的脏 KV,需要 re-prefill 才能干净;上游那套 re-prefill 显然没对 MiMo 的
+  SWA/DiffKV 生效。
+* **推荐**:MiMo 只开 `num_speculative_tokens=1`;不要开 k>1。
+
+复现:`--speculative-config '{"method":"mtp","model":"<ckpt>","num_speculative_tokens":1}'`。
 
 ---
 
