@@ -106,6 +106,29 @@ Every performance number below was taken on this machine:
 | MiMo-V2.5 | single card TP=1, Hybrid SWA-128 + DiffKV (`TRITON_ATTN_DIFFKV`), experts on CPU | decode **N=8×2**; prefill N=2. **MTP k=3 is unusable** (accept 1.016 ⇒ 2.4× slower); greedy output is **byte-identical** to spec-off; load takes ~25–30 min |
 | DeepSeek-V4.1-Flash | TP=2 · MBT=8192 · GPU prefill ON · **spec off** · prefix caching off (to measure real prefill) · random out=128 | full 6 lengths × 4 concurrencies in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); aggregate ceiling ≈420–455 tok/s; TTFT is linear in length and strongly concurrency-dependent |
 
+**⚠️ The table above uses the `random` dataset.** That is only good for measuring **raw prefill
+throughput**: random prompts share no prefix (so prefix caching buys nothing) and random tokens
+have ~zero predictability (so speculation is systematically understated). **A product summary must
+use ShareGPT with prefix caching on**, and the difference can be large:
+
+**Product-frame numbers: ShareGPT (real conversations, prefix caching on)**
+
+| Model | Spec | Conc. | prefill (tok/s) | decode (tok/s) | vs spec off |
+|---|---|---|---|---|---|
+| DeepSeek-V4.1-Flash | off | 1 | 115\* | — | — |
+| (TP=2 · 1M · GPU prefill 4096) | **on** (dspark k=5) | 1 | 113\* | **34.0** | output throughput **13.79 → 18.38 tok/s (+33%)** |
+| | off | 4 | — | — | output throughput **41.62** |
+| | on | 4 | — | 9.7 | output throughput 31.03 (**−25%**) |
+| | off | 8 | — | — | output throughput **48.56** |
+| | on | 8 | — | 6.6 | output throughput 41.26 (−15%) |
+| GLM-5.3-Flash | off | 1 | — | 21.9 | — |
+| (util 0.82 · 256K × 2) | on k=1 | 1 | — | **22.3** | +2% (MTP's win is limited on ShareGPT too) |
+
+\* DeepSeek-V4.1's ShareGPT prompts are not fixed-length; prefill is converted from mean TTFT and
+mean prompt length. **How to read this:** speculation **pays at C=1 and loses at C≥4** (the draft
+competes with the target for the same CPU expert compute), and **none of that +33% is visible on
+random** — which is exactly why random must not be used for a product summary.
+
 **How to read prefill** — all three models get **faster prefill as the prompt grows**, because part
 of the cost is a **fixed per-chunk cost** (streaming expert weights to the GPU) that a bigger chunk
 amortises:

@@ -98,6 +98,27 @@
 | MiMo-V2.5 | 单卡 TP=1,Hybrid SWA-128 + DiffKV(`TRITON_ATTN_DIFFKV`),专家在 CPU | decode 为 **N=8×2**;prefill 为 N=2。**MTP k=3 不可用**(accept 1.016 ⇒ 反而慢 2.4×);贪心输出与不开 MTP **逐字节相同**;加载 ~25–30 min |
 | DeepSeek-V4.1-Flash | TP=2 · MBT=8192 · GPU 预填充 ON · **投机关** · 关前缀缓存(量真实预填充) · random out=128 | 完整 6 长度 × 4 并发见 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md);总吞吐上界 ≈420–455 tok/s;TTFT 与长度线性、与并发强相关 |
 
+**⚠️ 上表的数据集是 `random`** —— 它只适合量**裸预填充吞吐**(prompt 之间不共享前缀,拿不到
+前缀缓存的好处;随机 token 可预测性≈0,投机的收益被系统性压低)。**产品口径必须用 ShareGPT
+且开前缀缓存**,两者的差距可以很大(见下表)。
+
+**产品口径:ShareGPT(真实对话,开前缀缓存)**
+
+| 模型 | 投机 | 并发 | prefill (tok/s) | decode (tok/s) | 相对不开投机 |
+|---|---|---|---|---|---|
+| DeepSeek-V4.1-Flash | 关 | 1 | 115\* | — | — |
+| (TP=2 · 1M · GPU 预填充 4096) | **开**(dspark k=5) | 1 | 113\* | **34.0** | **输出吞吐 13.79 → 18.38 tok/s(+33%)** |
+| | 关 | 4 | — | — | 输出吞吐 **41.62** |
+| | 开 | 4 | — | 9.7 | 输出吞吐 31.03(**−25%**) |
+| | 关 | 8 | — | — | 输出吞吐 **48.56** |
+| | 开 | 8 | — | 6.6 | 输出吞吐 41.26(−15%) |
+| GLM-5.3-Flash | 关 | 1 | — | 21.9 | — |
+| (util 0.82 · 256K × 2 路) | 开 k=1 | 1 | — | **22.3** | +2%(ShareGPT 上 MTP 收益同样有限) |
+
+\* DeepSeek-V4.1 的 ShareGPT prompt 非定长,prefill 由 mean TTFT 与 mean prompt 长度换算。
+**关键读法**:投机在 **C=1 赚、C≥4 亏**(draft 与 target 抢同一份 CPU 专家算力);
+**random 口径下这个 +33% 完全看不到** —— 这就是为什么不能用 random 做产品摘要。
+
 **怎么读 prefill** —— 三家的 prefill **都随 prompt 变长而升高**,因为里面有一项**每 chunk 固定成本**
 (把专家权重搬上 GPU),chunk 越大摊得越薄:
 
