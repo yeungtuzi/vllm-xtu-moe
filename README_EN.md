@@ -93,8 +93,10 @@ Every performance number below was taken on this machine:
 | | short | 153 | 4 | 59.9 | 6.0 |
 | | long | 4,148 | 1 | 179.1 | 17.4 |
 | | long | 4,148 | 4 | **1,844.8** | 6.4 |
-| **DeepSeek-V4.1-Flash**<br>TP=2 · dspark k=5 · GPU prefill | short | ~114 | 1 / 4 | measuring | measuring |
-| | long | ~4,479 | 1 / 4 | measuring | measuring |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · dspark k=5 · GPU prefill<br>KV capped 0.5 GiB · MBT 8192 | short | 84 | 1 | **217.7** | **21.3** |
+| | short | 84 | 4 | 83.7 | 10.7 |
+| | **long** | 4,796 | 1 | **330.3** | **24.7** |
+| | **long** | 4,796 | 4 | **2,595.2** | 10.6 |
 
 > **Dataset = ShareGPT real conversations**, filtered into a "short" (~150 tok) and a "long"
 > (~4.5K tok) band and fed via `--dataset-name custom` to bypass the **1024-token hard cap in
@@ -133,10 +135,11 @@ ShareGPT:
 **How to read prefill** — two non-obvious rules:
 
 1. **Longer prompt ⇒ higher rate** (the fixed cost amortises): GLM **110 → 207** (126 → 4,918 tok),
-   MiMo **71 → 179** (153 → 4,148 tok);
-2. **Batching lifts it another order of magnitude**: for the same MiMo long prompt, **C=1 179 →
-   C=4 1,845 tok/s (+10×)** — four streams batch 16,592 tokens so one weight transfer serves 4×
-   the tokens. This is also why short prompts look "slow": at 126 tok the fixed overhead dominates.
+   MiMo **71 → 179** (153 → 4,148 tok), DeepSeek-V4.1 **218 → 330** (84 → 4,796 tok);
+2. **Batching lifts it another order of magnitude**: for the same long prompt, C=1 → C=4 takes
+   **MiMo 179 → 1,845 (+10×)** and **DeepSeek-V4.1 330 → 2,595 (+7.9×)** — four streams batch
+   ~20K tokens so one weight transfer serves 4× the tokens. This is also why short prompts look
+   "slow": at 84–153 tok the fixed overhead dominates.
 3. **Decode is the opposite**: it falls as concurrency rises (GLM long: C=1 21.6 → C=4 **2.8**),
    because prefill and decode contend for the same CPU expert compute.
 
