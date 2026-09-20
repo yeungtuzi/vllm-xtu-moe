@@ -186,7 +186,18 @@ python scripts/tiny_moe_equiv.py         # CPU/GPU 专家端到端等价性
 * 报错点通常在**前一个内核已经越界**之后才由 Triton 的 `load_binary` 暴露;崩前最后两个
   JIT 警告是 `_kpool_tail_seed_kernel` → `_ktranspose_bytes_kernel` ⇒ 优先怀疑
   kpool / prefetch / resident-slot 路径的越界。
+* **已定位到"新代码"边界(2026-09-20)**:崩溃所走的调用链在**旧树里根本不存在** ——
+  * `vllm/models/glm5next/nvidia/sparse_indexer.py` 在旧树 `af3e7c14d7` **没有这个文件**,
+    上游这次 rebase **新增了 769 行**,`_kpool_compress_insert` 与 `kpool_seed_tail_cache`
+    的调用都由它引入(旧树的 GLM indexer 在别的模块里,不碰 tail-seed);
+  * `_kpool_tail_seed_kernel` 本身在旧树 `kpool_compress.py` 里**已存在**(不是新增),
+    但**新的调用方**是这次 rebase 才接上的;
+  * ⇒ 崩溃点是"**上游新 indexer ↔ 我们 SM80 的 `kpool_compress.py` uint8 改动**"的交互面,
+    而不是我们已有的补丁本身(旧树同款补丁在 8070 上跑了 10+ 小时没崩)。
+* **已排除**:`ktranspose_bytes` 本身干净 —— 用 GLM 真实形状(`E=288 H=4096 I=2048`)
+  连跑 `test_gpu_prefill_fp8_assembly.py` **10/10 全过**。
 * **规避**:`GP_PREFILL=0`(关 GPU 预填充,长 prompt 退 CPU,慢但稳)。
-* 复现配方:util 0.82 + GPU prefill 开 + `vllm bench serve` 4096/64。
-  定位建议:`CUDA_LAUNCH_BLOCKING=1` 找到真正的越界内核。
+* 复现配方:util 0.82 + GPU prefill 开 + `vllm bench serve` 4096/64(需要 GPU 0/1 = 生产窗口)。
+  定位建议:`CUDA_LAUNCH_BLOCKING=1`;然后在新的 `sparse_indexer.py` 的
+  `_kpool_compress_insert` 里逐个 kernel 二分。
 
