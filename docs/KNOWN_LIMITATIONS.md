@@ -287,6 +287,29 @@ of 2176 no matter how large `--max-num-batched-tokens` is"。若是**倍数**,`M
   (地板 144 ms/层 ⇒ 6.0 s/chunk)。**这是 GPU 预填充最大的单点机会。**
 * ⚠️ 插桩自身每子相 `cuda.synchronize()`,可能放大串行 ⇒ 需用 CUDA event 复核后再下结论。
 
+**2026-09-20 补充:决定性微基准 —— 差距在"重叠",不在"能力"**
+
+微基准(`/tmp/h2d_bench.py`,不加载模型,按 DSV4.1 每层每 rank 的真实字节数 3.86 GiB / 18 个缓冲):
+
+| 源内存 | 3.86 GiB 的 H2D | 带宽 |
+|---|---|---|
+| pageable | 0.552 s | 7.5 GB/s |
+| **pinned** | **0.154 s** | **26.9 GB/s**(与文档记的 26.85 一致) |
+| **服务里实测** | **0.334–0.599 s** | 11.5 / 6.4 GB/s |
+
+**三个假设被排除**:
+1. ❌ **ping/pong 槽太少** —— 槽 2→8,DMA 334→336 ms/层,**不动**;
+2. ❌ **源没锁页** —— 引擎已有 `pin_hostbufs()`(`moe_v2.hpp:1729`),日志证实 `[pin] host 分片锁页: 18/18 个缓冲成功`;
+3. ❌ **K-major 转置** —— 只占 1.1%(6.5 ms/层)。
+
+⇒ **机器能 154 ms/层搬完,服务要 334–599 ms ⇒ 2.2–3.9× 躺在"没重叠"上**。
+`gpu_prefill.py:1224` 的 prefetch ring 实测没盖住:层间是 "attention → DMA → 组装 → 转置" 的串行链。
+**下一步:改用 CUDA event 计时(排除插桩 sync 的口径问题),并量出 attention 与 DMA 的重叠比例。**
+
+> **关于 UVA(zero-copy,GPU 直接读 pinned host)**:**不建议**。pinned **DMA 引擎**实测 26.9 GB/s
+> 且不占 SM、可与计算重叠;UVA 让 kernel 的 load 去读 host ⇒ 每次访存暴露 PCIe ~1–2 µs 延迟、
+> 合并差、占 SM,对"流式搬大块权重"是负优化。staging + `cudaMemcpyAsync` 的意义就是**用上 DMA 引擎**。
+
 ### 10.2 方法论警告:小心前缀缓存伪装成"预填充很快"
 
 同一个 prompt 连发两次:第 1 次 TTFT **30.7 s**(真预填充),第 2 次 **869 ms**(**前缀缓存命中**)。
