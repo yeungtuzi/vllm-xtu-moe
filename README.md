@@ -135,17 +135,40 @@
 
 ### GPU 预填充(把长 prefill 交给 GPU)
 
-把长 prefill 的专家计算逐层流式搬上 GPU,支持两种专家格式:
+把长 prefill 的专家计算逐层流式搬上 GPU,支持两种专家格式:**MXFP4**(DeepSeek-V4.1-Flash 等)与
+**FP8 e4m3 block-128**(GLM-5.3-Flash)。
 
-* **MXFP4**(DeepSeek-V4.1-Flash 等):客户端 TTFT 实测 **快 2.0-2.8×**(阈值 ≥4096 才划算);
-* **FP8 e4m3 block-128**(GLM-5.3-Flash):µbench 一样把长 prompt 的 TTFT 从
-  **29.3 s 压到 22.8 s(1.29×,4096-in)。两点值得注意:
-  1. 权重装配是 **3.62 GB/rank 的纯 H2D 固定成本**,已到本机 26.86 GB/s 的 H2D 天花板
-     (1-D 与 pitched 2-D 同速,锁页/NUMA 交错/两 rank 并发都不改变),所以优化点是
-     **把装配与 attention 重叠**(默认开启的 side stream),不是"搬得更快";
-  2. GLM-5.3 的预填充 chunk 被 KDA state 的 `block_size=2176` 钉死,因此
-     **插件默认阈值 4096 对 GLM 永远不会触发** —— `scripts/serve_glm53_mainline.sh`
-     已把 GLM 专用默认改为 `GPU_PREFILL_MIN=1500`(实测盈亏平衡 ~1300)。
+**⚠️ 收益完全由 chunk 大小决定** —— 每个 chunk 都要把**该步所有层的专家权重整份 H2D 搬一遍**
+(与这个 chunk 里有多少 token **无关**)⇒ **单 chunk 成本近似固定**,chunk 越大摊得越薄。
+所以"收益是 1.3× 还是 4.4×"取决于**这个模型能不能用大 chunk**:
+
+| GLM-5.3-Flash(同一 prompt,切不同 chunk) | 纯 CPU | GPU 流式 | 收益 |
+|---|---|---|---|
+| **2176**(GLM 的**实际上限**,被 KDA `block_size` 钉死) | 11.3 s | 9.7 s | 1.2× |
+| 4096(反事实:去掉 KDA 约束) | 21.3 s | 9.7 s | **2.2×** |
+| 8192(反事实) | 42.6 s | 9.7 s | **4.4×** |
+
+⇒ **GPU 那一列三种 chunk 下都是 9.7 s**,这就是"固定成本"的直接证据;CPU 那列随 chunk 线性涨。
+**GLM 的 1.2× 不是这条路没用,是被 2176 封顶。**
+
+**DeepSeek-V4.1-Flash 不受此限,能用大 chunk,所以是另一个量级**(同一个 **13.8K** prompt):
+
+| 版本 | TTFT | prefill |
+|---|---|---|
+| 修复前 | 76.5 s | 181 tok/s |
+| **修复后**(环形槽复用 + 设备级判定 + 快速转置) | **8.008 s** | **1725 tok/s** |
+
+⇒ **9.6×**;对照 CPU 预填充(13.8K × 3.9 ms ≈ 54 s)是 **6.7×**。
+
+**每层成本分解(GLM 实测)**:`装配 207 ms`(权重 H2D 3.62 GB/rank)+ `GPU MoE 23 ms` —— **装配占 90%**,
+所以优化点是**把装配与 attention 重叠**(默认开启的 side stream),不是"搬得更快"。
+隔离环境实测装配 **134.9 ms = 26.86 GB/s**,即本机 H2D 天花板(1-D 与 pitched 2-D 同速,
+锁页/NUMA 交错/两 rank 并发都不改变);服务里的 207 ms 是与 vLLM 自身 PCIe 流量
+(TP=2 的 all-reduce,GPU0/1 之间无 NVLink)争用的结果。
+
+**GLM 专用注意**:chunk 被 `block_size=2176` 钉死,插件默认阈值 4096 **永远不会触发**
+⇒ `scripts/serve_glm53_mainline.sh` 已把 GLM 默认改为 `GPU_PREFILL_MIN=1500`(实测盈亏平衡 ~1300);
+MXFP4 侧默认阈值 ≥4096 才划算。
 
 CPU 侧另有一个可选开关 `XIAOTU_MOE_FP8_BF16_MMA=1`:FP8 内层改走 AVX512-BF16
 `vdpbf16ps`,**M≥6 快 1.17-1.20×**(全 CPU 预填充端到端 TTFT 1.12×),代价是权重被舍入到

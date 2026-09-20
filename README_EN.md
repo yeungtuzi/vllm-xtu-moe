@@ -153,9 +153,46 @@ here.
 
 ### GPU prefill (long prefill handed to the GPU)
 
-Streaming expert compute layer by layer onto the GPU makes client-side TTFT **2.0-2.8× faster**
-on DeepSeek-V4.1-Flash (worth it above a 4096-token threshold) and **1.29×** on GLM-5.3-Flash
-(FP8, 4096-in: 29.3 → 22.8 s). Configuration and the VRAM
+Streaming expert compute layer by layer onto the GPU. Two expert formats are supported:
+**MXFP4** (DeepSeek-V4.1-Flash et al.) and **FP8 e4m3 block-128** (GLM-5.3-Flash).
+
+**⚠️ The payoff is decided entirely by the chunk size.** Every chunk must stream **one full copy
+of all layers' expert weights** over H2D — independent of how many tokens the chunk holds — so the
+**per-chunk cost is near fixed** and a bigger chunk amortises it better. That is why the win is
+1.2× for one model and 4.4× for another: it depends on whether the model can use large chunks.
+
+| GLM-5.3-Flash (same prompt, different chunk size) | pure CPU | GPU streaming | win |
+|---|---|---|---|
+| **2176** (GLM's **hard cap**, pinned by the KDA `block_size`) | 11.3 s | 9.7 s | 1.2× |
+| 4096 (counterfactual: without the KDA constraint) | 21.3 s | 9.7 s | **2.2×** |
+| 8192 (counterfactual) | 42.6 s | 9.7 s | **4.4×** |
+
+⇒ the **GPU column is 9.7 s at every chunk size** — direct evidence of the fixed cost — while the
+CPU column grows linearly. **GLM's 1.2× is not the approach failing; it is the 2176 cap.**
+
+**DeepSeek-V4.1-Flash is not capped and can use large chunks, so it lands in a different league**
+(same **13.8K** prompt):
+
+| Version | TTFT | prefill |
+|---|---|---|
+| before the fix | 76.5 s | 181 tok/s |
+| **after the fix** (ring-slot reuse + device-level gating + fast transpose) | **8.008 s** | **1725 tok/s** |
+
+⇒ **9.6×**, and **6.7×** against CPU prefill (13.8K × 3.9 ms ≈ 54 s).
+
+**Per-layer cost breakdown (GLM, measured)**: `assembly 207 ms` (weight H2D, 3.62 GB/rank) +
+`GPU MoE 23 ms` — **assembly is 90%**, so the lever is **overlapping assembly with attention**
+(the side stream, on by default), not "moving bytes faster". In isolation assembly measures
+**134.9 ms = 26.86 GB/s**, this host's H2D ceiling (1-D and pitched 2-D are equally fast; pinned
+memory, `numactl --interleave` and two-rank concurrency change nothing). The 207 ms in service is
+contention with vLLM's own PCIe traffic (TP=2 all-reduce; there is no NVLink between GPU 0 and 1).
+
+**GLM-specific caveat**: its chunk is pinned by `block_size=2176`, so the plugin's 4096 default
+threshold **never fires** for GLM; `scripts/serve_glm53_mainline.sh` lowers it to
+`GPU_PREFILL_MIN=1500` (measured break-even ~1300). On the MXFP4 side the default ≥4096 is
+worth it.
+
+Configuration and the VRAM
 recipe are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
 **Full service-level comparison, methodology and reproduction commands:**
