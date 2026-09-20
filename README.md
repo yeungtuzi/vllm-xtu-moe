@@ -1,30 +1,32 @@
 # vllm-xtu-moe
 
-> **XTU = X Transformers Unity**(读音:汉语「小兔」)。
-> 一个 **vLLM 插件**:让 **MoE 专家权重住在 CPU 内存、注意力与 KV cache 留在 GPU**,
-> 从而在显存放不下专家权重的机器上把超大 MoE 跑起来。**不改主线、不需要 fork。**
+> **XTU = X Transformers Unity**(读音:汉语「小兔」)—— 一个**高性能 MoE 推理加速层**。
+>
+> 这是一个面向**超大 MoE 模型**的 **vLLM 插件**,核心思路是把计算拆开:
+>
+> * **GPU** 负责注意力、KV cache、embedding 等**非专家部分**;
+> * **CPU** 负责**专家权重**与**专家计算**;
+> * 对**长 prompt**,还会把**一部分专家计算流式搬到 GPU**。
+>
+> 也就是说:在**"显存放不下专家权重"**的情况下,仍然让大 MoE 模型跑起来,
+> 而且**尽量不改主线 vLLM**。
+>
+> **项目重点**
+>
+> * **DeepSeek / GLM / MiMo** 这类**超大 MoE**
+> * **CPU + GPU 混合推理** · **低显存需求**
+> * **高性能长上下文推理**
+> * **兼容主线 vLLM,不需要 fork**
+> * 主要面向**大模型部署与工程优化**
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 当前版本:v0.2.2**(2026-09-19)—— **支持 GLM-5.3-Flash**:FP8 GPU 预填充接线
-> (4K prompt 的 TTFT **29.3 s → 22.8 s**)、交付配置 **256K 上下文 × 2 路并发**,
-> 并修掉一个**真实的 e4m3 次正规数解码缺陷**(引擎 + 新增全码字门禁)。
->
-> 上一版 **v0.2.1**(2026-09-18)—— **针对引擎的显著性能优化**:
-> CPU MoE 引擎在全部真实形状上**反超参考实现 `lk_moe`**,DeepSeek-V4-Flash 同步受益。
-> 发行说明:[`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md)
+> **📌 当前版本:v0.2.3**(2026-09-20)—— **跟进上游 + GLM/MiMo 的 MTP**:
+> 补丁栈 rebase 到上游 `133b71e0b`;**GLM-5.3-Flash 的 MTP 落地并默认开**;
+> **MiMo-V2.5(310B/15B)单卡端到端跑通**;GLM 显存契约重标定(`GPU_UTIL` → **0.82**)。
+> 发行说明:[`RELEASE_NOTES_v0.2.3.md`](RELEASE_NOTES_v0.2.3.md)
 
 ---
-
-## 它解决什么问题
-
-超大 MoE(DeepSeek-V4.1-Flash 748B、V4-Flash、GLM-5.3-Flash 321B…)的专家权重动辄
-150-300 GiB,任何单卡/双卡都放不下;而**专家只占每 token 计算的一小部分**,
-剩下的是注意力与共享层 —— 它们在 GPU 上跑得很快。于是把两者拆开:
-
-* **非专家**(注意力、KV cache、embedding)→ GPU,正常走 vLLM 的高性能内核;
-* **专家** → CPU 内存,由 `xiaotu_moe` 引擎按 NUMA 分片计算;
-* **长 prefill**(token 数 ≥ 阈值)→ 再把专家逐层流式搬上 GPU 算。
 
 ## 目标与愿景
 
@@ -46,8 +48,8 @@
 |---|---|---|---|
 | **DeepSeek-V4.1-Flash** | 748B | MXFP4(E8M0 block-32) | ✅ 端到端(TP=2) |
 | **DeepSeek-V4-Flash**(0731) | 256 专家 / top-6 | MXFP4 | ✅ 端到端(基准引用历史数据,0.2.3 起不复测) |
-| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,交付配置 **256K 上下文 × 2 路并发**,需 `--kv-cache-dtype bfloat16`;**0.2.3 起 `GPU_UTIL` 必须用 `0.82`**;**MTP 默认开 `SPEC_K=1`**(TPOT 45.7→44.2 ms,KV 池 −27%;k>1 反而更差) |
-| **MiMo-V2.5** | 310B / 15B active、256 专家 / top-8 | FP8 block-128 | ✅ **单卡 A100-40GB(TP=1)端到端**,Hybrid SWA-128 + DiffKV(`TRITON_ATTN_DIFFKV`);**MTP `num_speculative_tokens=1` 实测 TPOT −9.4%**,k>1 不可用 |
+| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,交付配置 **256K 上下文 × 2 路并发**,需 `--kv-cache-dtype bfloat16`;**0.2.3 起 `GPU_UTIL` 必须用 `0.82`**;**MTP 默认开 `SPEC_K=1`**(decode 21.9→22.6 tok/s,KV 池 −27%;k>1 反而更差) |
+| **MiMo-V2.5** | 310B / 15B active、256 专家 / top-8 | FP8 block-128 | ✅ **单卡 A100-40GB(TP=1)端到端**,Hybrid SWA-128 + DiffKV(`TRITON_ATTN_DIFFKV`);**MTP `num_speculative_tokens=1` 实测 decode +10%**,k>1 不可用 |
 | 其它即插即用 MoE | — | BF16 / FP8 | ✅ 走通用路径,未逐模型标定 |
 
 **实测硬件平台(下文所有性能数字都在这台机器上取得)**
@@ -65,8 +67,8 @@
 
 > **v0.2.3 变更**:补丁栈 rebase 到上游 `133b71e0b`;**GLM 生产 `GPU_UTIL` 从 `0.85` 降到 `0.82`**
 > (上游改了 KV 定容 ⇒ 0.85 下两路并发会 OOM);GLM 的 MTP **默认开 `SPEC_K=1`**
-> (TPOT 小赚 −3%,代价是 **KV 池 −27%**、ITL 脉冲化);
-> **MiMo-V2.5 新增支持**,MTP k=1 实测 **TPOT 64.28 → 58.25 ms(−9.4%)**。
+> (decode 小赚 +3%,代价是 **KV 池 −27%**、单 token 间隔脉冲化);
+> **MiMo-V2.5 新增支持**,MTP k=1 实测 **decode 15.6 → 17.2 tok/s(+10%)**。
 > 详见 [`RELEASE_NOTES_v0.2.3.md`](RELEASE_NOTES_v0.2.3.md)。
 
 > **怎么读** —— 表里的数字都是**耗时(ms/层),越小越好**,即"同样的活干得更快"。
@@ -78,15 +80,21 @@
 
 官方 `vllm bench serve`,随机数据 + `--ignore-eos`,每格不同 seed。
 
-| 并发 | prompt / output | out tok/s(含 TTFT) | TTFT 均值 | TPOT 均值 | 完成 |
-|---|---|---|---|---|---|
-| C=1 | 256 / 128 | **16.18** | 2022 ms | **46.37 ms** | 8/8 |
-| C=2 | 256 / 128 | 19.36 | 3287 ms | 78.13 ms | 8/8 |
-| **C=1** | **4096 / 64** | 2.49 | **22764 ms** | 46.95 ms | 2/2 |
+| 并发 | prompt / output | prefill (tok/s) | decode (tok/s) | 完成 |
+|---|---|---|---|---|
+| C=1 | 256 / 128 | **127** | **21.6** | 8/8 |
+| C=2 | 256 / 128 | 78 | 12.8 | 8/8 |
+| **C=1** | **4096 / 64** | **180** | **21.3** | 2/2 |
 
-* **长 prompt 预填充**:4096-in 的 TTFT 从 **29.3 s(v0.2.1 全 CPU 预填充)降到 22.8 s(1.29×)** ——
+> **口径(全 README 统一)**:`prefill (tok/s) = prompt_tokens / TTFT`(首 token 前的预填充速率)、
+> `decode (tok/s) = 1000 / TPOT`(首 token 之后的解码速率,不含 prefill)。
+> 两者都由同一次 `vllm bench serve` 的 TTFT / TPOT 换算而来;
+> **不再公布 `output tok/s`(含 TTFT 的混合值)、TPOT、ITL**。
+> C=2 的 prefill/decode 是**单流**值(两路各自),不是聚合吞吐。
+
+* **长 prompt 预填充**:4096-in 的 **prefill 140 → 180 tok/s(1.29×)** ——
   FP8 GPU 预填充把每层 3.62 GB/rank 的专家权重逐层流式搬上 GPU,并与 attention **重叠**;
-* **解码不变**:C=1 TPOT 46 ms(≈22 tok/s),与 v0.2.1 持平(GPU 预填充只作用于 prefill);
+* **解码不变**:C=1 **21.3–21.6 tok/s**,与 v0.2.1 持平(GPU 预填充只作用于 prefill);
 * **上下文**:256K × 2 路并发是**本硬件的交付目标**;上表的 KV 池是 v0.2.2(util 0.85)口径
   = 988,081 token,**0.2.3 rebase 后同一 util 会涨到 1,018,328 并把激活余量吃掉**(两路并发 OOM),
   故 **0.2.3 交付改用 `GPU_UTIL=0.82`,KV 池 915,487**(32k 单请求 / 两路 14k+15k 实测均通过);
@@ -95,19 +103,23 @@
 * **正确性**:引擎确定性门禁 11/11;层门禁 rms_rel 4.4e-3;29,746-token 长文密钥检索完全命中;
   3 路 ~8K 并发(限两路)三个密钥全部正确;0 OOM。
 * **MTP(v0.2.3 起默认开 `SPEC_K=1`)**:draft 第 45 层常驻 GPU(3.38 GiB/rank);
-  接受长度 1.46,`256/128 C=1` TPOT **45.7 → 44.2 ms**(≈−3%,噪声内);代价是
-  **KV 池 915,487 → 666,366(−27%,256K 并发 3.49× → 2.54×)** 与 **ITL 46 → 64 ms**;
-  **k>1 反而更差**(k=4 掉到 11.2 tok/s)。数据见 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §4.3。
+  接受长度 1.46,`256/128 C=1` 解码 **21.9 → 22.6 tok/s**(≈+3%,噪声内);代价是
+  **KV 池 915,487 → 666,366(−27%,256K 并发 3.49× → 2.54×)**,且**单 token 间隔会脉冲化**
+  (一步吐 1–2 个 token,流式体验变差);**k>1 反而更差**(k=4 掉到 ~12 tok/s)。
+  数据见 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §4.3。
 
 > FP8 引擎内层另有一个**默认关闭**的加速开关 `XIAOTU_MOE_FP8_BF16_MMA=1`
 > (AVX512-BF16 `vdpbf16ps`,M≥6 快 1.17-1.20×,代价是权重舍入 bf16:两路 rms_rel 3.6e-3)。
 
 ### MiMo-V2.5(单卡 A100-40GB,TP=1,专家在 CPU;`vllm bench serve` C=1,N=8×2)
 
-| 配置 | out tok/s | TPOT 均值 | ITL 均值 |
-|---|---|---|---|
-| 不开 MTP | 10.88 / 10.93 | **64.56 / 64.00 ms** | 64.1 / 63.5 ms |
-| **MTP k=1**(推荐) | **11.54 / 11.59** | **58.02 / 58.48 ms(−9.4%)** | 99.9 / 99.9 ms(脉冲化) |
+| 配置 | prefill (tok/s) | decode (tok/s) |
+|---|---|---|
+| 不开 MTP | ~59 | 15.5 / 15.6 |
+| **MTP k=1**(推荐) | ~53 | **17.2 / 17.1(+10%)** |
+
+> 口径同 §GLM(`prefill = prompt/TTFT`、`decode = 1000/TPOT`)。decode 为 **N=8×2** 重复口径;
+> prefill 来自同参数的 N=2 单次运行,样本小、仅供量级参考。
 
 * 负载 = 256 in / 128 out / C=1;接受长度 **1.74**(accepted 869 / drafts 1169);
 **贪心输出与不开 MTP 逐字节相同**;
@@ -137,17 +149,17 @@
 ### DeepSeek-V4.1-Flash 服务级(等参数同机 A/B,TP=2,官方 `vllm bench serve`)
 
 两个 arm 跑在**同一个 conda env**、唯一变量是 CPU MoE 引擎;prompt 逐字节相同、线程数都是 60。
-**三项都是独立量,不做折算**——`output tok/s` 是整段解码的平均速率(**包含 TTFT**),
-TTFT 与 TPOT(**不含 TTFT**)各自单独公布。
+**只报两个速率,不做折算**:`prefill (tok/s)`(首 token 前)与 `decode (tok/s)`(首 token 后)。
+比值为 **我们 / `lk_moe`**,**> 1.0 表示我们更快**。
 
-| prompt / output | `lk_moe` out tok/s | 我们 out tok/s | 比值 | `lk_moe` TTFT | 我们 TTFT | 比值 | `lk_moe` TPOT | 我们 TPOT | 比值 |
-|---|---|---|---|---|---|---|---|---|---|
-| 256 / 32 | 11.24 | 9.44 | **0.840×** | 2153 ms | 2391 ms | 1.111× | 22.37 ms | 32.19 ms | 1.439× |
-| 256 / 1024 | 41.08 | 31.07 | **0.756×** | 2159 ms | 2436 ms | 1.128× | 22.26 ms | 29.83 ms | 1.340× |
-| 8192 / 32 | 0.49 | 0.44 | **0.898×** | 64259 ms | 71242 ms | 1.109× | 22.03 ms | 29.13 ms | 1.322× |
-| 8192 / 1024 | 11.76 | 10.53 | **0.895×** | 64208 ms | 67734 ms | 1.055× | 22.33 ms | 28.82 ms | 1.291× |
+| prompt / output | `lk_moe` prefill | 我们 prefill | 比值 | `lk_moe` decode | 我们 decode | 比值 |
+|---|---|---|---|---|---|---|
+| 256 / 32 | 118.9 | 107.1 | **0.900×** | 44.7 | 31.1 | **0.695×** |
+| 256 / 1024 | 118.6 | 105.1 | **0.886×** | 44.9 | 33.5 | **0.746×** |
+| 8192 / 32 | 127.5 | 115.0 | **0.902×** | 45.4 | 34.3 | **0.756×** |
+| 8192 / 1024 | 127.6 | 120.9 | **0.948×** | 44.8 | 34.7 | **0.775×** |
 
-⇒ 服务级我们**仍慢 10-24%**(`ttft` 高 5-13%,纯解码 `TPOT` 高 29-44%),
+⇒ 服务级我们**仍慢**:prefill 慢 **5-11%**、**decode 慢 29-44%**(decode 只有 lk 的 0.70-0.78×),
 但比上一版已收窄 **+8%~+15%**。
 
 ### GPU 预填充(把长 prefill 交给 GPU)
@@ -202,7 +214,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 
 | 版本 | 主题 |
 |---|---|
-| **v0.2.3** | **跟进上游 + GLM/MiMo 的 MTP** —— 补丁栈 rebase 到上游 `133b71e0b`(11 补丁/40 文件);**GLM-5.3-Flash 的 MTP 落地**(draft 层识别 + GPU 常驻,`SPEC_K=1..4`);**MiMo-V2.5(310B/15B)单卡端到端支持**,MTP k=1 TPOT −9.4%;显存契约重标定(GLM `GPU_UTIL` 0.85 → **0.82**) |
+| **v0.2.3** | **跟进上游 + GLM/MiMo 的 MTP** —— 补丁栈 rebase 到上游 `133b71e0b`(11 补丁/40 文件);**GLM-5.3-Flash 的 MTP 落地**(draft 层识别 + GPU 常驻,`SPEC_K=1..4`);**MiMo-V2.5(310B/15B)单卡端到端支持**,MTP k=1 decode +10%;显存契约重标定(GLM `GPU_UTIL` 0.85 → **0.82**) |
 | **v0.2.2** | **支持 GLM-5.3-Flash** —— FP8 GPU 预填充接线(4K prompt TTFT 29.3 → 22.8 s)、256K × 2 路并发交付配置;修掉 e4m3 次正规数解码缺陷 + 新增全码字门禁 |
 | **v0.2.1** | **针对引擎的显著性能优化** —— CPU MoE 引擎在全部真实形状上**反超 `lk_moe`**;DeepSeek-V4-Flash 同步受益 |
 | v0.2 | DeepSeek-V4.1-Flash 全链路可用(1M 上下文 + GPU 预填充 + 投机解码)+ CPU 预填充路径优化 |

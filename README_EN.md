@@ -1,18 +1,33 @@
 # vllm-xtu-moe
 
-> **XTU = X Transformers Unity** (pronounced *"xiao tu"*, Chinese for "little rabbit").
-> A **vLLM plugin** that keeps **MoE expert weights in CPU memory** while
-> **attention and KV cache stay on the GPU** — so large MoE models can be served on
-> machines where the experts do not fit in VRAM. **No fork, no upstream patching.**
+> **XTU = X Transformers Unity** (pronounced *"xiao tu"*, Chinese for "little rabbit") —
+> a **high-performance MoE inference acceleration layer**.
+>
+> It is a **vLLM plugin for very large MoE models**. The core idea is to split the work:
+>
+> * the **GPU** handles the **non-expert** parts — attention, KV cache, embeddings;
+> * the **CPU** holds the **expert weights** and does the **expert compute**;
+> * for **long prompts**, part of the expert compute is **streamed onto the GPU**.
+>
+> In other words: even when the **expert weights do not fit in VRAM**, a large MoE model
+> still runs — while **changing mainline vLLM as little as possible**.
+>
+> **Focus**
+>
+> * very large MoE models such as **DeepSeek / GLM / MiMo**
+> * **CPU + GPU hybrid inference** · **low VRAM footprint**
+> * **high-performance long-context inference**
+> * **mainline-vLLM compatible, no fork required**
+> * aimed at **large-model deployment and engineering optimisation**
 
 [中文](README.md) · English (default)
 
 > **📌 Current release: v0.2.3** (2026-09-20) — **upstream tracking + MTP for GLM and MiMo**:
 > the patch stack is rebased onto upstream `133b71e0b` (11 patches / 40 files);
 > **GLM-5.3-Flash MTP is wired up and ON by default** (`SPEC_K=1`; accept 1.46,
-> TPOT 45.7 → 44.2 ms, at the cost of a 27% smaller KV pool);
+> decode 21.9 → 22.6 tok/s, at the cost of a 27% smaller KV pool);
 > **MiMo-V2.5 (310B/15B) now runs end-to-end on a single A100-40GB**, where
-> **MTP k=1 measures −9.4% TPOT**. GLM production `GPU_UTIL` drops to **0.82**.
+> **MTP k=1 measures +10% decode**. GLM production `GPU_UTIL` drops to **0.82**.
 >
 > Previous, **v0.2.2** (2026-09-19) — **GLM-5.3-Flash support**: FP8 GPU prefill wired up
 > (4K-prompt TTFT **29.3 s → 22.8 s**), delivered as **256K context × 2 concurrent
@@ -24,17 +39,6 @@
 > Release notes: [`RELEASE_NOTES_v0.2.3.md`](RELEASE_NOTES_v0.2.3.md) · [`RELEASE_NOTES_v0.2.2.md`](RELEASE_NOTES_v0.2.2.md) · [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md)
 
 ---
-
-## What problem it solves
-
-Large MoE models (DeepSeek-V4.1-Flash 748B, V4-Flash, GLM-5.3-Flash 321B, …) carry
-150-300 GiB of expert weights — far beyond any single- or dual-GPU card. But the experts
-are only a small part of the per-token compute; the rest is attention and shared layers,
-which run fast on the GPU. So we split the model:
-
-* **non-expert** weights (attention, KV cache, embeddings) → GPU, using vLLM's own kernels;
-* **experts** → CPU memory, computed by the `xiaotu_moe` engine over NUMA shards;
-* **long prefill** (token count ≥ threshold) → experts are streamed layer by layer onto the GPU.
 
 ## Goals
 
@@ -57,7 +61,7 @@ which run fast on the GPU. So we split the model:
 |---|---|---|---|
 | **DeepSeek-V4.1-Flash** | 748B | MXFP4 (E8M0 block-32) | ✅ end to end (TP=2) |
 | **DeepSeek-V4-Flash** (0731) | 256 experts / top-6 | MXFP4 | ✅ end to end |
-| **GLM-5.3-Flash** | 321B / 18B active, 288 experts / top-8 | FP8 block-128 | ✅ **end to end (TP=2, A100/SM80)**, delivered as **256K context × 2 concurrent sequences** (KV pool 988,081 tokens), needs `--kv-cache-dtype bfloat16`; C=1 decode ~22 tok/s (TPOT 46 ms); 4K-prompt TTFT **29.3 s (CPU) → 22.8 s (FP8 GPU prefill, 1.29×)** |
+| **GLM-5.3-Flash** | 321B / 18B active, 288 experts / top-8 | FP8 block-128 | ✅ **end to end (TP=2, A100/SM80)**, delivered as **256K context × 2 concurrent sequences** (KV pool 988,081 tokens), needs `--kv-cache-dtype bfloat16`; C=1 decode ~21.5 tok/s; 4K-prompt prefill **140 → 180 tok/s (FP8 GPU prefill, 1.29×)** |
 | Other plug-and-play MoE | — | BF16 / FP8 | ✅ generic path, no per-model calibration |
 
 **Measurement host (every number below was taken here)**
@@ -83,16 +87,21 @@ which run fast on the GPU. So we split the model:
 
 Official `vllm bench serve`, random dataset + `--ignore-eos`, a distinct seed per cell.
 
-| Concurrency | prompt / output | out tok/s (incl. TTFT) | mean TTFT | mean TPOT | completed |
-|---|---|---|---|---|---|
-| C=1 | 256 / 128 | **16.18** | 2022 ms | **46.37 ms** | 8/8 |
-| C=2 | 256 / 128 | 19.36 | 3287 ms | 78.13 ms | 8/8 |
-| **C=1** | **4096 / 64** | 2.49 | **22764 ms** | 46.95 ms | 2/2 |
+| Concurrency | prompt / output | prefill (tok/s) | decode (tok/s) | completed |
+|---|---|---|---|---|
+| C=1 | 256 / 128 | **127** | **21.6** | 8/8 |
+| C=2 | 256 / 128 | 78 | 12.8 | 8/8 |
+| **C=1** | **4096 / 64** | **180** | **21.3** | 2/2 |
 
-* **Long-prompt prefill**: 4096-in TTFT drops from **29.3 s (v0.2.1, CPU prefill) to 22.8 s
-  (1.29×)** — the FP8 GPU prefill streams each layer's 3.62 GB/rank of expert weights onto the
+> **Metric definitions (uniform across this README)**: `prefill (tok/s) = prompt_tokens / TTFT`
+> and `decode (tok/s) = 1000 / TPOT`; both are converted from the TTFT/TPOT of the same
+> `vllm bench serve` run. **`output tok/s` (which mixes in TTFT), TPOT and ITL are no longer
+> reported.** For C=2 the two rates are per-stream, not aggregate throughput.
+
+* **Long-prompt prefill**: 4096-in goes from **140 to 180 tok/s (1.29×)** — the FP8 GPU prefill
+  streams each layer's 3.62 GB/rank of expert weights onto the
   GPU and **overlaps** that transfer with attention;
-* **Decode is unchanged**: C=1 TPOT 46 ms (~22 tok/s), as in v0.2.1 (the GPU path only affects
+* **Decode is unchanged**: C=1 **21.3–21.6 tok/s**, as in v0.2.1 (the GPU path only affects
   prefill);
 * **Context**: 256K × 2 concurrent (KV pool 988,081 tokens) is the **delivered target for this
   hardware**; 512K/704K merely start (704K with only 1.06× concurrency, ceiling ≈733K) and are
@@ -127,19 +136,20 @@ Official `vllm bench serve`, random dataset + `--ignore-eos`, a distinct seed pe
 ### DeepSeek-V4.1-Flash, service level (same-parameter A/B on one host, TP=2, official `vllm bench serve`)
 
 Both arms run in the **same conda env**; the only variable is the CPU MoE engine. Prompts are
-byte-identical and both arms use 60 threads. **The three metrics are independent and are never
-converted into one another** — `output tok/s` is the average decode rate for the whole run
-(**TTFT included**), while TTFT and TPOT (**TTFT excluded**) are reported separately.
+byte-identical and both arms use 60 threads. **Only two rates are reported, with no crosstalk**:
+`prefill (tok/s)` (before the first token) and `decode (tok/s)` (after it). Ratios are
+**ours / `lk_moe`**, so **> 1.0 means we are faster**.
 
-| prompt / output | `lk_moe` out tok/s | ours out tok/s | ratio | `lk_moe` TTFT | ours TTFT | ratio | `lk_moe` TPOT | ours TPOT | ratio |
-|---|---|---|---|---|---|---|---|---|---|
-| 256 / 32 | 11.24 | 9.44 | **0.840×** | 2153 ms | 2391 ms | 1.111× | 22.37 ms | 32.19 ms | 1.439× |
-| 256 / 1024 | 41.08 | 31.07 | **0.756×** | 2159 ms | 2436 ms | 1.128× | 22.26 ms | 29.83 ms | 1.340× |
-| 8192 / 32 | 0.49 | 0.44 | **0.898×** | 64259 ms | 71242 ms | 1.109× | 22.03 ms | 29.13 ms | 1.322× |
-| 8192 / 1024 | 11.76 | 10.53 | **0.895×** | 64208 ms | 67734 ms | 1.055× | 22.33 ms | 28.82 ms | 1.291× |
+| prompt / output | `lk_moe` prefill | ours prefill | ratio | `lk_moe` decode | ours decode | ratio |
+|---|---|---|---|---|---|---|
+| 256 / 32 | 118.9 | 107.1 | **0.900×** | 44.7 | 31.1 | **0.695×** |
+| 256 / 1024 | 118.6 | 105.1 | **0.886×** | 44.9 | 33.5 | **0.746×** |
+| 8192 / 32 | 127.5 | 115.0 | **0.902×** | 45.4 | 34.3 | **0.756×** |
+| 8192 / 1024 | 127.6 | 120.9 | **0.948×** | 44.8 | 34.7 | **0.775×** |
 
-⇒ At the service level we are **still 10-24% slower** (TTFT 5-13% higher, pure-decode TPOT
-29-44% higher), but the gap narrowed by **+8% to +15%** versus the previous release.
+⇒ At the service level we are **still slower**: prefill by **5-11%** and **decode by 29-44%**
+(decode is 0.70-0.78× of `lk_moe`), but the gap narrowed by **+8% to +15%** versus the previous
+release.
 
 ### GPU prefill (long prefill handed to the GPU)
 
@@ -180,7 +190,7 @@ Per-model recipes, memory budgeting, self-checks and troubleshooting →
 
 | Version | Theme |
 |---|---|
-| **v0.2.3** | **Upstream tracking + GLM/MiMo MTP** — patch stack rebased onto upstream `133b71e0b` (11 patches / 40 files); **GLM-5.3-Flash MTP wired up, ON by default** (`SPEC_K=1`, TPOT 45.7 → 44.2 ms at the cost of a 27% smaller KV pool); **MiMo-V2.5 (310B/15B) runs end-to-end on one A100-40GB** with MTP k=1 at −9.4% TPOT; GLM memory contract re-calibrated (`GPU_UTIL` 0.85 → **0.82**) |
+| **v0.2.3** | **Upstream tracking + GLM/MiMo MTP** — patch stack rebased onto upstream `133b71e0b` (11 patches / 40 files); **GLM-5.3-Flash MTP wired up, ON by default** (`SPEC_K=1`, decode 21.9 → 22.6 tok/s at the cost of a 27% smaller KV pool); **MiMo-V2.5 (310B/15B) runs end-to-end on one A100-40GB** with MTP k=1 at +10% decode; GLM memory contract re-calibrated (`GPU_UTIL` 0.85 → **0.82**) |
 | **v0.2.2** | **GLM-5.3-Flash support** — FP8 GPU prefill wired up (4K-prompt TTFT 29.3 → 22.8 s), delivered as 256K × 2 concurrent; fixes an e4m3 subnormal-decode defect and adds an all-codeword gate |
 | **v0.2.1** | **Major CPU-engine performance work** — the CPU MoE engine now **beats `lk_moe` on every real shape**; DeepSeek-V4-Flash benefits too |
 | v0.2 | DeepSeek-V4.1-Flash end-to-end (1M context + GPU prefill + speculative decoding) plus CPU-prefill path optimisation |
