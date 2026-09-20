@@ -210,3 +210,40 @@ python scripts/tiny_moe_equiv.py         # CPU/GPU 专家端到端等价性
   定位建议:`CUDA_LAUNCH_BLOCKING=1`;然后在新的 `sparse_indexer.py` 的
   `_kpool_compress_insert` 里逐个 kernel 二分。
 
+
+---
+
+## 9. 更新(2026-09-20 晚):长 prompt 测试暴露的两个坑(必读)
+
+### 9.1 DeepSeek-V4.1-Flash 的快照**没有 `chat_template`** ⇒ 必须用 `--backend openai`
+
+```
+ValueError: Cannot use chat template functions because tokenizer.chat_template is
+            not set and no template argument was passed!
+```
+
+* **影响面**:用 `vllm bench serve --backend openai-chat` 打 DSV4.1 时,**客户端直接抛异常**,
+  请求一条都发不出去(实测 8 个格全空,而**服务端日志完全正常** —— 很容易误判成显存/上下文问题)。
+* **修法**:DSV4.x 一律用 **`--backend openai`**(走 `/v1/completions`,**不套 chat template**),
+  或显式传 `--chat-template`。项目 `scripts/bench_sharegpt.sh` 一直用 `openai`,正是这个原因。
+* **判别依据**:`§9.1`(在 `BENCH_REFERENCE.md`)已经写过"判断依据是 template 有没有被套上,
+  不是 backend 的名字"。**这次是我没沿用,踩了同一个坑。**
+
+### 9.2 GLM 长 prompt:KV 池必须**封到 2 GiB** 左右,否则 `EngineCore` 直接死
+
+| KV 封顶 | MBT | GPU 预填充 | 4,918-token 单条探测 |
+|---|---|---|---|
+| 8 GiB | 8192 | 开 | ❌ 服务起不来 |
+| **2 GiB** | **4096** | **开** | ✅ 通过;C=1 全量成功 |
+| 2 GiB | 4096 | 开 | C=4(19,672 token 合批)**也成功**(TTFT 31.02 s) |
+
+* **机制**:长 prefill 的**激活工作区正比于 chunk(=MBT)**,而它是**唯一不参与 `vram_policy` 预检**的一项。
+  util 0.82 下非专家权重 + KV + staging + draft 已占 ~25 GiB,留给激活的只有 ~7 GiB。
+* **排查顺序(踩过两次)**:长 prompt OOM 时 → **先降 `MBT`**,再考虑**降 KV 池**,
+  然后才关投机/关 GPU 预填充。
+* **配套改动**:显存优先级已补上"激活工作区"这一档,见 README §目标与愿景 3、`RUNBOOK.md` §5.2。
+
+### 9.3 GLM 的投机解码**已改为默认关闭**(2026-09-20 用户裁定)
+
+理由与账本见 `RUNBOOK.md` §3.6b。一句话:**收益 +3%、代价 27% KV + 3.38 GiB + ITL 脉冲化,
+且它是长 prompt OOM 的元凶**。`SPEC_K=0` 现在是 `serve_glm53_mainline.sh` 的默认。
