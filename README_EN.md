@@ -83,66 +83,62 @@ Every performance number below was taken on this machine:
 > that column on long prompts (see the notes below). C=1 and C=2 rates are **per-stream**, not
 > aggregate throughput.
 
-| Model (hardware) | Spec | prompt | conc. | prefill (tok/s) | decode (tok/s) |
+| Model (optimal config) | prompt | actual tokens | conc. | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
-| **GLM-5.3-Flash**<br>2×A100-40GB · TP=2 | off | 256 | 1 | 110 | 21.9 |
-| | off | 4096 | 1 | 143 | 21.2 |
-| | **on k=1** (default) | 256 | 1 | 83 | **22.6** |
-| | on k=1 | 4096 | 1 | 138 | 16.7 |
-| | on k=4 | 256 | 1 | 111 | 12.4 |
-| **MiMo-V2.5**<br>1×A100-40GB · TP=1 | off | 256 | 1 | 59 | 15.6 |
-| | **on k=1** (recommended) | 256 | 1 | 53 | **17.2** |
-| | on k=1 | 1024 | 1 | 81 | 17.5 |
-| | on k=1 | 2048 | 1 | 85 | 17.1 |
-| | on k=1 | 4096 | 1 | 86 | 17.0 |
-| | on k=1 **+ GPU streaming prefill** | 4096 | 1 | **194** | 13.8 |
-| **DeepSeek-V4.1-Flash**<br>2×A100-40GB · TP=2 | off | 32 | 1 / 2 | 68 / 36 | 27.6 / 22.2 |
-| | off | 256 | 1 / 2 | 129 / 93 | 22.9 / 17.2 |
-| | off | 1024 | 1 / 2 | 102 / 68 | 15.5 / 8.7 |
-| | off | 4096 | 1 / 2 | 319 / 212 | 15.1 / 7.8 |
-| | off | 16384 | 1 / 2 | **474** / 272 | 18.4 / 7.6 |
-| | off | 32768 | 1 / 2 | 462 / 286 | 17.1 / 3.6 |
+| **GLM-5.3-Flash**<br>TP=2 · util 0.82 · GPU prefill<br>KV capped 2 GiB · MBT 4096 | short | 126 | 1 | 110.1 | **23.0** |
+| | short | 126 | 4 | 60.4 | 7.3 |
+| | long | 4,918 | 1 | **207.1** | 21.6 |
+| | long | 4,918 | 4 | 158.5 | 2.8 |
+| **MiMo-V2.5**<br>1×A100 · maxlen 16K · KV capped 4 GiB<br>MTP k=1 · GPU prefill | short | 153 | 1 | 70.9 | **18.0** |
+| | short | 153 | 4 | 59.9 | 6.0 |
+| | long | 4,148 | 1 | 179.1 | 17.4 |
+| | long | 4,148 | 4 | **1,844.8** | 6.4 |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · dspark k=5 · GPU prefill | short | ~114 | 1 / 4 | measuring | measuring |
+| | long | ~4,479 | 1 / 4 | measuring | measuring |
+
+> **Dataset = ShareGPT real conversations**, filtered into a "short" (~150 tok) and a "long"
+> (~4.5K tok) band and fed via `--dataset-name custom` to bypass the **1024-token hard cap in
+> vLLM's ShareGPT loader** (which silently degrades every "long prompt" back to a short one).
+> **Prefix caching on** (product behaviour); each cell is preceded by a discarded warm-up on a
+> disjoint slice. `--backend openai-chat` (V4.1 has no chat_template, so it uses `openai`).
+>
+> ⚠️ **Two counter-intuitive readings**:
+> (1) **A short prompt depresses prefill** — GLM gets 110 at 126 tok but 207 at 4,918 tok;
+> (2) **Batching lifts prefill by an order of magnitude** — for the same MiMo prompt, going from
+> C=1 to C=4 takes prefill from 179 to **1,845 tok/s** (four streams batch 16,592 tokens, so one
+> weight transfer serves 4× the tokens). **This is the project's only service-level measurement
+> above 1000 tok/s** (the other is the engine-side 1725 tok/s @13.8K chunk in the GPU prefill
+> section below).
 
 **Per-row configuration and sample size**
 
 | Model | Serving config | Sample / notes |
 |---|---|---|
-| GLM-5.3-Flash | `GPU_UTIL=0.82` (mandatory since 0.2.3), `SPEC_K` controls speculation, GPU prefill ON (threshold 1500) | decode is **N=8×2** repeated; prefill comes from the same config at N=1–2. KV pool: spec off **915,487** / on **666,366** (−27%); delivered as **256K × 2 concurrent** |
-| MiMo-V2.5 | single card TP=1, Hybrid SWA-128 + DiffKV (`TRITON_ATTN_DIFFKV`), experts on CPU | decode **N=8×2**; prefill N=2. **MTP k=3 is unusable** (accept 1.016 ⇒ 2.4× slower); greedy output is **byte-identical** to spec-off; load takes ~25–30 min |
-| DeepSeek-V4.1-Flash | TP=2 · MBT=8192 · GPU prefill ON · **spec off** · prefix caching off (to measure real prefill) · random out=128 | full 6 lengths × 4 concurrencies in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); aggregate ceiling ≈420–455 tok/s; TTFT is linear in length and strongly concurrency-dependent |
+| GLM-5.3-Flash | `GPU_UTIL=0.82`, **speculation OFF by default** (since 2026-09-20; rationale in [`docs/RUNBOOK.md`](docs/RUNBOOK.md) §3.6b), GPU prefill ON (threshold 1500), **KV capped at 2 GiB + MBT 4096** (required for long prompts; without the cap it OOMs) | short cells N=16, long N=8, all warmed up. KV pool: spec off **915,487** / on **666,366** (−27%); delivered as **256K × 2 concurrent** |
+| MiMo-V2.5 | single card TP=1, Hybrid SWA-128 + DiffKV (`TRITON_ATTN_DIFFKV`), MTP k=1, GPU prefill ON, `maxlen 16384` + KV capped 4 GiB | short N=16, long N=8. **MTP k=3 is unusable** (accept 1.016 ⇒ 2.4× slower); greedy output is **byte-identical** to spec-off; load takes 25–30 min |
+| DeepSeek-V4.1-Flash | TP=2 · MBT=8192 · dspark k=5 · GPU prefill ON · KV capped 0.5 GiB | ⚠️ this snapshot has **no `chat_template`** ⇒ the bench must use `--backend openai --skip-chat-template`, otherwise the client throws and sends nothing (see [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) §9.1) |
 
-**⚠️ The table above uses the `random` dataset.** That is only good for measuring **raw prefill
-throughput**: random prompts share no prefix (so prefix caching buys nothing) and random tokens
-have ~zero predictability (so speculation is systematically understated). **A product summary must
-use ShareGPT with prefix caching on**, and the difference can be large:
+**Speculation flips sign with concurrency (pays at C=1, loses at C≥4)** — DeepSeek-V4.1's dspark,
+ShareGPT:
 
-**Product-frame numbers: ShareGPT (real conversations, prefix caching on)**
+| Conc. | spec off (output tok/s) | spec on (output tok/s) |
+|---|---|---|
+| C=1 | 13.79 | **18.38 (+33%)** |
+| C=4 | **41.62** | 31.03 (**−25%**) |
+| C=8 | **48.56** | 41.26 (−15%) |
 
-| Model | Spec | Conc. | prefill (tok/s) | decode (tok/s) | vs spec off |
-|---|---|---|---|---|---|
-| DeepSeek-V4.1-Flash | off | 1 | 115\* | — | — |
-| (TP=2 · 1M · GPU prefill 4096) | **on** (dspark k=5) | 1 | 113\* | **34.0** | output throughput **13.79 → 18.38 tok/s (+33%)** |
-| | off | 4 | — | — | output throughput **41.62** |
-| | on | 4 | — | 9.7 | output throughput 31.03 (**−25%**) |
-| | off | 8 | — | — | output throughput **48.56** |
-| | on | 8 | — | 6.6 | output throughput 41.26 (−15%) |
-| GLM-5.3-Flash | off | 1 | — | 21.9 | — |
-| (util 0.82 · 256K × 2) | on k=1 | 1 | — | **22.3** | +2% (MTP's win is limited on ShareGPT too) |
+⇒ the draft competes with the target for the same CPU expert compute. GLM's MTP manages only
+**+2–3%** even at C=1 (a single recycled layer, acceptance 1.46), hence **off by default**.
 
-\* DeepSeek-V4.1's ShareGPT prompts are not fixed-length; prefill is converted from mean TTFT and
-mean prompt length. **How to read this:** speculation **pays at C=1 and loses at C≥4** (the draft
-competes with the target for the same CPU expert compute), and **none of that +33% is visible on
-random** — which is exactly why random must not be used for a product summary.
+**How to read prefill** — two non-obvious rules:
 
-**How to read prefill** — all three models get **faster prefill as the prompt grows**, because part
-of the cost is a **fixed per-chunk cost** (streaming expert weights to the GPU) that a bigger chunk
-amortises:
-
-* GLM 110 → 143 (short → 4K); MiMo 59 → **194** (with GPU streaming prefill on);
-  DeepSeek-V4.1 68 → **474** (32 → 16K, 6×);
-* conversely DeepSeek-V4.1 on a **32-token prompt** gets only 68 tok/s — all fixed overhead;
-* **decode is the opposite**: it falls as concurrency rises (clearly at C=2), because prefill and
-  decode contend for the same CPU expert compute.
+1. **Longer prompt ⇒ higher rate** (the fixed cost amortises): GLM **110 → 207** (126 → 4,918 tok),
+   MiMo **71 → 179** (153 → 4,148 tok);
+2. **Batching lifts it another order of magnitude**: for the same MiMo long prompt, **C=1 179 →
+   C=4 1,845 tok/s (+10×)** — four streams batch 16,592 tokens so one weight transfer serves 4×
+   the tokens. This is also why short prompts look "slow": at 126 tok the fixed overhead dominates.
+3. **Decode is the opposite**: it falls as concurrency rises (GLM long: C=1 21.6 → C=4 **2.8**),
+   because prefill and decode contend for the same CPU expert compute.
 
 **Other points**
 
