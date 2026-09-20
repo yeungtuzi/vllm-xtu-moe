@@ -571,7 +571,10 @@ python -m vllm.entrypoints.openai.api_server \
   取 TP=1(单卡)或 TP=2;
 * **加载很慢**:每层要建一次 xiaotu 引擎(实测 dummy 下 ~2 min/层 ⇒ 48 层 ≈1.5 h),
   实权重还要先读 282 GB;Dummy 加载用于**只验后端**时可用 `--load-format dummy`。
-* GPU 流式预填充暂不可用(沿用 `KNOWN_LIMITATIONS.md` §8.3 的 `GP_PREFILL=0` 规避)。
+* **GPU 流式预填充可用,而且收益很大(实测)**:L=4096 的 TTFT **47.4 s(CPU)→ 21.1 s(GPU,2.25×)**,
+  0 错误。代价是 staging **12.75 GiB/rank**(比 GLM 的 7.59 大,因为 `E=256×I=2048` 更宽)
+  ⇒ 要配更低的 `GPU_UTIL`(实测 `0.65`)让出激活余量,KV 池随之变小(47,459 token,
+  8K 上下文下 5.8× 并发,够用)。给 MiMo 起服务时**不要**再用 `XIAOTU_GP_ACT_RESERVE_GIB=99`。
 
 **MTP(2026-09-20 实测,TP=1 / GPU 2 / 单请求)**:检查点带 **3 层** dense MTP
 (`model.mtp.layers.{0,1,2}`);主线原来只建第 1 层,本项目已改成

@@ -298,6 +298,30 @@ GPU 流式预填充关(`GP_ACT_RESERVE_GIB=99`)。同一个服务进程分别跑
 | 2000 in / 64 out / C=1,N=1 | 2.31 tok/s,TTFT 23.6 s,TPOT 66.01 ms | 2.27 tok/s,TTFT 24.5 s,TPOT 58.48 ms | TPOT −11.4%(单请求) |
 | 4000 in / 64 out / C=1,N=1 | 1.25 tok/s,TTFT 46.8 s,TPOT 68.31 ms | 1.22 tok/s,TTFT 47.1 s,TPOT 84.70 ms | TPOT +24%(单请求,噪声) |
 
+**prompt 长度 → TTFT(MTP k=1,O=32,C=1,N=2;GPU 流式预填充关)**
+
+| prompt | TTFT | 有效预填充速率 | TPOT |
+|---|---|---|---|
+| 256 | 3.75 s | ~68 tok/s | 61.9 ms |
+| 1024 | 12.6 s | ~81 tok/s | 57.3 ms |
+| 2048 | 24.0 s | ~85 tok/s | 58.6 ms |
+| 4096 | 47.4 s | ~86 tok/s | 58.8 ms |
+
+⇒ **TTFT 随 prompt 线性增长(~11.6 ms/token)**,因为专家在 CPU、MiMo 的 GPU 流式预填充还没接线;
+TPOT 基本平坦(57–62 ms)。**长 prompt 是 MiMo 当前最大的短板**,也是下一步最值得做的一项。
+
+**✅ 打开 GPU 流式预填充后(2026-09-20 实测,同一台机)**
+
+| L=4096,O=32,C=1 | TTFT | staging | 备注 |
+|---|---|---|---|
+| GPU 预填充**关** | 47.4 s | — | util 0.85,KV 84,385 |
+| GPU 预填充**开** | **21.1 s(2.25×)** | **12.75 GiB/rank** | util **0.65**,KV 47,459 |
+
+⇒ 插件的 FP8 流式预填充**对 MiMo 同样有效**(`GPU prefill ACTIVE ... weights from engine shards`,
+18 个 host 分片锁页,**0 错误**)。注意 MiMo 的 staging 比 GLM 大(12.75 vs 7.59 GiB/rank,
+因为 `E=256 × I=2048` 比 GLM 的 `E=288 × I=1024` 更宽),所以**要用更低的 `GPU_UTIL` 换激活余量**,
+KV 池相应变小;短上下文(≤8K)完全够用,长上下文需要在"TTFT"与"KV 并发"之间取舍。
+
 * **接受长度**:256/128 N=8 的稳定口径 = **1.743**(accepted 869 / drafts 1169 = 74.3%);
   早期小样本给到 1.83~1.87。**k=3 = 1.016(p0 = 0.016 ⇒ 坏)**;
 * 同 prompt 128-token 直接对拍:不开 **8.72 s** → k=1 **7.33 s(1.19×)**,且**贪心输出逐字节相同**;
