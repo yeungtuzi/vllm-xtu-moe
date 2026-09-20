@@ -282,6 +282,26 @@ DeepSeek-V4-Flash 的**逐步使用指南、完整初步性能表
 > 复现:`SPEC_K=1|2|3|4 GPU_UTIL=0.82 GP_PREFILL=0 bash scripts/serve_glm53_mainline.sh`,
 > 接受长度取 `/metrics` 的 `vllm:spec_decode_num_accepted_tokens_per_pos_total`。
 
+## 4.4 MiMo-V2.5 MTP(2026-09-20,单卡 A100-40GB / TP=1 / 专家在 CPU)
+
+模型:`XiaomiMiMo/MiMo-V2.5`(310B / 15B active,48 层,256 专家 top-8,FP8 block-128);
+`--language-model-only --trust-remote-code`,`--gpu-memory-utilization 0.85`,
+GPU 流式预填充关(`GP_ACT_RESERVE_GIB=99`)。同一个服务进程分别跑 MTP 开/关。
+
+| 工作负载(官方 `vllm bench serve`) | 不开 MTP | MTP k=1 | 不开 vs k=1 |
+|---|---|---|---|
+| 256 in / 128 out / C=1 | 10.24 tok/s,TTFT 4.36 s,TPOT 64.12 ms,ITL 63.6 ms | 10.39 tok/s,TTFT 4.81 s,**TPOT 59.16 ms**,ITL 102.9 ms | TPOT **−7.7%** |
+| 2000 in / 64 out / C=1 | 2.31 tok/s,TTFT 23.6 s,TPOT 66.01 ms | 2.27 tok/s,TTFT 24.5 s,**TPOT 58.48 ms** | TPOT **−11.4%** |
+| 4000 in / 64 out / C=1 | 1.25 tok/s,TTFT 46.8 s,TPOT 68.31 ms | 1.22 tok/s,TTFT 47.1 s,TPOT 84.70 ms | TPOT +24%(单请求噪声,见下) |
+
+* **接受长度 k=1 = 1.83~1.87**(p0 = 0.83~0.87),**k=3 = 1.016**(p0 = 0.016 ⇒ 坏);
+  128-token 同 prompt 直接对拍:不开 **8.72 s** → k=1 **7.33 s(1.19×)**,且**贪心输出逐字节相同**;
+* ⚠️ 上表是**单请求**跑出来的,TPOT 的 run-to-run 抖动 ~10%,4000-token 那一格与其余方向相反
+  多半是噪声(ITL 也没变差到那个程度);**要下定论需要每格 ≥8 次重复**;
+* **ITL 被脉冲化**(63.6 → 103 ms)是 MTP 的固有权衡;k=1 每步只多吐 1 个 token,冲击比 GLM k=4 小;
+* 结论:**MiMo 用 `num_speculative_tokens=1`;不要用 k>1**。方法/复现见
+  [`MODEL_GUIDES.md`](MODEL_GUIDES.md) §3。
+
 ## 5. 服务端吞吐与时延(DeepSeek-V4-Flash,单卡)
 
 | 指标 | 数值 |
