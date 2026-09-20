@@ -45,8 +45,9 @@
 | 模型 | 规模 | 专家格式 | 状态 |
 |---|---|---|---|
 | **DeepSeek-V4.1-Flash** | 748B | MXFP4(E8M0 block-32) | ✅ 端到端(TP=2) |
-| **DeepSeek-V4-Flash**(0731) | 256 专家 / top-6 | MXFP4 | ✅ 端到端 |
-| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,交付配置 **256K 上下文 × 2 路并发**(KV 池 988,081 token),需 `--kv-cache-dtype bfloat16`;C=1 解码 ~22 tok/s(TPOT 46 ms);4K prompt TTFT **29.3 s(CPU)→ 22.8 s(FP8 GPU 预填充,1.29×)** |
+| **DeepSeek-V4-Flash**(0731) | 256 专家 / top-6 | MXFP4 | ✅ 端到端(基准引用历史数据,0.2.3 起不复测) |
+| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,交付配置 **256K 上下文 × 2 路并发**,需 `--kv-cache-dtype bfloat16`;**0.2.3 起 `GPU_UTIL` 必须用 `0.82`**(见下);MTP 已实现但实测净负,**默认关**(`SPEC_K=1..4` 可开) |
+| **MiMo-V2.5** | 310B / 15B active、256 专家 / top-8 | FP8 block-128 | ✅ **单卡 A100-40GB(TP=1)端到端**,Hybrid SWA-128 + DiffKV(`TRITON_ATTN_DIFFKV`);**MTP `num_speculative_tokens=1` 实测 TPOT −9.4%**,k>1 不可用 |
 | 其它即插即用 MoE | — | BF16 / FP8 | ✅ 走通用路径,未逐模型标定 |
 
 **实测硬件平台(下文所有性能数字都在这台机器上取得)**
@@ -60,7 +61,12 @@
 
 ---
 
-## 性能(最新版本 **v0.2.2**)
+## 性能(最新版本 **v0.2.3**)
+
+> **v0.2.3 变更**:补丁栈 rebase 到上游 `133b71e0b`;**GLM 生产 `GPU_UTIL` 从 `0.85` 降到 `0.82`**
+> (上游改了 KV 定容 ⇒ 0.85 下两路并发会 OOM);GLM 的 MTP 已实现但实测净负、**默认关**;
+> **MiMo-V2.5 新增支持**,MTP k=1 实测 **TPOT 64.28 → 58.25 ms(−9.4%)**。
+> 详见 [`RELEASE_NOTES_v0.2.3.md`](RELEASE_NOTES_v0.2.3.md)。
 
 > **怎么读** —— 表里的数字都是**耗时(ms/层),越小越好**,即"同样的活干得更快"。
 > 对照方是 `lk_moe`(Lvllm 的 CPU MoE 引擎):同一台机器、同一份真实层权重、同一线程数,
@@ -80,7 +86,9 @@
 * **长 prompt 预填充**:4096-in 的 TTFT 从 **29.3 s(v0.2.1 全 CPU 预填充)降到 22.8 s(1.29×)** ——
   FP8 GPU 预填充把每层 3.62 GB/rank 的专家权重逐层流式搬上 GPU,并与 attention **重叠**;
 * **解码不变**:C=1 TPOT 46 ms(≈22 tok/s),与 v0.2.1 持平(GPU 预填充只作用于 prefill);
-* **上下文**:256K × 2 路并发(KV 池 988,081 token)是**本硬件的交付目标**;
+* **上下文**:256K × 2 路并发是**本硬件的交付目标**;上表的 KV 池是 v0.2.2(util 0.85)口径
+  = 988,081 token,**0.2.3 rebase 后同一 util 会涨到 1,018,328 并把激活余量吃掉**(两路并发 OOM),
+  故 **0.2.3 交付改用 `GPU_UTIL=0.82`,KV 池 915,487**(32k 单请求 / 两路 14k+15k 实测均通过);
   512K/704K 实测「能起」但只作能力记录(704K 仅 1.06× 并发,上限约 733K),
   **1M 不在目标内**(需 fp8 KV,已决定不做;见 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md));
 * **正确性**:引擎确定性门禁 11/11;层门禁 rms_rel 4.4e-3;29,746-token 长文密钥检索完全命中;
@@ -88,6 +96,20 @@
 
 > FP8 引擎内层另有一个**默认关闭**的加速开关 `XIAOTU_MOE_FP8_BF16_MMA=1`
 > (AVX512-BF16 `vdpbf16ps`,M≥6 快 1.17-1.20×,代价是权重舍入 bf16:两路 rms_rel 3.6e-3)。
+
+### MiMo-V2.5(单卡 A100-40GB,TP=1,专家在 CPU;`vllm bench serve` C=1,N=8×2)
+
+| 配置 | out tok/s | TPOT 均值 | ITL 均值 |
+|---|---|---|---|
+| 不开 MTP | 10.88 / 10.93 | **64.56 / 64.00 ms** | 64.1 / 63.5 ms |
+| **MTP k=1**(推荐) | **11.54 / 11.59** | **58.02 / 58.48 ms(−9.4%)** | 99.9 / 99.9 ms(脉冲化) |
+
+* 负载 = 256 in / 128 out / C=1;接受长度 **1.74**(accepted 869 / drafts 1169);
+**贪心输出与不开 MTP 逐字节相同**;
+* **MTP k=3 不可用**:accept 1.016(p0 从 0.83 崩到 0.016)⇒ 反而慢 2.4×,与上游 PR #31180
+  的 *"acceptance rate of 0"* 一致 ⇒ 只开 `num_speculative_tokens=1`;
+* 加载:293 GiB / 17 分片,每层建一次 xiaotu FP8 引擎,整轮 ~25-30 min;详见
+  [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) §3。
 
 ### DeepSeek-V4.1-Flash(真实路由形状 `na≈226`,60 线程,单位 ms/层)
 
