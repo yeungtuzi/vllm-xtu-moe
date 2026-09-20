@@ -87,8 +87,8 @@ Every performance number below was taken on this machine:
 |---|---|---|---|---|---|
 | **GLM-5.3-Flash**<br>TP=2 · util 0.82 · GPU prefill<br>KV capped 2 GiB · MBT 4096 | short | 126 | 1 | 110.1 | **23.0** |
 | | short | 126 | 4 | 60.4 | 7.3 |
-| | long | 4,918 | 1 | **207.1** | 21.6 |
-| | long | 4,918 | 4 | 158.5 | 2.8 |
+| | long | 4,538 | 1 | **178.3** | 21.3 |
+| | long | 4,518 | 4 | **92.9** | 2.2 |
 | **MiMo-V2.5**<br>1×A100 · maxlen 16K · KV capped 4 GiB<br>MTP k=1 · GPU prefill | short | 153 | 1 | 70.9 | **18.0** |
 | | short | 153 | 4 | 59.9 | 6.0 |
 | | long | 4,148 | 1 | 179.1 | 17.4 |
@@ -97,6 +97,14 @@ Every performance number below was taken on this machine:
 | | short | 84 | 4 | 83.7 | 10.7 |
 | | **long** | 4,796 | 1 | **330.3** | **24.7** |
 | | **long** | 4,796 | 4 | **2,595.2** | 10.6 |
+
+> ### ⚠️ 2026-09-20 correction: the C=4 column carried a **prefix-cache artifact**
+> The earlier C=4 figures (C=1 and C=4 run against the **same prompts** with prefix caching on)
+> showed **MiMo 1,845 / DeepSeek-V4.1 2,595 tok/s**. Those were **cache hits left behind by the
+> C=1 run** — no prefill happened. A cold/hot control measured **31,896 ms cold vs 838 ms hot**
+> on the same prompts (38×). The table is being re-measured with **disjoint prompt slices**
+> (the GLM rows above are already corrected; MiMo/V4.1 pending).
+> **Hard rule: any C=1 vs C>1 comparison must use non-overlapping prompt slices.**
 
 > **Dataset = ShareGPT real conversations**, filtered into a "short" (~150 tok) and a "long"
 > (~4.5K tok) band and fed via `--dataset-name custom` to bypass the **1024-token hard cap in
@@ -136,10 +144,11 @@ ShareGPT:
 
 1. **Longer prompt ⇒ higher rate** (the fixed cost amortises): GLM **110 → 207** (126 → 4,918 tok),
    MiMo **71 → 179** (153 → 4,148 tok), DeepSeek-V4.1 **218 → 330** (84 → 4,796 tok);
-2. **Batching lifts it another order of magnitude**: for the same long prompt, C=1 → C=4 takes
-   **MiMo 179 → 1,845 (+10×)** and **DeepSeek-V4.1 330 → 2,595 (+7.9×)** — four streams batch
-   ~20K tokens so one weight transfer serves 4× the tokens. This is also why short prompts look
-   "slow": at 84–153 tok the fixed overhead dominates.
+2. ⚠️ **Higher concurrency makes per-request prefill SLOWER** (prefill is a **shared serial
+   resource**): DeepSeek-V4.1 long prompt **C=1 330 → C=4 131 tok/s**, GLM **178 → 93**.
+   **~~"batching lifts it an order of magnitude"~~ was wrong and is retracted** (see the
+   correction note below). Short prompts look "slow" because at 84–153 tok the fixed overhead
+   dominates.
 3. **Decode is the opposite**: it falls as concurrency rises (GLM long: C=1 21.6 → C=4 **2.8**),
    because prefill and decode contend for the same CPU expert compute.
 
