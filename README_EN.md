@@ -7,15 +7,21 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.2.2** (2026-09-19) — **GLM-5.3-Flash support**: the FP8 GPU
-> prefill path is wired up (4K-prompt TTFT **29.3 s → 22.8 s**) and the delivered service
-> config is **256K context × 2 concurrent sequences**. This release also fixes a **real
-> e4m3 subnormal-decode defect** in the engine and adds an all-codeword gate for it.
+> **📌 Current release: v0.2.3** (2026-09-20) — **upstream tracking + MTP for GLM and MiMo**:
+> the patch stack is rebased onto upstream `133b71e0b` (11 patches / 40 files);
+> **GLM-5.3-Flash MTP is wired up and ON by default** (`SPEC_K=1`; accept 1.46,
+> TPOT 45.7 → 44.2 ms, at the cost of a 27% smaller KV pool);
+> **MiMo-V2.5 (310B/15B) now runs end-to-end on a single A100-40GB**, where
+> **MTP k=1 measures −9.4% TPOT**. GLM production `GPU_UTIL` drops to **0.82**.
 >
-> Previous, **v0.2.1** (2026-09-18) — **major CPU-engine performance work**:
+> Previous, **v0.2.2** (2026-09-19) — **GLM-5.3-Flash support**: FP8 GPU prefill wired up
+> (4K-prompt TTFT **29.3 s → 22.8 s**), delivered as **256K context × 2 concurrent
+> sequences**; also fixed an **e4m3 subnormal-decode defect** and added an all-codeword gate.
+>
+> **v0.2.1** (2026-09-18) — **major CPU-engine performance work**:
 > the CPU MoE engine now **beats the reference `lk_moe` implementation on every real shape**;
 > DeepSeek-V4-Flash benefits as well.
-> Release notes: [`RELEASE_NOTES_v0.2.2.md`](RELEASE_NOTES_v0.2.2.md) · [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md)
+> Release notes: [`RELEASE_NOTES_v0.2.3.md`](RELEASE_NOTES_v0.2.3.md) · [`RELEASE_NOTES_v0.2.2.md`](RELEASE_NOTES_v0.2.2.md) · [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md)
 
 ---
 
@@ -65,7 +71,7 @@ which run fast on the GPU. So we split the model:
 
 ---
 
-## Performance (latest release **v0.2.2**)
+## Performance (latest release **v0.2.3**)
 
 > **How to read these tables.** Every number is **elapsed time in ms/layer — lower is better**,
 > i.e. "the same work done faster". The baseline is `lk_moe` (Lvllm's CPU MoE engine), measured
@@ -143,7 +149,7 @@ on DeepSeek-V4.1-Flash (worth it above a 4096-token threshold) and **1.29×** on
 recipe are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
 **Full service-level comparison, methodology and reproduction commands:**
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) · [`RELEASE_NOTES_v0.2.2.md`](RELEASE_NOTES_v0.2.2.md) · [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md).
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) · [`RELEASE_NOTES_v0.2.3.md`](RELEASE_NOTES_v0.2.3.md) · [`RELEASE_NOTES_v0.2.2.md`](RELEASE_NOTES_v0.2.2.md) · [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md).
 
 ---
 
@@ -174,13 +180,14 @@ Per-model recipes, memory budgeting, self-checks and troubleshooting →
 
 | Version | Theme |
 |---|---|
+| **v0.2.3** | **Upstream tracking + GLM/MiMo MTP** — patch stack rebased onto upstream `133b71e0b` (11 patches / 40 files); **GLM-5.3-Flash MTP wired up, ON by default** (`SPEC_K=1`, TPOT 45.7 → 44.2 ms at the cost of a 27% smaller KV pool); **MiMo-V2.5 (310B/15B) runs end-to-end on one A100-40GB** with MTP k=1 at −9.4% TPOT; GLM memory contract re-calibrated (`GPU_UTIL` 0.85 → **0.82**) |
 | **v0.2.2** | **GLM-5.3-Flash support** — FP8 GPU prefill wired up (4K-prompt TTFT 29.3 → 22.8 s), delivered as 256K × 2 concurrent; fixes an e4m3 subnormal-decode defect and adds an all-codeword gate |
 | **v0.2.1** | **Major CPU-engine performance work** — the CPU MoE engine now **beats `lk_moe` on every real shape**; DeepSeek-V4-Flash benefits too |
 | v0.2 | DeepSeek-V4.1-Flash end-to-end (1M context + GPU prefill + speculative decoding) plus CPU-prefill path optimisation |
 | v0.1.0 | First public release: hybrid mode (CPU experts + GPU rest), AVX2 / AVX-512 multi-ISA, DeepSeek-V4 family |
 
 Details, performance comparisons and parameter changes:
-[**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
+[**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
 (archived: [v0.2pre](RELEASE_NOTES_v0.2pre.md))
 
 ---

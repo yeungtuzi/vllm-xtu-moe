@@ -220,7 +220,8 @@ xiaotu_moe variant = _avx512_bf16
 | `--tensor-parallel-size` | `1`(单卡)或 `2` | 目前**不支持 expert_map(EP)**,TP>1 走权重分片 |
 | `--max-model-len` | GLM-5.3:**交付默认 262144(256K)**,实测可起 512K/704K;DeepSeek-V4 系列先 `4096`–`8192` 再放大 | KV 单价差异极大:**GLM-5.3 ≈ 11.9-12.3 KB/token**,DeepSeek-V4.1 ≈ 40 KB/token |
 | `--gpu-memory-utilization` | GLM-5.3:`0.85`(v0.2.2 及以前)/ **`0.82`(0.2.3 rebase 后)**;开 MTP 时必须 `0.82` 或 `GP_PREFILL=0` | 非专家权重 + KV cache 在显存;见 §3.2 的 slack |
-| `SPEC_K`(env,`serve_glm53_mainline.sh`) | **默认 `0`(关)** | `1..4` ⇒ `--speculative-config method=mtp`;实测净负,保持关闭(数据见 `MODEL_GUIDES.md` §2.6) |
+| `SPEC_K`(env,`serve_glm53_mainline.sh`) | **默认 `1`(开,按用户要求)**;`0` 关 | `1` ⇒ `--speculative-config method=mtp`。**只开 k=1**:TPOT −3%(噪声内)但 **KV 池 −27%**(915,487→666,366)、ITL 46→64 ms;**k>1 明确更差**(k=4 掉到 11.2 tok/s)。数据见 `MODEL_GUIDES.md` §2.6 |
+| `SPEC_CONFIG`(env,`serve_glm53_mainline.sh`) | 默认空 | 透传任意 vLLM 投机配置 JSON(覆盖 `SPEC_K`),用于 **外挂 draft** 方案:`ngram` / `suffix` / `eagle` / `eagle3` / `medusa` / `draft_model`。⚠️ `ngram` 需要 `numba`(本环境未装,启动会 `ModuleNotFoundError: numba`) |
 | `GP_PREFILL`(env,`serve_glm53_mainline.sh`) | 默认 `1`(开);**不稳时置 `0`** | `0` ⇒ 把 `XIAOTU_GP_ACT_RESERVE_GIB` 拉到 99 ⇒ GPU 流式预填充永不放行(长 prompt 退 CPU,慢但稳) |
 | `--enforce-eager` | 建议先开 | 避免 CUDA graph 与 CPU 引擎 host 回调的额外变量;稳定后可尝试关闭 |
 | `--kernel-config.enable_jit_warmup=false` | 建议 | 跳过 JIT 预热,加快启动 |

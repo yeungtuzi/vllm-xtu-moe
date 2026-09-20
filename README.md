@@ -46,7 +46,7 @@
 |---|---|---|---|
 | **DeepSeek-V4.1-Flash** | 748B | MXFP4(E8M0 block-32) | ✅ 端到端(TP=2) |
 | **DeepSeek-V4-Flash**(0731) | 256 专家 / top-6 | MXFP4 | ✅ 端到端(基准引用历史数据,0.2.3 起不复测) |
-| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,交付配置 **256K 上下文 × 2 路并发**,需 `--kv-cache-dtype bfloat16`;**0.2.3 起 `GPU_UTIL` 必须用 `0.82`**(见下);MTP 已实现但实测净负,**默认关**(`SPEC_K=1..4` 可开) |
+| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,交付配置 **256K 上下文 × 2 路并发**,需 `--kv-cache-dtype bfloat16`;**0.2.3 起 `GPU_UTIL` 必须用 `0.82`**;**MTP 默认开 `SPEC_K=1`**(TPOT 45.7→44.2 ms,KV 池 −27%;k>1 反而更差) |
 | **MiMo-V2.5** | 310B / 15B active、256 专家 / top-8 | FP8 block-128 | ✅ **单卡 A100-40GB(TP=1)端到端**,Hybrid SWA-128 + DiffKV(`TRITON_ATTN_DIFFKV`);**MTP `num_speculative_tokens=1` 实测 TPOT −9.4%**,k>1 不可用 |
 | 其它即插即用 MoE | — | BF16 / FP8 | ✅ 走通用路径,未逐模型标定 |
 
@@ -64,7 +64,8 @@
 ## 性能(最新版本 **v0.2.3**)
 
 > **v0.2.3 变更**:补丁栈 rebase 到上游 `133b71e0b`;**GLM 生产 `GPU_UTIL` 从 `0.85` 降到 `0.82`**
-> (上游改了 KV 定容 ⇒ 0.85 下两路并发会 OOM);GLM 的 MTP 已实现但实测净负、**默认关**;
+> (上游改了 KV 定容 ⇒ 0.85 下两路并发会 OOM);GLM 的 MTP **默认开 `SPEC_K=1`**
+> (TPOT 小赚 −3%,代价是 **KV 池 −27%**、ITL 脉冲化);
 > **MiMo-V2.5 新增支持**,MTP k=1 实测 **TPOT 64.28 → 58.25 ms(−9.4%)**。
 > 详见 [`RELEASE_NOTES_v0.2.3.md`](RELEASE_NOTES_v0.2.3.md)。
 
@@ -93,6 +94,10 @@
   **1M 不在目标内**(需 fp8 KV,已决定不做;见 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md));
 * **正确性**:引擎确定性门禁 11/11;层门禁 rms_rel 4.4e-3;29,746-token 长文密钥检索完全命中;
   3 路 ~8K 并发(限两路)三个密钥全部正确;0 OOM。
+* **MTP(v0.2.3 起默认开 `SPEC_K=1`)**:draft 第 45 层常驻 GPU(3.38 GiB/rank);
+  接受长度 1.46,`256/128 C=1` TPOT **45.7 → 44.2 ms**(≈−3%,噪声内);代价是
+  **KV 池 915,487 → 666,366(−27%,256K 并发 3.49× → 2.54×)** 与 **ITL 46 → 64 ms**;
+  **k>1 反而更差**(k=4 掉到 11.2 tok/s)。数据见 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §4.3。
 
 > FP8 引擎内层另有一个**默认关闭**的加速开关 `XIAOTU_MOE_FP8_BF16_MMA=1`
 > (AVX512-BF16 `vdpbf16ps`,M≥6 快 1.17-1.20×,代价是权重舍入 bf16:两路 rms_rel 3.6e-3)。
@@ -197,13 +202,14 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 
 | 版本 | 主题 |
 |---|---|
+| **v0.2.3** | **跟进上游 + GLM/MiMo 的 MTP** —— 补丁栈 rebase 到上游 `133b71e0b`(11 补丁/40 文件);**GLM-5.3-Flash 的 MTP 落地**(draft 层识别 + GPU 常驻,`SPEC_K=1..4`);**MiMo-V2.5(310B/15B)单卡端到端支持**,MTP k=1 TPOT −9.4%;显存契约重标定(GLM `GPU_UTIL` 0.85 → **0.82**) |
 | **v0.2.2** | **支持 GLM-5.3-Flash** —— FP8 GPU 预填充接线(4K prompt TTFT 29.3 → 22.8 s)、256K × 2 路并发交付配置;修掉 e4m3 次正规数解码缺陷 + 新增全码字门禁 |
 | **v0.2.1** | **针对引擎的显著性能优化** —— CPU MoE 引擎在全部真实形状上**反超 `lk_moe`**;DeepSeek-V4-Flash 同步受益 |
 | v0.2 | DeepSeek-V4.1-Flash 全链路可用(1M 上下文 + GPU 预填充 + 投机解码)+ CPU 预填充路径优化 |
 | v0.1.0 | 首个公开版:混合模式(CPU 专家 + GPU 其余)、AVX2 / AVX-512 多 ISA、DeepSeek-V4 系列 |
 
 改动清单、性能对照与运行参数变更:
-[**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
+[**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
 (归档:[v0.2pre](RELEASE_NOTES_v0.2pre.md))
 
 ---

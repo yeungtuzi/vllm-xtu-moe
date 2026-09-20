@@ -61,11 +61,14 @@ THREADS="${THREADS:-60}"
 KV_DTYPE="${KV_DTYPE:-bfloat16}"
 # 投机解码(MTP,2026-09-20)。GLM-5.3-Flash 的检查点自带 **1 层 MTP**
 # (`model.language_model.layers.45`,见 docs/MODEL_GUIDES.md §2.6)。
-#   SPEC_K=0(默认)= 关;SPEC_K=1..4 = 开 MTP 并取 num_speculative_tokens=K。
-# 单层 MTP 通过复用 hidden state 支持 K>1(`index_share_for_mtp_iteration=True`)。
-# 注意:开投机时插件会把第 45 层**强制常驻 GPU**(CPU draft 实测净负),
-# 代价约 1.7 GiB/rank;实际以启动日志的 `spec draft layer ... kept GPU-resident` 为准。
-SPEC_K="${SPEC_K:-0}"
+#   **SPEC_K=1(默认,按用户要求开)**;`SPEC_K=0` 关;1..4 取 num_speculative_tokens。
+#   单层 MTP 通过复用 hidden state 支持 K>1(`index_share_for_mtp_iteration=True`),
+#   但**实测 K>1 明显更差**(K=4 时 accept 只到 1.63、吞吐掉到 11.2 tok/s),所以默认 K=1。
+# 代价(必须知道):draft 第 45 层**强制常驻 GPU**(约 3.38 GiB/rank)+ profile 会把激活峰
+# 从 2.9 GiB 低估到 0.84 GiB ⇒ **KV 池 915,487 → 666,366 token(−27%)**,
+# 256K 的并发从 3.49× 掉到 2.54×(仍够"2 路 256K"交付口径)。
+# 实测净效果:TPOT 约 −3%(·256/128 C=1:45.7 → 44.2 ms),ITL 脉冲化 46 → 64 ms。
+SPEC_K="${SPEC_K:-1}"
 SPEC_MODEL="${SPEC_MODEL:-$CKPT}"
 # EAGER=1 ⇒ --enforce-eager。MTP 的 draft 图捕获若在插件路径下有问题,退这一档。
 EAGER="${EAGER:-0}"
@@ -126,7 +129,11 @@ ARGS=(
 [ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
 # 让客户端能读到前缀缓存命中数(usage.prompt_tokens_details.cached_tokens)
 [ "$PROMPT_TOKENS_DETAILS" = "1" ] && ARGS+=(--enable-prompt-tokens-details)
-if [ "$SPEC_K" != "0" ]; then
+if [ -n "${SPEC_CONFIG:-}" ]; then
+  # Escape hatch: any other vLLM speculative method (ngram / eagle / medusa /
+  # draft_model / suffix), passed through verbatim as JSON. Overrides SPEC_K.
+  ARGS+=(--speculative-config "$SPEC_CONFIG")
+elif [ "$SPEC_K" != "0" ]; then
   ARGS+=(--speculative-config \
     "{\"method\":\"mtp\",\"model\":\"$SPEC_MODEL\",\"num_speculative_tokens\":$SPEC_K}")
 fi

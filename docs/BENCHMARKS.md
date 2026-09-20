@@ -254,32 +254,36 @@ DeepSeek-V4-Flash 的**逐步使用指南、完整初步性能表
 
 ## 4.3 GLM-5.3-Flash 的 MTP 投机解码(2026-09-20,实测)
 
-配置:2×A100-40GB / TP=2 / `GPU_UTIL=0.82` / `GP_PREFILL=0`(关 GPU 流式预填充,
-理由见 `KNOWN_LIMITATIONS.md` §8);官方 `vllm bench serve`;`SPEC_K` 控制
-`num_speculative_tokens`。draft = 检查点自带的第 45 层(3.38 GiB/rank 常驻 GPU)。
+配置:2×A100-40GB / TP=2 / `GPU_UTIL=0.82` / GPU 流式预填充开;官方 `vllm bench serve`;
+`SPEC_K` 控制 `num_speculative_tokens`。draft = 检查点自带的第 45 层(3.38 GiB/rank 常驻 GPU)。
 
-**接受长度(逐位接受率反推,k=1 有直接实测可交叉验证)**
+**接受长度**
 
-| k | accept(random) | accept(ShareGPT) | 逐位接受率(ShareGPT) |
+| k | accept(random) | accept(ShareGPT) | 来源 |
 |---|---|---|---|
-| 1 | 1.452 | 1.400 | 0.400 |
-| 2 | 1.584 | 1.539 | +0.139 |
-| 3 | 1.614 | 1.595 | +0.056 |
-| 4 | 1.619 | 1.626 | +0.031 |
+| **1(默认)** | **1.469** | **1.459** | N=16/1327 drafts,直接实测 |
+| 2 | — | 1.539 | † 由 k=4 运行的逐位接受率反推 |
+| 3 | — | 1.595 | † |
+| 4 | 1.619 | 1.626 | † (那次 p0=0.400) |
 
-**端到端**:同机同参 A/B(util 0.82 + 关 GPU 预填充)
+† k=2/3/4 由一次**独立的 k=4 运行**的 `num_accepted_tokens_per_pos` 反推(逐位:p0≈0.40、
+p1≈0.14、p2≈0.06、p3≈0.03);与直接实测的 k=1 = 1.459 有 run-to-run 差异,**不要混着比**。
+
+**端到端**:同机同参 A/B(`SPEC_K=0` vs `1`,256/128 C=1 N=8,各重复 2 次;ShareGPT N=16)
 
 | 工作负载 | 不开 MTP | MTP k=1 | MTP k=4 |
 |---|---|---|---|
-| random 256/128 C=1 | **15.54 tok/s**,TPOT 46.45 ms,ITL 47.58 ms | 14.74 tok/s,TPOT 44.09 ms,ITL 67.06 ms | 10.19 tok/s,TPOT 80.82 ms,ITL 129.93 ms |
-| random 4096/64 C=1 | **2.02 tok/s**,TTFT 28.6 s | 1.91 tok/s,TTFT 29.7 s | 1.85 tok/s,TTFT 29.3 s |
-| ShareGPT C=1 N=16/128 | **16.83 tok/s**,TPOT 46.15 ms | 16.04 tok/s,TPOT 47.82 ms | 11.24 tok/s,TPOT 75.35 ms |
+| random 256/128 C=1 | 16.14 / 16.13 tok/s,TPOT **45.76 / 45.72 ms**,ITL 46.2 / 46.6 ms | 16.65 / 16.12 tok/s,TPOT **43.33 / 45.08 ms**,ITL 64.4 / 64.2 ms | (单请求)10.19 tok/s,TPOT 80.82 ms,ITL 129.9 ms |
+| ShareGPT C=1 N=16/128 | 17.08 tok/s,TPOT 45.58 ms | 16.93 tok/s,TPOT **44.82 ms**,ITL 64.4 ms | 11.24 tok/s,TPOT 75.35 ms |
+| **KV 池** | **915,487 token**(256K 并发 3.49×) | **666,366 token**(2.54×) | 508,519 |
 
-**结论:单层回收的 MTP 在这套 CPU 专家架构上净负** —— accept 到 k=4 才 1.63,而
-被验证 token 数 T=1+k 会抬高每步的专家访问数,ITL 也脉冲化(46→122 ms)。因此
-**默认关**;数据与方法见 [`MODEL_GUIDES.md`](MODEL_GUIDES.md) §2.6。
+**结论**:GLM 的单层回收 MTP **k=1 的 TPOT 小赚(−3%,噪声内),真正的代价是 KV −27%**;
+**k>1 明确更差**(accept 只涨到 1.63,但每个 step 要验证 T=1+k 个 token ⇒ CPU 专家路径的
+不同专家数近乎翻倍)。因此默认 `SPEC_K=1`(**按用户要求开**),`SPEC_K=0` 可关、`>1` 不要开。
+同族对照:MiMo 的 k=1 因为 p0 高得多(0.83 vs GLM 0.46),收益是明确的 −9.4%(见 §4.4)。
+数据与方法见 [`MODEL_GUIDES.md`](MODEL_GUIDES.md) §2.6。
 
-> 复现:`SPEC_K=1|2|3|4 GPU_UTIL=0.82 GP_PREFILL=0 bash scripts/serve_glm53_mainline.sh`,
+> 复现:`SPEC_K=0|1 GPU_UTIL=0.82 bash scripts/serve_glm53_mainline.sh`,
 > 接受长度取 `/metrics` 的 `vllm:spec_decode_num_accepted_tokens_per_pos_total`。
 
 ## 4.4 MiMo-V2.5 MTP(2026-09-20,单卡 A100-40GB / TP=1 / 专家在 CPU)

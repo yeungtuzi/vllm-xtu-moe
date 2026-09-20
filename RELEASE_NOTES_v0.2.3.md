@@ -9,7 +9,7 @@
 ## 1. 一句话
 
 补丁栈从上游 `dabc4362b4` **rebase 到 `133b71e0b`**(+11 个补丁 / 40 文件);
-**GLM-5.3-Flash 的 MTP 已实现但实测净负(默认关)**;
+**GLM-5.3-Flash 的 MTP 落地并默认开 `SPEC_K=1`**(TPOT 小赚、代价是 KV −27%);
 **MiMo-V2.5(310B/15B)在单张 A100-40GB 上端到端跑通**,**MTP k=1 实测 TPOT −9.4%**;
 所有正确性门禁全绿。
 
@@ -24,23 +24,31 @@
   `deepseek_v41/nvidia/flashmla.py`);`glm5next/nvidia/attention.py → common/attention.py` 由 git rename 自动重指。
 * 门禁(SM8x 稀疏 MLA、GPU 预填充三方对拍、FP8 assembly/kernel/vs-CPU、GLM53 层内数值、
   引擎确定性 11/11、fp8 一致性)**全部通过**。
+* ⚠️ **升级必读**:上游改了 KV 定容/激活估计 ⇒ **GLM 生产 `GPU_UTIL` 必须从 `0.85` 降到 `0.82`**
+  (同一 util 下 KV 池 971,949 → 1,018,328,激活余量被吃掉,两路并发会 OOM;0.82 下 KV 915,487 通过)。
 
-## 3. GLM-5.3-Flash 的 MTP:已实现,但**默认关**
+## 3. GLM-5.3-Flash 的 MTP:默认开 `SPEC_K=1`
 
 插件补上了 GLM 的 draft 判定:第 45 层在模型里只构造一次,DSpark 的"同 prefix 二次出现"
 认不出;现按"层号 ≥ 目标 `num_hidden_layers`"识别,命中即 **GPU 常驻(3.38 GiB/rank)**。
-serve 脚本加 `SPEC_K=1..4`。
+serve 脚本加 `SPEC_K`(默认 **1**)。
 
-| k | accept(random) | accept(ShareGPT) | ShareGPT tok/s | TPOT |
-|---|---|---|---|---|
-| 0(默认) | 1.000 | 1.000 | **16.83** | **46.15 ms** |
-| 1 | 1.452 | 1.400 | 16.04 | 47.82 ms |
-| 2 | 1.584 | 1.539 | — | — |
-| 3 | 1.614 | 1.595 | — | — |
-| 4 | 1.619 | 1.626 | 11.24 | 75.35 ms |
+| k | accept(random) | accept(ShareGPT) | out tok/s(256/128 N=8×2) | TPOT | KV 池 |
+|---|---|---|---|---|---|
+| 0 | 1.000 | 1.000 | 16.14 / 16.13 | 45.76 / 45.72 ms | **915,487** |
+| **1(默认)** | **1.469** | **1.459** | 16.65 / 16.12 | **43.33 / 45.08 ms** | 666,366 |
+| 2 † | — | 1.539 | — | — | — |
+| 3 † | — | 1.595 | — | — | — |
+| 4 † | 1.619 | 1.626 | (单请求)10.19 | 80.82 ms | 508,519 |
 
-单层回收在 k≈4 饱和,而每步成本涨得更快 ⇒ **吞吐反而降、ITL 脉冲化(46→122 ms)**
-⇒ **保持关闭**。`SPEC_K=1..4` 只是给需要的人留的口子。
+† k=2/3/4 由一次独立 k=4 运行的逐位接受率反推(p0≈0.40、p1≈0.14、p2≈0.06、p3≈0.03),
+与直接实测的 k=1 有 run-to-run 差异,不要混着比。
+
+**怎么读这张表**:k=1 的 **TPOT 小赚(−3%,在噪声内)**,真正付出的是 **KV 池 −27%**
+(256K 并发 3.49× → 2.54×,仍够"2 路 256K")和 **ITL 脉冲化(46 → 64 ms)**;
+**k>1 不要开** —— accept 只涨到 1.63,但每步要验证 T=1+k 个 token,CPU 专家路径的
+不同专家数近乎翻倍,吞吐反而掉(11.2 tok/s)。想关:`SPEC_K=0`。
+
 
 ## 4. MiMo-V2.5:单卡端到端已支持;MTP 用 **k=1**
 
@@ -90,7 +98,7 @@ pip install vllm-xtu-moe-0.2.3-*.whl        # 或源码 pip install -e .
 
 # GLM-5.3-Flash(2×A100-40GB,TP=2)
 GPU_UTIL=0.82 bash scripts/serve_glm53_mainline.sh
-# 需要 MTP(实测净负,默认关):SPEC_K=1 bash scripts/serve_glm53_mainline.sh
+# 默认已开 MTP k=1;要关:SPEC_K=0 bash scripts/serve_glm53_mainline.sh
 
 # MiMo-V2.5(单卡,TP=1)
 VLLM_EXPERTS_LOAD_DEVICE=cpu CUDA_VISIBLE_DEVICES=2 \
