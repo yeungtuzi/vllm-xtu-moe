@@ -197,6 +197,14 @@ of all layers' expert weights** over H2D — independent of how many tokens the 
 ⇒ the **GPU column is 9.7 s at every chunk size** — direct evidence of the fixed cost — while the
 CPU column grows linearly. **GLM's 1.2× is not the approach failing; it is the 2176 cap.**
 
+> **⚠️ Settled by measurement (2026-09-20)**: GLM's chunk does **not** grow with `MBT`. Raising
+> `MBT` from 2048 to 8192 (4×) moved TTFT only from 24.4 s to 22.9 s (**6%**, where a real chunk
+> increase would have cut it to ~7 s) ⇒ the chunk really is pinned at ~2176 and the ceiling is
+> **~380 tok/s** — a physical limit of the KDA state block granularity, not an implementation
+> defect. Breaking it needs a change to the KDA block granularity (engine-level). **DeepSeek-V4.1
+> and MiMo are not capped**: they can use the full MBT and reach **2,595 / 1,845 tok/s** on long
+> prompts at C=4 (see the performance table above).
+
 **DeepSeek-V4.1-Flash is not capped and can use large chunks, so it lands in a different league**
 (same **13.8K** prompt):
 
