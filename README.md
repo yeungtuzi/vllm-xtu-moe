@@ -138,7 +138,11 @@
 * 加载:293 GiB / 17 分片,每层建一次 xiaotu FP8 引擎,整轮 ~25-30 min;详见
   [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) §3。
 
-### DeepSeek-V4.1-Flash(真实路由形状 `na≈226`,60 线程,单位 ms/层)
+### DeepSeek-V4.1-Flash(引擎级微基准:每层 CPU MoE 计算耗时,单位 ms/层)
+
+> ⚠️ 这两张表量的是**引擎本身**(`xiaotu_moe` vs `lk_moe`),**不是服务端速率**:
+> 单位是**每层毫秒**,`BS` = 该次调用的 token 数(BS>1 即预填充形状)。
+> **端到端 prefill / decode (tok/s) 见下一节**。
 
 | 形状 | `xiaotu_moe` | `lk_moe` | 比值 |
 |---|---|---|---|
@@ -147,7 +151,9 @@
 | BS=8192 | **877.55** | 933.94 | **0.940×** |
 | 解码 BS=1 | **0.37** | 0.43 | **0.861×** |
 
-### DeepSeek-V4-Flash(0731,同协议)
+### DeepSeek-V4-Flash(0731,同协议;引擎级微基准,单位 ms/层)
+
+> 该检查点**已不再复测**(0.2.3 起按历史数据引用)。端到端速率同样见下一节。
 
 | 形状 | `xiaotu_moe` | `lk_moe` | 比值 |
 |---|---|---|---|
@@ -162,7 +168,7 @@
 **只报两个速率,不做折算**:`prefill (tok/s)`(首 token 前)与 `decode (tok/s)`(首 token 后)。
 比值为 **我们 / `lk_moe`**,**> 1.0 表示我们更快**。
 
-| prompt / output | `lk_moe` prefill | 我们 prefill | 比值 | `lk_moe` decode | 我们 decode | 比值 |
+| prompt / output | `lk_moe` prefill (tok/s) | 我们 prefill (tok/s) | 比值 | `lk_moe` decode (tok/s) | 我们 decode (tok/s) | 比值 |
 |---|---|---|---|---|---|---|
 | 256 / 32 | 118.9 | 107.1 | **0.900×** | 44.7 | 31.1 | **0.695×** |
 | 256 / 1024 | 118.6 | 105.1 | **0.886×** | 44.9 | 33.5 | **0.746×** |

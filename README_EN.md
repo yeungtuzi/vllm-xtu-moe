@@ -115,7 +115,11 @@ Official `vllm bench serve`, random dataset + `--ignore-eos`, a distinct seed pe
 > (AVX512-BF16 `vdpbf16ps`; 1.17-1.20× for M≥6, at the cost of rounding weights to bf16:
 > rms_rel 3.6e-3 between the two paths).
 
-### DeepSeek-V4.1-Flash (real routing shape `na≈226`, 60 threads, ms/layer)
+### DeepSeek-V4.1-Flash (engine microbenchmark: per-layer CPU MoE time, ms/layer)
+
+> ⚠️ These two tables measure the **engine itself** (`xiaotu_moe` vs `lk_moe`), **not service
+> rates**: the unit is **milliseconds per layer**, and `BS` is the number of tokens in that
+> call (BS>1 is a prefill shape). **End-to-end prefill / decode (tok/s) is the next table.**
 
 | Shape | `xiaotu_moe` | `lk_moe` | Ratio |
 |---|---|---|---|
@@ -124,7 +128,10 @@ Official `vllm bench serve`, random dataset + `--ignore-eos`, a distinct seed pe
 | BS=8192 | **877.55** | 933.94 | **0.940×** |
 | decode BS=1 | **0.37** | 0.43 | **0.861×** |
 
-### DeepSeek-V4-Flash (0731, same protocol)
+### DeepSeek-V4-Flash (0731, same protocol; engine microbenchmark, ms/layer)
+
+> This checkpoint is **no longer re-benchmarked** (historical data since 0.2.3). End-to-end
+> rates are in the next table too.
 
 | Shape | `xiaotu_moe` | `lk_moe` | Ratio |
 |---|---|---|---|
@@ -140,7 +147,7 @@ byte-identical and both arms use 60 threads. **Only two rates are reported, with
 `prefill (tok/s)` (before the first token) and `decode (tok/s)` (after it). Ratios are
 **ours / `lk_moe`**, so **> 1.0 means we are faster**.
 
-| prompt / output | `lk_moe` prefill | ours prefill | ratio | `lk_moe` decode | ours decode | ratio |
+| prompt / output | `lk_moe` prefill (tok/s) | ours prefill (tok/s) | ratio | `lk_moe` decode (tok/s) | ours decode (tok/s) | ratio |
 |---|---|---|---|---|---|---|
 | 256 / 32 | 118.9 | 107.1 | **0.900×** | 44.7 | 31.1 | **0.695×** |
 | 256 / 1024 | 118.6 | 105.1 | **0.886×** | 44.9 | 33.5 | **0.746×** |
