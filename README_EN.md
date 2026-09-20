@@ -115,11 +115,6 @@ Official `vllm bench serve`, random dataset + `--ignore-eos`, a distinct seed pe
 > (AVX512-BF16 `vdpbf16ps`; 1.17-1.20× for M≥6, at the cost of rounding weights to bf16:
 > rms_rel 3.6e-3 between the two paths).
 
-> **Engine-level microbenchmarks** (`xiaotu_moe` vs `lk_moe`, **milliseconds per layer** across
-> BS shapes) are a **development metric** and are not published in the README — see the internal
-> dev doc `dev-docs/TUNING_LK_MOE_VS_XIAOTU.md`. The README keeps only **service rates**
-> (prefill / decode below).
-
 ### DeepSeek-V4.1-Flash, service level (same-parameter A/B on one host, TP=2, official `vllm bench serve`)
 
 Both arms run in the **same conda env**; the only variable is the CPU MoE engine. Prompts are

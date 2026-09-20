@@ -138,10 +138,6 @@
 * 加载:293 GiB / 17 分片,每层建一次 xiaotu FP8 引擎,整轮 ~25-30 min;详见
   [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) §3。
 
-> **引擎级微基准**(`xiaotu_moe` vs `lk_moe` 的**每层毫秒**、各种 BS 形状)属于**开发口径**,
-> 不在 README 公布,数值与复现见**内部开发文档** `dev-docs/TUNING_LK_MOE_VS_XIAOTU.md`。
-> README 只保留**服务端速率**(下面的 prefill / decode)。
-
 ### DeepSeek-V4.1-Flash 服务级(等参数同机 A/B,TP=2,官方 `vllm bench serve`)
 
 两个 arm 跑在**同一个 conda env**、唯一变量是 CPU MoE 引擎;prompt 逐字节相同、线程数都是 60。
