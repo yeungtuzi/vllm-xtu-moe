@@ -1002,6 +1002,14 @@ def kmajor_from_engine_shards_v2(engine, device, hidden: int, inter: int,
     rb2 = I // 2
     gk = int(group_k) if int(group_k) > 0 else 1
     dbg = os.environ.get("XIAOTU_GPF_STAGE") == "1"
+    # 【goal③】`XIAOTU_GPF_EVT=1`：用 CUDA event 计时，**只在最后同步一次**。
+    # 旧写法每个子相都 `cuda.synchronize()`，会把上一层未完成的 asm/tr 算进本层 dma
+    # （这就是实测 dma 334 vs 599 ms/层 漂移的根源），且把并行度打掉。
+    evt = os.environ.get("XIAOTU_GPF_EVT") == "1"
+    _e = None
+    if evt:
+        _e = [_torch.cuda.Event(enable_timing=True) for _ in range(4)]
+        _e[0].record()
 
     # ---- D) 所有 DMA 背靠背发出(不夹 D2D)----------------------------------
     t0 = _time.perf_counter()
@@ -1009,7 +1017,9 @@ def kmajor_from_engine_shards_v2(engine, device, hidden: int, inter: int,
     b2 = [_dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device) for n in range(ns)]
     bs13 = _dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device)
     bs2 = _dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device)
-    if dbg:
+    if evt:
+        _e[1].record()
+    elif dbg:
         _torch.cuda.synchronize()
     t_d = _time.perf_counter() - t0
 
@@ -1031,7 +1041,9 @@ def kmajor_from_engine_shards_v2(engine, device, hidden: int, inter: int,
         w2_raw[:, c0:c0 + cr2, :].copy_(b2[n].view(E, cr2, rb2))
     s13_raw = bs13.view(E, 2 * I, H // gk)
     s2_raw = bs2.view(E, H, I // gk)
-    if dbg:
+    if evt:
+        _e[2].record()
+    elif dbg:
         _torch.cuda.synchronize()
     t_b = _time.perf_counter() - t1
 
@@ -1039,11 +1051,18 @@ def kmajor_from_engine_shards_v2(engine, device, hidden: int, inter: int,
     t2 = _time.perf_counter()
     out = (_kmajor_bytes(w13_raw), _kmajor_bytes(s13_raw),
            _kmajor_bytes(w2_raw), _kmajor_bytes(s2_raw))
-    if dbg:
+    if evt:
+        _e[3].record()
+    elif dbg:
         _torch.cuda.synchronize()
     t_c = _time.perf_counter() - t2
 
-    if dbg:
+    if evt:
+        _torch.cuda.synchronize()   # 全路径只在这同步一次
+        t_d = _e[0].elapsed_time(_e[1])
+        t_b = _e[1].elapsed_time(_e[2])
+        t_c = _e[2].elapsed_time(_e[3])
+    if dbg or evt:
         a = _STAGE_ACC
         a["n"] += 1
         a["dma"] += t_d * 1e3
