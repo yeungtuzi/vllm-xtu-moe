@@ -115,30 +115,10 @@ Official `vllm bench serve`, random dataset + `--ignore-eos`, a distinct seed pe
 > (AVX512-BF16 `vdpbf16ps`; 1.17-1.20× for M≥6, at the cost of rounding weights to bf16:
 > rms_rel 3.6e-3 between the two paths).
 
-### DeepSeek-V4.1-Flash (engine microbenchmark: per-layer CPU MoE time, ms/layer)
-
-> ⚠️ These two tables measure the **engine itself** (`xiaotu_moe` vs `lk_moe`), **not service
-> rates**: the unit is **milliseconds per layer**, and `BS` is the number of tokens in that
-> call (BS>1 is a prefill shape). **End-to-end prefill / decode (tok/s) is the next table.**
-
-| Shape | `xiaotu_moe` | `lk_moe` | Ratio |
-|---|---|---|---|
-| BS=227 (~6 rows/expert) | **28.56** | 30.24 | **0.944×** |
-| BS=1893 | **213.36** | 217.34 | **0.982×** |
-| BS=8192 | **877.55** | 933.94 | **0.940×** |
-| decode BS=1 | **0.37** | 0.43 | **0.861×** |
-
-### DeepSeek-V4-Flash (0731, same protocol; engine microbenchmark, ms/layer)
-
-> This checkpoint is **no longer re-benchmarked** (historical data since 0.2.3). End-to-end
-> rates are in the next table too.
-
-| Shape | `xiaotu_moe` | `lk_moe` | Ratio |
-|---|---|---|---|
-| BS=227 | **20.89** | 22.18 | **0.942×** |
-| BS=1893 | 162.05 | **155.86** | 1.040× |
-| BS=8192 | **646.60** | 668.10 | **0.968×** |
-| decode BS=1 | 0.29 | 0.29 | 1.000× |
+> **Engine-level microbenchmarks** (`xiaotu_moe` vs `lk_moe`, **milliseconds per layer** across
+> BS shapes) are a **development metric** and are not published in the README — see the internal
+> dev doc `dev-docs/TUNING_LK_MOE_VS_XIAOTU.md`. The README keeps only **service rates**
+> (prefill / decode below).
 
 ### DeepSeek-V4.1-Flash, service level (same-parameter A/B on one host, TP=2, official `vllm bench serve`)
 
