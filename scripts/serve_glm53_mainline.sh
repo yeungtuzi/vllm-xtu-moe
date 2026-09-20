@@ -61,14 +61,26 @@ THREADS="${THREADS:-60}"
 KV_DTYPE="${KV_DTYPE:-bfloat16}"
 # 投机解码(MTP,2026-09-20)。GLM-5.3-Flash 的检查点自带 **1 层 MTP**
 # (`model.language_model.layers.45`,见 docs/MODEL_GUIDES.md §2.6)。
-#   **SPEC_K=1(默认,按用户要求开)**;`SPEC_K=0` 关;1..4 取 num_speculative_tokens。
+#   **SPEC_K=0(默认,关闭)**;要尝鲜再 `SPEC_K=1..4`。
 #   单层 MTP 通过复用 hidden state 支持 K>1(`index_share_for_mtp_iteration=True`),
-#   但**实测 K>1 明显更差**(K=4 时 accept 只到 1.63、吞吐掉到 11.2 tok/s),所以默认 K=1。
-# 代价(必须知道):draft 第 45 层**强制常驻 GPU**(约 3.38 GiB/rank)+ profile 会把激活峰
-# 从 2.9 GiB 低估到 0.84 GiB ⇒ **KV 池 915,487 → 666,366 token(−27%)**,
-# 256K 的并发从 3.49× 掉到 2.54×(仍够"2 路 256K"交付口径)。
-# 实测净效果:TPOT 约 −3%(·256/128 C=1:45.7 → 44.2 ms),ITL 脉冲化 46 → 64 ms。
-SPEC_K="${SPEC_K:-1}"
+#   但**实测 K>1 明显更差**(K=4 时 accept 只到 1.63、吞吐掉到 11.2 tok/s)。
+#
+# 【2026-09-20 改默认:关】用户裁定。实测的收益/代价严重不成比例:
+#   * **收益太小**:·256/128 C=1 只把 decode 从 21.9 抬到 22.6 tok/s(≈+3%,噪声内);
+#     ShareGPT 上更小(21.9 → 22.3)。接受率只有 **1.46**(p0≈0.46),逐位衰减极快。
+#   * **代价三项都是硬的**:
+#       ① draft 第 45 层**强制常驻 GPU**(约 **3.38 GiB/rank**);
+#       ② profile 把激活峰从 2.9 GiB 低估到 0.84 GiB ⇒ **KV 池 915,487 → 666,366(−27%)**,
+#          256K 并发 3.49× → 2.54×;
+#       ③ 单 token 间隔**脉冲化**(46 → 64 ms)。
+#   * **而且它是长 prompt OOM 的元凶**:util 0.82 下
+#     `非专家 ~7.5 + KV 6 + staging 8.35 + draft 3.38 ≈ 25.2 GiB`,留给**激活工作区**
+#     的只剩 ~7 GiB,长 prefill 的激活会超过它 ⇒ **实测 CUDA OOM / EngineCore 死**
+#     (dev-docs/HANDOFF_PERF_TOPN.md §10)。
+#     ⇒ GLM 上"GPU 预填充 + 投机 + 长上下文"**不可兼得**,而投机的 +3% 最不值得保。
+#   * MiMo 不受此限:draft 是 **dense 3 层**(很小),GPU 预填充与投机共存 ——
+#     实测 4,148-token × C=4 拿到 **1,845 tok/s** prefill 且投机开着。
+SPEC_K="${SPEC_K:-0}"
 SPEC_MODEL="${SPEC_MODEL:-$CKPT}"
 # EAGER=1 ⇒ --enforce-eager。MTP 的 draft 图捕获若在插件路径下有问题,退这一档。
 EAGER="${EAGER:-0}"
@@ -129,6 +141,10 @@ ARGS=(
 [ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
 # 让客户端能读到前缀缓存命中数(usage.prompt_tokens_details.cached_tokens)
 [ "$PROMPT_TOKENS_DETAILS" = "1" ] && ARGS+=(--enable-prompt-tokens-details)
+# 【RUNBOOK §5.8 铁律】开 GPU 预填充时**必须**显式封顶 KV 池,否则 vLLM 会把 util 填满、
+# 让 staging/投机/长 prefill 激活没地方放 ⇒ 长 prompt 直接 CUDA OOM。
+# 用法:KV_CACHE_BYTES=6442450944(6 GiB) bash scripts/serve_glm53_mainline.sh
+[ -n "${KV_CACHE_BYTES:-}" ] && ARGS+=(--kv-cache-memory "$KV_CACHE_BYTES")
 if [ -n "${SPEC_CONFIG:-}" ]; then
   # Escape hatch: any other vLLM speculative method (ngram / eagle / medusa /
   # draft_model / suffix), passed through verbatim as JSON. Overrides SPEC_K.

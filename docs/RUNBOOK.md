@@ -220,7 +220,7 @@ xiaotu_moe variant = _avx512_bf16
 | `--tensor-parallel-size` | `1`(单卡)或 `2` | 目前**不支持 expert_map(EP)**,TP>1 走权重分片 |
 | `--max-model-len` | GLM-5.3:**交付默认 262144(256K)**,实测可起 512K/704K;DeepSeek-V4 系列先 `4096`–`8192` 再放大 | KV 单价差异极大:**GLM-5.3 ≈ 11.9-12.3 KB/token**,DeepSeek-V4.1 ≈ 40 KB/token |
 | `--gpu-memory-utilization` | GLM-5.3:`0.85`(v0.2.2 及以前)/ **`0.82`(0.2.3 rebase 后)**;开 MTP 时必须 `0.82` 或 `GP_PREFILL=0` | 非专家权重 + KV cache 在显存;见 §3.2 的 slack |
-| `SPEC_K`(env,`serve_glm53_mainline.sh`) | **默认 `1`(开,按用户要求)**;`0` 关 | `1` ⇒ `--speculative-config method=mtp`。**只开 k=1**:TPOT −3%(噪声内)但 **KV 池 −27%**(915,487→666,366)、ITL 46→64 ms;**k>1 明确更差**(k=4 掉到 11.2 tok/s)。数据见 `MODEL_GUIDES.md` §2.6 |
+| `SPEC_K`(env,`serve_glm53_mainline.sh`) | **默认 `0`(关)** —— 2026-09-20 用户裁定关闭 | `1..4` ⇒ `--speculative-config method=mtp`。**收益/代价严重不成比例,故默认关**:收益只有 decode **+3%**(21.9→22.6 tok/s,噪声内;ShareGPT 上只有 +2%),代价却是 ①draft 第 45 层常驻 **3.38 GiB/rank** ②KV 池 **−27%**(915,487→666,366,256K 并发 3.49×→2.54×)③ITL 脉冲化 46→64 ms。**而且它是长 prompt OOM 的元凶** —— 详见 §3.7。`k>1` 更差(k=4 掉到 11.2 tok/s)。数据见 `MODEL_GUIDES.md` §2.6 |
 | `SPEC_CONFIG`(env,`serve_glm53_mainline.sh`) | 默认空 | 透传任意 vLLM 投机配置 JSON(覆盖 `SPEC_K`),用于 **外挂 draft** 方案:`ngram` / `suffix` / `eagle` / `eagle3` / `medusa` / `draft_model`。⚠️ `ngram` 需要 `numba`(本环境未装,启动会 `ModuleNotFoundError: numba`) |
 | `GP_PREFILL`(env,`serve_glm53_mainline.sh`) | 默认 `1`(开);**不稳时置 `0`** | `0` ⇒ 把 `XIAOTU_GP_ACT_RESERVE_GIB` 拉到 99 ⇒ GPU 流式预填充永不放行(长 prompt 退 CPU,慢但稳) |
 | `--enforce-eager` | 建议先开 | 避免 CUDA graph 与 CPU 引擎 host 回调的额外变量;稳定后可尝试关闭 |
@@ -392,7 +392,43 @@ settings,只能走 `~/.dsh/profiles/web/cordis.patch.yml`)。
 ⇒ **共享前缀不足 2176 token 时永远显示 0 命中**,这是块粒度的必然结果,不是缓存坏了;
 每次命中至少 2176 token。看 DSH 命中率时按这个粒度解读。
 
-### 3.7 JIT 固定缓存目录(`JITCACHE`)
+### 3.6b GLM 的投机解码(MTP):**默认关闭**(2026-09-20 用户裁定)
+
+**一句话**:GLM-5.3-Flash 的 MTP **收益只有 +3%,代价却是 27% 的 KV 池 + 3.38 GiB 显存**,
+而且**它是长 prompt 显存不足的元凶** ⇒ **默认 `SPEC_K=0`**,不再默认开。
+
+**实测账本**
+
+| 维度 | 数字 |
+|---|---|
+| 收益:decode(256/128 C=1) | 21.9 → **22.6 tok/s(+3%,在噪声内)**;ShareGPT 上只有 **+2%**(21.9→22.3) |
+| 接受率 | **1.46**(p0≈0.46,逐位衰减极快:p1≈0.14、p2≈0.06、p3≈0.03) |
+| 代价①draft 常驻 | 第 45 层强制 GPU 常驻 **3.38 GiB/rank** |
+| 代价②KV 池 | **915,487 → 666,366 token(−27%)**;256K 并发 **3.49× → 2.54×** |
+| 代价③ITL | **脉冲化 46 → 64 ms**(一步吐 1–2 个 token,流式体验变差) |
+| `k>1` | **明确更差**:k=4 时 accept 1.63、吞吐掉到 11.2 tok/s |
+
+**为什么这是"长 prompt 的元凶"** —— 显存账本(util 0.82 / 2×A100-40GB):
+
+```
+非专家权重 ~7.5 GiB
++ KV 池(封顶 6 GiB)
++ GPU 预填充 staging 8.35 GiB   (7.59 × 1.10)
++ MTP draft 常驻 3.38 GiB      ← 这一项
+= ~25.2 GiB   ⇒ 留给「激活工作区」的只剩 ~7 GiB
+```
+而**长 prefill 的激活正比于 chunk 大小**(MBT),4,148-token 级的请求会超过这 7 GiB
+⇒ **实测 `torch.OutOfMemoryError` → EngineCore 死**。诊断见 `dev-docs/HANDOFF_PERF_TOPN.md` §10。
+
+⇒ **GLM 上"GPU 预填充 + 投机 + 长上下文"三者不可兼得**,而投机只值 +3%,**最不值得保**。
+
+**要开的话**(不建议):`SPEC_K=1 bash scripts/serve_glm53_mainline.sh`,并接受上面的代价;
+若同时要长 prompt,必须再让出一项(降 KV 池 / 降 `MBT` / 关 GPU 预填充)。
+
+**对照组 —— MiMo 不适用此结论**:MiMo-V2.5 的 draft 是 **dense 3 层**(极小),
+GPU 预填充与投机**可以共存**:实测 4,148-token × C=4 拿到 **1,845 tok/s prefill 且投机开着**。
+⇒ **"投机与预填充二选一"是 GLM 的特例,不是通用规律。**
+
 
 > **背景(v0.1 起)**:每次启动都重新 JIT 太慢,所以把编译缓存固定到一个目录,跨重启复用。
 
@@ -703,17 +739,28 @@ curl -s http://127.0.0.1:8070/metrics | grep -E "num_requests_running|spec_decod
 
 ### 5.2 R-VRAM 策略(权威输出)
 
+> **2026-09-20 修订(用户裁定)**:优先级里**去掉"专家层常驻"** —— 实测收益为负(每层 3.36 GiB,
+> 换来的收益抵不过它对 32K 预填充的挤压,见 §584),**不再作为一档**;
+> 并**补上"激活工作区"** —— 它正比于 chunk(=MBT),是长 prompt OOM 的真凶,之前一直没被列出。
+> (`vram_policy` 的输出里仍会打印一行"专家层常驻 0 层",那是**已退役项**的残留兜底,不再参与优先级。)
+
 ```bash
 python -m vllm_xiaotu_moe.vram_policy --maxlen 1048576 --max-num-seqs 2 --tp 2 --gpu-mem-util 0.55
 ```
 ```
 [vram-policy] maxlen=1048576 × 2 并发  util=0.55  ⇒ 填池后净空 17.8 GiB(预填充 preflight 要 8.4)
-✅ 1. 1M 上下文(KV)        4.4 GiB/卡(maxlen=1048576 × 2 并发)
+✅ 1. KV 池               4.4 GiB/卡(maxlen=1048576 × 2 并发)
 ✅ 2. GPU 预填充          8.4 GiB(staging 6.72 × 1.25)
-✅ 3. GPU 投机解码        3.7 GiB
-❌ 4. 专家层常驻          0 层(§584 实测:常驻收益为负 ⇒ 显存改投 KV)
+✅ 3. GPU 投机解码        3.7 GiB        ← GLM 上已默认关(§3.6b)
+  4. 激活工作区          ∝ chunk(=MBT)：**不预检,但必须留够** —— GLM 长 prompt OOM 就是栽在这里
+  ❌ 已退役:专家层常驻   (收益为负,不再参与优先级)
 ```
 任一项不足即按优先级 fallback;**绝不额外多占系统内存**。
+
+⚠️ **激活工作区(第 4 项)是唯一"不预检却会致命"的项**:`vram_policy` 只算前 3 项,
+而长 prefill 的激活正比于 chunk 大小。GLM 在 util 0.82 下前 3 项用完 ~19 GiB,
+留给激活的 ~7 GiB 会被 4K 级 prompt 的 chunk 打穿 ⇒ **`torch.OutOfMemoryError`**。
+**排查长 prompt OOM 时,先降 `MBT`,再考虑关投机/关 GPU 预填充。**
 
 **输入口径(§592 全部改成"不用填"或"实测值")**
 | 量 | 值 | 来源 |
