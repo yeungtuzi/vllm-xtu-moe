@@ -89,7 +89,7 @@ Every performance number below was taken on this machine:
 | | long | 4,661 | 1 | **156.2** | 15.6 |
 | | long | 4,819 | 4 | **83.2** | 1.9 |
 | **DeepSeek-V4.1-Flash**<br>TP=2 · dspark k=5 · GPU prefill<br>KV capped 0.5 GiB · MBT 8192 | short | 129 | 1 | **226.0** | **33.8** |
-| | short | 84 | 4 | measuring | measuring |
+| | short | 106 | 4 | **102.5** | 14.9 |
 | | long | 4,554 | 1 | **286.3** | 27.7 |
 | | long | 4,447 | 4 | **190.4** | 3.1 |
 
