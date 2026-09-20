@@ -85,8 +85,8 @@ Every performance number below was taken on this machine:
 
 | Model (optimal config) | prompt | actual tokens | conc. | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
-| **GLM-5.3-Flash**<br>TP=2 · util 0.82 · GPU prefill<br>KV capped 2 GiB · MBT 4096 | short | 126 | 1 | 110.1 | **23.0** |
-| | short | 126 | 4 | 60.4 | 7.3 |
+| **GLM-5.3-Flash**<br>TP=2 · util 0.82 · GPU prefill<br>KV capped 2 GiB · MBT 4096 | short | 151 | 1 | **114.8** | **21.7** |
+| | short | 126 | 4 | **36.5** | 8.2 |
 | | long | 4,538 | 1 | **178.3** | 21.3 |
 | | long | 4,518 | 4 | **92.9** | 2.2 |
 | **MiMo-V2.5**<br>1×A100 · maxlen 16K · KV capped 4 GiB<br>MTP k=1 · GPU prefill | short | 153 | 1 | 70.9 | **18.0** |
