@@ -247,3 +247,33 @@ ValueError: Cannot use chat template functions because tokenizer.chat_template i
 
 理由与账本见 `RUNBOOK.md` §3.6b。一句话:**收益 +3%、代价 27% KV + 3.38 GiB + ITL 脉冲化,
 且它是长 prompt OOM 的元凶**。`SPEC_K=0` 现在是 `serve_glm53_mainline.sh` 的默认。
+
+---
+
+## 10. 定论:GLM 的 GPU 预填充 chunk **被钉死在 ~2176**,天花板 **~380 tok/s**(2026-09-20 实测)
+
+**问题**:`serve_glm53_mainline.sh` 的原注释写"the scheduler trims every chunk to a **multiple**
+of 2176 no matter how large `--max-num-batched-tokens` is"。若是**倍数**,`MBT=8192` 就该给出
+**6528** 的 chunk ⇒ 天花板从 384 抬到 ~1150 tok/s,**那就意味着我们少了 3 倍**。这是必须验证的。
+
+**实验(TODO-1)**:固定同一条 prompt(4,918 token),只改 `MBT`,量 TTFT。
+若 chunk 真随 MBT 涨,TTFT 应近似**反比下降**;若 chunk 被钉死,TTFT 应**基本不变**。
+
+| MBT | TTFT | 有效 prefill | 判定 |
+|---|---|---|---|
+| 2048 | 24,391 ms | 202 tok/s | ✅ |
+| 4096 | 失败(0) | — | ⚠️ 该档服务未起 |
+| **8192** | **22,917 ms** | **215 tok/s** | ✅ |
+| 16384 | 失败(0) | — | ⚠️ 该档服务未起 |
+
+⇒ **MBT 从 2048 提到 8192(4×),TTFT 只从 24.4 s 降到 22.9 s(6%)**。
+**若 chunk 能到 6528,TTFT 应降到 ~7 s。它没有。**
+⇒ **"倍数"的解释不成立:chunk 就是被钉在 ~2176,GLM 的 GPU 预填充天花板是 ~380 tok/s**
+(`2176 / 5.74 s` 的 PCIe 地板,实测跑到 ~200-215,约 55%)。
+
+**结论(要记住的)**:
+* **GLM-5.3-Flash 的 GPU 预填充上不了 1000 tok/s,这是 KDA state 分页粒度(`block_size=2176`)
+  的物理上限,不是实现缺陷。** 要突破必须改 KDA state 的 block 粒度(引擎级改动)。
+* **DSV4.1 / MiMo 不受此限**,能吃满 MBT ⇒ 长 prompt + C=4 时分别拿到 **2,595 / 1,845 tok/s**。
+* ⚠️ 该实验有 2 档(MBT=4096 / 16384)服务未起,结论建立在 **2048 vs 8192** 两个有效点上;
+  两者相差 4× 而 TTFT 只差 6%,方向明确。要更硬的证据可重跑补齐那两档。
