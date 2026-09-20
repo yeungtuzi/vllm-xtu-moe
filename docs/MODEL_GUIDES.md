@@ -522,7 +522,53 @@ MiMo 那边对应的多层 MTP PR([#31180](https://github.com/vllm-project/vllm/
 
 ---
 
-## 3. 数据来源与复现
+## 3. MiMo-V2.5(A100 / SM80:骨架与后端已通,性能待测)
+
+> 命名:`MiMo-2.5` 是 **`XiaomiMiMo/MiMo-V2.5`**(310B / 15B active,48 层,256 专家 top-8,
+> Hybrid SWA-128 + DiffKV,官方只有 FP8 block-128)。完整调研见内部
+> `dev-docs/MIMO25_ANALYSIS.md`。检查点 ~295 GB(17 分片 + `model_mtp.safetensors`)。
+
+**启动(TP=1 单卡 A100-40GB,专家在 CPU)**:
+
+```bash
+CKPT=/home/user/.cache/modelscope/models/XiaomiMiMo--MiMo-V2.5/snapshots/master
+VLLM_EXPERTS_LOAD_DEVICE=cpu CUDA_VISIBLE_DEVICES=2 \
+VLLM_USE_FLASHINFER_SAMPLER=0 FLASHINFER_DISABLE_VERSION_CHECK=1 \
+XIAOTU_GP_ACT_RESERVE_GIB=99 \
+python -m vllm.entrypoints.openai.api_server \
+  --model "$CKPT" --tensor-parallel-size 1 --dtype bfloat16 --kv-cache-dtype bfloat16 \
+  --max-model-len 8192 --gpu-memory-utilization 0.85 \
+  --language-model-only --trust-remote-code
+```
+
+**P0 oracle 自检(2026-09-20,实测通过)**:
+
+| 检查 | 实测 |
+|---|---|
+| 注意力后端 | `[mimo_v2.py:319] Using TRITON_ATTN_DIFFKV for attention.` ✅ SM80 的必需回退 |
+| MoE 后端被插件换掉 | `Using CPU Fp8 MoE backend out of potential backends: ['CPU', …]` ✅ |
+| Model Runner | `Using V2 Model Runner` ✅ |
+| 每层引擎参数 | `xiaotu MOE_FP8 engine: E=256 H=4096 I=2048 topk=8 group=128x128 scales=yes routing=sigmoid/grouped1x1/bias swiglu=plain` ✅ |
+
+**已知坑**:
+
+* 即使 `--language-model-only`,架构仍解析成 `MiMoV2OmniForCausalLM`(会加载 audio
+  encoder/quantizer);**必须 `--trust-remote-code`**(否则仓库自定义代码被拒);
+* `--dtype` 只能是 `bfloat16`(KV 也只支持 bf16,见 `_shard_fp8_qkv_proj` 的 kv 格式约束);
+* TP 被 `num_kv_heads % tp_size == 0` 卡住(GA KV=4 / SWA KV=8)⇒ 3 卡上 **TP=3 不可用**,
+  取 TP=1(单卡)或 TP=2;
+* **加载很慢**:每层要建一次 xiaotu 引擎(实测 dummy 下 ~2 min/层 ⇒ 48 层 ≈1.5 h),
+  实权重还要先读 282 GB;Dummy 加载用于**只验后端**时可用 `--load-format dummy`。
+* GPU 流式预填充暂不可用(沿用 `KNOWN_LIMITATIONS.md` §8.3 的 `GP_PREFILL=0` 规避)。
+
+**MTP**:检查点带 **3 层** dense MTP(`model.mtp.layers.{0,1,2}`);主线原来只建第 1 层,
+本项目已改成 `min(checkpoint_layers, num_speculative_tokens)`(照 Inkling 模板)⇒
+k=1 只建 1 层、k=3 解锁全链。**接受长度与净收益待实测**(MiMo-V2-Flash 报告 3 层 accept 3.6,
+但那是另一代模型;本项目自己的判据见 §2.6)。
+
+---
+
+## 4. 数据来源与复现
 
 | 数据 | 来源 / 复现命令 |
 |---|---|
