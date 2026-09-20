@@ -84,8 +84,8 @@ Every performance number below was taken on this machine:
 | | short | 126 | 4 | **36.5** | 8.2 |
 | | long | 4,538 | 1 | **178.3** | 21.3 |
 | | long | 4,518 | 4 | **92.9** | 2.2 |
-| **MiMo-V2.5**<br>1×A100 · maxlen 16K · KV capped 4 GiB<br>MTP k=1 · GPU prefill | short | 153 | 1 | 70.9 | **18.0** |
-| | short | 153 | 4 | measuring | measuring |
+| **MiMo-V2.5**<br>1×A100 · maxlen 16K · KV capped 4 GiB<br>MTP k=1 · GPU prefill | short | 179 | 1 | **70.9** | 17.1 |
+| | short | 151 | 4 | **34.5** | 5.6 |
 | | long | 4,661 | 1 | **156.2** | 15.6 |
 | | long | 4,819 | 4 | **83.2** | 1.9 |
 | **DeepSeek-V4.1-Flash**<br>TP=2 · dspark k=5 · GPU prefill<br>KV capped 0.5 GiB · MBT 8192 | short | 84 | 1 | **217.7** | **21.3** |
