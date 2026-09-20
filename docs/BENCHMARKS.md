@@ -252,6 +252,36 @@ GLM-5.3 想拿到更多,需要把装配与 attention 重叠(目标:207 → 135 m
 DeepSeek-V4-Flash 的**逐步使用指南、完整初步性能表
 (含数据来源与复现命令)**见 [`MODEL_GUIDES.md`](MODEL_GUIDES.md)。
 
+## 4.3 GLM-5.3-Flash 的 MTP 投机解码(2026-09-20,实测)
+
+配置:2×A100-40GB / TP=2 / `GPU_UTIL=0.82` / `GP_PREFILL=0`(关 GPU 流式预填充,
+理由见 `KNOWN_LIMITATIONS.md` §8);官方 `vllm bench serve`;`SPEC_K` 控制
+`num_speculative_tokens`。draft = 检查点自带的第 45 层(3.38 GiB/rank 常驻 GPU)。
+
+**接受长度(逐位接受率反推,k=1 有直接实测可交叉验证)**
+
+| k | accept(random) | accept(ShareGPT) | 逐位接受率(ShareGPT) |
+|---|---|---|---|
+| 1 | 1.452 | 1.400 | 0.400 |
+| 2 | 1.584 | 1.539 | +0.139 |
+| 3 | 1.614 | 1.595 | +0.056 |
+| 4 | 1.619 | 1.626 | +0.031 |
+
+**端到端**:同机同参 A/B(util 0.82 + 关 GPU 预填充)
+
+| 工作负载 | 不开 MTP | MTP k=1 | MTP k=4 |
+|---|---|---|---|
+| random 256/128 C=1 | **15.54 tok/s**,TPOT 46.45 ms,ITL 47.58 ms | 14.74 tok/s,TPOT 44.09 ms,ITL 67.06 ms | 10.19 tok/s,TPOT 80.82 ms,ITL 129.93 ms |
+| random 4096/64 C=1 | **2.02 tok/s**,TTFT 28.6 s | 1.91 tok/s,TTFT 29.7 s | 1.85 tok/s,TTFT 29.3 s |
+| ShareGPT C=1 N=16/128 | **16.83 tok/s**,TPOT 46.15 ms | 16.04 tok/s,TPOT 47.82 ms | 11.24 tok/s,TPOT 75.35 ms |
+
+**结论:单层回收的 MTP 在这套 CPU 专家架构上净负** —— accept 到 k=4 才 1.63,而
+被验证 token 数 T=1+k 会抬高每步的专家访问数,ITL 也脉冲化(46→122 ms)。因此
+**默认关**;数据与方法见 [`MODEL_GUIDES.md`](MODEL_GUIDES.md) §2.6。
+
+> 复现:`SPEC_K=1|2|3|4 GPU_UTIL=0.82 GP_PREFILL=0 bash scripts/serve_glm53_mainline.sh`,
+> 接受长度取 `/metrics` 的 `vllm:spec_decode_num_accepted_tokens_per_pos_total`。
+
 ## 5. 服务端吞吐与时延(DeepSeek-V4-Flash,单卡)
 
 | 指标 | 数值 |

@@ -196,6 +196,15 @@ python scripts/tiny_moe_equiv.py         # CPU/GPU 专家端到端等价性
     而不是我们已有的补丁本身(旧树同款补丁在 8070 上跑了 10+ 小时没崩)。
 * **已排除**:`ktranspose_bytes` 本身干净 —— 用 GLM 真实形状(`E=288 H=4096 I=2048`)
   连跑 `test_gpu_prefill_fp8_assembly.py` **10/10 全过**。
+* **缩小范围(2026-09-20,GPU 2 上用缩层 dummy 模型复现)**:用 `--load-format dummy`
+  + `num_hidden_layers=8`(含 index 3 的 DSA 层,才会走 kpool 路径)在 GPU 2 上跑,
+  `_kpool_tail_seed_kernel` 与 `_ktranspose_bytes_kernel` **都被真实调用过**,
+  连跑 3 轮 `bench serve 4096/64 --ignore-eos` **0 错误**。⇒ 两个内核**单独不越界**,
+  崩溃需要**满模型 + 紧显存**的组合(缩层模型的激活峰太小)。
+* **新增怀疑:流序**。崩溃前的顺序是 `_kpool_tail_seed_kernel`(默认流)→ `[pin]` 主机锁页
+  → `_ktranspose_bytes_kernel`(**GPU 预填充 side stream** 首次 JIT)。跨流若缺一次
+  event/同步,可能读到尚未就绪/已释放的地址 ⇒ `illegal memory access`。
+  待验证:在 `gpu_prefill` 的 side-stream 入口加 event 后重跑。
 * **规避**:`GP_PREFILL=0`(关 GPU 预填充,长 prompt 退 CPU,慢但稳)。
 * 复现配方:util 0.82 + GPU prefill 开 + `vllm bench serve` 4096/64(需要 GPU 0/1 = 生产窗口)。
   定位建议:`CUDA_LAUNCH_BLOCKING=1`;然后在新的 `sparse_indexer.py` 的
