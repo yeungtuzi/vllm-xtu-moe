@@ -30,8 +30,8 @@
 
 ## 目标与愿景
 
-1. **任意 MoE 模型**:不绑死某一代架构。已跑通 DeepSeek-V4 / V4.1 系列,
-   以及 **GLM-5.3-Flash**(含 A100 / SM80 的注意力后端,见支持矩阵)。
+1. **任意 MoE 模型**:不绑死某一代架构。已跑通 DeepSeek-V4 / V4.1 系列、
+   **GLM-5.3-Flash**(含 A100 / SM80 的注意力后端)与 **MiMo-V2.5**。
 2. **任意 x86 指令集**:`scalar → AVX2 → AVX-512(base/VNNI/BF16/VBMI)`,
    运行时按 `/proc/cpuinfo` 自动选最高可用变体。
 3. **显存优先级固定不变**:`1M 上下文 → GPU 预填充 → 投机解码 → 常驻`;
@@ -42,24 +42,16 @@
 
 ---
 
-## 支持矩阵
+## 实测平台
 
-| 模型 | 规模 | 专家格式 | 状态 |
-|---|---|---|---|
-| **DeepSeek-V4.1-Flash** | 748B | MXFP4(E8M0 block-32) | ✅ 端到端(TP=2) |
-| **DeepSeek-V4-Flash**(0731) | 256 专家 / top-6 | MXFP4 | ✅ 端到端(基准引用历史数据,0.2.3 起不复测) |
-| **GLM-5.3-Flash** | 321B / 18B active、288 专家 / top-8 | FP8 block-128 | ✅ **端到端(TP=2,A100/SM80)**,交付配置 **256K 上下文 × 2 路并发**,需 `--kv-cache-dtype bfloat16`;**0.2.3 起 `GPU_UTIL` 必须用 `0.82`**;**MTP 默认开 `SPEC_K=1`**(decode 21.9→22.6 tok/s,KV 池 −27%;k>1 反而更差) |
-| **MiMo-V2.5** | 310B / 15B active、256 专家 / top-8 | FP8 block-128 | ✅ **单卡 A100-40GB(TP=1)端到端**,Hybrid SWA-128 + DiffKV(`TRITON_ATTN_DIFFKV`);**MTP `num_speculative_tokens=1` 实测 decode +10%**,k>1 不可用 |
-| 其它即插即用 MoE | — | BF16 / FP8 | ✅ 走通用路径,未逐模型标定 |
-
-**实测硬件平台(下文所有性能数字都在这台机器上取得)**
+下文所有性能数字都在这台机器上取得:
 
 | 项 | 配置 |
 |---|---|
 | CPU | 2× AMD EPYC 9654(192 物理核 / 384 线程,8 NUMA node) |
 | 内存 | 1538 GiB DDR5 |
 | GPU | 3× NVIDIA A100-PCIE-40GB |
-| 系统 | Ubuntu 22.04 · conda env `lvllm`(vLLM 2.5.0 基座) |
+| 系统 | Ubuntu 22.04 · conda env `lvllm` |
 
 ---
 
@@ -71,77 +63,65 @@
 > **MiMo-V2.5 新增支持**,MTP k=1 实测 **decode 15.6 → 17.2 tok/s(+10%)**。
 > 详见 [`RELEASE_NOTES_v0.2.3.md`](RELEASE_NOTES_v0.2.3.md)。
 
-> **怎么读** —— 表里的数字都是**耗时(ms/层),越小越好**,即"同样的活干得更快"。
-> 对照方是 `lk_moe`(Lvllm 的 CPU MoE 引擎):同一台机器、同一份真实层权重、同一线程数,
-> 且**每个 arm 的 `lk_moe` 分母都在同一个 session 里现量**,避免跨时段漂移。
-> **比值 < 1.0 表示我们更快。**
+> **口径(全 README 统一)**:`prefill (tok/s) = prompt_tokens / TTFT`(首 token 之前的预填充速率)、
+> `decode (tok/s) = 1000 / TPOT`(首 token 之后的解码速率,**不含 prefill**)。
+> 两者都由同一次 `vllm bench serve` 的 TTFT / TPOT 换算而来。
+> **不再公布 `output tok/s`(含 TTFT 的混合值)、TPOT、ITL。**
+> ⚠️ **短 prompt 的 prefill 会被固定开销压低**,必须按长 prompt 读(见下表最后一段说明)。
+> C=1 与 C=2 的速率都是**单流**值(每路各自),不是聚合吞吐。
 
-### GLM-5.3-Flash(2×A100-40GB,TP=2,SM80;交付配置 256K × 2 路)
+| 模型(硬件) | 投机 | prompt | 并发 | prefill (tok/s) | decode (tok/s) |
+|---|---|---|---|---|---|
+| **GLM-5.3-Flash**<br>2×A100-40GB · TP=2 | 关 | 256 | 1 | 110 | 21.9 |
+| | 关 | 4096 | 1 | 143 | 21.2 |
+| | **开 k=1**(默认) | 256 | 1 | 83 | **22.6** |
+| | 开 k=1 | 4096 | 1 | 138 | 16.7 |
+| | 开 k=4 | 256 | 1 | 111 | 12.4 |
+| **MiMo-V2.5**<br>单卡 A100-40GB · TP=1 | 关 | 256 | 1 | 59 | 15.6 |
+| | **开 k=1**(推荐) | 256 | 1 | 53 | **17.2** |
+| | 开 k=1 | 1024 | 1 | 81 | 17.5 |
+| | 开 k=1 | 2048 | 1 | 85 | 17.1 |
+| | 开 k=1 | 4096 | 1 | 86 | 17.0 |
+| | 开 k=1 **+ GPU 流式预填充** | 4096 | 1 | **194** | 13.8 |
+| **DeepSeek-V4.1-Flash**<br>2×A100-40GB · TP=2 | 关 | 32 | 1 / 2 | 68 / 36 | 27.6 / 22.2 |
+| | 关 | 256 | 1 / 2 | 129 / 93 | 22.9 / 17.2 |
+| | 关 | 1024 | 1 / 2 | 102 / 68 | 15.5 / 8.7 |
+| | 关 | 4096 | 1 / 2 | 319 / 212 | 15.1 / 7.8 |
+| | 关 | 16384 | 1 / 2 | **474** / 272 | 18.4 / 7.6 |
+| | 关 | 32768 | 1 / 2 | 462 / 286 | 17.1 / 3.6 |
 
-官方 `vllm bench serve`,随机数据 + `--ignore-eos`,每格不同 seed。
+**每行的配置与样本量**
 
-| 并发 | prompt / output | prefill (tok/s) | decode (tok/s) | 完成 |
-|---|---|---|---|---|
-| C=1 | 256 / 128 | **127** | **21.6** | 8/8 |
-| C=2 | 256 / 128 | 78 | 12.8 | 8/8 |
-| **C=1** | **4096 / 64** | **180** | **21.3** | 2/2 |
+| 模型 | 服务配置 | 样本 / 备注 |
+|---|---|---|
+| GLM-5.3-Flash | `GPU_UTIL=0.82`(0.2.3 起必须),`SPEC_K` 控投机,GPU 预填充 ON(阈值 1500) | decode 为 **N=8×2** 重复口径;prefill 来自同参数 N=1–2 次运行。KV 池:关 MTP **915,487** / 开 MTP **666,366**(−27%);交付配置 **256K × 2 路** |
+| MiMo-V2.5 | 单卡 TP=1,Hybrid SWA-128 + DiffKV(`TRITON_ATTN_DIFFKV`),专家在 CPU | decode 为 **N=8×2**;prefill 为 N=2。**MTP k=3 不可用**(accept 1.016 ⇒ 反而慢 2.4×);贪心输出与不开 MTP **逐字节相同**;加载 ~25–30 min |
+| DeepSeek-V4.1-Flash | TP=2 · MBT=8192 · GPU 预填充 ON · **投机关** · 关前缀缓存(量真实预填充) · random out=128 | 完整 6 长度 × 4 并发见 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md);总吞吐上界 ≈420–455 tok/s;TTFT 与长度线性、与并发强相关 |
 
-> **口径(全 README 统一)**:`prefill (tok/s) = prompt_tokens / TTFT`(首 token 前的预填充速率)、
-> `decode (tok/s) = 1000 / TPOT`(首 token 之后的解码速率,不含 prefill)。
-> 两者都由同一次 `vllm bench serve` 的 TTFT / TPOT 换算而来;
-> **不再公布 `output tok/s`(含 TTFT 的混合值)、TPOT、ITL**。
-> C=2 的 prefill/decode 是**单流**值(两路各自),不是聚合吞吐。
+**怎么读 prefill** —— 三家的 prefill **都随 prompt 变长而升高**,因为里面有一项**每 chunk 固定成本**
+(把专家权重搬上 GPU),chunk 越大摊得越薄:
 
-* **长 prompt 预填充**:4096-in 的 **prefill 140 → 180 tok/s(1.29×)** ——
-  FP8 GPU 预填充把每层 3.62 GB/rank 的专家权重逐层流式搬上 GPU,并与 attention **重叠**;
-* **解码不变**:C=1 **21.3–21.6 tok/s**,与 v0.2.1 持平(GPU 预填充只作用于 prefill);
-* **上下文**:256K × 2 路并发是**本硬件的交付目标**;上表的 KV 池是 v0.2.2(util 0.85)口径
-  = 988,081 token,**0.2.3 rebase 后同一 util 会涨到 1,018,328 并把激活余量吃掉**(两路并发 OOM),
-  故 **0.2.3 交付改用 `GPU_UTIL=0.82`,KV 池 915,487**(32k 单请求 / 两路 14k+15k 实测均通过);
-  512K/704K 实测「能起」但只作能力记录(704K 仅 1.06× 并发,上限约 733K),
-  **1M 不在目标内**(需 fp8 KV,已决定不做;见 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md));
+* GLM 110 → 143(短→4K);MiMo 59 → **194**(开了 GPU 流式预填充);
+  DeepSeek-V4.1 68 → **474**(32 → 16K,6 倍);
+* 反过来,DeepSeek-V4.1 在 **32-token 短 prompt** 上只有 68 tok/s,全被固定开销吃掉;
+* **decode 则相反**:并发越高越低(C=2 时明显掉),这是"预填充与解码争同一份 CPU 专家算力"的必然结果。
+
+**其它要点**
+
+* **GLM 交付配置 = 256K 上下文 × 2 路并发**;0.2.3 起 `GPU_UTIL` **必须 `0.82`**
+  (上游改了 KV 定容,0.85 下两路并发会 OOM):KV 池 915,487(关 MTP)/ 666,366(开 MTP),
+  即 **MTP 的真代价是 KV −27%**(256K 并发 3.49× → 2.54×),且**单 token 间隔脉冲化**
+  (一步吐 1–2 个 token,流式体验变差)。1M 不在目标内(需 fp8 KV,已决定不做)。
 * **正确性**:引擎确定性门禁 11/11;层门禁 rms_rel 4.4e-3;29,746-token 长文密钥检索完全命中;
   3 路 ~8K 并发(限两路)三个密钥全部正确;0 OOM。
-* **MTP(v0.2.3 起默认开 `SPEC_K=1`)**:draft 第 45 层常驻 GPU(3.38 GiB/rank);
-  接受长度 1.46,`256/128 C=1` 解码 **21.9 → 22.6 tok/s**(≈+3%,噪声内);代价是
-  **KV 池 915,487 → 666,366(−27%,256K 并发 3.49× → 2.54×)**,且**单 token 间隔会脉冲化**
-  (一步吐 1–2 个 token,流式体验变差);**k>1 反而更差**(k=4 掉到 ~12 tok/s)。
-  数据见 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §4.3。
+* **MiMo 开 GPU 流式预填充**要用更低的 `GPU_UTIL`(实测 0.65),因为 staging **12.75 GiB/rank**
+  (比 GLM 的 7.59 大,`E=256×I=2048` 更宽);8K 上下文下 5.8× 并发仍够用。
+* FP8 引擎内层另有一个**默认关闭**的加速开关 `XIAOTU_MOE_FP8_BF16_MMA=1`
+  (AVX512-BF16 `vdpbf16ps`,M≥6 快 1.17–1.20×,代价是权重舍入 bf16:两路 rms_rel 3.6e-3)。
 
-> FP8 引擎内层另有一个**默认关闭**的加速开关 `XIAOTU_MOE_FP8_BF16_MMA=1`
-> (AVX512-BF16 `vdpbf16ps`,M≥6 快 1.17-1.20×,代价是权重舍入 bf16:两路 rms_rel 3.6e-3)。
-
-### MiMo-V2.5(单卡 A100-40GB,TP=1,专家在 CPU)
-
-**解码 —— MTP A/B**(256 in / 128 out,C=1,每格 **N=8×2** 重复)
-
-| 配置 | decode (tok/s) |
-|---|---|
-| 不开 MTP | 15.5 / 15.6 |
-| **MTP k=1**(推荐) | **17.2 / 17.1(+10%)** |
-
-**预填充 —— 与 MTP 无关,取决于是否开 GPU 流式预填充**(同机实测)
-
-| 配置 | 256 in | 1024 in | 2048 in | 4096 in |
-|---|---|---|---|---|
-| 专家在 CPU(GPU 预填充关) | 68 | 81 | 85 | **86** |
-| **+ GPU 流式预填充** | — | — | — | **194(2.25×)** |
-
-> ⚠️ **MiMo 的 TTFT ≈ 0.84 s 固定 + 11.4 ms/token**,所以**短 prompt 的 prefill (tok/s) 会被固定开销压低**(256 token 只有 68 tok/s),必须按**长 prompt** 读这个指标。
-> GPU 流式预填充的代价是 staging **12.75 GiB/rank**(比 GLM 的 7.59 大,因为 `E=256×I=2048` 更宽)⇒ 要用更低的 `GPU_UTIL`(实测 0.65)换激活余量,KV 池随之变小(47,459),8K 上下文下 5.8× 并发仍够用。
-
-
-* 负载 = 256 in / 128 out / C=1;接受长度 **1.74**(accepted 869 / drafts 1169);
-**贪心输出与不开 MTP 逐字节相同**;
-* **MTP k=3 不可用**:accept 1.016(p0 从 0.83 崩到 0.016)⇒ 反而慢 2.4×,与上游 PR #31180
-  的 *"acceptance rate of 0"* 一致 ⇒ 只开 `num_speculative_tokens=1`;
-* 加载:293 GiB / 17 分片,每层建一次 xiaotu FP8 引擎,整轮 ~25-30 min;详见
-  [`docs/MODEL_GUIDES.md`](docs/MODEL_GUIDES.md) §3。
-
-### DeepSeek-V4.1-Flash 服务级(等参数同机 A/B,TP=2,官方 `vllm bench serve`)
+### DeepSeek-V4.1-Flash 服务级:与参考实现 `lk_moe` 的等参数 A/B
 
 两个 arm 跑在**同一个 conda env**、唯一变量是 CPU MoE 引擎;prompt 逐字节相同、线程数都是 60。
-**只报两个速率,不做折算**:`prefill (tok/s)`(首 token 前)与 `decode (tok/s)`(首 token 后)。
 比值为 **我们 / `lk_moe`**,**> 1.0 表示我们更快**。
 
 | prompt / output | `lk_moe` prefill (tok/s) | 我们 prefill (tok/s) | 比值 | `lk_moe` decode (tok/s) | 我们 decode (tok/s) | 比值 |
@@ -151,8 +131,7 @@
 | 8192 / 32 | 127.5 | 115.0 | **0.902×** | 45.4 | 34.3 | **0.756×** |
 | 8192 / 1024 | 127.6 | 120.9 | **0.948×** | 44.8 | 34.7 | **0.775×** |
 
-⇒ 服务级我们**仍慢**:prefill 慢 **5-11%**、**decode 慢 29-44%**(decode 只有 lk 的 0.70-0.78×),
-但比上一版已收窄 **+8%~+15%**。
+⇒ 服务级我们**仍慢**:prefill 慢 **5-11%**、**decode 慢 29-44%**,但比上一版已收窄 **+8%~+15%**。
 
 ### GPU 预填充(把长 prefill 交给 GPU)
 

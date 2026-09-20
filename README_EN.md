@@ -43,8 +43,8 @@
 ## Goals
 
 1. **Any MoE model.** Not tied to one architecture generation. DeepSeek-V4 / V4.1 work
-   end to end; GLM-5.3-Flash runs end to end too, with an FP8 GPU prefill path and a
-   delivered **256K × 2-concurrent** service config (see the support matrix).
+   end to end; GLM-5.3-Flash runs end to end too with an FP8 GPU prefill path; MiMo-V2.5
+   runs end to end on a single card.
 2. **Any x86 ISA.** `scalar → AVX2 → AVX-512 (base/VNNI/BF16/VBMI)`, selected at import
    time from `/proc/cpuinfo`.
 3. **A fixed VRAM priority order.** `1M context → GPU prefill → speculative decoding → residency`.
@@ -55,72 +55,89 @@
 
 ---
 
-## Support matrix
+## Measurement host
 
-| Model | Size | Expert format | Status |
-|---|---|---|---|
-| **DeepSeek-V4.1-Flash** | 748B | MXFP4 (E8M0 block-32) | ✅ end to end (TP=2) |
-| **DeepSeek-V4-Flash** (0731) | 256 experts / top-6 | MXFP4 | ✅ end to end |
-| **GLM-5.3-Flash** | 321B / 18B active, 288 experts / top-8 | FP8 block-128 | ✅ **end to end (TP=2, A100/SM80)**, delivered as **256K context × 2 concurrent sequences** (KV pool 988,081 tokens), needs `--kv-cache-dtype bfloat16`; C=1 decode ~21.5 tok/s; 4K-prompt prefill **140 → 180 tok/s (FP8 GPU prefill, 1.29×)** |
-| Other plug-and-play MoE | — | BF16 / FP8 | ✅ generic path, no per-model calibration |
-
-**Measurement host (every number below was taken here)**
+Every performance number below was taken on this machine:
 
 | Item | Configuration |
 |---|---|
 | CPU | 2× AMD EPYC 9654 (192 physical cores / 384 threads, 8 NUMA nodes) |
 | RAM | 1538 GiB DDR5 |
 | GPU | 3× NVIDIA A100-PCIE-40GB |
-| OS | Ubuntu 22.04 · conda env `lvllm` (vLLM 2.5.0 base) |
+| OS | Ubuntu 22.04 · conda env `lvllm` |
 
 ---
 
 ## Performance (latest release **v0.2.3**)
 
-> **How to read these tables.** Every number is **elapsed time in ms/layer — lower is better**,
-> i.e. "the same work done faster". The baseline is `lk_moe` (Lvllm's CPU MoE engine), measured
-> on the same machine, same real layer weights and same thread count, with the **`lk_moe`
-> denominator re-measured in the same session** to avoid cross-session drift.
-> **A ratio below 1.0 means we are faster.**
-
-### GLM-5.3-Flash (2×A100-40GB, TP=2, SM80; delivered config: 256K × 2 concurrent)
-
-Official `vllm bench serve`, random dataset + `--ignore-eos`, a distinct seed per cell.
-
-| Concurrency | prompt / output | prefill (tok/s) | decode (tok/s) | completed |
-|---|---|---|---|---|
-| C=1 | 256 / 128 | **127** | **21.6** | 8/8 |
-| C=2 | 256 / 128 | 78 | 12.8 | 8/8 |
-| **C=1** | **4096 / 64** | **180** | **21.3** | 2/2 |
-
 > **Metric definitions (uniform across this README)**: `prefill (tok/s) = prompt_tokens / TTFT`
-> and `decode (tok/s) = 1000 / TPOT`; both are converted from the TTFT/TPOT of the same
+> (the prefill rate before the first token) and `decode (tok/s) = 1000 / TPOT` (the decode rate
+> after it, **prefill excluded**); both are converted from the TTFT/TPOT of the same
 > `vllm bench serve` run. **`output tok/s` (which mixes in TTFT), TPOT and ITL are no longer
-> reported.** For C=2 the two rates are per-stream, not aggregate throughput.
+> reported.** ⚠️ **A short prompt depresses prefill (tok/s)** because of fixed overhead, so read
+> that column on long prompts (see the notes below). C=1 and C=2 rates are **per-stream**, not
+> aggregate throughput.
 
-* **Long-prompt prefill**: 4096-in goes from **140 to 180 tok/s (1.29×)** — the FP8 GPU prefill
-  streams each layer's 3.62 GB/rank of expert weights onto the
-  GPU and **overlaps** that transfer with attention;
-* **Decode is unchanged**: C=1 **21.3–21.6 tok/s**, as in v0.2.1 (the GPU path only affects
-  prefill);
-* **Context**: 256K × 2 concurrent (KV pool 988,081 tokens) is the **delivered target for this
-  hardware**; 512K/704K merely start (704K with only 1.06× concurrency, ceiling ≈733K) and are
-  recorded as capability, not targets; **1M is out of scope** (needs an fp8 KV cache, decided
-  against — see [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md));
+| Model (hardware) | Spec | prompt | conc. | prefill (tok/s) | decode (tok/s) |
+|---|---|---|---|---|---|
+| **GLM-5.3-Flash**<br>2×A100-40GB · TP=2 | off | 256 | 1 | 110 | 21.9 |
+| | off | 4096 | 1 | 143 | 21.2 |
+| | **on k=1** (default) | 256 | 1 | 83 | **22.6** |
+| | on k=1 | 4096 | 1 | 138 | 16.7 |
+| | on k=4 | 256 | 1 | 111 | 12.4 |
+| **MiMo-V2.5**<br>1×A100-40GB · TP=1 | off | 256 | 1 | 59 | 15.6 |
+| | **on k=1** (recommended) | 256 | 1 | 53 | **17.2** |
+| | on k=1 | 1024 | 1 | 81 | 17.5 |
+| | on k=1 | 2048 | 1 | 85 | 17.1 |
+| | on k=1 | 4096 | 1 | 86 | 17.0 |
+| | on k=1 **+ GPU streaming prefill** | 4096 | 1 | **194** | 13.8 |
+| **DeepSeek-V4.1-Flash**<br>2×A100-40GB · TP=2 | off | 32 | 1 / 2 | 68 / 36 | 27.6 / 22.2 |
+| | off | 256 | 1 / 2 | 129 / 93 | 22.9 / 17.2 |
+| | off | 1024 | 1 / 2 | 102 / 68 | 15.5 / 8.7 |
+| | off | 4096 | 1 / 2 | 319 / 212 | 15.1 / 7.8 |
+| | off | 16384 | 1 / 2 | **474** / 272 | 18.4 / 7.6 |
+| | off | 32768 | 1 / 2 | 462 / 286 | 17.1 / 3.6 |
+
+**Per-row configuration and sample size**
+
+| Model | Serving config | Sample / notes |
+|---|---|---|
+| GLM-5.3-Flash | `GPU_UTIL=0.82` (mandatory since 0.2.3), `SPEC_K` controls speculation, GPU prefill ON (threshold 1500) | decode is **N=8×2** repeated; prefill comes from the same config at N=1–2. KV pool: spec off **915,487** / on **666,366** (−27%); delivered as **256K × 2 concurrent** |
+| MiMo-V2.5 | single card TP=1, Hybrid SWA-128 + DiffKV (`TRITON_ATTN_DIFFKV`), experts on CPU | decode **N=8×2**; prefill N=2. **MTP k=3 is unusable** (accept 1.016 ⇒ 2.4× slower); greedy output is **byte-identical** to spec-off; load takes ~25–30 min |
+| DeepSeek-V4.1-Flash | TP=2 · MBT=8192 · GPU prefill ON · **spec off** · prefix caching off (to measure real prefill) · random out=128 | full 6 lengths × 4 concurrencies in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); aggregate ceiling ≈420–455 tok/s; TTFT is linear in length and strongly concurrency-dependent |
+
+**How to read prefill** — all three models get **faster prefill as the prompt grows**, because part
+of the cost is a **fixed per-chunk cost** (streaming expert weights to the GPU) that a bigger chunk
+amortises:
+
+* GLM 110 → 143 (short → 4K); MiMo 59 → **194** (with GPU streaming prefill on);
+  DeepSeek-V4.1 68 → **474** (32 → 16K, 6×);
+* conversely DeepSeek-V4.1 on a **32-token prompt** gets only 68 tok/s — all fixed overhead;
+* **decode is the opposite**: it falls as concurrency rises (clearly at C=2), because prefill and
+  decode contend for the same CPU expert compute.
+
+**Other points**
+
+* **GLM delivery = 256K context × 2 concurrent**; since 0.2.3 `GPU_UTIL` **must be `0.82`**
+  (the upstream KV sizing changed, and 0.85 OOMs at two-way concurrency): KV pool 915,487
+  (spec off) / 666,366 (spec on), i.e. **MTP's real cost is KV −27%**
+  (256K concurrency 3.49× → 2.54×) plus **pulsing inter-token spacing** (1–2 tokens per step,
+  which hurts streaming). 1M is out of scope (needs an fp8 KV cache, decided against).
 * **Correctness**: engine determinism gate 11/11; layer gate rms_rel 4.4e-3; a 29,746-token
-  needle retrieval is exact; three concurrent ~8K requests (two-way admission) all retrieve
-  their own secret; 0 OOM.
+  needle retrieval is exact; three concurrent ~8K requests (two-way admission) all retrieve their
+  own secret; 0 OOM.
+* **MiMo with GPU streaming prefill** needs a lower `GPU_UTIL` (measured 0.65) because staging is
+  **12.75 GiB/rank** (larger than GLM's 7.59 — `E=256×I=2048` is wider); at 8K context 5.8×
+  concurrency still fits.
+* The FP8 CPU inner loop has a **default-off** switch, `XIAOTU_MOE_FP8_BF16_MMA=1`
+  (AVX512-BF16 `vdpbf16ps`; 1.17–1.20× for M≥6, at the cost of rounding weights to bf16:
+  rms_rel 3.6e-3 between the two paths).
 
-> The FP8 CPU inner loop has a **default-off** acceleration switch, `XIAOTU_MOE_FP8_BF16_MMA=1`
-> (AVX512-BF16 `vdpbf16ps`; 1.17-1.20× for M≥6, at the cost of rounding weights to bf16:
-> rms_rel 3.6e-3 between the two paths).
-
-### DeepSeek-V4.1-Flash, service level (same-parameter A/B on one host, TP=2, official `vllm bench serve`)
+### DeepSeek-V4.1-Flash, service level: same-parameter A/B against `lk_moe`
 
 Both arms run in the **same conda env**; the only variable is the CPU MoE engine. Prompts are
-byte-identical and both arms use 60 threads. **Only two rates are reported, with no crosstalk**:
-`prefill (tok/s)` (before the first token) and `decode (tok/s)` (after it). Ratios are
-**ours / `lk_moe`**, so **> 1.0 means we are faster**.
+byte-identical and both arms use 60 threads. Ratios are **ours / `lk_moe`**, so
+**> 1.0 means we are faster**.
 
 | prompt / output | `lk_moe` prefill (tok/s) | ours prefill (tok/s) | ratio | `lk_moe` decode (tok/s) | ours decode (tok/s) | ratio |
 |---|---|---|---|---|---|---|
@@ -131,7 +148,8 @@ byte-identical and both arms use 60 threads. **Only two rates are reported, with
 
 ⇒ At the service level we are **still slower**: prefill by **5-11%** and **decode by 29-44%**
 (decode is 0.70-0.78× of `lk_moe`), but the gap narrowed by **+8% to +15%** versus the previous
-release.
+release. Engine-level microbenchmarks (ms/layer) are a development metric and are not published
+here.
 
 ### GPU prefill (long prefill handed to the GPU)
 
