@@ -1541,6 +1541,45 @@ gpu_worker.py:564    Initial free memory 38.79 GiB, **reserved 4.76 GiB memory f
 **⇒ 因此最可靠的杠杆仍是**降 MBT**(已用),而 256K 下的 `MBT=16384` 需要**激活侧**的改动
 (而非 staging 或 `FLA_CHUNK_SIZE`)。**
 
+### B58 ⭐⭐⭐ **根因确认(两条独立路径吻合到 3%)**:17.5 GiB = 34 层 KDA 的 `h`(bf16) 累积
+
+**关键:dtype。** `chunk_delta_h.py:352` 的 `h = k.new_empty(B, NT, H, V, K)` ——
+**`k` 是 KDA 的 key 张量,KDA 在 **bf16** 下运行 ⇒ `h` 是 **bf16**,不是 fp32。**
+
+```
+单层 h @MBT=16384, BT=64:  bf16 = **0.50 GiB**   (fp32 会是 1.00)
+34 个 KDA 层:               bf16 = **17.0 GiB**
+```
+
+**而 B57 从**日志账本**(`Model loading 11.1` + `reserved 4.76` + staging 5.62 + inter 0.50)
+**独立**算出的"激活/工作区" = **17.5 GiB**。
+
+**⇒ 17.0 vs 17.5 —— 两条完全独立的推导(读 OOM 栈 + 读 config vs 读日志账本）吻合到 3%。**
+**⇒ 根因确认:那 17.5 GiB 就是 **34 层 KDA 的 chunk 状态 `h`(bf16) 累积**。
+它被保留是因为 `kda.py:670` 的调用传了 `output_final_state=True`。**
+**⇒ B56 的假设 A 成立、假设 B 排除(不是通用激活,是 KDA 状态)。**
+
+**⇒ 这解释了全部现象,且每条都有实测支撑:**
+| 现象 | 机制 |
+|---|---|
+| MBT 8192 能跑、16384 OOM | `h ∝ NT = T/BT` ⇒ MBT 减半 ⇒ `h` 减半(省 8.5 GiB) |
+| ②c 省 1.12 GiB 几乎无用 | 它只占 17.5 的 6% ⇒ 与"只多跑 2 层"一致 |
+| `expandable_segments` 无效 | 是真实状态,非碎片 |
+| B52 的 22 GiB 未归属 | = 17.0(KDA h) + inter 0.5 + 零头(当时漏算模型权重 11.1) |
+| OOM 落在 `chunk_gated_delta_rule_fwd_h` | `h` 正是该行分配 |
+
+**⇒ 杠杆(最终排序):**
+| 杠杆 | 省 | 评价 |
+|---|---|---|
+| **`FLA_CHUNK_SIZE` 64 → 128** | **h 减半 ⇒ ~8.5 GiB** | **最直接**(远超所缺的 120 MiB);但跨 FLA 模型共用 + 数值会变 + Triton constexpr 可能不支持 |
+| 降 MBT 到 8192 | ~8.5 GiB | **已在用**、零风险;每 chunk 代价 8.7 s |
+| ②c / ②b staging | 1.12 / 3.3 GiB | **只占 6–19%**,不是决定性杠杆 |
+
+**⚠️ 仍未验证(标注)**:
+1. `h` **是否真的 34 层同时存活** —— 两条独立推导的吻合**强烈支持**是,但**没有直接测量**;
+   直接测法是 `output_final_state` 的语义 + 在各层后打 `memory_allocated()`;
+2. `FLA_CHUNK_SIZE=128` 是否被 Triton 核接受、数值影响多大 —— **必须先做数值 A/B**。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
