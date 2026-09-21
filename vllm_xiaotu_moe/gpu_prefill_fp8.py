@@ -198,7 +198,7 @@ def prealloc_fp8_buffers(device, n_experts: int, hidden: int, inter: int) -> Non
     _buf("raw13", (E, 2 * I, H), device)
     # 【②c】共享模式下 raw2 是 raw13 上的视图(w2_raw = w13_raw.view(...)),
     # 不再单独分配 —— 省 1.12 GiB 设备显存。`XIAOTU_GPF_RAW2_SHARE=0` 退回独立缓冲。
-    if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "1") != "1":
+    if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "0") != "1":
         _buf("raw2", (E, H, I), device)
     _buf("km13", (E, H, 2 * I), device)
     _buf("km2", (E, I, H), device)
@@ -279,7 +279,7 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
     # 因而 raw13 的存储装得下 raw2 ⇒ 省 1.12 GiB 设备显存。
     # ⚠️ 代价:DMA/转置流水被串行化(见下方 w13 转置被提前到 w2 DMA 之前)。
     # `XIAOTU_GPF_RAW2_SHARE=0` 可退回独立缓冲(一键回滚)。
-    if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "1") == "1":
+    if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "0") == "1":
         w2_raw = w13_raw.view(-1)[: E * H * I].view(E, H, I)
     else:
         w2_raw = _buf("raw2", (E, H, I), device)
@@ -324,7 +324,7 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
                         f"{got}/{cr13 * H * E} bytes)")
         _hit("w13")
         # 【②c】w13 转置必须在 w2 的 DMA 之前完成 —— 否则 w2 的 DMA 会覆盖 raw13。
-        if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "1") == "1":
+        if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "0") == "1":
             w13t = _kmajor_bytes(w13_raw, _buf("km13", (E, H, 2 * I), device))
         for n in range(ns):
             c0 = n * cr2
@@ -344,7 +344,7 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
             w13_raw[:, I + c0:I + c0 + cr13, :].copy_(blk[:, 1, :].reshape(E, cr13, H))
             del buf, blk
         # 【②c】同上:先把 w13 转置做完,再让 w2 的 DMA 覆盖 raw13。
-        if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "1") == "1":
+        if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "0") == "1":
             w13t = _kmajor_bytes(w13_raw, _buf("km13", (E, H, 2 * I), device))
         for n in range(ns):
             buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
