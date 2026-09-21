@@ -587,6 +587,36 @@ value_error: 0     ← 不再报错
 
 **⇒ 顺带验证了 GLM 那次启动竞态的修复是通用的** —— 两个脚本现在都有轮询到 0 的逻辑。
 
+### B27 ✅✅✅ **V4.1-Flash @256K long prompt 修好（最高优先级项 (a) 类结案）**
+
+```
+配置: GPUS=0,1 TP=2 MAXLEN=262144 MAXSEQS=1 GPU_UTIL=0.85
+      KV_CACHE_BYTES=8031830016 (7.48 GiB,引擎反算真实需求,无乘性余量)
+      MBT=**4096**            SPEC 未设 ⇒ 0(无 dspark)
+结果: Successful requests=**1**  Failed=**0**
+      Mean TTFT=**141,617.56 ms**  Mean TPOT=**53.48 ms**
+      ⇒ prefill **115.8 tok/s**  decode **18.7 tok/s**
+判据: new_empty=**0**  OOM=**0**  illegal=**0**  DISABLED=**0**
+```
+
+**⇒ 修法 = `MBT=16384 → 4096`（B25 定位的 `q_out=(T,padded_heads,D)` 分配 ∝ T ⇒ 小 4 倍）。
+`aten::new_empty` 失败消失,请求成功。无需改任何代码。**
+
+**⚠️ 判据口径的重要修正(V4.1 与 GLM 不同):**
+`[fp8-asm]=0` 在 V4.1 上是**预期的,不是问题** —— 那是 **GLM/FP8 路径**的装配标记,
+而 **V4.1 走 MXFP4 路径**,不打印该行。
+**⇒ 对 V4.1 不能用 `[fp8-asm]` 作"GPU 预填充是否运行"的判据;`DISABLED=0` 仍有效。**
+(这是我先前把 GLM 的判据套到 V4.1 上的口径错误,记此以免误读。)
+
+**⚠️ 过程中三次失败全是我自己的参数/脚本错误(与 V4.1 本身无关):**
+1. 漏传 `GPUS=0,1`(serve_v41.sh 默认 `GPUS=0`)⇒ 单卡+TP=2 ⇒ pydantic 校验失败(B26);
+2. `--served-model-name` **猜错**:真名是 **`dsv41`**(`serve_v41.sh:277`),我传 `DeepSeek-V4.1-Flash`
+   ⇒ `NotFound`,请求从未送达 ⇒ **那次"失败"完全不能说明 MBT 修法无效**;
+3. 查日志查错了路径(`logs/` 而非 `dev-docs/report/tuning/logs/`)⇒ 一度看不到错误。
+
+**⇒ 规则(与 B26 同类,再记一次):传参前读服务脚本的接口与 `--served-model-name`;
+查日志前确认脚本的 `$OUTDIR`。**
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
