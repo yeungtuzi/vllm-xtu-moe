@@ -793,3 +793,38 @@ TTFT 52.8 s(实测)                      ⇒ 差 35.5 s(67%)不在 MoE 层内
 ```
 两个被减数都是实测,但"**差额归给 attention/indexer**"这一步尚未被 kernel 表证实。
 **替代路径**:①查清 `hybrid_model.py:1301` 的调用条件;②上 `nsys`(环境里有 2023.1.2)。
+
+### 20.1 🎯 profiler 打不出表的**真正原因:钩子只挂在 MXFP4 路径上**
+
+`hybrid_model.py:1295-1301`:
+
+```python
+    w13, s13, w2, s2, ..., device=hidden_states.device, slot=slot,
+)
+if _nvtx: torch.cuda.nvtx.range_pop()
+_maybe_profile()                       # ← 这里
+if self.shared_experts is not None: ...
+```
+
+**这一段是 `gpu_moe_layer`(MXFP4 路径,`gpu_prefill.py`)的调用点。**
+而 **GLM-5.3-Flash 走的是 FP8 路径**(`gpu_prefill_fp8.py`,经
+`mixed_experts.py` 的 `_gp_mod.kmajor_from_engine_shards`) ⇒
+**`_maybe_profile()` 对 GLM 永远不会被调用**,所以:
+
+* trace 目录为空;
+* 表格一行都没有;
+* **而且不报错**(静默失效)。
+
+**⇒ `XIAOTU_TORCH_PROFILE` 目前对 FP8 模型(含 GLM)是失效的。**
+
+### 20.2 要拿到 kernel 表,只需一处两行的改动(下一步)
+
+在 `mixed_experts.py` 的 **FP8 装配分支**末尾(即 `kmajor_from_engine_shards`
+返回之后、MoE 内核完成之后)补一次 `_maybe_profile()` 调用,与 MXFP4 路径对齐。
+`_maybe_profile` 已存在于 `hybrid_model.py:337`,可直接复用(注意它已有
+`_capture_guard()`,捕获期会自动退出)。
+
+**或在改代码之前先用 `nsys`**(环境里是 2023.1.2)——
+`nsys` 不需要插件配合,但输出大、需 `nsys stats` 后处理。
+
+**⇒ ④ 的直接观测目前卡在"钩子挂错路径"这一处,已有明确修法,不是死路。**
