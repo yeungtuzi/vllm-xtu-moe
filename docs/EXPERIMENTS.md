@@ -1580,6 +1580,39 @@ gpu_worker.py:564    Initial free memory 38.79 GiB, **reserved 4.76 GiB memory f
    直接测法是 `output_final_state` 的语义 + 在各层后打 `memory_allocated()`;
 2. `FLA_CHUNK_SIZE=128` 是否被 Triton 核接受、数值影响多大 —— **必须先做数值 A/B**。
 
+### B59 ⚠️ **B58 与持久状态的事实相冲突** —— 矛盾已定位,但不猜
+
+**读 `get_state_shape()` 得到一个与 B58 张力的事实:**
+```python
+MambaStateShapeCalculator.kda_state_shape(tp_size, num_heads, head_dim,
+                                          conv_kernel_size=..., num_spec=...)
+⇒ KDA 的**持久**状态缓存**只依赖 heads / head_dim,不依赖 NT 或 T**
+⇒ 每层约 64×128×128 bf16 ≈ **2 MiB**,34 层合计 ~68 MiB
+```
+**⇒ 那 17 GiB **不是持久状态缓存**。它只能是 **prefill 期的 `h`(NT=256 个 chunk 状态)**。
+而 `h` 是 `chunk_gated_delta_rule_fwd_h` 的**局部变量**,提取 final state 后应可释放
+⇒ **理论上峰值只 0.5 GiB / 层,不是 17 GiB。**
+⇒ **这与 B58(34 层累积 = 17.0 GiB)直接冲突。**
+
+**两条独立推导吻合到 3% 是强证据,但代码结构说 `h` 不该累积。⇒ 矛盾未解。**
+
+**⇒ 可能的解释(均未验证,不下结论):**
+| # | 解释 | 可测性 |
+|---|---|---|
+| 1 | **prefill 把 45 层拆成多个"微批",且每微批内多个 KDA 层的 `h` 同时存活** | 需读调度/分块逻辑 |
+| 2 | **`torch.compile`/CUDA graph 的 PIECEWISE 捕获**让中间态不释放(即使 mode 是 DECODE_ONLY) | 需读编译配置的影响范围 |
+| 3 | **分配器未归还**(reserved 而非 allocated) —— 但 OOM 行说 "38.40 GiB **allocated** by PyTorch" | 与 OOM 行矛盾,可排除 |
+| 4 | `h` 之外还有别的 17 GiB(那么 B57/B58 的吻合是巧合) | 需实测 |
+
+**⇒ 唯一能定案的方法(我已反复写明、但未执行)**:在 KDA 各层前后打印
+`torch.cuda.memory_allocated()` / `max_memory_allocated()`,看**是逐层台阶还是累积**。
+**⇒ 我停在这里,不再用推理去消解这个矛盾 —— 本段前 44 轮已证明"从差值/吻合推结论"会出错。**
+
+**⚠️ 但两条**已确立的硬事实**不受此矛盾影响:**
+1. **OOM 发生在 `chunk_gated_delta_rule_fwd_h`**(读栈,硬事实);
+2. **预算闭合:模型 11.1 + KV 4.76 + staging 5.62 + inter 0.5 + 其余 17.5 = 39.49**(日志账本,硬事实)。
+**⇒ 所以"靶子在 KDA 侧、量级 ~17 GiB"成立;只是"是不是 `h` 累积"这一步待实测。**
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
