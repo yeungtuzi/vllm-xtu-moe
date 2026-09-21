@@ -18,7 +18,7 @@
 
 | # | 实验 | 目的 | 判据 | 状态 |
 |---|---|---|---|---|
-| **G-5** | 线上跑**完整最优 tile**：`BM=256 BN=128 NS=3 WARPS=8`（五变量给全） | 验证隔离台的 −38% 能否传导到线上 | 隔离预测 `gate_up 2.57→~1.6 s`、合计 `5.45→~3.4 s` | **RUNNING** |
+| **G-6** | GLM **256K + MBT=16384** + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | ③' 零代码路径:碎片化是否是那次 120 MiB OOM 的真因 | `Successful=1` 且 `OOM=0`;若成功 ⇒ 1 chunk ⇒ 按 B37 省 ~8.7 s | **RUNNING** |
 
 ## B. 已完成（本会话全部硬数据）
 
@@ -971,6 +971,36 @@ w2t  = _kmajor_bytes(w2_raw,  _buf("km2",  ...))
 而 KV 池现在按**真实需求 4.76 GiB** 配置(不加余量)。**若把 util 从 0.85 提高,
 或其他 vLLM 保留量调小,可能直接腾出 120 MiB 缺口而不需要任何代码改动。**
 **⇒ 这应当是下一步的第一件事(纯配置、零风险),而不是先去改装配代码。**
+
+### B40 ❌ ③' 零成本路径**不存在** —— 碎片化假设被证伪,② 确实必需
+
+**G-6**:256K + `MBT=16384` + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+```
+结果: Successful=0  OOM=5
+Tried to allocate **120.00 MiB**;GPU 0 free **49.5 MiB**(与 D-1 完全一致)
+日志确认该配置**已生效**:`expandable_segments: memory mapping failed with OOM ... map 20971520 byte`
+```
+
+**⇒ 碎片化不是原因** —— 开了 expandable_segments 仍是同一个 120 MiB / 同样 49.5 MiB 空闲
+⇒ **卡是真的满,需求确实多 120 MiB 以上。**
+
+**⇒ 因此 ②(腾出 3.37 GiB staging)是**必需的**,不是"可选的优化"。**
+**⇒ 而 ③'(纯配置调 util)也无效**:`GPU_UTIL=0.85` 下进程仍占 39.40 GiB ⇒ **util 上限没在起作用**
+(插件自己的 staging 分配在 vLLM 的 accounting 之外)。
+
+**⚠️ 我上一轮从 OOM 消息里读出"碎片化"是**过度解读**:** PyTorch 那句提示是通用模板,
+不代表本案例适用。**我又一次用"看起来合理的解释"代替了验证。**
+(与 B21/B30 的量纲错误、B35 的"噪声"判断同源:**都是拿未核对的解释去套现象。**)
+
+**⇒ 至此三条路只剩 ②:**
+| 路径 | 状态 |
+|---|---|
+| ③' 纯配置(util/expandable_segments) | ❌ **本轮证伪** |
+| ②b 分块 staging(重排 40 行,有静默损坏风险) | 待做 |
+| ②a host 侧 K-major(94 GiB 一次性) | 待做(更重) |
+
+**⇒ ②b/②a 的预期不变:staging 7.59→4.2 GiB ⇒ MBT 16384 ⇒ 1 chunk ⇒
+按 B37 每-chunk 8.7 s ⇒ TTFT 70.2→~61.5 s ⇒ prefill 233.6→~266 tok/s(+14%)。**
 
 ## C. 上报上游
 
