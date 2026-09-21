@@ -1432,6 +1432,48 @@ kda/kernels.py    chunk_size = FLA_CHUNK_SIZE        (fwd 内局部赋值,不可
 **⇒ 规则:任何"缺资源"类问题,第一步永远是**读失败点的栈**,而不是从差值去推测该省什么。**
 **⇒ 这条规则的代价对比很直接:读栈 = 1 次 grep;不读 = 8 轮 + 4 次 9 分钟运行。**
 
+### B55 ⭐⭐⭐ **256K OOM 的完整定量解释** —— KDA 的 chunk 中间态 `h`,34 层 × 1 GiB
+
+**从 config 读出(实测,非估算):**
+```
+text_config.linear_attn_config = {'num_heads': 64, 'head_dim': 128, ...}
+text_config.layer_types = **34 × 'linear_attention' + 11 × 'deepseek_sparse_attention'** (共 45)
+```
+**⇒ B53 里我假设的 H=64 / V=K=128 被 config 证实,所以下面的数是实数而非估算:**
+```
+h = (B=1, NT=256, H=64, V=128, K=128) fp32 = **1.00 GiB / 层**(MBT=16384, BT=64)
+                                            **0.50 GiB / 层**(MBT= 8192)
+⇒ 34 个 linear_attention 层若同时存活 = **34.0 GiB**
+⇒ 对比 B52 的「22.4 GiB 未归属」 —— **量级完全对得上**
+```
+
+**⇒ 这一条**完整解释**了本段观察到的**每一个**现象:**
+| 现象 | 解释 |
+|---|---|
+| MBT=8192 能跑、16384 OOM | `h ∝ MBT` ⇒ 16384 时每层 1 GiB,8192 时 0.5 GiB |
+| ②c 省 1.12 GiB MoE staging 几乎无用 | **要腾的是 KDA 的 `h`(几十 GiB),不是 MoE staging** |
+| `expandable_segments` 无效 | 是**真实中间态**,不是碎片 |
+| B52 的 22 GiB 未归属 | **就是 `h`** |
+| OOM 栈落在 `chunk_gated_delta_rule_fwd_h` | `h` 正是在该行分配 |
+
+**⇒ 杠杆(按直接程度,修正 B54):**
+| 杠杆 | 效果 | 风险 |
+|---|---|---|
+| **`FLA_CHUNK_SIZE` 64 → 128** | `NT` 减半 ⇒ **`h` 减半(省 ~17 GiB @34 层)** | 跨模型共用 + 数值会变 + Triton constexpr 可能不支持 |
+
+**⇒ ⚠️ 但这里有一个我需要标注的关键未知:**
+**`h` 是否真的 34 层同时存活?** 代码是**逐层 forward**,理论上 `h` 在层内用完即可释放
+(它只用于 `chunk_gated_delta_rule_fwd_h` 内部与 `output_final_state`)。
+**⇒ 若逐层释放,峰值只有 1 GiB,那 22 GiB 就另有来源 —— 而这条我没查。**
+**⇒ 判据:在 KDA forward 前后打印 `torch.cuda.max_memory_allocated()`。**
+
+**⚠️ 而本段最贵的一课(第 7 次同类,但这次代价最大):**
+**这条路我做了 8 轮 MoE staging 才走到 —— 而入口只有两步:**
+1. **读 OOM 栈**(第 38 轮才做,1 次 grep);
+2. **读 config**(本轮,1 次 json 读)。
+**⇒ 两步的总成本不到 5 分钟;而绕路的成本是 8 轮 + 4 次 9 分钟运行 + 5 次口径错误。**
+**⇒ 规则(已写死"永远先做"):资源不足类问题,先读**失败点的栈**,再读**失败对象的 config/形状**。**
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
