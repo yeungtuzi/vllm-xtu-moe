@@ -238,7 +238,51 @@ def _gp_side_stream(dev):
 
 
 def gp_side_stream_enabled() -> bool:
-    return os.environ.get("XIAOTU_GP_ASM_SIDE_STREAM", "1") != "0"
+    """FP8 装配是否跑在**旁路流**上。**2026-09-21 起默认关闭。**
+
+    为什么改成默认关:旁路流是 **GLM-5.3-Flash 长 prompt 非法访存**的根因,
+    有单变量实测支撑(见 dev-docs/RND_CAMPAIGN_DIAGNOSIS.md §13/§15):
+
+    * `seqA`(旁路流开):`128:1:8` + `128:2:8` + `16384` ⇒ **必崩**,
+      `cudaMemcpy2DAsync` 报 `cudaErrorIllegalAddress`,`illegal=12`;
+    * `seqM`(**旁路流关**,`XIAOTU_GP_ASM_SIDE_STREAM=0`):**完全相同的序列**
+      ⇒ `ok=1/1`、`illegal=0`,且 `GPU prefill ACTIVE=84`(装配确实跑了 84 次);
+    * 两者只差这一个 env。
+
+    触发条件已定死:必须 `L=128 C=1` 与 `L=128 C=2` **两种 decode batch 都跑过**
+    (对应两张 CUDA graph)之后,第一次长 prompt 才越界;`CUDA_LAUNCH_BLOCKING=1`
+    也让它消失 ⇒ 是**异步/竞态**,不是尺寸越界(几何与两侧边界都已逐字节验算在界内)。
+
+    **代价(实测):** 长 prompt TTFT 从 ~89.8 s 升到 ~105.4 s(**+17%**)——
+    旁路流本来就是把这段 H2D 藏到 attention 后面用的。先修正确性,性能后续用
+    正确的流间同步(而不是关掉重叠)换回来。
+    `XIAOTU_GP_ASM_SIDE_STREAM=1` 仍可**显式**打开,仅供性能实验;
+    在流间同步被真正修好之前不要把它写回默认值。
+    """
+    return os.environ.get("XIAOTU_GP_ASM_SIDE_STREAM", "0") == "1"
+
+
+def gp_capturing() -> bool:
+    """当前流是否在 **CUDA graph 捕获**之中。
+
+    【2026-09-21 修 GLM 长 prompt 非法访存】FP8 装配必须感知捕获期:它整段跑在
+    **旁路流**上(`with torch.cuda.stream(_side)`),而 CUDA graph 捕获**不允许跨流
+    依赖**;更糟的是,H2D 的 `cudaMemcpy2DAsync` 会把**主机源指针烤进图里**,
+    回放时去读一个可能已经失效的地址 ⇒ `cudaErrorIllegalAddress`。
+
+    实测复现(见 dev-docs/RND_CAMPAIGN_DIAGNOSIS.md §13):只有先跑过
+    `L=128 C=1` 与 `L=128 C=2` **两种 decode batch**(对应两张 CUDA graph)之后,
+    第一次长 prompt 的装配才越界;而 `CUDA_LAUNCH_BLOCKING=1` 让它完全消失。
+
+    MXFP4 路径(`gpu_prefill.py`)对这件事有 **3 处**显式保护
+    (`wait_no_capture` / `wait_capture_done` / `is_current_stream_capturing`),
+    **FP8 路径一处都没有** —— 这是全案唯一的结构性不对称。
+    捕获期返回 True ⇒ 调用方退回"当前流 + 不建跨流事件"的保守路径。
+    """
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:  # noqa: BLE001  (驱动/后端缺席时按"没在捕获"处理)
+        return False
 
 
 # --- ping/pong K-major + cross-layer prefetch -------------------------------
@@ -1563,7 +1607,10 @@ class _XiaotuExpertsMixin:
                 if _t_split and os.environ.get("XIAOTU_GP_SPLIT_PRESYNC", "1") == "1":
                     torch.cuda.synchronize(_dev)
                 _t0 = time.perf_counter() if _t_split else 0.0
-                _side_ok = gp_side_stream_enabled()
+                # 【2026-09-21】捕获期**不能**用旁路流:见 gp_capturing() 的注释。
+                # 捕获期把 _side_ok 置 False ⇒ 走后面的 `elif _km is None:` 保守分支
+                # (在当前/捕获流上装配,不建跨流事件),与 MXFP4 路径的语义对齐。
+                _side_ok = gp_side_stream_enabled() and not gp_capturing()
                 if _side_ok:
                     # Pre-allocate the persistent buffers on the MAIN stream, then
                     # assemble on the side stream: the buffers outlive every layer
