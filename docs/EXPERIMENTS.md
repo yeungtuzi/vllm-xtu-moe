@@ -191,7 +191,8 @@ bf16 在 cc<8.0 硬报错。**更正我 §25.2**：`cp.async` **不是**真阻�
 
 | # | 内容 | 状态 |
 |---|---|---|
-| C1 | [vllm-project/vllm#57971](https://github.com/vllm-project/vllm/issues/57971) —— SM8x sparse-MLA prefill 回退核：**KV 按 head 重复读（64× 冗余）** + **~17× 带宽低效** | ✅ OPEN，作者 yeungtuzi |
+| C1 | [vllm-project/vllm#57971](https://github.com/vllm-project/vllm/issues/57971) —— SM8x sparse-MLA prefill 回退核 | ✅ OPEN，作者 yeungtuzi |
+| **C2** | **自更正评论**（[issuecomment-5762891125](https://github.com/vllm-project/vllm/issues/57971#issuecomment-5762891125)）：坦白「64× 冗余是事实但不是瓶颈」；给出 B10b 的实测表；把建议从「修冗余」改为「改 tile 形状」；并请维护者解释**为什么二维形式本身快 2.8×** | ✅ 已发 |
 
 **证据**：grid `(num_tokens, active_heads)`，而 `kv` 的寻址**不含 `head_idx`**
 ⇒ 64 个 head 各自重读同一份 latent。算法需 32.2 GB，实际读 2062 GB。
@@ -203,8 +204,11 @@ bf16 在 cc<8.0 硬报错。**更正我 §25.2**：`cp.async` **不是**真阻�
 
 | # | 任务 | 依据 | 状态 |
 |---|---|---|---|
-| **D1** | **pr4-A1'**：head 分块，`BLOCK_H=4`，**保留逐元素数学** ⇒ **bit 级 A/B**，隔离「KV 复用」收益 | `patches/upstream/pr4_body.md` | 待开始 |
-| **D2** | **pr4-A2**：`BLOCK_H=16` + `tl.dot` ⇒ KV 流量 /16 + 张量核 | 同上 | 待 D1 |
+| **D1'** | **改写 pr4**：按 B10b 改为「**二维 tile 形状**」为主（`BLOCK_H=2` 或 8，**不用 16**），KV 复用是附带；目标是端到端把 22.3 s → ~8 s | B10b | **立即做** |
+| ~~D1~~ | ~~A1' BLOCK_H=4 bit 级 A/B~~ | | ❌ 已废：非 bit 级（规约顺序），且 BLOCK_H=4 劣于 1/2/8 |
+| ~~D2~~ | ~~pr4-A2 BLOCK_H=16 + tl.dot~~ | | ❌ 已废：BLOCK_H=16 实测 0.58× 且精度差 60× |
+| **D1b** | **查清「二维 tile 为什么快 2.8×」** | B10b | 待做（也是问维护者的点） |
+| **D1c** | 端到端验证：把核换进 rebase 树，跑 16384 请求，确认 22.3 s → ~8 s 且无 illegal | B10b | 待 D1' |
 | **D3** | **锁页那 6.16 s 的 Pageable H2D**（16.22%），与模型/硬件无关、风险最低 | B4 | 待做 |
 | **D4** | 查清那个 **~25 s 固定项**（B5 的 ⚠️） | B5 | 待做 |
 | **D5** | 修 DeepSeek-V4.1 长 prompt 的 `aten::new_empty` 分配失败 | B1 | 待做 |
