@@ -1002,6 +1002,30 @@ Tried to allocate **120.00 MiB**;GPU 0 free **49.5 MiB**(与 D-1 完全一致)
 **⇒ ②b/②a 的预期不变:staging 7.59→4.2 GiB ⇒ MBT 16384 ⇒ 1 chunk ⇒
 按 B37 每-chunk 8.7 s ⇒ TTFT 70.2→~61.5 s ⇒ prefill 233.6→~266 tok/s(+14%)。**
 
+### B41 ❌ 最后一条便宜的替代路径也被否掉:`inter` 不能从 T*K 缩到 T
+
+**猜想**:`_buf("inter", (A, 2*I))` 里 `A = T*K = 131072` ⇒ 131072×2048×2 B = **512 MiB**。
+而其 wrapper docstring 写「`inter` 是按 **token id** 索引的,所以行数本来就要 ≥ T」
+⇒ 若真如此,**A 只需 T=16384 ⇒ 省 448 MiB,远超 256K/MBT=16384 所缺的 120 MiB** ⇒ 一行改动即可。
+
+**⇒ 读代码后否掉**:`down_kernel_fp8` **存与取都用 `g_rows`(排序后位置,可达 T*K)**:
+```python
+gate = tl.load(inter_ptr + g_rows[:, None] * inter_ld + ...)   # :35
+up   = tl.load(inter_ptr + g_rows[:, None] * inter_ld + ...)   # :38
+```
+**⇒ A = T*K 是正确的**,不能缩。
+**⚠️ 顺带发现 wrapper 的 docstring 措辞误导**(说按 token id 索引),**与 kernel 实际行为不符** ——
+**这条 docstring 本身值得修,以免后来者重复我这次的猜想。**
+
+**⇒ 至此所有"便宜的替代"都已穷尽:**
+
+| 替代路径 | 结论 |
+|---|---|
+| ③' 调 `GPU_UTIL` | ❌ util 上限没在起作用(B40) |
+| ③' `expandable_segments` | ❌ 实测无效(B40) |
+| `inter` 缩容省 448 MiB | ❌ **本轮否掉**(B41) |
+| **②b/②a staging** | ✅ **唯一剩余路径**,但需重排 ~40 行装配代码,且有**静默损坏权重**风险 |
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
