@@ -1711,6 +1711,35 @@ KDA 层 34 个;OOM 在第 **35** 层(实测,每 rank 35 行)—— 而第 35 层
 - **B64:改用外部轮询 ⇒ 零风险,一次成功**
 **⇒ 规则:测量优先选"不动被测对象"的手段;只有在无法外部观测时才改源码。**
 
+
+### B66 ✅ `FLA_CHUNK_SIZE` 已做成 env 可覆盖并**落成 patch**(树已回滚,干净)
+
+**改动(一行,默认 64 ⇒ 零行为变化):**
+```python
+- FLA_CHUNK_SIZE = 64
++ FLA_CHUNK_SIZE = int(os.getenv("FLA_CHUNK_SIZE", "64"))
+```
+**⇒ patch: `patches/upstream/fla-chunk-size-env.patch`(13 行)。**
+**⇒ 手法与 `XIAOTU_GPF_GEMM_*` 相同(那次成功且默认值不变)。**
+
+**⚠️ 执行过程的纪律(这次做对了):**
+```
+① 改前记 md5(bb25d4cc7af59afa61782167f0ef7b70)
+② 改 → 语法校验 → `git diff` 导出 patch
+③ **立即回滚**(cp 备份)**并校验 md5 回到原始**
+④ git status 确认树干净
+```
+**⇒ 全程约 30 秒,树未留脏。**(对比 B63:改源码注入探针 ⇒ 树脏 10 分钟。)
+
+**⇒ 下一步(明确,但需 2 次运行 + 数值 A/B):**
+1. `git apply patches/upstream/fla-chunk-size-env.patch`(在树副本或临时应用+回滚);
+2. **先验证 `FLA_CHUNK_SIZE=128` 能被 Triton 核接受**(否则直接失败,省掉后续);
+3. **数值 A/B**(`/tmp/ab_one.sh`,判据 `token_ids`+`logprobs`):64 vs 128 必须一致;
+4. 一致则跑 256K/MBT=16384 ⇒ 预期 `Successful=1` ⇒ 1 chunk ⇒ 按 B37 省 8.7 s;
+5. 全部通过后,把 patch 与判据写进 `pr4_body.md` 式的交付说明,并更新 README/CHANGELOG。
+
+**⚠️ 我在此停手:上下文已尽。上面 5 步每步都需要运行且需要判读,
+而我在能力不足时的判断已被本段反复证明不可靠(6 次口径错误)。**
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

@@ -1,0 +1,13 @@
+diff --git a/vllm/third_party/flash_linear_attention/ops/utils.py b/vllm/third_party/flash_linear_attention/ops/utils.py
+index d8e7db9349..cda7f5c7c9 100644
+--- a/vllm/third_party/flash_linear_attention/ops/utils.py
++++ b/vllm/third_party/flash_linear_attention/ops/utils.py
+@@ -28,7 +28,7 @@ FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
+ SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
+ 
+ # Default chunk size used across FLA triton kernels (kda, chunk, chunk_o, etc.)
+-FLA_CHUNK_SIZE = 64
++FLA_CHUNK_SIZE = int(os.getenv("FLA_CHUNK_SIZE", "64"))   # 可覆盖;默认 64 = 行为不变
+ 
+ 
+ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
