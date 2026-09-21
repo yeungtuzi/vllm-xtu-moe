@@ -82,17 +82,68 @@ but **I have not verified that** -- the check would be diffing `convert_layout` 
 2.81x of the 2.88x: changing only the `q` load. I have kept the head-blocked form because it
 is the one measured end-to-end, but the minimal version is the one worth reviewing.
 
+## Precedent in this codebase
+
+Head-blocked prefill is not a new idea here. `sparse_mla_kernels.py` already contains a
+head-blocked path for the same kind of attention:
+
+```python
+_PREFILL_INDEXED_HEAD_BLOCK = 8                      # line 1041
+def accumulate_indexed_sparse_mla_attention_chunk(...):
+    head_block = _PREFILL_INDEXED_HEAD_BLOCK
+    if num_heads >= head_block:
+        grid = (num_tokens, triton.cdiv(num_heads, head_block))
+        _accumulate_indexed_attention_chunk_multihead_kernel[grid](..., HEAD_BLOCK=head_block, ...)
+```
+
+and it is already used in production by two models:
+
+* `vllm/models/deepseek_v4/nvidia/flashmla.py:755`
+* `vllm/models/deepseek_v41/nvidia/flashmla.py:569`
+
+GLM does not use it. `flashmla_sparse_sm8x.py:165` calls `sparse_mla_fwd_with_sink`, the
+per-token kernel with no head blocking, and that backend sets
+`supports_dense_mha_prefill = False` with a comment saying every token, prefill included, is
+forced through the sparse-MQA gather path.
+
+Two things follow. The block size in this patch is not arbitrary -- `BLOCK_H = 8` matches
+`_PREFILL_INDEXED_HEAD_BLOCK`, which is the value already in use. And the approach has
+production precedent rather than being an unproven idea.
+
+It does **not** follow that the fix should instead be to route GLM through
+`accumulate_indexed_sparse_mla_attention_chunk`. I assumed that at first and had to withdraw
+it: the two are different decompositions, not one function called differently. That path runs
+a token-chunk loop around a topk-chunk loop plus a separate finish kernel, with
+`max_score`/`denom`/`acc` allocated and threaded by the caller, so adopting it means
+restructuring GLM's prefill into that pipeline. This patch is self-contained and keeps GLM's
+single-call interface, which is probably the smaller change of the two.
+
 ## Open items
 
-1. **The 1-D-broadcast explanation is still unverified** (see above) -- the bisect says where
-   the time goes, not why.
-2. **End-to-end numerics** were not checked — the standalone harness compared kernels, the
-   end-to-end run only measured time. A quality check is still owed.
-3. `BLOCK_H` should be 2 or 8; 4 is a local optimum to avoid and 16 is bad. `BLOCK_H=8` is
-   what the patch uses.
-4. The patch also depends on a detail worth re-checking: the wrapper zeroes heads past
-   `num_heads`, and the new kernel writes them via `head_mask` instead. That path was not
-   exercised in my tests (H was always a multiple of BLOCK_H).
+1. **The 1-D-broadcast explanation is still unverified.** The bisect says where the time goes
+   (the 2-D `q` load), not why. A TTIR/PTX diff would settle it; I tried `TRITON_KERNEL_DUMP`
+   and failed to capture both variants (switching the dump dir within one process caught only
+   the second kernel; separate processes caught neither). Reading `asm` out of the compiled
+   kernel via `device_caches` or `triton.compile` is the untried alternative. **Do not state
+   the layout-conversion explanation as fact until then.**
+2. **End-to-end numerics are unverified.** Kernel-level A/B is done: `max|diff| = 2.819e-05`
+   at realistic shapes, from reduction order, not bit-exact. Confirming that this propagates
+   to identical model output is still owed. Six attempts failed on my own scripting, not on
+   the code — a one-word prompt, a `$tag_w` typo, a `pgrep` matching my own command line, a
+   relative patch path that silently compared the unpatched kernel against itself, a
+   comparison on `message.content` when `finish_reason=length` leaves it `None`, and a missing
+   `chmod +x`. A seventh version is ready (arm B only, absolute patch path, compare
+   `token_ids`, no `kill -PGID`) but has not been run.
+3. `BLOCK_H` should be 2 or 8; 4 measured worse than 1, 2 and 8 (non-monotonic, looks like an
+   occupancy effect) and 16 was a clear loss on both time and precision. It is 8 here, which
+   also matches `_PREFILL_INDEXED_HEAD_BLOCK`.
+4. The wrapper zeroes heads past `num_heads`; the new kernel writes them under `head_mask`
+   instead. **That path was never exercised** — every test used `H` a multiple of `BLOCK_H`,
+   and GLM's 64 heads divide evenly by 8, so the masking branch is untested.
+5. The rebase tree was reverted after each measurement and verified by md5 and `diff -q`
+   against a backup. One exception is recorded in the experiment ledger (B20): a run was
+   interrupted after `git apply` but before the revert, leaving the tree modified; it was
+   caught and reverted, and the three-way check is now mandatory rather than incidental.
 
 ## Appendix: the superseded head-blocking rationale
 
