@@ -1,0 +1,102 @@
+diff --git a/vllm/v1/attention/backends/mla/sparse_mla_kernels.py b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
+index 84c1a0ab80..f311fc84a2 100644
+--- a/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
++++ b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
+@@ -3597,6 +3597,78 @@ def _sparse_mla_fwd_with_sink_kernel(
+     )
+ 
+ 
++# --- pr4 临时验证:head 分块变体(2026-09-21) ---------------------------------
++# 同一数学、同一 per-token topk 索引;仅把 q / running_acc 变成二维 (BLOCK_H, BLOCK_D)
++# tile,让 BLOCK_H 个 head 共用一个 KV tile。独立测试台(/tmp/kern_ab.py)实测:
++# 真实尺寸下 BLOCK_H=1 即 2.78x(无复用),BLOCK_H=8 为 2.88x(复用再 +3%)。
++# ⚠️ 非 bit 级:max|diff| ≈ 2.8e-05,来自 tl.sum 的规约顺序。
++@triton.jit
++def _sparse_mla_fwd_with_sink_kernel_hb(
++    q_ptr, kv_ptr, indices_ptr, lens_ptr, attn_sink_ptr, output_ptr,
++    stride_q_t, stride_q_h, stride_q_d,
++    stride_kv_r, stride_kv_d,
++    stride_idx_t, stride_idx_k,
++    stride_out_t, stride_out_h, stride_out_d,
++    qk_scale,
++    num_heads: tl.constexpr,
++    head_dim: tl.constexpr,
++    topk: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++):
++    token_idx = tl.program_id(0)
++    head_blk = tl.program_id(1)
++    head_offs = head_blk * BLOCK_H + tl.arange(0, BLOCK_H)
++    head_mask = head_offs < num_heads
++
++    dim_offsets = tl.arange(0, BLOCK_D)
++    dim_mask = dim_offsets < head_dim
++
++    q = tl.load(
++        q_ptr + token_idx * stride_q_t
++        + head_offs[:, None] * stride_q_h + dim_offsets[None, :] * stride_q_d,
++        mask=head_mask[:, None] & dim_mask[None, :], other=0.0,
++    ).to(tl.float32)
++
++    length = tl.load(lens_ptr + token_idx)
++    running_max = tl.load(attn_sink_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32)
++    running_denom = tl.zeros((BLOCK_H,), tl.float32) + 1.0
++    running_acc = tl.zeros((BLOCK_H, BLOCK_D), tl.float32)
++
++    for k_start in range(0, topk, BLOCK_K):
++        candidates = k_start + tl.arange(0, BLOCK_K)
++        k_mask = (candidates < length) & (candidates < topk)
++        row = tl.load(
++            indices_ptr + token_idx * stride_idx_t + candidates * stride_idx_k,
++            mask=k_mask, other=0,
++        ).to(tl.int64)
++        row_safe = tl.where(k_mask, tl.maximum(row, 0), 0)
++        kv = tl.load(
++            kv_ptr + row_safe[:, None] * stride_kv_r + dim_offsets[None, :] * stride_kv_d,
++            mask=k_mask[:, None] & dim_mask[None, :], other=0.0,
++        ).to(tl.float32)
++
++        scores = tl.sum(q[:, None, :] * kv[None, :, :], axis=2) * qk_scale
++        scores = tl.where(k_mask[None, :], scores, -float("inf"))
++        next_max = tl.maximum(running_max, tl.max(scores, axis=1))
++        previous_weight = tl.exp(running_max - next_max)
++        weights = tl.exp(scores - next_max[:, None])
++        running_acc = running_acc * previous_weight[:, None] + tl.sum(
++            weights[:, :, None] * kv[None, :, :], axis=1
++        )
++        running_denom = running_denom * previous_weight + tl.sum(weights, axis=1)
++        running_max = next_max
++
++    tl.store(
++        output_ptr + token_idx * stride_out_t
++        + head_offs[:, None] * stride_out_h + dim_offsets[None, :] * stride_out_d,
++        running_acc / running_denom[:, None],
++        mask=head_mask[:, None] & dim_mask[None, :],
++    )
++# --- pr4 临时验证 end -------------------------------------------------------
++
++
+ def sparse_mla_fwd_with_sink(
+     q: torch.Tensor,
+     kv: torch.Tensor,
+@@ -3636,7 +3708,9 @@ def sparse_mla_fwd_with_sink(
+     topk = indices.shape[-1]
+     head_dim = q.shape[-1]
+     block_d = 512 if head_dim <= 512 else next_power_of_2(head_dim)
+-    _sparse_mla_fwd_with_sink_kernel[(num_tokens, active_heads)](
++    _HB_BLOCK_H = 8
++    _HB_H_BLOCKS = (active_heads + _HB_BLOCK_H - 1) // _HB_BLOCK_H
++    _sparse_mla_fwd_with_sink_kernel_hb[(num_tokens, _HB_H_BLOCKS)](
+         q,
+         kv,
+         indices,
+@@ -3659,6 +3733,7 @@ def sparse_mla_fwd_with_sink(
+         topk,
+         BLOCK_K=16,
+         BLOCK_D=block_d,
++        BLOCK_H=_HB_BLOCK_H,
+         num_warps=8,
+     )
+     if q.shape[1] > active_heads:
