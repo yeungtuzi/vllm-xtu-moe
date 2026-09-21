@@ -185,7 +185,13 @@ xiaotu_moe variant = _avx512_bf16
   —— **以后调 util 就看这一行的 slack**,不要凭感觉。
 * **生产默认因此从 util 0.90 降到 0.85**(实测 KV 池 988,081 → **971,949** token,只掉 1.6%;
   2 路 256K 占 54%),并加 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 治那份 695 MiB 碎片
-  (本服务没有 KV connector,不触发 vLLM 对该 env 的兼容性报错)。要回 0.90 请先确认 slack 够。
+  (本服务没有 KV connector,不触发 vLLM 对该 env 的兼容性报错)。
+  > **2026-09-20 更新**:那次 0.90 装不下的**真因是"没有封顶 KV 池"** —— 池把预算填满,
+  > 7.59 GiB 的持久 staging 与激活峰自然挤不下。**现在 `serve_glm53_mainline.sh` 默认
+  > `GPU_UTIL=0.90` + 自动按 `MAXLEN×SEQS` 封顶 KV(见 §5.1b)** ⇒ 池不再顶满预算,
+  > 0.90 的前提已经变了。**若仍要保守,可用 `GPU_UTIL=0.85`(池与 cap 都由脚本算)。**
+  > ⚠️ **该新默认尚未在本机做过 A/B**(cap 固定、扫 util 0.82/0.86/0.90);
+  > 未经 A/B 前,生产可先用 0.85 兜底。
 * **验收(已在 8070 实跑)**:32,077-token 真实长请求(**TTFT 108.4 s**)、两路并发
   (14,084 + 15,423 token)全部跑通、零 OOM;4096/64 C=1 基准 22,650 ms / 2.50 tok/s
   (旧 util 0.90:22,764 ms / 2.49)—— 换配置**没有性能回退**。
