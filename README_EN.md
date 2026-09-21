@@ -54,9 +54,9 @@
    > the user retired it from the priority list); (b) the activation workspace is added — it
    > scales with the chunk (i.e. MBT) and was the real cause of two consecutive long-prompt OOMs,
    > yet it had never been listed.
-4. Exactly one copy of the weights in host memory (not "source tensors + engine copy").
-5. Engine efficiency benchmarked against the best available. `xiaotu_moe` is compared with
-   `lk_moe` on the same machine, same weights, same thread count; the target is at least 90% of it.
+4. One copy of the weights even across the multiple NUMA nodes of a single server:
+   each NUMA node only reads and writes its local memory, maximising performance while
+   saving memory.
 
 ---
 ## Measurement host
