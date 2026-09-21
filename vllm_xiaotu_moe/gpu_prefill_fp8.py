@@ -272,7 +272,14 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
     w13_raw = _buf("raw13", (E, 2 * I, H), device)
     c13 = int(geo["w13_cbytes"])
     cr13 = int(geo["w13_crows"])
-    w2_raw = _buf("raw2", (E, H, I), device)
+    # 【②c】raw2 复用 raw13 的存储:raw13=(E,2I,H)=2.25GiB 恰好是 raw2=(E,H,I)=1.12GiB 的 2 倍,
+    # 因而 raw13 的存储装得下 raw2 ⇒ 省 1.12 GiB 设备显存。
+    # ⚠️ 代价:DMA/转置流水被串行化(见下方 w13 转置被提前到 w2 DMA 之前)。
+    # `XIAOTU_GPF_RAW2_SHARE=0` 可退回独立缓冲(一键回滚)。
+    if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "1") == "1":
+        w2_raw = w13_raw.view(-1)[: E * H * I].view(E, H, I)
+    else:
+        w2_raw = _buf("raw2", (E, H, I), device)
     c2 = int(geo["w2_cbytes"])
     cr2 = int(geo["w2_crows"])
     _dma2d = _dma2d_available(engine)
@@ -289,6 +296,7 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
             e.record(torch.cuda.current_stream(device))
             _ev[name] = e
 
+    w13t = None
     _hit("start")
     if _dma2d:
         stream = torch.cuda.current_stream(device).cuda_stream
@@ -312,6 +320,9 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
                         f"gpu-prefill: 2-D shard DMA failed (w13 node={n} off={_off}: "
                         f"{got}/{cr13 * H * E} bytes)")
         _hit("w13")
+        # 【②c】w13 转置必须在 w2 的 DMA 之前完成 —— 否则 w2 的 DMA 会覆盖 raw13。
+        if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "1") == "1":
+            w13t = _kmajor_bytes(w13_raw, _buf("km13", (E, H, 2 * I), device))
         for n in range(ns):
             c0 = n * cr2
             got = engine.copy_hostbuf_to_device_2d(
@@ -329,6 +340,9 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
             w13_raw[:, c0:c0 + cr13, :].copy_(blk[:, 0, :].reshape(E, cr13, H))
             w13_raw[:, I + c0:I + c0 + cr13, :].copy_(blk[:, 1, :].reshape(E, cr13, H))
             del buf, blk
+        # 【②c】同上:先把 w13 转置做完,再让 w2 的 DMA 覆盖 raw13。
+        if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "1") == "1":
+            w13t = _kmajor_bytes(w13_raw, _buf("km13", (E, H, 2 * I), device))
         for n in range(ns):
             buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
             c0 = n * cr2
@@ -349,13 +363,13 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
     s2t = s2_raw.transpose(1, 2).contiguous()        # [E, I/128, H/128]
 
     if dst is not None:
-        w13t = _kmajor_bytes(w13_raw, dst[0])
+        w13t = w13t if w13t is not None else _kmajor_bytes(w13_raw, dst[0])
         w2t = _kmajor_bytes(w2_raw, dst[1])
     else:
         # Reuse the K-major targets too: fresh-per-layer allocation is the
         # documented ~365 ms/layer allocator churn (NOTES §466). One slot is
         # safe here because assembly and GEMM are strictly ordered on one stream.
-        w13t = _kmajor_bytes(w13_raw, _buf("km13", (E, H, 2 * I), device))
+        w13t = w13t if w13t is not None else _kmajor_bytes(w13_raw, _buf("km13", (E, H, 2 * I), device))
         w2t = _kmajor_bytes(w2_raw, _buf("km2", (E, I, H), device))
     _stage_mark(_t_dma_end, "tr")
     if _trace:
