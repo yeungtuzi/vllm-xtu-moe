@@ -82,39 +82,36 @@ Every performance number below was taken on this machine:
 
 | Model (optimal config) | prompt | actual tokens | conc. | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
-| **GLM-5.3-Flash**<br>TP=2 · util 0.82 · GPU prefill<br>KV capped 2 GiB · MBT 4096 · MTP off | short | 140 | 1 | **115.2** | **22.0** |
+| **GLM-5.3-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 12288 · MTP off | short | 140 | 1 | **115.2** | **22.0** |
 | | short | 140 | 2 | **70.4** | 13.9 |
-| | long | 16,396 | 1 | **155.3** | **21.5** |
-| | long | 16,396 | 2 | **119.5** | 1.7 |
-| **DeepSeek-V4.1-Flash**<br>TP=2 · GPU prefill<br>KV capped 1.0 GiB · MBT 16384 · spec decode off | short | 128 | 1 | **254.3** | **19.8** |
+| | long | 16,396 | 1 | **266.3** | **21.4** |
+| | long | 16,396 | 2 | pending † | pending † |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 4096 · spec decode off | short | 128 | 1 | **254.3** | **19.8** |
 | | short | 128 | 2 | **175.2** | 14.0 |
+| | long | 16,384 | 1 | **115.8** | **18.7** |
+| | long | 16,384 | 2 | pending † | pending † |
 
-> **MiMo-V2.5 is still supported** (see "Supported models"), but since its successor MiMo-2.6
-> is about to be released, this table **no longer lists its performance data**.
+> † **The two long/C=2 cells are not yet available.** Configuration and criteria for the rest follow.
 
-## Long context (256K) long prefill
-
-The table above uses a 32K budget. The one below is measured **with a required 256K context**
-(`MAXLEN=262144`), giving everything else to GPU prefill. **Single 16384-token random prompt,
-C=1, prefix caching on.**
-
-| Model | prefill (tok/s) | decode (tok/s) | TTFT | Key config | Criteria |
-|---|---|---|---|---|---|
-| **GLM-5.3-Flash** | **266.3** | **21.4** | 61,562 ms | TP=2 · util 0.85 · **MBT 12288** · `KV_CACHE_BYTES=5113807360` (4.76 GiB) | `[fp8-asm]=168`, `DISABLED=0`, `illegal=0` |
-| **DeepSeek-V4.1-Flash** | **115.8** | **18.7** | 141,618 ms | TP=2 · util 0.85 · **MBT 4096** · `KV_CACHE_BYTES=8031830016` (7.48 GiB) | `DISABLED=0`, `aten::new_empty=0`, `illegal=0` |
-
-* The KV cap is set to the **engine-derived requirement** (GLM 19,505 B/token, V4.1 30,639
-  B/token) with **no multiplicative margin** -- at 256K a 10% margin is 0.48 GiB and was measured
-  to OOM.
-* **MBT is the critical knob at 256K**: GLM OOMs at `MBT=16384` and succeeds at
-  **`MBT=12288`** (two chunks, the first larger and so more efficient); `MBT=8192` also works but
-  is 14% slower; V4.1 hits an `aten::new_empty` allocation failure at `MBT=16384` and succeeds at
-  `MBT=4096`. Mechanism in `docs/PREFILL_KNOWN_ISSUES.md`.
-* Neither model uses speculative decoding here (random tokens are its worst case, and the draft
-  layer competes with long prefill for VRAM).
-* **MiMo-V2.5 cannot run at 256K**: its KV is about 248 KiB/token (GLM's is 19 KiB), so 256K
-  needs **61.9 GiB/rank** against a 35.5 GiB budget -- a factor of 1.74, determined by
-  architecture rather than configuration.
+* **Context**: every configuration in this table **guarantees at least 256K** (`MAXLEN=262144`). The KV cap is
+  set to the **engine-derived requirement** (GLM 19,505 B/token, i.e. 4.76 GiB; V4.1 30,639 B/token, i.e.
+  7.48 GiB) with **no multiplicative margin** -- at 256K a 10% margin is 0.48 GiB and was measured to OOM.
+* **Criteria for the long-prompt cells**:
+  * GLM-5.3-Flash: TTFT 61,562 ms; `[fp8-asm]=168` (42 layers x 2 chunks x 2 ranks), `DISABLED=0`, `illegal=0`, `OOM=0`.
+  * DeepSeek-V4.1-Flash: TTFT 141,618 ms; `DISABLED=0`, `aten::new_empty=0`, `illegal=0`, `OOM=0`.
+* **MBT is the critical knob at 256K**: GLM OOMs at `MBT=16384` (measured, layer 35) and succeeds at
+  **`MBT=12288`** (two chunks, the first larger and so more efficient); `MBT=8192` also works but is 14%
+  slower (233.6 tok/s) and `MBT=4096` is 34% slower (154.5 tok/s) while allowing a longer context. The
+  three-tier trade-off is in `docs/TUNING_GUIDE.md` section 8. V4.1 hits an `aten::new_empty` allocation
+  failure at `MBT=16384` and succeeds at `MBT=4096`.
+* **The three short-prompt rows come from an earlier measurement round under a 32K budget** (a different
+  configuration from the 256K one listed above) and **have not been re-measured under 256K**.
+* Neither model uses speculative decoding (random tokens are its worst case, and the draft layer competes
+  with long context for VRAM).
+* **MiMo-V2.5 is still supported** (see "Supported models"), but since its successor MiMo-2.6 is about to be
+  released this table **no longer lists its performance data**. Note also that MiMo-V2.5 **cannot run at
+  256K** (its KV is about 248 KiB/token, so 256K needs 61.9 GiB/rank, 1.74x the single-card budget --
+  an architectural limit).
 
 ## Quick start
 
