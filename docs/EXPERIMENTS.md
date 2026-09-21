@@ -1351,6 +1351,52 @@ MBT= 8192: inter = 0.25 GiB
 **⚠️ 而且它与我先前的一条推断(「H2D 是关键路径的首选嫌疑」)**并不冲突但需要区分**:
 H2D 是**时间**上的瓶颈嫌疑,这 22 GiB 是**显存**上的未归属。两者是不同的轴。**
 
+### B53 ⭐⭐⭐ **决定性发现:256K 下的 OOM 根本不在 MoE staging,而在 KDA(线性注意力)的中间态**
+
+**从 OOM 栈逐帧读出(实测,`logs/g9.log` 600-700 行):**
+```
+glm5next/common/model.py:520            forward
+ → glm5next/common/kda.py:438           forward
+ → compilation/breakable_cudagraph.py:104  wrapper
+ → glm5next/common/kda.py:670           _forward
+ → glm5next/nvidia/ops/third_party/kda/kernels.py:1230  chunk_kda_with_fused_gate
+ → kernels.py:1156                      chunk_kda_with_fused_gate_fwd
+ → kernels.py:1056                      _chunk_kda_fwd_with_cumulative_g
+ → flash_linear_attention/ops/chunk_delta_h.py:352
+   **chunk_gated_delta_rule_fwd_h**     ← **OOM 在这里**
+```
+
+**而该函数的分配点是(代码事实):**
+```python
+# chunk_delta_h.py:352
+h = k.new_empty(B, NT, H, V, K)         # NT = triton.cdiv(T, BT) = **chunk 数**
+```
+
+**⇒ 大小 ∝ `NT = T/BT`(T = 本次 forward 的 token 数 = MBT)。**
+按 KDA 常见形状估算(⚠️ H/V/K 未读 config,是假设):
+```
+T=16384 BT=64  ⇒ NT=256  h = 1.00 GiB(fp32) / 0.50 GiB(bf16)
+T= 8192 BT=64  ⇒ NT=128  h = 0.50 GiB / 0.25 GiB      ← **MBT 减半 ⇒ h 减半**
+```
+
+**⇒ 这一条**解释了本段全部现象**:**
+1. **MBT 16384→8192 就能跑** —— 因为 `h` 随之减半;
+2. **省 1.12 GiB staging(②c)几乎无用** —— 因为要腾的是 KDA 的 `h`,不在同一子系统;
+3. **`expandable_segments` 无效** —— 不是碎片,是真实的中间态需求;
+4. **B52 的「22 GiB 未归属」有了着落** —— 极可能就是 KDA 的中间态(按上式每层 ~1 GiB × 多份)。
+
+**⇒ ⭐ 最重要的推论:② 一直在打错的子系统。**
+**真正的杠杆是:**
+| 杠杆 | 机制 | 备注 |
+|---|---|---|
+| **提高 `BT`(KDA chunk size)** | `h ∝ 1/BT` ⇒ **BT 翻倍即 `h` 减半** | **最直接** —— 若能配 |
+| 降 MBT | 同上,有效但每 chunk 代价 8.7 s(B37) | 已在用(MBT=8192) |
+| 把 KDA prefill 再分块 | 让 `h` 只覆盖子块 | 需改调用 |
+
+**⚠️ 未验证**:①`H/V/K` 的实际值(决定 `h` 的绝对大小);②`BT` 是否可配、改了是否影响数值;
+③`h` 是否真占 22 GiB(B52 的算术仍是推断)。
+**⇒ 但"OOM 在 KDA 而非 MoE"这一条是**读栈得到的硬事实**,足以推翻本段前面对 ② 的全部投入方向。**
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
