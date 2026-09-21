@@ -219,7 +219,7 @@ xiaotu_moe variant = _avx512_bf16
 |---|---|---|
 | `--tensor-parallel-size` | `1`(单卡)或 `2` | 目前**不支持 expert_map(EP)**,TP>1 走权重分片 |
 | `--max-model-len` | GLM-5.3:**交付默认 262144(256K)**,实测可起 512K/704K;DeepSeek-V4 系列先 `4096`–`8192` 再放大 | KV 单价差异极大:**GLM-5.3 ≈ 11.9-12.3 KB/token**,DeepSeek-V4.1 ≈ 40 KB/token |
-| `--gpu-memory-utilization` | GLM-5.3:`0.85`(v0.2.2 及以前)/ **`0.82`(0.2.3 rebase 后)**;开 MTP 时必须 `0.82` 或 `GP_PREFILL=0` | 非专家权重 + KV cache 在显存;见 §3.2 的 slack |
+| `--gpu-memory-utilization` | **默认 `0.90`**(2026-09-20 起);**必须与 `KV_CACHE_BYTES` 同时设** | **原则:留给 staging+激活 = util×VRAM − 非专家 − KV 池** ⇒ **util 尽量高、KV 池按需最小**。⚠️ 只提 util 不封顶 ⇒ 池填满预算、staging 被逐层拒(比不开还慢)、长 prompt 激活 OOM(**0.2.3 的 0.85 回归**)。**顺序:先定 cap,再提 util。** 若启动报 `Free memory ... less than desired`,按实际空闲把 util 降下来 |
 | `SPEC_K`(env,`serve_glm53_mainline.sh`) | **默认 `0`(关)** —— 2026-09-20 用户裁定关闭 | `1..4` ⇒ `--speculative-config method=mtp`。**收益/代价严重不成比例,故默认关**:收益只有 decode **+3%**(21.9→22.6 tok/s,噪声内;ShareGPT 上只有 +2%),代价却是 ①draft 第 45 层常驻 **3.38 GiB/rank** ②KV 池 **−27%**(915,487→666,366,256K 并发 3.49×→2.54×)③ITL 脉冲化 46→64 ms。**而且它是长 prompt OOM 的元凶** —— 详见 §3.7。`k>1` 更差(k=4 掉到 11.2 tok/s)。数据见 `MODEL_GUIDES.md` §2.6 |
 | `SPEC_CONFIG`(env,`serve_glm53_mainline.sh`) | 默认空 | 透传任意 vLLM 投机配置 JSON(覆盖 `SPEC_K`),用于 **外挂 draft** 方案:`ngram` / `suffix` / `eagle` / `eagle3` / `medusa` / `draft_model`。⚠️ `ngram` 需要 `numba`(本环境未装,启动会 `ModuleNotFoundError: numba`) |
 | `GP_PREFILL`(env,`serve_glm53_mainline.sh`) | 默认 `1`(开);**不稳时置 `0`** | `0` ⇒ 把 `XIAOTU_GP_ACT_RESERVE_GIB` 拉到 99 ⇒ GPU 流式预填充永不放行(长 prompt 退 CPU,慢但稳) |
@@ -736,6 +736,31 @@ curl -s http://127.0.0.1:8070/metrics | grep -E "num_requests_running|spec_decod
 | `XIAOTU_ENGRAM_VERIFY` | **1** | 表内容逐 chunk 抽验、失败 fail-closed(§564) |
 | GPU 预填充 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` | 由 `vram_policy` 给(**4096**;§603 按实测盈亏平衡 ~2860 token 定) | GPU 路径非逐位确定(§572),但更快;低于 ~2860 反而更慢 |
 | 投机解码 | `--speculative-config dspark` | R-VRAM 优先级 3 |
+
+### 5.1b ⭐ 显存预算的正确设法学(2026-09-20 定案)
+
+```
+留给 staging + 激活工作区 = util × VRAM − 非专家权重 − KV 池
+```
+* **`util` 是总预算上限,`KV_CACHE_BYTES` 是只给 KV 的上限**;
+* **只提 util 不封 KV** ⇒ 池会**填满预算**(vLLM 按"填满 util"定池,与 maxlen 无关)
+  ⇒ staging 被逐层拒(静默退回 CPU 预填充,**比不开还慢**)、长 prompt 激活 OOM;
+* **只封 KV 不提 util** ⇒ 池合适了,但总预算小,留给激活的也少;
+* ⇒ **两者同时设**:`util` 拉高做预算,`KV_CACHE_BYTES` 按需封池,**差额全给 staging + 激活**。
+
+**KV 标尺(本机 GLM 实测,分毫不差)**:`6 GiB ↔ 293,651 token` ⇒ **48,942 token/GiB**。
+
+| 目标 | 需要 token | 折合 cap |
+|---|---|---|
+| 256K × 2 | 524,288 | **≥ 11.8 GiB** |
+| 256K × 3 | 786,432 | ≥ 17.6 GiB |
+| 32K × 2 | 65,536 | ≥ 1.5 GiB |
+
+**`serve_glm53_mainline.sh` 已内建**:不给 `KV_CACHE_BYTES` 时**按 `MAXLEN × SEQS × 1.10` 自动推算**
+(262144×2 ⇒ 自动 11.8 GiB),`GPU_UTIL` 默认 **0.90**。
+
+⚠️ **前提**:`util` 不得超过**启动时的实际空闲比例**,否则报
+`Free memory on device cuda:N (...) is less than desired GPU memory utilization`。
 
 ### 5.2 R-VRAM 策略(权威输出)
 

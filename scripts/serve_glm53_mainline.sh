@@ -37,7 +37,13 @@ TP="${TP:-2}"
 # 现在也把这份激活预留算进去,腾不出来就**优雅退回 CPU 预填充**而不是崩服务。
 # 代价:KV 池 988,081 → ~814,000 token(2 路 256K 仍占 64%,3.1x 并发)。
 # 要换回更大的 KV 池,先量 `GPU prefill ACTIVE ... slack` 那行的余量再动。
-GPU_UTIL="${GPU_UTIL:-0.85}"
+# 【2026-09-20 新默认:util 高 + 显式封顶 KV】
+# 原则:留给 staging+激活的空间 = util×VRAM − 非专家 − KV池
+#   ⇒ **util 尽量高**(把总预算做大)、**KV 池按需最小**(用 KV_CACHE_BYTES 封顶)。
+#   ⚠️ 只提 util 不封顶 ⇒ 池会填满预算、staging 被逐层拒(比不开 GPU 预填充还慢),
+#      长 prompt 激活也会 OOM(0.2.3 的 0.85 回归就是这么来的)。
+#   ⇒ **顺序:先定 cap,再提 util。**
+GPU_UTIL="${GPU_UTIL:-0.90}"
 # Context length. The 4096 this script used to default to was a *test* setting, not a
 # hardware limit: measured on 2xA100-40GB at util 0.88 (bf16 KV, TP=2), the KV pool and
 # the largest max-model-len that starts are
@@ -144,7 +150,16 @@ ARGS=(
 # 【RUNBOOK §5.8 铁律】开 GPU 预填充时**必须**显式封顶 KV 池,否则 vLLM 会把 util 填满、
 # 让 staging/投机/长 prefill 激活没地方放 ⇒ 长 prompt 直接 CUDA OOM。
 # 用法:KV_CACHE_BYTES=6442450944(6 GiB) bash scripts/serve_glm53_mainline.sh
-[ -n "${KV_CACHE_BYTES:-}" ] && ARGS+=(--kv-cache-memory "$KV_CACHE_BYTES")
+# cap 未显式给定时,**按 maxlen × 并发 自动推算**(留 1.10 余量)。
+# 标尺:GLM 实测 6 GiB ↔ 293,651 token ⇒ **48,942 token/GiB**(分毫不差)。
+# 例:MAXLEN=262144、SEQS=2 ⇒ 524,288×1.10=576,717 tok ⇒ ~11.8 GiB。
+if [ -z "${KV_CACHE_BYTES:-}" ]; then
+  _tok=$(( MAXLEN * SEQS * 11 / 10 ))
+  KV_CACHE_BYTES=$(( _tok * 1073741824 / 48942 ))
+  echo "[glm53] KV 池自动封顶: ${KV_CACHE_BYTES} bytes(~$(( KV_CACHE_BYTES / 1073741824 )) GiB) "\
+       "for maxlen=${MAXLEN} × seqs=${SEQS}"
+fi
+ARGS+=(--kv-cache-memory "$KV_CACHE_BYTES")
 if [ -n "${SPEC_CONFIG:-}" ]; then
   # Escape hatch: any other vLLM speculative method (ngram / eagle / medusa /
   # draft_model / suffix), passed through verbatim as JSON. Overrides SPEC_K.
