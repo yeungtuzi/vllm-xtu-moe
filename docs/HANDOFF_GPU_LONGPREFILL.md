@@ -766,3 +766,30 @@ grep -ic "nan|inf|invalid"          logs/abl_fakeall.log  →  7      ← 启动
 - [ ] 用 `XIAOTU_TORCH_PROFILE=<path>` 拿到**逐 kernel 表格**,证实 attention/indexer 的占比
       (本轮那次因请求失败未产出:TTFT 0.00,原因待查);
 - [ ] 那条 `pre` 里 ~224 ms/层(GPU MoE 内核 + 等待)也要归属 —— 但优先级低于 19.2 的 2/3。
+
+---
+
+## 20. ④ 的直接观测:两次尝试都未产出 kernel 表(2026-09-21 13:25)
+
+| 尝试 | 配置 | 结果 |
+|---|---|---|
+| `p4`(prof4.sh) | 默认图 + `TORCH_PROFILE_CALLS=200` + `LAYER_TIMING=1` | ❌ 请求到服务端但引擎死:`RuntimeError: cancelled` → `EngineDeadError`;**表格 0 行** |
+| `p5`(prof5.sh) | **`EAGER=1`** + `CALLS=45` | ⚠️ 跑通了(TTFT **112,074 ms**),但 **trace 目录为空、表格 0 行、无报错** |
+
+**两个副产物值得记下:**
+
+1. **`EAGER=1` 代价 2.1×**:关掉 CUDA graph 后 TTFT **112,074 ms**,而开图是 **52,794 ms**。
+   ⇒ 图对本工作负载是**真实且巨大**的收益(与 `TRIED_AND_REVERTED` R15 里"图对解码没用"相反 ——
+   那条是**解码**,这里是**预填充**)。
+2. **profiler 钩子没有触发**:`_maybe_profile()` 的调用点在 `hybrid_model.py:1301`。
+   需查该行是否在**本配置实际走到的那条路径**上(它旁边还有 `_maybe_profile_decode()` 在 1369)。
+   `_capture_guard()` 会正确地在捕获期退出(见 R101),但 `EAGER=1` 下不存在捕获,
+   所以**不是**被 guard 挡掉的。
+
+**⇒ ④ 的结论目前是算术推断,不是直接观测:**
+```
+每层 MoE 413 ms(实测,[layer-timing])× 42 层 = 17.3 s
+TTFT 52.8 s(实测)                      ⇒ 差 35.5 s(67%)不在 MoE 层内
+```
+两个被减数都是实测,但"**差额归给 attention/indexer**"这一步尚未被 kernel 表证实。
+**替代路径**:①查清 `hybrid_model.py:1301` 的调用条件;②上 `nsys`(环境里有 2023.1.2)。
