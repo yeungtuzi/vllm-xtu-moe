@@ -562,6 +562,31 @@ deepseek_v41/attention.py:871  _fused_qnorm_rope_kv_insert
 
 **⇒ 下一步:按方案 1 在 256K 下实测 V4.1。**
 
+### B26 V4.1 @256K 第一次启动失败:**我漏传 `GPUS`**(已修并重启)
+
+```
+pydantic ValidationError: 1 validation error for ParallelConfig
+  Value error, World size (2) is larger than the number of available GPUs (1) in this node.
+```
+
+**根因**:`serve_v41.sh` 的接口是 `TAG PORT **GPUS** TP MAXLEN ...`,而
+**`GPUS="${GPUS:-0}"`(默认只给 GPU 0)**。我只传了 `TP=2` 却没传 `GPUS=0,1`
+⇒ 单卡 + TP=2 ⇒ 校验失败。
+
+**⚠️ 这是本会话第 N 次「没读全脚本接口就传参」**:与 `VLLM_HANDSHAKE_TIMEOUT`
+(不是有效变量)、`GPU_PREFILL`(脚本变量而非 `VLLM_XIAOTU_*`)、`XIAOTU_GPF_STAGE`
+(需回读 env 桥) 是同一类。
+**⇒ 规则:传参前先读服务的接口注释行**(`serve_*.sh` 第 24 行就是接口说明)。
+
+**已修**:`GPUS=0,1` 补上,端口 8611,tag `dv41b`。重启时:
+```
+GPU 已清(30s)      ← 显存轮询判据生效(等待旧进程释放)
+GPU: 0 / 0 / 0
+value_error: 0     ← 不再报错
+```
+
+**⇒ 顺带验证了 GLM 那次启动竞态的修复是通用的** —— 两个脚本现在都有轮询到 0 的逻辑。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
