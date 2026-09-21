@@ -57,9 +57,35 @@ reduction order: `tl.sum(q[:, None, :] * kv[None, :, :], axis=2)` versus the ori
 probably benign, but it is a difference and needs a decision rather than a shrug.
 `BLOCK_H=16` measured 1.170e-03, sixty times worse.
 
+## Why it is faster (bisected)
+
+I bisected the two changes on the standalone harness, using four variants that share one loop
+body, at the realistic shapes:
+
+| variant | time | speedup |
+|---|---|---|
+| original | 311.200 ms | 1.00x |
+| **2-D `q`, 1-D `acc`** | **110.899 ms** | **2.81x** |
+| 1-D `q`, 2-D `acc` | compile error | — |
+| 2-D `q`, 2-D `acc` (= this patch) | 112.572 ms | 2.76x |
+| 2-D `q`, 2-D `acc`, `BLOCK_H=8` | 108.176 ms | 2.88x |
+
+**The whole 2.8x comes from loading `q` as a 2-D `(1, BLOCK_D)` tile.** The 2-D accumulator
+contributes nothing, and head blocking adds only about 3% on top.
+
+That means two things. First, the mechanism is narrower than I described: in the original, `q`
+is a 1-D `(BLOCK_D,)` vector and `tl.sum(kv * q[None, :], axis=1)` broadcasts it across the K
+dimension of a 2-D tile; with the 2-D load the layouts line up. The plausible reason is that
+the 1-D broadcast forces a layout conversion or costs vectorisation on the `(K, D)` product,
+but **I have not verified that** -- the check would be diffing `convert_layout` and
+`ld.global` widths in the ttgir/PTX of the two forms. Second, a smaller patch should get
+2.81x of the 2.88x: changing only the `q` load. I have kept the head-blocked form because it
+is the one measured end-to-end, but the minimal version is the one worth reviewing.
+
 ## Open items
 
-1. **Why is the 2-D form 2.8x faster?** Unexplained. Worth understanding before shipping.
+1. **The 1-D-broadcast explanation is still unverified** (see above) -- the bisect says where
+   the time goes, not why.
 2. **End-to-end numerics** were not checked — the standalone harness compared kernels, the
    end-to-end run only measured time. A quality check is still owed.
 3. `BLOCK_H` should be 2 or 8; 4 is a local optimum to avoid and 16 is bad. `BLOCK_H=8` is
