@@ -1,0 +1,550 @@
+# HANDOFF:全力追查 GPU long prefill 吞吐
+
+**日期**:2026-09-21
+**背景**:用户对 GPU long prefill 的实测吞吐(100–200 tok/s)**明确不接受**,判断
+「**计算流水线根本没走对**」。本文把所有已知硬数据、缺口分析与现场信息交接出去,
+后续全力只做这一件事:**停 MTP/dspark、停 MoE 常驻,在保证上下文的前提下把显存全部让给 long prefill。**
+
+---
+
+## 0. 一句话结论
+
+**实测 GLM long prefill = 155 tok/s,而 DMA 线速给出的下界是 690 tok/s —— 差 4.4 倍。
+更关键的是:插件自报的装配耗时只占实测的三分之一,`~436 ms/层` 花在了装配之外。**
+
+---
+
+## 1. 硬数据(全部实测,可复现)
+
+`random` 数据集(短 128 / 长 16384,输出 128,N=8,每格不同 seed,prefix cache 开),
+`prefill (tok/s) = total_input_tokens / (completed × TTFT)`、`decode = 1000/TPOT`:
+
+| 模型 | prompt | 实际 token | 并发 | prefill (tok/s) | decode (tok/s) | 来源 |
+|---|---|---|---|---|---|---|
+| GLM-5.3-Flash | 短 | 140 | 1 | 115.2 | 22.0 | `/tmp/rnd2/glm_L128_C1.json` |
+| GLM-5.3-Flash | 短 | 140 | 2 | 70.4 | 13.9 | `glm_L128_C2.json` |
+| **GLM-5.3-Flash** | **长** | **16,396** | **1** | **155.3**(TTFT **105,555 ms**) | 21.5 | `glm_L16384_C1.json` |
+| GLM-5.3-Flash | 长 | 16,396 | 2 | 119.5 | 1.7 | `glm_L16384_C2.json` |
+| MiMo-V2.5 | 短 | 152 | 1 / 2 | 64.2 / 48.1 | 16.7 / 9.6 | `mimo_L128_C*.json` |
+| DeepSeek-V4.1 | 短 | 128 | 1 / 2 | 254.3 / 175.2 | 19.8 / 14.0 | `v41_L128_C*.json` |
+
+4 格长 prompt 未取得(MiMo/V4.1 撞显存预算,见 §6.2)。
+
+**配置**(GLM):`TP=2 · GPU_UTIL=0.82 · SPEC_K=0 · SEQS=2 · MAXLEN=32768 · MBT=4096 ·
+KV_CACHE_BYTES=2 GiB · 旁路流已关(2026-09-21 修复)`。
+
+---
+
+## 2. 🎯 缺口分析(这是最该先看的东西)
+
+### 2.1 DMA 下界
+
+GLM FP8 每层要从主机流到 GPU 的权重(形状取自引擎自报
+`[xtu-eng-shape] w13 shape=(288,2048,4096) w2 shape=(288,4096,1024)`):
+
+```
+w13 = 2.25 GiB   w2 = 1.12 GiB   scales ≈ 0.001 GiB
+每层合计 3.38 GiB
+实测锁页 H2D 线速 26.86 GB/s   ⇒  135 ms/层   ⇒  44 层一次全量装配 5.9 s
+```
+
+**设计上每个 chunk 都要流一次全量权重**,所以:
+
+```
+理论 prefill 速率 = MBT / 每趟耗时 = 4096 / 5.9 s = 690 tok/s   ← 与 prompt 长度无关
+实测             = 4096 / 26.4 s = 155 tok/s
+差距             = 4.4×
+```
+
+### 2.2 更刺眼的:**装配自报时间只占三分之一**
+
+插件自己的逐层计时(`XIAOTU_GP_TIMING=1`,崩溃前实测):
+
+```
+[f8-asm] w13=105.5  w2=52.2  scales=0.17  tr=6.3  total=164.1 ms   (TP0)
+```
+
+```
+44 层 × 164 ms = 7.2 s/趟
+但实测每趟 = 26.4 s
+⇒ **装配之外还有 19.2 s/趟,摊到每层 436 ms**
+```
+
+**也就是说:真正吃掉时间的不是 H2D、不是转置,而是装配之外的每层 436 ms。**
+`[fp8-asm]` 的 `total` 已经把 w13+w2+scales+tr 全算进去了,所以这 436 ms/层必须来自:
+
+1. **MoE 的 GPU 计算内核**(`gate_up_kernel_fp8` / `down_kernel_fp8` 及其分段)——
+   它们在 `[fp8-asm]` 的计时窗口**之外**;
+2. **attention / sparse indexer / kpool**(GLM 是 KDA,block_size 2176);
+3. **chunk 之间没有流水**(装配下一层/下一个 chunk 时 GPU 在等);
+4. **侧流被关掉后,装配与 compute 变成串行**(这是我 2026-09-21 的修复的代价,
+   实测 +17% TTFT;380→ 但**远不足以解释 436 ms/层**)。
+
+> **这就是"流水线没走对"的量化形态**:H2D 只占 135/600 ≈ 22%,
+> 而 73% 的时间在装配窗口之外,很可能既没与 H2D 重叠、也没与前一层的计算重叠。
+
+**下一步的第一件事:把每层的时间按「H2D / 转置 / MoE 内核 / attention / 空等」五段拆开。**
+现有工具:`XIAOTU_GP_TIMING=1`(装配内)、`XIAOTU_GPF_STAGE=1`(阶段断点)、
+`TORCH_PROFILER`/`nsys`(未用过,最该用)。
+
+---
+
+## 3. 现场信息(接手必备)
+
+### 3.1 代码与树
+
+| | 路径 |
+|---|---|
+| 插件(可改) | `/home/user/lvllm/vllm-xiaotu-moe`(HEAD 见 `git log`) |
+| 上游 rebase 树 | `/home/user/lvllm/vllm-up-133b71e0b`(**不要改**) |
+| GPU 预填充(FP8) | `vllm_xiaotu_moe/gpu_prefill_fp8.py` |
+| GPU 预填充(MXFP4) | `vllm_xiaotu_moe/gpu_prefill.py` |
+| 装配调度 / 旁路流 | `vllm_xiaotu_moe/mixed_experts.py`(`apply()` 约 1560–1760 行) |
+| K-major 转置 | `vllm_xiaotu_moe/byte_transpose.py` |
+| host 分片 / DMA | `xiaotu_moe/csrc/moe/moe_v2.hpp`、`csrc/python_binding/binding.cpp` |
+
+### 3.2 关键 env 旋钮
+
+| 变量 | 作用 |
+|---|---|
+| `XIAOTU_GP_TIMING=1` | 打印 `[fp8-asm]` 逐层装配分段计时 |
+| `XIAOTU_GPF_STAGE=1` | 打印阶段断点(`[gpf-ptr]` 等) |
+| `XIAOTU_GPF_DMA2D=0` | 不用 pitched 2-D DMA,走 staging 回退 |
+| `XIAOTU_GPF_TT=0` | 关 Triton 转置,走 torch 回退 |
+| `XIAOTU_GPF_PIN=0` | 不锁页引擎 host 分片 |
+| `XIAOTU_GP_ASM_SIDE_STREAM=1` | 打开旁路流(**默认已关**,见 §5) |
+| `GPU_PREFILL=0` | 彻底关 GPU 预填充(脚本变量,**不是** `VLLM_XIAOTU_*`) |
+| `XIAOTU_MOE_GPU_RESIDENT_LAYERS` / `XIAOTU_MOE_RESIDENT_BUDGET_GB` | MoE 常驻(**本阶段全部置 0/空**) |
+
+⚠️ **`serve_*.sh` 会把自己的值写进 env-bridge 文件,而插件在 `XIAOTU_ENV_FILE` 显式指定时
+以文件为准覆盖 `os.environ`** ⇒ 有些变量会被静默丢弃。**任何开关都要回读日志确认生效**
+(本次会话因此栽了两次)。
+
+---
+
+## 4. 本阶段的目标配置(用户指定)
+
+**停 MTP/dspark、停 MoE 常驻,保证上下文,其余全部给 long prefill:**
+
+```bash
+SPEC_K=0                       # 停投机解码(省 draft 常驻 + 不再吃 KV)
+# 不加 XIAOTU_MOE_GPU_RESIDENT_LAYERS / RESIDENT_BUDGET_GB(即 0 层常驻)
+GPU_PREFILL=1                  # long prefill 是本阶段唯一优化对象
+MAXLEN=<保证的上下文>          # GLM:262144;V4.1:1048576;MiMo:1048576(见 §6)
+GPU_UTIL=<尽量高>              # 把省下的显存全部让给 staging + 激活
+```
+
+**上下文对应的 KV(必须留足,用引擎反算的每 token KV):**
+
+| 模型 | KiB/token | 1M | 256K | 出处 |
+|---|---|---|---|---|
+| GLM-5.3-Flash | 19.0 | 19.0 GiB | **4.8 GiB** | `GPU KV cache size: 110,100 @ 2 GiB` |
+| DeepSeek-V4.1 | 29.9 | **29.9 GiB** | 7.5 GiB | `GPU KV cache size: 41,078 @ 1.17 GiB` |
+| MiMo-V2.5 | 247.7(疑似**被高估**,见 §6.1) | 247.7 GiB | 61.9 GiB | `GPU KV cache size: 40,974 @ 9.68 GiB` |
+
+---
+
+## 5. 2026-09-21 已做的修复(不要回退)
+
+**`vllm_xiaotu_moe/mixed_experts.py`**:FP8 装配的**旁路流默认改为关闭**
+(`gp_side_stream_enabled()` 默认 `"0"`),并新增 `gp_capturing()` 在捕获期强制走保守路径。
+
+* **为什么**:长 prompt 首次请求触发 `cudaErrorIllegalAddress`,崩在装配的
+  pitched 2-D DMA(`cudaMemcpy2DAsync`)。单变量证据:仅置
+  `XIAOTU_GP_ASM_SIDE_STREAM=0` 即干净,且 `GPU prefill ACTIVE=84` 证明装配确实跑了。
+* **代价**:长 prompt TTFT **+17%**。**这正是本阶段要抢回来的东西之一** ——
+  正确的做法是实现**真正的流间依赖/重叠**,而不是把重叠关掉。
+* 完整复盘见 `CHANGELOG.md`;诊断过程见 `dev-docs/RND_CAMPAIGN_DIAGNOSIS.md`。
+
+---
+
+## 6. 两条必须先纠正的错误结论(我留下的,别再踩)
+
+### 6.1 ❌「MiMo 的 1M 上下文不可达(需 247.7 GiB)」
+
+**这个结论很可能是错的。** MiMo-V2.5 是**滑窗(混合)注意力**
+(`config.json: sliding_window = 128`),滑窗层不需要按全上下文分配 KV。
+我**没有读 MiMo-2.5 的技术报告**就下了结论,违反了本任务的要求。
+
+**接手第一件事:读 MiMo-2.5 技术报告,搞清滑窗层与全注意力层的比例与各自窗口**,
+然后判断:
+* vLLM 的 `GPU KV cache size` 是否已经对滑窗层做了节省(若没做,那是可观的优化空间);
+* 1M 上下文在 MiMo 上真实需要的 KV。
+
+### 6.2 ❌ 我曾用 `config.json` 推算每 token KV
+
+按 `48层 × 4 KV头 × (192+128) × 2B` 给 MiMo 推出 120 KiB/token,而引擎实测是
+**247.7 KiB/token** —— 差 2.06 倍。**只信 `GPU KV cache size: N tokens`,
+不要按配置字段推算**(对齐/填充/额外层会让推算失效)。
+
+---
+
+## 7. 我踩过的坑(请勿重蹈)
+
+1. **自己脚本的 `kill -9` 制造假故障**:脚本收尾 `kill -9 $(nvidia-smi ...)` 只杀 worker,
+   存活的 EngineCore 把它记成 `Worker proc died unexpectedly` —— 我据此追查了
+   「空闲期静默死亡 / SIGTERM / memlock / OOM」**数轮,全是假象**。
+   **判定方法:跑一个「全程不做任何 kill」的对照组。**
+2. **prefix cache 混淆**:早期收窄实验里两条长请求用了**相同 seed**,第二条命中
+   prefix cache(TTFT 89.7 → 8.3 s),根本没跑装配,实验无效。**每格必须换 seed。**
+3. **开关设了没生效**:见 §3.2 的警告。**每次都要 grep 日志确认实际值。**
+4. **`waitp` 用 `kill -0 $wrapper_pid` 判据是错的**:`serve_glm53_mainline.sh` 非 FOREGROUND
+   模式会 fork 后自退 ⇒ 判据恒假。改用 pidfile + 日志。
+5. **判据必须与"本次运行"绑定**:陈旧 pidfile / 等错文件 / 等错标记,
+   本次会话因此各空等过 70 分钟。**写等待条件时先确认标记真的写在你等的那个文件里。**
+
+---
+
+## 8. 脚本
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/bench_random_12cells.sh` | 12 格基准(KV cap 自动算 + 前置断言 + 早退检测) |
+| `scripts/bench_resident_sweep.sh` | 常驻层扫描(**本阶段停用**) |
+| `scripts/summarize_random12.py` | 从 JSON 出表 |
+| `dev-docs/RND_CAMPAIGN_DIAGNOSIS.md` | 非法访存事故的完整诊断(含所有弯路) |
+| `docs/TUNING_GUIDE.md` | 三方显存预算框架与实测单位代价 |
+| `CHANGELOG.md` | 旁路流修复的复盘 |
+
+---
+
+## 9. 建议的第一步(按顺序)
+
+1. **读 MiMo-2.5 技术报告**(滑窗),纠正 §6.1。
+2. **把每层 600 ms 拆成五段**(H2D / 转置 / MoE 内核 / attention / 空等)。
+   先用 `nsys profile` 或 torch profiler 抓一次 16384 的单请求;
+   `XIAOTU_GP_TIMING=1` 只能看到装配内的 164 ms,**看不见那 436 ms**。
+3. 按拆分结果决定方向:
+   * 若 **MoE 内核占大头** ⇒ 优化 FP8 GEMM(分段/块大小/占用率),与 DMA 无关;
+   * 若 **attention/indexer 占大头** ⇒ 那是 GLM 的 KDA 路径,单独查;
+   * 若 **空等占大头** ⇒ 流水线问题:让「下一层的 H2D」与「本层的 MoE 内核」重叠
+     (MXFP4 路径的 ping-pong **预取环**就是干这个的,FP8 路径有没有等价物?),
+     或在**同一个 chunk 内**按专家分块流水。
+4. 目标:先把每趟从 26.4 s 压到接近 5.9 s 的 DMA 下界(690 tok/s),
+   再考虑把旁路重叠**正确地**加回来。
+
+---
+
+## 10. 🔴 2026-09-21 新增硬结论:**GPU 预填充目前是纯开销**
+
+用 `scripts/longprefill_probe.sh` 单模型(GL GLM)、逐步留痕测的两个 arm(16384 token,C=1):
+
+| arm | 配置 | TTFT | prefill | 装配行数 |
+|---|---|---|---|---|
+| **A** | GPU 预填充 **开** | **106,186 ms** | 154.4 tok/s | `ACTIVE=84`,`[fp8-asm]=588(294/rank)`,无 illegal |
+| **B** | 纯 CPU(`GPU_PREFILL=0`) | **106,367 ms** | 154.1 tok/s | `ACTIVE=0`,`[fp8-asm]=0` |
+
+**⇒ 开关 GPU 预填充,TTFT 差 0.2%(噪声)。那 48.5 s 的 GPU 装配换来零收益。**
+
+### 10.1 三个数拼出的账
+
+```
+42 个 MoE 层(ACTIVE/2)× 8 chunk(16384/2176)= 294 次装配/rank
+每次 ~165 ms ⇒ 装配合计 48.5 s
+实测 TTFT 106 s ⇒ 非装配 57.5 s
+```
+
+| | 装配 | GPU MoE | 注意力 | 合计 |
+|---|---|---|---|---|
+| arm A(旁路流**关**) | 48.5 s | ~49 s | ~8.5 s | **106 s** |
+| arm B(纯 CPU) | 0 | — | ~8.5 s | **106 s**(CPU MoE ~98 s) |
+
+**106 s 与 CPU 引擎的实测速率吻合**:`106 / 8 chunk / 42 层 = 315 ms/层/chunk`,
+而 `NOTES` R17 实测 CPU 引擎 B=1024 → 113.3 ms/层、B=4096 → 365.0 ms/层 —— **2176 token 正落在这一档**。
+⇒ **106 s ≈ 纯 CPU MoE 计算时间。**
+
+### 10.2 结论与责任
+
+**GPU 侧 MoE 计算比 CPU 快约 2×(~49 s vs ~98 s),但那 48.5 s 的装配被串行加上去,
+恰好抵消全部收益。** 而**串行是 2026-09-21 那次修复造成的** —— 为了绕开长 prompt 的
+非法访存,我把旁路流默认关掉了,连带把「装配与计算的重叠」一起关掉。
+
+**正确的修法是保留重叠、只修同步;不是关掉重叠。**
+`/tmp/arm_c.sh`(`XIAOTU_GP_ASM_SIDE_STREAM=1`,单条长请求以避开竞态)是判决实验:
+若 TTFT ≈ 57 s,即证实恢复重叠就能拿回 ~1.8×。
+
+### 10.3 另一个待验事实:chunk 由 **KDA block_size 2176** 决定,不是 MBT
+
+`ACTIVE=84`(2 rank × 42 层)而装配行数 294/rank ⇒ **294 / 42 = 7 chunk**,
+而 `MBT=4096` 本应给 4 ⇒ **chunk 被 GLM 的 KDA `block_size=2176` 钉住**。
+若成立,则**放大 MBT 不会减少 chunk 数、因而不会减少总 H2D** ——
+"MBT 放大到 16384 ⇒ 4×" 的前提对 GLM 不成立。MBT 扫描会以装配行数判据验证。
+
+---
+
+## 11. 🔴 1M 上下文下 GPU 预填充被**禁用**(2026-09-21,MBT 扫描第一档)
+
+`MAXLEN=1048576`(KV=19.05 GiB/rank)+ 16384 prompt 的实测:
+
+```
+TTFT 112,787 ms   prefill 145.4 tok/s   ← 与纯 CPU 同档
+(Worker_TP1) GPU prefill DISABLED for this process -> staying on CPU (slower but correct).
+    per-layer staging ~7.6 GiB; preflight wants ~11.4 GiB free VRAM
+    (staging x1.10 + 3.0 GiB activation reserve), only 4.5 GiB is free.
+```
+
+**⇒ 1M 的 KV(19.05 GiB)把空闲挤到 4.5 GiB,而预检要 11.4 GiB ⇒ 禁用 GPU 预填充 ⇒ 全程 CPU。**
+
+### 11.1 ⚠️ 会误导人的日志缺陷(必修)
+
+同一个日志的**相邻行**:
+
+```
+GPU prefill ACTIVE: first 2176 tokens >= threshold 1500; ...
+    preflight: staging ~7.59 GiB, required >= 11.35 GiB free, had 4.45 GiB (**slack -6.90 GiB**)
+```
+
+**`ACTIVE` 横幅带着负 slack 照样打印。** 它按**设备级**判定 `_ok` 打,而**每请求**的
+preflight 另算;两者不一致时只打 ACTIVE、不打 REJECTED。
+**本次会话我反复以 `GPU prefill ACTIVE=84` 为"GPU 预填充在跑"的证据 —— 这个证据是不可靠的。**
+修法:横幅应带 `slack` 的符号判定,`slack < 0` 时打 `REJECTED`。
+
+**判据修正**:以后确认 GPU 预填充,必须用 **`[fp8-asm]` 行数 > 0**
+(需要 `XIAOTU_GPF_STAGE=1`),或检查 `GPU prefill DISABLED` **未出现**;
+**不能用 `GPU prefill ACTIVE` 单独作证。**
+
+### 11.2 量化边界(2×A100-40GB / GLM-5.3-Flash)
+
+```
+单卡 util 0.90 可用           35.5 GiB
+− KV(1M)                     19.05     ← 引擎反算 19,505 B/token
+− 非 KV(权重+激活,实测反推)   ~12.0
+= 空闲                         4.5 GiB   ← 预检要 11.4
+⇒ KV 必须 ≤ 23.5 − 11.4 = 12.1 GiB 才能开 GPU 预填充
+⇒ 12.1 GiB × 55,050 tok/GiB ≈ **650K token**
+```
+
+**⇒ 二选一(不可兼得):**
+* 要 **GPU 预填充** ⇒ 上下文 ≤ **~650K**
+* 要 **1M 上下文** ⇒ **放弃 GPU 预填充**(全程 CPU,~145 tok/s)
+
+**可调的两个旋钮**(按效果排序):`XIAOTU_GP_ACT_RESERVE_GIB`(3.0 → 更小,但换来 OOM 风险,
+见 NOTES §601)、`--gpu-memory-utilization`(调低可给 staging 腾地方,但会压小 KV 池)。
+
+---
+
+## 12. 🎯 唯一可行的解法:**砍掉 staging 的那份多余拷贝**
+
+### 12.1 光靠旋钮救不回来(算术)
+
+```
+预检要求 = staging × 1.10 + 激活备用
+       = 7.59 × 1.10 + 3.0 = 11.4 GiB
+1M 下空闲 = 4.5 GiB                      ⇒ 差 6.9 GiB
+把激活备用 3.0 → 0:仍要 8.3 GiB > 4.5    ⇒ ✗ 不够
+```
+
+`XIAOTU_GP_ACT_RESERVE_GIB` 与 `--gpu-memory-utilization` **都不足以**填平这个缺口。
+
+### 12.2 staging 为什么会是 7.59 GiB
+
+FP8 装配**同时持有原始布局和 K-major 拷贝两份**设备常驻:
+
+```
+raw13(2.25) + raw2(1.12) + km13(2.25) + km2(1.12) ≈ 6.74 GiB
+(+ 单 node 的 DMA staging、scales)           ≈ 7.59 GiB
+```
+
+### 12.3 MXFP4 路径早就解决了,FP8 路径缺这个优化
+
+`gpu_prefill.py` 的 `_pinned_kmajor` 在**主机侧**做字节转置并锁页缓存,其 docstring 原话:
+
+> Doing the byte transpose once on the host (at cache-build time) instead of once per layer
+> on the GPU removes a **~3.4 GiB device read+write per layer** ...
+
+**⇒ 把 host 侧 K-major 缓存移植到 FP8 路径**,则:
+
+| | 现在 | 移植后 |
+|---|---|---|
+| 设备 staging | **7.59 GiB** | **~3.4 GiB** |
+| 每层 GPU 转置 | 6.3 ms(×294 装配 ≈ 1.9 s) | **0** |
+| 预检需要 | 11.4 GiB | **~3.7 GiB** |
+| 1M 上下文下能否开 GPU 预填充 | ❌(只有 4.5 GiB) | **✅ 3.7 < 4.5** |
+
+**这才是「1M 上下文 + GPU 预填充」不可兼得的真正原因与唯一解法。**
+不是调 util,不是调 reserve,而是**消掉那一份多余的设备常驻拷贝**。
+
+### 12.4 与 §10 的关系
+
+§10 的「GPU MoE 快 2×、被 48.5 s 串行装配抵消」是在 **32K 上下文**(preflight 通过、
+装配真的跑了)下测得的,结论仍成立。§11/§12 是 **1M 上下文**下的另一件事:
+那里装配**根本没跑**。两件事不要混。
+
+### 12.5 下一步(优先级)
+
+1. 等 `/tmp/knob_probe.sh` 的 4 档旋钮结果(预计都失败,但要有实测记录);
+2. **实现 FP8 的 host 侧 K-major 缓存**(移植 `_pinned_kmajor` 的语义到
+   `gpu_prefill_fp8.py`),把 staging 从 7.59 压到 ~3.4 GiB;
+3. 重测 1M + GPU 预填充,用 **`[fp8-asm] > 0` 且无 `DISABLED`** 作判据;
+4. 若成立,再回头做 §10 的重叠恢复(把 48.5 s 的装配藏到计算后面)。
+
+---
+
+## 13. ✅ 最终结论:1M 上下文 + 16384 random prompt(C=1)、GLM-5.3-Flash、2×A100-40GB
+
+### 13.1 现状(当前代码,已实测)
+
+| 项 | 值 | 证据 |
+|---|---|---|
+| 上下文要求 | 1M(262,144 是旧值;**本 goal 用 1,048,576**) | — |
+| KV 池 | **19.05 GiB/rank**(19,505 B/token) | 引擎 `GPU KV cache size` 反算 |
+| GPU 预填充 | **被禁用**(空闲 4.5 GiB < 预检要求 11.4 GiB) | `GPU prefill DISABLED for this process` |
+| **可达 prefill** | **145.4 tok/s**(TTFT 112,787 ms)—— **这是纯 CPU 路径** | `/tmp/lp/20260921-114341/gap.txt` |
+| 装配是否执行 | **否**(`[fp8-asm]` 行数 = 0) | 同上 |
+
+> ⚠️ **不能用 `GPU prefill ACTIVE` 当判据** —— 它在 preflight 失败(slack 为负)时**照样打印**,
+> 这是本次会话最大的误导源。可靠判据只有两个:**`XIAOTU_GPF_STAGE=1` 下 `[fp8-asm]` 行数 > 0**,
+> 或 **`GPU prefill DISABLED` 未出现**。
+
+### 13.2 为什么不可兼得(预算恒等式,全部实测)
+
+```
+单卡 util 0.90 可用                     35.5 GiB
+− KV(1M)                              19.05
+− staging(原始 + K-major 两份)         7.59
+− 非专家权重 + 激活(反推)              ~12.0
+=                                  −3.1 GiB   ← 已经超了
+预检还额外要 激活备用 3.0
+```
+
+**⇒ 1M 与 GPU 预填充在 2×A100-40GB 上**在当前代码里**不可兼得。**
+
+### 13.3 唯一的解法:把 staging 从 7.59 压到 ~3.4 GiB(尚未实现)
+
+FP8 路径**同时**在设备上持有 `raw13/raw2` 与 `km13/km2` 两份布局;
+而 **MXFP4 路径早就有 host 侧 K-major 缓存**(`_pinned_kmajor`),其注释明说
+这省掉「每层 ~3.4 GiB 的设备读写」。**把该优化移植到 FP8 路径**即可:
+
+```
+移植后:35.5 − 19.05(KV) − 3.4(staging) − 12.0 = 1.05 GiB
+       预检需要 3.4×1.10 + 3.0 = 6.7 GiB   仍差 5.7 GiB
+```
+
+**⇒ 光移植 K-major 还不够。** 必须**同时**处理「非专家权重 + 激活」的 ~12.0 GiB:
+
+* 其中 **~2.9 GiB 是 vLLM 的 prefill 激活峰**(`KNOWN_LIMITATIONS` §8.2);
+* `XIAOTU_GP_ACT_RESERVE_GIB` 默认 3.0 是**给这份峰留的安全垫**,不能归零(会 OOM);
+* 剩下 ~6 GiB 需要在**降 util** 与**降上下文**之间取舍。
+
+**可行的组合(需要实测确认)**:
+```
+KV(1M)=19.05 必须保住
+staging 移植后 3.4  (+ 备用 1.5)  = 4.9
+非专家权重 + 激活 ≈ 让 util 决定
+⇒ 需要 util ≥ (19.05 + 3.4 + 权重 + 激活) / 39.49
+```
+
+### 13.4 结论:**1M 是"声明"还是"必须装载"?**
+
+这是本 goal 唯一未澄清、且**决定成败**的前提(2026-09-21 曾就此提问,未获答复):
+
+* **若"1M"= 必须在 GPU 上装载 1M 的 KV** ⇒ 在 2×A100-40GB 上**代价极高**:
+  要放弃 GPU 预填充(且放弃 MTP、放弃常驻层),prefill 停在 **~145 tok/s**;
+* **若"1M"= 按模型能力声明**(如同 `settings.yaml` 里 GLM 的 `contextWindow: 262144`),
+  则**不必现在装载**:把 `MAXLEN` 设成能负担的值(算得 **~650K**),就能保住 GPU 预填充。
+
+**实测边界:要 GPU 预填充 ⇒ 上下文 ≤ ~650K;要 1M ⇒ 放弃 GPU 预填充。**
+
+### 13.5 另附:32K 上下文下的另一半问题(与本节独立)
+
+见 §10。在 32K(preflight 通过、装配真的跑了 294 次/rank、48.5 s)时:
+**GPU MoE 计算比 CPU 快约 2×,但 48.5 s 的串行装配把收益全部抵消。**
+那个串行是 2026-09-21 修复非法访存时**关掉旁路流重叠**造成的,
+正确修法是**保留重叠、只修同步**(`/tmp/arm_c.sh` 为判决实验)。
+
+**⇒ 两个问题、两个修法:**
+| 上下文 | 症状 | 修法 |
+|---|---|---|
+| 32K | 装配串行,收益被抵消 | 恢复流间重叠(改调度) |
+| 1M | 预填充被禁用,全程 CPU | 砍 staging(改内存布局) |
+
+---
+
+## 14. 旋钮实测:确认「调参数救不回来」(2026-09-21 12:03)
+
+`/tmp/knob_probe.sh`,1M 上下文,逐档实测:
+
+| 档 | util | `GP_ACT_RESERVE_GIB` | TTFT | `[fp8-asm]` | `DISABLED` | 判定 |
+|---|---|---|---|---|---|---|
+| `k_res30` | 0.90 | 3.0 | 112,399 ms | 0 | **2** | ❌ 仍走 CPU |
+| `k_res10` | 0.90 | 1.0 | **0.00 ms** | 0 | 0 | ❌ **服务崩了(OOM)** |
+| `k_res00` | 0.90 | 0.0 | 运行中 | | | |
+| `k_u085r10` | 0.85 | 1.0 | 待跑 | | | |
+
+**第 2 档是决定性的**:把激活备用从 3.0 降到 1.0 **不会**让 GPU 预填充启用,
+而是让服务**直接 OOM 挂掉** —— 这正是插件代码里的原话:
+
+> The reserve protects vLLM's own activation peak: the staging buffers are process-persistent,
+> so spending that peak makes a long prefill OOM **after** a passing preflight (NOTES §601).
+
+**⇒ `XIAOTU_GP_ACT_RESERVE_GIB` 这条路是死的:调小它只把 OOM 从 preflight 推迟到预填充,
+不会换来 reach。** 与 §12.1 的算术一致(3.0 → 0 也仍要 8.3 GiB > 4.5 GiB 空闲)。
+
+### 14.1 旋钮探针完整结果(4/4 全部失败)
+
+| 档 | util | `GP_ACT_RESERVE_GIB` | TTFT | `[fp8-asm]` | `DISABLED` | 判定 |
+|---|---|---|---|---|---|---|
+| `k_res30` | 0.90 | 3.0 | 112,399 ms | 0 | **2** | ❌ 走 CPU |
+| `k_res10` | 0.90 | 1.0 | **0.00 ms** | 0 | 0 | ❌ **崩(OOM)** |
+| `k_res00` | 0.90 | 0.0 | 112,761 ms | 0 | **2** | ❌ 走 CPU |
+| `k_u085r10` | 0.85 | 1.0 | **0.00 ms** | 0 | 0 | ❌ **崩(OOM)** |
+
+**两个关键观察:**
+
+1. **激活备用降到 0 也仍然被禁用**(`DISABLED=2`)。因为 staging 本身
+   `7.59 × 1.10 = 8.3 GiB` 就已经超过 1M 下的 4.5 GiB 空闲 ——
+   **不砍 staging,任何 reserve 都救不了**。这与 §12.1 的算术完全一致。
+2. **备用 = 1.0 反而崩**(两档都崩),3.0 与 0.0 却能起服务 —— 非单调。
+   最可能是 1.0 时 preflight 恰好**通过**,于是预填充真的开跑、
+   然后撞上代码警告的那个 OOM:
+   > spending that peak makes a long prefill OOM **after** a passing preflight (NOTES §601)
+
+**⇒ 「调旋钮换 reach」这条路有 4 个实测点判死。唯一出路是 §12 的「砍 staging」。**
+
+---
+
+## 15. 🎯 **更正**:MBT **确实**控制 chunk 数 —— 用户是对的,我先前判错了
+
+**2026-09-21 判决实验**(`MAXLEN=32768`,preflight 通过、GPU 预填充活着,
+`DISABLED=0`,单条 16384 / C=1):
+
+| MBT | `[fp8-asm]` 总行数 | 每 rank | `ACTIVE` | 隐含 chunk | 结果 |
+|---|---|---|---|---|---|
+| **4096** | 588 | **294** | 84 | **7** | ✅ TTFT **106,156 ms**,prefill **154.5 tok/s** |
+| **16384** | 82 | **41** | 82 | **1** | ❌ **OOM,completed=0** |
+
+**⇒ 装配次数 294 → 41(降 7.2 倍)。MBT 放大确实把 chunk 从 7 压到 1。**
+
+### 15.1 ⚠️ 我先前两次判错,一并更正
+
+1. **「chunk 被 GLM 的 KDA `block_size=2176` 钉住、MBT 无效」** —— **错**。
+   实测 MBT 从 4096 到 16384,装配行数从 294 掉到 41。**用户假设的杠杆成立。**
+   (我当时是从 `ACTIVE=84` 与 294 行反推出「294/42=7 chunk,故 chunk 由 2176 定」——
+   这个反推的层数假设错了,结论也就错了。**教训:不要用行的间接反推去否定一个可以用一次
+   单变量实验直接验证的假设。**)
+2. **「MBT 放大拿不到收益」** —— **错**。收益是 7× 的量级。
+
+### 15.2 真正的约束:**MBT=16384 的激活工作区放不下**
+
+```
+torch.OutOfMemoryError: Tried to allocate 120.00 MiB.
+GPU 1 has 39.49 GiB of which 63.50 MiB is free. this process has 39.38 GiB in use.
+38.38 GiB allocated by PyTorch
+```
+
+`UTIL=0.82` / `MAXLEN=32768` / KV 2 GiB 下,MBT=16384 把进程推到 39.38 GiB。
+
+**⇒ 结论不是「MBT 无用」,而是「MBT 的上限由激活工作区决定,需要找出能放下的最大值」。**
+参考:`MBT=32768` 在 util 0.82 下也 OOM(§5.2),`MBT=4096` 稳。
+
+### 15.3 下一步(明确且小)
+
+1. **扫 MBT ∈ {8192, 12288}**(在 `MAXLEN=32768`、util 0.82、KV 2 GiB 下),
+   找 **能放下的最大 MBT**;判据同时看 `[fp8-asm]` 行数(应为 ~147 / ~98)与是否 OOM;
+2. 该 MBT 下的 prefill 就是**这个显存预算下可达的最优**;
+3. 若还要更大 MBT ⇒ 必须给激活腾地方:砍 staging(§12 的 host 侧 K-major,
+   省 ~4.2 GiB)或降 KV/上下文;
+4. **然后**再回头做 §10 的重叠恢复(把剩下的装配藏到计算后面)。
+
+**§13.4 的分叉在实测面前变简单了**:既然 MBT 是有效杠杆且其上限受显存限制,
+那么"1M 还是 650K"这个选择,直接等价于"能留多少显存给激活工作区与 staging"。
