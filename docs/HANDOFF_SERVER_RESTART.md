@@ -61,6 +61,19 @@
 
 ## 3. 当前主攻项：③「~14 s 未归属时间」（用户指定）
 
+> ## ✅ 2026-09-21 深夜：**③ 已结案** —— 详见 `docs/EXPERIMENTS.md` **B87 / B88**。结论三句话：
+>
+> 1. **缺口不在 MoE 之外**：逐层计时显示 `pre`（apply 内）= **98.9%**、`other`（apply 之外，含注意力/层间）= **1.1%（11.3 ms/层）**。
+>    注意力时间是被 **MoE `apply()` 的 `pre` 吸收**了（host 在 apply 内阻塞等 GPU）。
+> 2. **慢层精确等于 DSA 层**：逐层「3 快 1 慢」，慢层名就是 `layers.7/11/15/…`，与
+>    `layer_types` 的周期 4（`deepseek_sparse_attention`）一一对应。
+> 3. **闭合账（chrome trace，无残差）**：`_sparse_mla_fwd_with_sink_kernel` **24.80 s = 59.8%**、
+>    MoE GEMM 5.80 s、NCCL 2.08 s、其余核 2.11 s、**非核空隙（H2D DMA）6.71 s**，合计 **41.49 s**。
+>    ⭐ **最大的一笔现成收益**：交付树跑的是**未优化**的 1-D 稀疏 MLA 核；
+>    `patches/upstream/pr4-sm8x-sparse-mla-2d-tile.patch`（自测**核 2.88× / 端到端 1.52×**）
+>    被标为 "Tree reverted; patch is standalone"，**没有打进树**。
+>    打回去预期注意力 24.8→~8.6 s、TTFT 47.4→~30 s 量级。**未动手（生产树）。**
+
 ### 3.1 已确立的事实（实测）
 
 **(a) 账目（32K / MBT=16384 / TP=2 / 单条 16384 / C=1，基线 TTFT 36.86 s）**
@@ -116,7 +129,12 @@ profile 的调用次数 vs 应有层数：
 | chrome trace | 只有 64 个 event、58 个 metadata、**没有 kernel 时间线** |
 | `XIAOTU_TORCH_PROFILE_CALLS=1000000` | **profiler 从不 flush ⇒ 0 行输出**（该值必须 ≤ 实际调用数才会输出） |
 
-⇒ **结论：现有工具链拿不到完整 GPU 时间线。** 缺口是「工具盲区」而非「实验没跑成」。
+⇒ ~~**结论：现有工具链拿不到完整 GPU 时间线。** 缺口是「工具盲区」而非「实验没跑成」。~~
+
+> ❌ **这一条已被 B88 推翻**：`export_chrome_trace` 的 JSON **里有**带 `ts/dur` 的 `cat=kernel` 事件
+> （本次一个 rank **8633 个核事件**）。之前"只有 64 个 event、没有 kernel 时间线"是**读法/配置**的问题,
+> 不是工具链的限制。解析器已写好:`probes/attrib_trace.py`（算 GPU 忙占比 + 最大空隙 + top 核）。
+> ⇒ **不要再花时间在 TRITON_KERNEL_DUMP / nsys 上,直接用 chrome trace。**
 
 ### 3.4 下一步（**2026-09-21 深夜更新：第 2 条已做，第 3 条已作废**）
 
@@ -203,7 +221,7 @@ for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do kill -
 
 | 项 | 状态 |
 |---|---|
-| **③ ~13.95 s 未归属** | ⚠️ **未解**，见 §3.4 的下一步 |
+| **③ ~13.95 s 未归属** | ✅ **已结案（B87/B88）**：它是稀疏 MLA 注意力被记进 MoE 的 `pre`；闭合账见 §3 顶部 |
 | `h` 为何逐层不释放（结构上应释放） | ⚠️ 未查 |
 | pr4 的**端到端数值**与 `head_mask` 分支 | ⚠️ 未验证（核级 `max|diff|=2.819e-05` 已做） |
 | 布局转换（为何二维 `q` 快 2.8×）的解释 | ⚠️ 未证实 |

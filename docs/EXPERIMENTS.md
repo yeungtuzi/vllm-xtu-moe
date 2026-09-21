@@ -2355,6 +2355,93 @@ sqlite 表清单: 只有 CUPTI_ACTIVITY_KIND_RUNTIME,**没有 CUPTI_ACTIVITY_KIN
    可**逐层**反解 `pre/eng/post`(由相邻累计平均作差)并得到**层间墙钟**
    ⇒ 一跑就能把每层拆成「apply 内 MoE」vs「apply 之外(注意力/indexer/层间)」,
    **不需要 nsys、不动任何计算路径**。解析器:`probes/attrib_layer_timing.py`。这是 ③ 的下一步。
+
+### B87 ⭐⭐⭐ ③ 结案(一):缺口**不在 MoE 之外**,而是**稀疏 MLA 注意力被记进了 MoE 的 `pre`** —— 且慢层**精确等于 DSA 层**
+
+**做法**(不碰被测对象):给 `[layer-timing]` 加墙钟时间戳 + 打印**层名**(只改打印),
+`XIAOTU_LAYER_TIMING=1 XIAOTU_LAYER_TIMING_EVERY=1`,跑一次 **32K/MBT=16384/单条 15399 token**
+基线(`MAXLEN=32768 SEQS=1 GPU_UTIL=0.85 KV_CACHE_BYTES=805306368 XIAOTU_GPF_STAGE=1`,
+GPU 预填充 ACTIVE:`first 15232 tokens >= threshold 1500`)。TTFT **47.44 s**;解析器 `probes/attrib_layer_timing.py`。
+
+**两个 rank 完全一致(41.702 s vs 41.697 s)**,prefill 那一段(42 个 MoE 层):
+
+| 项 | 时间 | 占比 | 每层 |
+|---|---|---|---|
+| `pre`(**apply 内**) | **41.23 s** | **98.9%** | **981.6 ms** |
+| `eng`(`engine.cpu_decode`) | 0.000 s | 0.0% | 0 ms ← 走的是 GPU 流式路径,符合预期 |
+| `post` | 0.001 s | 0.0% | — |
+| **`other`(apply 之外:注意力/indexer/层间)** | **0.474 s** | **1.1%** | **11.3 ms** |
+
+⇒ **"apply 之外"几乎没有时间。** B17/B83 里那个「插件看不到的 1/3 / 缺口」**不在注意力、也不在层间** ——
+它是被 `pre` **吸收**了(host 在 `apply()` 里阻塞等 GPU,而不是在两次 `apply` 之间空闲)。
+
+**逐层结构是严格的「3 快 1 慢」**(快 ≈ 372 ms,慢 ≈ 2.94 s),而且**慢层的层名就是 DSA 层**:
+
+```
+  380  212.3ms  pre= 194.3  layer=...layers.4.mlp.experts
+  382  378.4ms  pre= 372.7  layer=...layers.6.mlp.experts
+  383 2928.1ms  pre=2912.8  layer=...layers.7.mlp.experts   ← DSA
+  387 2936.7ms  pre=2921.9  layer=...layers.11.mlp.experts  ← DSA
+  391 2939.3ms  pre=2924.8  layer=...layers.15.mlp.experts  ← DSA
+```
+
+配置文件 `text_config.layer_types` 是**严格周期 4**:`[linear,linear,linear,deepseek_sparse_attention] × 11`
+⇒ DSA 层 = **7,11,15,19,23,27,31,35,39,43**(首个 MoE 层 `layers.3` 本身也是 DSA,
+但它是窗口第一行、没有前驱区间,故不在上表里)。
+**10 个可测慢层 = 10 个可测 DSA 层,一一对应,无例外。**
+
+**⇒ ③ 的结论修正(重要):**
+* 那 ~13.95 s **不是"没有归属的 GPU 工作"**,而是**相位归属错了**:`pre` = MoE **+ DSA 注意力**;
+  正因如此 `other` ≈ 0,而 B19/B83 的「叶子核求和 < 墙钟」才会长期挂着。
+* 慢层里 DSA 的净增量 ≈ **2.55 s/层**,10 个可测慢层 ≈ 25.5 s ≈ 整个 pass 的 **61%**。
+* 也解释了 B23 的「关掉 2.11 s 的 all_reduce 而墙钟不动」:那些时间本来就与其他相位重叠/被阻塞吸收。
+
+### B88 ⭐⭐⭐ ③ 结案(二):chrome trace 给出**闭合账** —— 最大项 = **稀疏 MLA 核**(占 prefill 59.8%);
+且**交付树里并没有 pr4(2.88×)那个 2-D tile 补丁**
+
+**做法**:同一次请求,另起一次服务并开插件自带 profiler
+(`XIAOTU_TORCH_PROFILE=/tmp/attrib/glmprof XIAOTU_TORCH_PROFILE_CALLS=42`),
+**直接解析 `export_chrome_trace` 的 JSON**(`probes/attrib_trace.py`)——
+只取 `cat=kernel` 且带 `ts/dur` 的事件,按流合并算「忙/空隙」。
+**历史上"chrome trace 没有 kernel 时间线"的说法不成立:本次一个 rank 就有 8633 个核事件。**
+
+窗口(= 42 个 MoE 层,即整段 prefill)= **41.49 s**;GPU 忙碌 = **34.78 s ⇒ 忙占比 83.8%**;
+非核空隙合计 **6.71 s**(最大的若干个都是 **~160 ms**,位置规律)。
+
+| 类别 | 时间 | 占窗口 |
+|---|---|---|
+| **`_sparse_mla_fwd_with_sink_kernel`** | **24.80 s** | **59.8%**(占核时间 71.3%) |
+| MoE GEMM(`down_kernel_fp8` 3.04 + `gate_up_kernel_fp8` 2.76) | 5.80 s | 14.0% |
+| `ncclDevKernel_AllReduce_Sum_bf16_RING_LL` | 2.08 s | 5.0% |
+| 其余**所有**核(8600+ 个;最大的 sgemm / bf16 s16816gemm / hc_prenorm / ktranspose 均 < 0.3 s) | ~2.11 s | 5.1% |
+| **非核空隙**(= 专家权重 **H2D DMA**;profiler 的 kernel 视图归因不到,与 B18 的 `Memcpy HtoD` 同源) | **6.71 s** | **16.2%** |
+| **合计** | **41.49 s** | **100%(闭合,无残差)** |
+
+**⇒ 这是 ③ 第一次拿到「没有残差」的账:24.80 + 5.80 + 2.08 + 2.11 + 6.71 = 41.50 s。**
+
+**⇒ 但这里出现了一个必须说清的重大事实:交付树跑的是原始(未优化)的稀疏 MLA 核。**
+* 本树 `vllm/v1/attention/backends/mla/sparse_mla_kernels.py:3521` 的
+  `_sparse_mla_fwd_with_sink_kernel` 是 **1-D** 版:`running_acc = tl.zeros((BLOCK_D,), tl.float32)`,
+  一个 program 只算**一个 head**(`head_idx = tl.program_id(1)`)。
+* 而 **pr4**(`patches/upstream/pr4-sm8x-sparse-mla-2d-tile.patch`,102 行)把 `q`/`running_acc` 改成
+  `(BLOCK_H, BLOCK_D)` 二维 tile、一个 program 算多个 head;其文件头写着
+  **"Status: measured end-to-end, 2026-09-21. Tree reverted; patch is standalone."**
+  自测:**核 2.78–2.88×**(BLOCK_H=1/2/8),**端到端 1.52×**。
+* ⇒ **B83 账上的 `_sparse_mla_fwd_with_sink_kernel_hb` 7.74 s 是打了 pr4 的数**;
+  本树(未打)**同一个核是 24.80 s**,比值 **3.20×**,与 pr4 自测的 2.88×(核)同一量级。
+* ⇒ **③ 的"未归属"在数值上就是这个差:注意力被少记了约 17 s。**
+
+**⇒ 可执行结论(最大的一笔现成收益,且补丁已自测过):**
+把 `pr4-sm8x-sparse-mla-2d-tile.patch` 重新打进 `vllm-up-133b71e0b`,
+预期注意力 24.80 → **~8.6 s**、pass 41.5 → **~25 s**、TTFT 47.4 → **~30 s 量级**(1.5× 上下)。
+⚠️ 但它是**生产树**(8070 在用),按铁律 1「不要改 `vllm-up-133b71e0b`」,
+**本会话没有动手**,只把结论与依据写在这里。
+
+**⇒ 另外两条被本次实测钉死的事实:**
+1. **`Memcpy HtoD` 的 ~6.7 s 就是那些非核空隙**(~160 ms × 42 层),它**不是**缺口,
+   也不需要 nsys 才能看见。
+2. GPU **忙占比 83.8%** 而非 98%:先前"外部轮询 median 98%"是在**含加载/收尾的整个进程**上采的;
+   只看这一次 prefill 的真实窗口,**16.2% 的墙钟是 DMA 在跑、核没在跑**。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

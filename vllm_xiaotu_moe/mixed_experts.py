@@ -73,7 +73,7 @@ import threading as _threading
 _LT_LOCK = _threading.Lock()
 
 
-def _lt_record(pre_ms: float, eng_ms: float, post_ms: float) -> None:
+def _lt_record(pre_ms: float, eng_ms: float, post_ms: float, name: str = "") -> None:
     if not _LT_ON:
         return
     with _LT_LOCK:
@@ -93,6 +93,7 @@ def _lt_record(pre_ms: float, eng_ms: float, post_ms: float) -> None:
             # 不需要 nsys、也不动任何计算路径。用法:XIAOTU_LAYER_TIMING=1
             # XIAOTU_LAYER_TIMING_EVERY=1(每层一行)。
             print(f"[layer-timing] t={time.perf_counter():.6f} n={n} "
+                  f"layer={name} "
                   f"pre={_LT_ACC['pre']/n:.3f}ms "
                   f"eng={_LT_ACC['eng']/n:.3f}ms post={_LT_ACC['post']/n:.3f}ms "
                   f"total={tot/n:.3f}ms (每层;越接近 100% 说明开销在哪个相位)",
@@ -1928,7 +1929,8 @@ class _XiaotuExpertsMixin:
         if _LT_ON:
             _lt_t3 = time.perf_counter()
             _lt_record((_lt_t1 - _lt_t0) * 1e3, (_lt_t2 - _lt_t1) * 1e3,
-                       (_lt_t3 - _lt_t2) * 1e3)
+                       (_lt_t3 - _lt_t2) * 1e3,
+                       str(getattr(layer, "layer_name", "?")))
         if output is not None:
             # Modular upstream API: the caller owns the output buffer and uses it
             # directly, so the result must land in it (upstream ignores our return).
