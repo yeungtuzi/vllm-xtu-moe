@@ -1125,6 +1125,36 @@ E=4 H=512 I=256 shards ns=8 w13_crows=32 w13_cbytes=16384 w2_crows=64 w2_cbytes=
 **⚠️ 而它**仍是有价值的**:逐字节测试证明装配逻辑正确,且 `[fp8-asm] total` 149.2 ms(原 163.3)
 说明共享视图本身不带来性能损失 —— **将来若找到"为何没省显存"的原因,这条路仍可行。**
 
+### B45 ⭐ ②c 未兑现的**首要嫌疑**:`_kmajor_bytes` 的**静默回退**分配了等量临时张量
+
+**读代码得到两个事实:**
+1. `prealloc_fp8_buffers` **确实被调用**(`mixed_experts.py:1621`)⇒ 我的守卫在活路径上;
+2. 编辑后 `_buf("raw2")` 的两处(202 行受守卫、285 行是 else 分支)在共享模式下**都不可达**
+   ⇒ **1.12 GiB 本应被释放。**
+
+**⇒ 但实测只多出 78 MiB。矛盾。**
+
+**⇒ 首要嫌疑:`_kmajor_bytes` 的静默回退:**
+```python
+try:
+    from vllm_xiaotu_moe.byte_transpose import ktranspose_bytes
+    return ktranspose_bytes(t, dst)          # 快路径:写进 dst,不额外分配
+except Exception:  # noqa: BLE001
+    r = t.transpose(1, 2).contiguous()       # **静默回退:分配一个全新临时张量!**
+    if dst is not None: dst.copy_(r); return dst
+    return r
+```
+**若 `w2_raw` 作为视图让 `ktranspose_bytes` 走了回退路径,它会**静默分配 ~1.12 GiB 临时张量**,
+把省下的显存又吃回去 ⇒ **恰好解释「只多 78 MiB」**,
+也解释了**失败分配从 120 MiB 变成 238 MiB**(分配模式变了)。**
+
+**⚠️ 未验证。判定方法(秒级,不需加载模型):**
+在 `scripts/test_gpu_prefill_fp8_assembly.py` 里给回退分支加一个 print 或计数器,
+或直接断言 `ktranspose_bytes(w2_raw_view, dst)` 不抛异常。
+**若确认回退,修法是把视图改成让快路径接受的形态,或让回退路径不分配(写进 dst 的分块循环)。**
+
+**⇒ 我到此为止:上下文已耗尽。⚠️ 未解,但首次给出了**具体到行**的嫌疑点。**
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
