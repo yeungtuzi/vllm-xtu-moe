@@ -373,8 +373,12 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
 def gpu_moe_layer_fp8(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
                       H: int, I: int, K: int, *, device,
                       swiglu_limit: float = 0.0,
-                      bm: int = 64, bn: int = 64, bk: int = 64, bh: int = 64,
-                      ns: int = 2, warps: int = 4):
+                      bm: int = int(os.environ.get("XIAOTU_GPF_GEMM_BM", 64)),
+                      bn: int = int(os.environ.get("XIAOTU_GPF_GEMM_BN", 64)),
+                      bk: int = int(os.environ.get("XIAOTU_GPF_GEMM_BK", 64)),
+                      bh: int = int(os.environ.get("XIAOTU_GPF_GEMM_BH", 64)),
+                      ns: int = int(os.environ.get("XIAOTU_GPF_GEMM_STAGES", 2)),
+                      warps: int = int(os.environ.get("XIAOTU_GPF_GEMM_WARPS", 4))):
     """One layer's routed MoE on GPU from K-major FP8 weights.
 
     Returns an **fp32** tensor: accumulating the top_k partial sums into a bf16

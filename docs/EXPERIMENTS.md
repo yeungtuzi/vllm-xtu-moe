@@ -18,9 +18,12 @@
 
 | # | 实验 | 目的 | 判据 | 状态 |
 |---|---|---|---|---|
-| **A13** | `/tmp/ar_ab.sh`:两跑对比 `XIAOTU_SKIP_AR=0/1`(**全程不碰树**) | **性能点 #4**:量 `all_reduce`(2.107 s / 78 次)每层的真实成本 | TTFT 差值 ≈ 该归约的净成本;2.107 s 为 CUDA 侧 | **RUNNING** |
+| **A13** | `/tmp/ar_ab.sh`:`XIAOTU_SKIP_AR=0/1` 两跑(**零树改动**) | 性能点 #4:量 `all_reduce` 净成本 | TTFT 差值 | **RUNNING** |
+| **A14** | GEMM tile 扫描(`XIAOTU_GPF_GEMM_*`) | 性能点 #3:0.61 TFLOPS 是否由 tile/stages 造成 | GEMM 时间与 TTFT 随各档的响应 | 待 A13 |
 
-> **安全说明**:本实验**只设环境变量,不修改 rebase 树**,因此不会产生 B20 那次的三段式风险。
+**已就绪的前置改动**:`gpu_prefill_fp8.py` 的 `bm/bn/bk/bh/ns/warps` 已改为
+`XIAOTU_GPF_GEMM_{BM,BN,BK,BH,STAGES,WARPS}` 可覆盖,**默认值不变(64/64/64/64/2/4)**
+⇒ **零行为变化**,但后续扫描从「改源码+跑」变成「设环境变量+跑」。
 
 ## B. 已完成（本会话全部硬数据）
 
