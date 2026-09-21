@@ -1012,3 +1012,55 @@ vllm::moe_forward_shared           11.628 s  30.28%   (39)
 **⇒ 结论:8×V100(免费)在聚合资源上是升级而非降级,值得评估;
 但它的门槛是「注意力核能否移植到 Volta(cp.async 缺失)」,而不是算力或显存。**
 **建议先做一件事:查 vLLM 的 `_sparse_mla_fwd_with_sink_kernel` 是否有 SM70 变体或回退路径。**
+
+---
+
+# 26. ✅ 最终结论(本 goal 收口,2026-09-21)
+
+## 26.1 四项任务的证据
+
+| 项 | 结论 | 直接证据 |
+|---|---|---|
+| **①** 逐步留痕 | ✅ | `/tmp/lp/<时间戳>/` 每轮独立目录:`00_env.txt`(旋钮实际生效值)、`manifest.txt`(完整命令+env-bridge 文件内容)、`verify.txt`(判据)、`gap.txt`(成绩)、`run.log`、`step_*.log` |
+| **②** 硬判据确认走 GPU 流水线 | ✅ | **`[fp8-asm]` 行数**:MBT=4096→**588**、12288→**168**、16384→**84**(= MoE 层数 × chunk 数);`DISABLED` 计数;**并发现 `GPU prefill ACTIVE` 横幅在 slack 为负时照样打印 ⇒ 不能单独作证** |
+| **③** MBT 扫描与边界 | ✅ | 154.5 → 266.5 → **310.6 tok/s**(4096/12288/16384);1M 侧 OOM + 被 preflight 禁用 |
+| **④** 非装配时间的归属 | ✅ | **逐 kernel 表**:`_sparse_mla_fwd_with_sink_kernel` **58.80%**、`moe_forward_shared` 30.28%、`Memcpy HtoD (Pageable)` **16.22%**、装配转置仅 0.58% |
+
+## 26.2 最终答案:16384 prompt(C=1)、GLM-5.3-Flash、2×A100-40GB
+
+| 约束 | 最优配置 | **可达 prefill** | GPU 预填充 |
+|---|---|---|---|
+| **保证 1M 上下文** | `MAXLEN=1048576`、KV 19.05 GiB/rank、`SPEC_K=0`、0 层常驻 | **145.4 tok/s**(TTFT 112,787 ms) | ❌ **被 preflight 禁用** |
+| **放开到 32K**(KV 0.75 GiB、util 0.85) | **`MBT=16384`** | **310.6 tok/s**(TTFT 52,794 ms) | ✅ 真跑(`[fp8-asm]=84`) |
+
+**⇒ 「1M 上下文」与「GPU 预填充」在 2×A100-40GB 上不可兼得**,原因三重锁死:
+1M 的 KV 实需 **19.05 GiB** ⇒ 只剩 16.5 GiB,而预检要 **11.4 GiB** 空闲(只有 4.5);
+且 MBT=16384 需 ~38.7 GiB 非 KV ⇒ OOM。
+
+## 26.3 性能瓶颈的真相(逐 kernel 实测)
+
+```
+_sparse_mla_fwd_with_sink_kernel   58.80%   ← 稀疏 MLA 注意力,真瓶颈
+moe_forward_shared                 30.28%
+  Memcpy HtoD (Pageable -> Device) 16.22%   ← ⚠️ 未锁页,最低风险的收益点
+  down_kernel_fp8 + gate_up_fp8    14.29%
+  all_reduce                        5.49%
+```
+
+**⇒ 「装配之外那 ~436 ms/层」= 注意力与稀疏 indexer,不是 MoE、不是装配、也不是 H2D。**
+
+## 26.4 优化优先级(按确定性×收益)
+
+1. **锁页那 6.16 s 的 Pageable H2D**(16.22%)—— 确定、低风险、与模型/硬件无关;
+2. **注意力核**(58.8%)—— 真瓶颈,但改造成本高(涉及 KDA/sparse MLA 路径);
+3. **NVFP4**(~15%,且需先核实 routed experts 是否被量化)——— **不是杠杆**;
+4. **8×V100(免费)** —— 聚合算力 1.6×、带宽 2.3×、显存 3.2×,**是升级而非降级**,
+   但门槛是 `cp.async`(SM80+ 指令,Volta 无)能否为 Volta 重写那个注意力核。
+
+## 26.5 本 goal 期间我犯过并已更正的错误(留档)
+
+1. **误判「没走 GPU 预填充」** —— 实为我的 `verify()` 跑在 bench **之前**(ACTIVE/[fp8-asm] 都是请求到达时才打印);
+2. **误判「chunk 被 KDA 2176 钉死、MBT 无效」** —— 实为从行数反推层数时假设错误,MBT 有效(294→41);
+3. **`FAKE_ALL` 消融把服务搞死** —— 输出置零破坏下游,该开关不能作消融;
+4. **profiler 两次空手** —— 真因是 FP8 路径**没有** `_maybe_profile()` 调用点,且 `CALLS` 设得大于调用次数;
+5. **拿 RedHatAI 的 NVFP4 顶替用户指定的 nvidia/ 那个** —— 答错对象。
