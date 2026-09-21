@@ -1972,6 +1972,44 @@ chunk_gated_delta_rule_fwd_h(k,w,u,g,gk,
 
 **⇒ 相对于本段已关闭的四条调参路径,这条是**唯一有依据的结构性方向**,且它的关键接口(`initial_state`)
 已经存在。**
+
+### B75 ✅ 可行性评估:改动可**局限在 `_flashkda_prefill` 一个函数内**,且串接机制已存在
+
+**读代码得到的三条事实:**
+```
+def _flashkda_prefill(self, ..., initial_state: torch.Tensor,
+                              cu_seqlens: torch.Tensor, ...)
+    ...
+    final_state = final_state[: initial_state.shape[0]]      ← 已在处理 state 形状契约
+
+调用处(约 656 行): core_attn_out_non_spec, last_recurrent_state = self._flashkda_prefill(
+                       ..., cu_seqlens=non_spec_query_start_loc)
+```
+
+**⇒ 结论:分块所需的**全部机制都已存在** ——
+`initial_state` 入参、`final_state` 返回、以及 state 形状契约的处理。
+**⇒ 改动可局限在 `_flashkda_prefill` 内部**:把序列按子块循环,每块用上一块的 `final_state`。
+**⇒ 即"中等改动、单函数内、无新接口"。**
+
+**⇒ 完整方案(B74+B75 合并):**
+```
+for i, (s, e) in enumerate(sub_blocks_of(cu_seqlens)):
+    out_i, state = chunk_gated_delta_rule_fwd_h(
+        k=sliced..., w=..., u=...,
+        initial_state=state, output_final_state=True, chunk_size=BT)
+    core_attn_out[..., s:e, ...] = out_i
+⇒ 每次调用的 T = 子块长度 ⇒ h 缩小到 1/N ⇒ 累积 21.65 → ~21.65/N GiB
+```
+
+**⚠️ 必须先验证(不可直接改):**
+1. **数值等价性** —— 子块串接 vs 单次调用的**端到端** `token_ids`/`logprobs` 必须一致
+   (理论上一致,因为 `initial_state` 就是该递推的状态;但**本段测试台三次失败 ⇒ 只信端到端**);
+2. **`non_spec_query_start_loc` 的语义**(它可能已编码了变长序列的边界 ⇒ 切分要与之协调);
+3. **性能代价** —— 子块循环引入 N 次 kernel launch + state 拷贝;
+   **但不动 MoE 的 chunk 数 ⇒ 不增加 141.8 GiB 的权重重流** ⇒ 这是它与"降 MBT"的本质差别。
+
+**⇒ 本段到此:这是**唯一一条有代码依据、且不付 MoE 重流代价**的杠杆。
+**它的下一步是端到端数值 A/B(2 次运行),而不是直接改代码。**
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
