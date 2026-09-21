@@ -86,9 +86,9 @@ Every performance number below was taken on this machine:
 | | short | 140 | 2 | **70.4** | 13.9 |
 | | long | 16,396 | 1 | **266.3** | **21.4** |
 | | long | 16,396 | 2 | pending † | pending † |
-| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 4096 · spec decode off | short | 128 | 1 | **254.3** | **19.8** |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 8192 · spec decode off | short | 128 | 1 | **254.3** | **19.8** |
 | | short | 128 | 2 | **175.2** | 14.0 |
-| | long | 16,384 | 1 | **115.8** | **18.7** |
+| | long | 16,384 | 1 | **355.0** | **19.5** |
 | | long | 16,384 | 2 | pending † | pending † |
 
 > † **The two long/C=2 cells are not yet available.** Configuration and criteria for the rest follow.
@@ -98,12 +98,14 @@ Every performance number below was taken on this machine:
   7.48 GiB) with **no multiplicative margin** -- at 256K a 10% margin is 0.48 GiB and was measured to OOM.
 * **Criteria for the long-prompt cells**:
   * GLM-5.3-Flash: TTFT 61,562 ms; `[fp8-asm]=168` (42 layers x 2 chunks x 2 ranks), `DISABLED=0`, `illegal=0`, `OOM=0`.
-  * DeepSeek-V4.1-Flash: TTFT 141,618 ms; `DISABLED=0`, `aten::new_empty=0`, `illegal=0`, `OOM=0`.
+  * DeepSeek-V4.1-Flash: TTFT **46,150 ms**; `DISABLED=0`, `aten::new_empty=0`, `illegal=0`, `OOM=0`.
 * **MBT is the critical knob at 256K**: GLM OOMs at `MBT=16384` (measured, layer 35) and succeeds at
   **`MBT=12288`** (two chunks, the first larger and so more efficient); `MBT=8192` also works but is 14%
   slower (233.6 tok/s) and `MBT=4096` is 34% slower (154.5 tok/s) while allowing a longer context. The
   three-tier trade-off is in `docs/TUNING_GUIDE.md` section 8. V4.1 hits an `aten::new_empty` allocation
-  failure at `MBT=16384` and succeeds at `MBT=4096`.
+  failure at `MBT=16384`, and **`MBT=8192` succeeds** (two chunks) -- TTFT 141,618 -> 46,150 ms and
+  prefill 115.8 -> 355.0 tok/s (3.07x) -- while `MBT=4096` (four chunks) also works but is far
+  slower.
 * **The three short-prompt rows come from an earlier measurement round under a 32K budget** (a different
   configuration from the 256K one listed above) and **have not been re-measured under 256K**.
 * Neither model uses speculative decoding (random tokens are its worst case, and the draft layer competes
