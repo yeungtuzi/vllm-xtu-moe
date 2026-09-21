@@ -1939,6 +1939,39 @@ RuntimeError: Engine core initialization failed. See root cause above. Failed co
 
 **⇒ 本段(第 2 段,65 轮)到此:256K/MBT=16384 的所有已试杠杆均失败(staging ②c / graph / chunk size);
 唯一可用的是**降 MBT 到 8192**(已在用),其代价是 B37 的每-chunk 8.7 s。**
+
+### B74 ⭐ 最后一个便宜检查给出了**具体可行的结构性路径** —— 用已存在的 `initial_state` 接口
+
+**检查内容(读代码):**
+```
+_flashkda_prefill(self, ..., cu_seqlens, ...)               ← 支持变长序列
+chunk_gated_delta_rule_fwd_h(k,w,u,g,gk,
+        initial_state=None, output_final_state=False, ...)   ← **状态可跨调用传递**
+```
+**⇒ KDA 的 prefill **本来就能分次调用并携带状态**,而 `h` 的大小只取决于**本次调用的 T**
+(`h = (B, NT, H, V, K)`,`NT = T/BT`)。**
+
+**⇒ 因此结构性修法是具体的(而非"改核结构"这种笼统说法):**
+> **把 KDA 的 prefill 拆成 N 个子块,每块用上一块的 `output_final_state` 作为 `initial_state`,**
+> **⇒ 每次调用的 `T = 总长 / N` ⇒ `h` 缩小 N 倍 ⇒ 累积从 21.65 GiB 降到 ~21.65/N GiB。**
+
+**⇒ 与 `MBT` 的区别(重要):**
+* **降 MBT** 减小的是**整层**的 token 数 ⇒ 但它同时把 MoE/注意力也切碎,
+  **代价是 B37 的每-chunk 8.7 s**(因为每个 chunk 都要**重流 141.8 GiB 专家权重**);
+* **只切 KDA 的 prefill** 则**不动 MoE 的 chunk 数** ⇒ **不增加权重重流** ⇒
+  **可能只付很小的代价就把 `h` 压下去。**
+
+**⇒ 这就是本段一直缺的那条路径:一个**不动 MoE chunk 数**的显存杠杆。**
+
+**⚠️ 未验证(必须先做,不可直接改):**
+1. **数值**:子块串接是否与单次调用**逐位一致**(理论上应一致,因为 `initial_state` 就是那个递推的状态;
+   但**必须实测** —— 而本段的测试台已三次失败(接口语义),**故应走端到端 A/B**:`token_ids`+`logprobs);
+2. **`_flashkda_prefill` 的调用点是否允许拆分**(它接收 `cu_seqlens`,拆分可能只需改调用处的切分);
+3. **`output_final_state` 的 dtype/形状契约**(KDA 的持久 state shape 见 `kda_state_shape`:只依赖 heads/head_dim,
+   ⇒ 与 NT 无关 ⇒ **串接所需的 state 是小张量,不会引入新的累积**)。第 3 条**由代码读出,较可靠**。
+
+**⇒ 相对于本段已关闭的四条调参路径,这条是**唯一有依据的结构性方向**,且它的关键接口(`initial_state`)
+已经存在。**
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
