@@ -2263,6 +2263,98 @@ Memcpy HtoD (Pageable -> Device)   0.00%  0.000us  0.00%  0.000us  0.000us
 **⇒ 下一步(见 `docs/HANDOFF_SERVER_RESTART.md` §3.4):开 `XIAOTU_LAYER_TIMING=1` 把逐层三相
 (`pre`/`eng`/`post`)与墙钟 878 ms/层对齐 —— B17 测得该回调只覆盖 320.9 ms/层 ⇒
 **缺口很可能在插件看不到的那部分前向**(而非 MoE)。**
+
+### B84 ⭐⭐⭐ CED(decoder-side SWA bounded replay,上游 #56752)验收:V4.1 长 prefill **2.08×**、并发 **1.80×**、零失败
+
+**被测对象**:`/home/user/lvllm/vllm-ced`(分支 `ced/pr56752`,HEAD `f8a142e168` = 生产树 `eddc6d0eb7` **+3 commits / 15 文件 +1500−92**)
+⇒ 两臂之间**唯一**的差异就是 CED。
+
+**为什么 A/B 必须各起一次服务**:上游复用 `CacheConfig.swa_bounded_replay`(默认 `True`,**没有单独的 CED 旗标**),
+而该值在 `CacheConfig` 构造时读取 ⇒ 关掉只能靠 `--no-swa-bounded-replay`,**服务起来后改不了**。
+已把该开关做成 `scripts/serve_v41.sh` 的 `CED=0/1`(默认 1 = 树默认),A/B 驱动 = `probes/ced_v41_ab.sh`。
+
+**配置**(与 README 的 256K 口径一致):`GPUS=0,1 TP=2 MAXLEN=262144 MBT=8192 GPU_UTIL=0.85
+KV_CACHE_BYTES=8031830016 SPEC=0 PREFIX_CACHE=1 MAXSEQS=2 LOAD=auto`;
+工具 = 官方 `vllm bench serve --dataset-name random --random-input-len 16384 --random-output-len 128
+--num-prompts 8 --max-concurrency {1,2}`;**两臂同 seed**(`L*7+C*131+17`)⇒ prompt 逐字节相同,**配对比较**。
+
+**CED 生效的判据是日志,不是猜**:
+`Decoder SWA bounded replay: layers past the last KV source prefill only each request's last 128 tokens.`
+(`nvidia/model_state.py:232`;关臂无此行)。前置条件是 **Model Runner V2**(`Using V2 Model Runner`);
+否则 `attention.py:516` 会 `warning_once` 后**自行关闭**。V4.1 的 `kv_source_layer_ids=[2,8,14,20]`
+⇒ 回放层 = **21..39(19 层)**,engram 层(1/14)都在切点之前 ⇒ 结构上满足。
+
+| 臂 | C | mean TTFT | **prefill(mean)** | median TTFT | prefill(median) | mean TPOT | **median TPOT** | decode(median) | ok/failed |
+|---|---|---|---|---|---|---|---|---|---|
+| CED 关 | 1 | 37,704 ms | 434.5 tok/s | 33,992 ms | 482.0 | 51.90 ms | 51.91 | 19.3 | 8/0 |
+| **CED 开** | 1 | **18,125 ms** | **903.9** | 18,097 ms | 905.4 | 69.76 | **51.84** | 19.3 | 8/0 |
+| CED 关 | 2 | 48,972 ms | 334.6 | 42,772 ms | 383.1 | 208.18 | 257.30 | 3.9 | 8/0 |
+| **CED 开** | 2 | **27,213 ms** | **602.1** | 27,196 ms | 602.5 | 129.30 | **129.38** | **7.7** | 8/0 |
+
+**⇒ prefill 加速比:C=1 = 2.08×,C=2 = 1.80×。**
+**⇒ decode:median TPOT 在 C=1 完全不变(51.91 → 51.84 ms);C=2 反而快 1.99×(257.3 → 129.4 ms)。**
+**⇒ 不崩:4 格全部 8/8 成功、0 失败**(含两路并发与 CUDA graph 路径)。
+**⇒ ⚠️ 判据教训:CED 开臂的 `mean` TPOT 被少数 185 ms 离群步拉高(69.76 vs median 51.84)**
+⇒ 报 decode 用 **median**;若照抄 `mean` 会得出"CED 让 decode 慢 26%"的**假结论**。
+原始 JSON/日志已留在 `dev-docs/report/tuning/raw/ced_ab/`。
+
+### B85 ⚠️ 生成等价性:首 token **全一致**;但「逐字节全文」在 ≥5K 上**不能用作判据**(同臂就自相矛盾)
+
+**语料与口径**:自然长 prompt(ShareGPT 取 3 条 = **2160 / 5193 / 10071** token,互不共享前缀)
++ 合成重复句语料(300/1024/4096/16384);`temperature=0 max_tokens=32 ignore_eos`;
+工具 `probes/ced_equiv.py`(自然)与 `probes/ced_gencheck.py`(合成)。
+
+**(a) 自然长 prompt —— 首 token 全一致,且同臂重复稳定:**
+
+| 对比 | sg0(2160) | sg1(5193) | sg2(10071) | 三档首 token |
+|---|---|---|---|---|
+| **CED 关 r1 vs r2**(同臂!) | SAME | **TEXT-DIFF** | **TEXT-DIFF** | 全相同 |
+| **CED 关 r1 vs CED 开 r1** | SAME | **SAME** | TEXT-DIFF | 全相同 |
+
+⇒ **同一臂(同权重、同配置,只有前缀缓存路径不同)自己就矛盾**,而且比跨臂差异**更大**
+⇒ sg2 的差异**不能归因于 CED**。CED 开/关在 5193 token 上**全文逐字节相同**。
+
+**(b) 合成重复句语料 —— 三次运行的模式与「CED 改变输出」不一致:**
+
+| case | CED 关#1 | CED 开 | CED 关#2 |
+|---|---|---|---|
+| long_300 | SAME | SAME | SAME |
+| long_1024 | SAME | SAME | **DIFF** ← 同为 CED 关 |
+| long_4096 | DIFF | **SAME** | **SAME** ← CED 开与一次 CED 关逐字节相同 |
+| long_16384 | SAME | DIFF | SAME |
+
+⇒ **重复同一句话的 prompt,logits 大量近似并列,极小数值差就翻转贪心** ⇒ 该语料是**坏尺子**;
+先前把 long_4096/16384 的差异记成 CED 的错是**归因错误**。
+
+**(c) 一条设计事实(堵死了一条更强的判据)**:请求带 `prompt_logprobs` 时,
+CED **不对该请求裁剪**(`model_state.py:240` `_req_keeps_rows`:"every prompt row is read")
+⇒ **不能用 prompt logprobs 做 Golden 对拍** —— 那会让 CED 自动关闭。
+
+**⇒ 结论:在这个口径下 CED 未被证伪(首 token 等价 + 5193 token 全文相同);
+但更强的判据——逐层 SWA KV 的 Golden 对拍(CED_PR_PLAN §4)——仍未做,不要当成已证。**
+
+### B86 ❌ ③ 的工具链结论:`nsys` 在本机**不可用**(handoff §3.4 第 3 条作废)
+
+```
+nsys profile --trace=cuda ... → 生成 .nsys-rep(退出码 0,看起来成功)
+  ⚠️ 处理期报 "Unknown runtime API function index: 461"
+nsys stats --report cuda_gpu_kern_sum  → SKIPPED: "does not contain CUDA kernel data"
+sqlite 表清单: 只有 CUPTI_ACTIVITY_KIND_RUNTIME,**没有 CUPTI_ACTIVITY_KIND_KERNEL**
+版本: Nsight Systems 2023.1.2 / Compute 2023.1.1  vs  driver 580.178.04 + CUDA 12.1
+```
+⇒ **"一次运行即可给出完整时间线"不成立** —— 容器里套件太旧,CPU 侧 API 能采、**GPU 核事件采不到**。
+③ 只能走**插件内**的 torch profiler 与分相计时。
+
+**顺带查清两件与 ③ 直接相关的事:**
+
+1. **`[layer-timing]` 打在哪儿**:`_lt_record` 在 `mixed_experts.py:1919`(CPU 引擎调用**之后**),
+   但 `_lt_t0` 在 `:1368`(GPU 流式分支**之前**)⇒ **GPU 预填充时 `pre` 覆盖的就是整段 GPU MoE
+   (H2D + 两个核),`eng`≈0**;CPU 路径才 `eng`>0。⇒ 该行对两条路径**都有效,但语义不同**,
+   历史上把两种运行的 `pre/eng` 混着比是错的。
+2. **已给该行加墙钟时间戳**(`_lt_record`,**只改打印**):配合 `XIAOTU_LAYER_TIMING_EVERY=1`
+   可**逐层**反解 `pre/eng/post`(由相邻累计平均作差)并得到**层间墙钟**
+   ⇒ 一跑就能把每层拆成「apply 内 MoE」vs「apply 之外(注意力/indexer/层间)」,
+   **不需要 nsys、不动任何计算路径**。解析器:`probes/attrib_layer_timing.py`。这是 ③ 的下一步。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

@@ -87,6 +87,15 @@ LOAD="${LOAD:-dummy}"          # dummy = no disk read, exercises the kernels
 GPU_UTIL="${GPU_UTIL:-0.85}"
 EXTRA_ENV="${EXTRA_ENV:-}"
 
+# CED(默认 **1** = 用树默认:`CacheConfig.swa_bounded_replay=True`,decoder 侧 SWA
+#   有界回放开启)。=0 时加 `--no-swa-bounded-replay`,即 A/B 的**基线臂**。
+#   上游 #56752 复用 `CacheConfig.swa_bounded_replay`,没有单独的 CED 旗标,
+#   所以 A/B 只能靠这个旗标;两臂必须**各起一次服务**(旗标在 CacheConfig 构造时读取,
+#   服务起来后改不了)。
+#   ⚠️ 该机制要求 **Model Runner V2**(否则 attention.py 会 warning_once 后自行关闭):
+#   日志里若出现 "SWA bounded replay needs model runner V2" 就说明 CED 没生效。
+CED="${CED:-1}"
+
 # COMPILE(默认 0 = 与 cellV/参考实现一致的 vLLM 默认:mode=NONE + cudagraph
 #   FULL_AND_PIECEWISE)。=1 时用参考实现 lk 的那组旗标
 #   `{"cudagraph_mode":"FULL_DECODE_ONLY","mode":"VLLM_COMPILE"}`(probe 里一直是这个)。
@@ -281,6 +290,7 @@ nohup env \
     --gpu-memory-utilization "$GPU_UTIL" \
     $( [ -n "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ] && printf -- '--kv-cache-memory %s' "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ) \
     $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager ) \
+    $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
     $( [ "${SPEC:-0}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" ) \
     $( [ -n "$CC_JSON" ] && printf -- '--compilation-config %s' "$CC_JSON" ) \
     $( [ "${PREFIX_CACHE:-1}" = "1" ] || echo --no-enable-prefix-caching ) --trust-remote-code \

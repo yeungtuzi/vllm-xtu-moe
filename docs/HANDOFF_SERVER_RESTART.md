@@ -23,6 +23,30 @@
 
 ---
 
+## 1b. 2026-09-21 深夜续做（重启之后）——**CED 已验收，V4.1 长两行已换数**
+
+**CED（decoder-side SWA bounded replay，上游 PR #56752）验收完成**，被测树 `/home/user/lvllm/vllm-ced`
+（= `eddc6d0eb7` **+3 commits / 15 文件 +1500−92**；两臂之间唯一差异就是 CED）：
+
+* **32/32 格零失败**（`vllm bench serve`，L=16384，N=8，C=1/C=2 × 两臂，两臂同 seed ⇒ 配对比较）；
+* **prefill**：C=1 **434.5 → 903.9 tok/s（2.08×）**、C=2 **334.6 → 602.1 tok/s（1.80×）**；
+* **decode**：C=1 持平（median TPOT 51.91 → 51.84 ms）、C=2 快 **1.99×**（257.3 → 129.4 ms）；
+* **生成等价性**：3 条自然长 prompt（2160/5193/10071 token）**首 token 全一致**，
+  且 5193 token 上**全文逐字节相同**。⚠️ 「逐字节全文」在 ≥5K **不能当判据**：
+  同一臂（CED 关）两次运行自己就不一致（前缀缓存路径差异）——详见 `docs/EXPERIMENTS.md` B84/B85。
+* README（中/英）的 V4.1「长」两行已换成 CED 开的数据，并补上原「待测」的「长/C=2」。
+
+**两件工具链结论（都写进 B86）：**
+
+1. **`nsys` 在本机不可用**：容器里只有 2023.1.2，对 driver 580 + CUDA 12.1 采不到 GPU 核事件
+   （`nsys stats` 报 `does not contain CUDA kernel data`，sqlite 里没有 KERNEL 表）
+   ⇒ **§3.4 第 3 条「nsys 一次运行给出完整时间线」作废**。
+2. ③ 的下一步改为**插件自带的逐层计时**：`[layer-timing]` 已加**墙钟时间戳**（只改打印），
+   配 `XIAOTU_LAYER_TIMING=1 XIAOTU_LAYER_TIMING_EVERY=1` 可逐层反解 `pre/eng/post` + 层间墙钟，
+   解析器 `dev-docs/report/tuning/probes/attrib_layer_timing.py`。**这是 ③ 现在最便宜的一步。**
+
+---
+
 ## 2. 重启会打断的任务
 
 | 任务 | 状态 | 重启后如何处理 |
@@ -30,7 +54,8 @@
 | ~~**V4.1 长/C=2**（`/tmp/v81c2.sh`，PORT 8701）~~ | **已由我主动停掉**（未出结果）。原因：它只为一格 README 数据，而 CED 子代理要用 GPU0/1 验证 1500 行实现 —— 优先级明确 | **需重跑**（若仍要那格数据）。命令见 §4 |
 | 所有 256K 测量 | ✅ 已完成并写入 README/CHANGELOG | 无需重跑 |
 
-**README 里「长/C=2」两格仍标 `待测 †`** —— GLM 与 V4.1 各一格，**均未取得**。
+**README 里「长/C=2」两格** —— **V4.1 那一格已在 §1b 取得**（CED 开：prefill 602.1 / decode 7.7）；
+**GLM 那一格仍未取得**（`待测 †`）。
 
 ---
 
@@ -93,18 +118,24 @@ profile 的调用次数 vs 应有层数：
 
 ⇒ **结论：现有工具链拿不到完整 GPU 时间线。** 缺口是「工具盲区」而非「实验没跑成」。
 
-### 3.4 下一步（建议，按便宜程度排序）
+### 3.4 下一步（**2026-09-21 深夜更新：第 2 条已做，第 3 条已作废**）
 
-1. **最便宜**：开 `XIAOTU_LAYER_TIMING=1`（插件自带，分 `pre`/`eng`/`post` 三相，见
-   `vllm_xiaotu_moe/mixed_experts.py:68-90`），跑一次基线请求，把**逐层三相**与
-   墙钟 878 ms/层对齐 ⇒ 判断缺口是均匀分布还是集中在某相。
-   **B17 曾测得 `[layer-timing]` = 320.9 ms/层**（attention 修复后），而墙钟是 878 ms/层 ⇒
-   **插件回调只覆盖约 1/3 的每层时间** ⇒ 缺口很可能在**插件看不到的那部分前向**（不是 MoE）。
-2. **次便宜**：给插件的 `[fp8-asm]` 与 `[layer-timing]` 的 `print` **加时间戳**（一行改动，默认不变），
-   这样可从日志直接得到**逐层时间线**，无需 trace。
-3. **较贵**：`nsys`（若容器里可用）—— 一次运行即可给出完整时间线。
+1. **最便宜（仍在）**：开 `XIAOTU_LAYER_TIMING=1 XIAOTU_LAYER_TIMING_EVERY=1` 跑一次 32K 基线请求。
+   ⚠️ **口径先修正**：`_lt_t0` 在 `mixed_experts.py:1368`（GPU 流式分支**之前**）、
+   `_lt_record` 在 `:1919`（CPU 引擎调用**之后**）⇒ **GPU 预填充时 `pre` 覆盖整段 GPU MoE（H2D+核）、
+   `eng`≈0**；CPU 路径才 `eng`>0。历史上把两种运行的 `pre/eng` 混着比是**错的**
+   （B17 的 `eng` 21.9–33.3 ms 说明那次是 CPU 路径）。
+2. **已做**：`[layer-timing]` 加了**墙钟时间戳**（只改打印，默认不变）。
+   现在可直接从日志得到**逐层时间线**：相邻行 Δt = 层间墙钟，逐层 `pre/eng/post` 由累计平均反解
+   ⇒ 一跑就能把每层拆成「apply 内 MoE」vs「apply 之外（注意力/indexer/层间）」。
+   解析器：`dev-docs/report/tuning/probes/attrib_layer_timing.py`。
+3. **❌ 已作废**：`nsys` **在本机采不到 GPU 核事件**（只有 2023.1.2 套件 vs driver 580；
+   `nsys stats` → `does not contain CUDA kernel data`，sqlite 无 KERNEL 表）。见 B86。
 4. **结构性怀疑对象**（未验证）：KDA 侧的**非核**工作、CUDA graph 的 replay 开销、
    或 vLLM 侧未进 profile 的融合核。**注意 KDA 四核只 0.12 s，所以不是 KDA 的核。**
+5. **另一条更硬的判据（未做）**：插件内 `XIAOTU_TORCH_PROFILE` 会 `export_chrome_trace`，
+   而 chrome trace 里**有**带 `ts/dur` 的 GPU kernel 事件 ⇒ 可直接算「窗口内 GPU 忙/空隙」，
+   判断那 332 ms/层是「真空隙」还是「叶子求和漏项」。**这是与第 1 条互补的一步。**
 
 ---
 
@@ -176,7 +207,8 @@ for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do kill -
 | `h` 为何逐层不释放（结构上应释放） | ⚠️ 未查 |
 | pr4 的**端到端数值**与 `head_mask` 分支 | ⚠️ 未验证（核级 `max|diff|=2.819e-05` 已做） |
 | 布局转换（为何二维 `q` 快 2.8×）的解释 | ⚠️ 未证实 |
-| README 的「长/C=2」两格 | 未取得（`待测 †`） |
+| README 的「长/C=2」两格 | **V4.1 已取得（CED 开：602.1 tok/s / decode 7.7）；GLM 仍待测**（§1b） |
+| CED 逐层 SWA KV 的 **Golden 对拍** | ⚠️ 未做（`CED_PR_PLAN.md` §4；注意带 `prompt_logprobs` 时 CED 会自动不裁剪，见 B85c） |
 | README 的「短」三行 | 来自**早期 32K 预算**的测量，**未在 256K 配置下重测** |
 
 ---
@@ -190,7 +222,10 @@ for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do kill -
 * **⚠️ 子代理报告称「V4.1-Flash 检查点本机已删」，此说法不成立** ——
   检查点实际存在（`/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master`，**476 GB**），
   且我在 22:25 用它跑通了 256K 请求。**我已在会话中发出更正。**
-* 其验证三件套（生成等价性 / 加速比 / 端到端不崩）**尚未做** —— 重启后可用真权重做。
+* 其验证三件套（生成等价性 / 加速比 / 端到端不崩）**已于 §1b 完成**（2026-09-21 深夜，真权重）：
+  加速比 2.08×/1.80×、32/32 格零失败、首 token 等价。
+  ⚠️ 仍**未做**：逐层 SWA KV 的 **Golden 对拍**（`CED_PR_PLAN.md` §4），
+  以及 pr4 的端到端数值与 `head_mask` 分支。
 * **子代理补充的两条事实（有用，已采纳）**：
   1. **CED 复用 `CacheConfig.swa_bounded_replay`（默认 `True`），没有单独 flag** ⇒ A/B 要用 `--no-swa-bounded-replay`；
   2. `serve_v41.sh` 的 **`--load-format` 默认 `dummy`** ⇒ `dummy` 只能证明「kernel/服务不崩」与 A/B 确定性，

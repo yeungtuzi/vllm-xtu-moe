@@ -7,22 +7,21 @@
 
 ## [Unreleased]
 
-### Fixed
-
-- **GLM-5.3-Flash 长 prompt 首次请求触发 CUDA `illegal memory access`,导致引擎崩溃**
-  (`EngineDeadError`,bench 侧表现为 `TTFT 0.00` + `ConnectionRefusedError`)。
-  根因是 **FP8 GPU 预填充装配运行在未正确同步的旁路流上**。
-  修复:FP8 装配的旁路流**默认关闭**,并新增捕获期保护。
-  详见下方「事故复盘」。
-
-### Changed
-
-- `gp_side_stream_enabled()` 默认值由「开」改为**「关」**
-  (`XIAOTU_GP_ASM_SIDE_STREAM=1` 仍可显式打开,仅供性能实验)。
-  **代价:长 prompt TTFT +17%**(实测 89.8 s → 105.4–108.8 s),待用正确的流间同步换回。
-
 ### Added
 
+- **DeepSeek-V4.1-Flash 的 CED(decoder-side SWA bounded replay)验收数据**:承接上游
+  [PR #56752](https://github.com/vllm-project/vllm/pull/56752)(`ced/pr56752` = 生产树 +3 commits)。
+  同批**配对 A/B**(256K / L=16384 / MBT=8192 / TP=2 / 两臂同 seed,仅 `--no-swa-bounded-replay` 不同):
+  * **prefill:C=1 434.5 → 903.9 tok/s(2.08×)、C=2 334.6 → 602.1 tok/s(1.80×)**;
+  * **decode:C=1 持平(median TPOT 51.91 → 51.84 ms)、C=2 快 1.99×(257.3 → 129.4 ms)**;
+  * **零失败(0/16,含两路并发)**。
+  README 的 V4.1「长」两行已改用 CED 开的数据,并补上原「待测」的「长/C=2」。
+  详见 `docs/EXPERIMENTS.md` B84/B85。
+- `scripts/serve_v41.sh` 的 `CED=0/1` 开关(默认 1 = 树默认):`CED=0` 加 `--no-swa-bounded-replay`,
+  因为上游复用 `CacheConfig.swa_bounded_replay` 且**没有独立 CED 旗标**、启动后不可改 ⇒ A/B 必须两臂各起一次。
+- 插件 `[layer-timing]` 行新增**墙钟时间戳**(`XIAOTU_LAYER_TIMING=1` 时才有该行,只改打印):
+  配合 `XIAOTU_LAYER_TIMING_EVERY=1` 可**逐层**反解 `pre/eng/post` 并得到层间墙钟,
+  用于定位「~13.95 s 未归属时间」。解析器 `dev-docs/report/tuning/probes/attrib_layer_timing.py`。
 - `gp_capturing()`(`vllm_xiaotu_moe/mixed_experts.py`):CUDA graph 捕获期判定;
   捕获期**强制不用旁路流**,落到「当前流 + 不建跨流事件」的保守路径。
 - `XIAOTU_DEATH_DEBUG=1`(`vllm_xiaotu_moe/__init__.py`,默认关闭):给
@@ -32,6 +31,22 @@
   含 KV cap 自动推算与**前置断言**、日志/pidfile 双判据的早退检测、显式 `PYTHONPATH`、
   清场与观测分离。
 - `dev-docs/RND_CAMPAIGN_DIAGNOSIS.md`:本次事故的完整诊断记录(含所有走过的弯路)。
+
+### Changed
+
+- README(中/英)口径补充:**decode 取 median TPOT**。CED 开臂的 `mean` TPOT 被少数(p99≈185 ms)
+  离群解码步拉高(69.76 vs median 51.84 ms),照抄 mean 会误判「CED 让 decode 慢 26%」。
+- `gp_side_stream_enabled()` 默认值由「开」改为**「关」**
+  (`XIAOTU_GP_ASM_SIDE_STREAM=1` 仍可显式打开,仅供性能实验)。
+  **代价:长 prompt TTFT +17%**(实测 89.8 s → 105.4–108.8 s),待用正确的流间同步换回。
+
+### Fixed
+
+- **GLM-5.3-Flash 长 prompt 首次请求触发 CUDA `illegal memory access`,导致引擎崩溃**
+  (`EngineDeadError`,bench 侧表现为 `TTFT 0.00` + `ConnectionRefusedError`)。
+  根因是 **FP8 GPU 预填充装配运行在未正确同步的旁路流上**。
+  修复:FP8 装配的旁路流**默认关闭**,并新增捕获期保护。
+  详见下方「事故复盘」。
 
 ---
 

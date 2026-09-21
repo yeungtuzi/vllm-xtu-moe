@@ -84,7 +84,16 @@ def _lt_record(pre_ms: float, eng_ms: float, post_ms: float) -> None:
         if _LT_ACC["n"] % max(1, _LT_EVERY) == 0:
             n = _LT_ACC["n"]
             tot = _LT_ACC["pre"] + _LT_ACC["eng"] + _LT_ACC["post"]
-            print(f"[layer-timing] n={n} pre={_LT_ACC['pre']/n:.3f}ms "
+            # 【2026-09-21 ③】加墙钟时间戳(**只影响这一行打印**)。
+            # 为什么必须加:这行原本只打**累计平均**,把逐层分辨率丢掉了。配上时间戳后,
+            # 相邻两行的 Δt = 上一层 MoE 结束到下一层 MoE 结束的墙钟,而 pre/eng/post
+            # 的**逐层值**可由相邻累计平均反解:
+            #     x_k = avg_n·n − avg_{n−1}·(n−1)
+            # ⇒ 一跑就能把每层拆成「MoE(apply 内)」 vs 「apply 之外(注意力/indexer/…）」,
+            # 不需要 nsys、也不动任何计算路径。用法:XIAOTU_LAYER_TIMING=1
+            # XIAOTU_LAYER_TIMING_EVERY=1(每层一行)。
+            print(f"[layer-timing] t={time.perf_counter():.6f} n={n} "
+                  f"pre={_LT_ACC['pre']/n:.3f}ms "
                   f"eng={_LT_ACC['eng']/n:.3f}ms post={_LT_ACC['post']/n:.3f}ms "
                   f"total={tot/n:.3f}ms (每层;越接近 100% 说明开销在哪个相位)",
                   flush=True)

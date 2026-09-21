@@ -75,6 +75,9 @@ Every performance number below was taken on this machine:
 ## Performance
 
 * Metric: `prefill (tok/s) = prompt_tokens / TTFT`, `decode (tok/s) = 1000 / TPOT` (both converted from the same `vllm bench serve` run).
+  > **decode uses the `median` TPOT**: the CED-on arm's `mean` TPOT is inflated by a handful of
+  > outlier decode steps (p99 ~185 ms), which would wrongly read as "CED costs 26% of decode" --
+  > median TPOT is identical across the arms (51.91 vs 51.84 ms).
 * Dataset: **random tokens**, with `--random-input-len` pinned to short 128 / long 16384 and output 128; **prefix caching on**; **a distinct seed per cell** (otherwise C=2 reads the cache C=1 left behind); 8 requests per cell.
   > Two differences from the previous revision: (1) ShareGPT was replaced by the random dataset -- the goal is prefill/decode throughput at a **controlled input length**, and ShareGPT's length distribution cannot produce a "long = 16384" column; (2) the concurrency bands changed from C=1/C=4 to **C=1/C=2**.
   > Note the random dataset is **random tokens**, the worst case for speculative decoding (predictability ~0), so this table does **not** represent the real gain from enabling MTP.
@@ -86,26 +89,42 @@ Every performance number below was taken on this machine:
 | | short | 140 | 2 | **70.4** | 13.9 |
 | | long | 16,396 | 1 | **266.3** | **21.4** |
 | | long | 16,396 | 2 | pending † | pending † |
-| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 8192 · spec decode off | short | 128 | 1 | **254.3** | **19.8** |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 8192 · **CED on** (long rows) · spec decode off | short | 128 | 1 | **254.3** | **19.8** |
 | | short | 128 | 2 | **175.2** | 14.0 |
-| | long | 16,384 | 1 | **355.0** | **19.5** |
-| | long | 16,384 | 2 | pending † | pending † |
+| | long | 16,384 | 1 | **903.9** | **19.3** |
+| | long | 16,384 | 2 | **602.1** | **7.7** |
 
-> † **The two long/C=2 cells are not yet available.** Configuration and criteria for the rest follow.
+> † **The long/C=2 cells, previously "pending", are now available** for V4.1; GLM's long/C=2 is still pending.
+> Configuration and criteria for the rest follow.
 
 * **Context**: every configuration in this table **guarantees at least 256K** (`MAXLEN=262144`). The KV cap is
   set to the **engine-derived requirement** (GLM 19,505 B/token, i.e. 4.76 GiB; V4.1 30,639 B/token, i.e.
   7.48 GiB) with **no multiplicative margin** -- at 256K a 10% margin is 0.48 GiB and was measured to OOM.
 * **Criteria for the long-prompt cells**:
   * GLM-5.3-Flash: TTFT 61,562 ms; `[fp8-asm]=168` (42 layers x 2 chunks x 2 ranks), `DISABLED=0`, `illegal=0`, `OOM=0`.
-  * DeepSeek-V4.1-Flash: TTFT **46,150 ms**; `DISABLED=0`, `aten::new_empty=0`, `illegal=0`, `OOM=0`.
+  * DeepSeek-V4.1-Flash: TTFT **18,097 ms** (median, C=1, CED on); `DISABLED=0`, `aten::new_empty=0`, `illegal=0`, `OOM=0`.
 * **MBT is the critical knob at 256K**: GLM OOMs at `MBT=16384` (measured, layer 35) and succeeds at
   **`MBT=12288`** (two chunks, the first larger and so more efficient); `MBT=8192` also works but is 14%
   slower (233.6 tok/s) and `MBT=4096` is 34% slower (154.5 tok/s) while allowing a longer context. The
   three-tier trade-off is in `docs/TUNING_GUIDE.md` section 8. V4.1 hits an `aten::new_empty` allocation
   failure at `MBT=16384`, and **`MBT=8192` succeeds** (two chunks) -- TTFT 141,618 -> 46,150 ms and
   prefill 115.8 -> 355.0 tok/s (3.07x) -- while `MBT=4096` (four chunks) also works but is far
-  slower.
+  slower. (This paragraph is the **pre-CED** historical record; with CED available the CED-off
+  baseline under this same configuration is already 434.5 tok/s -- see below.)
+* **The two V4.1 long rows now report CED (decoder-side SWA bounded replay) enabled**, measured on
+  upstream PR [#56752](https://github.com/vllm-project/vllm/pull/56752) (`ced/pr56752`, i.e. this
+  repository's production tree plus 3 commits). Paired A/B from the same batch (identical seeds and
+  configuration, only `--no-swa-bounded-replay` differs):
+
+  | arm | long/C=1 prefill | long/C=2 prefill | long/C=1 decode | long/C=2 decode | failures |
+  |---|---|---|---|---|---|
+  | CED off (baseline) | 434.5 tok/s | 334.6 tok/s | 19.3 tok/s | 3.9 tok/s | 0/16 |
+  | **CED on** | **903.9** | **602.1** | **19.3** | **7.7** | 0/16 |
+
+  => **prefill 2.08x (C=1) / 1.80x (C=2)**; decode is unchanged at C=1 and **1.99x faster** at C=2;
+  **zero failures** including two-way concurrency. Details, criteria and the equivalence caveat are
+  in `docs/EXPERIMENTS.md` B84/B85 (first token equivalent; byte-for-byte full text is not
+  reproducible even within one arm above ~5K, so it cannot serve as the criterion).
 * **The three short-prompt rows come from an earlier measurement round under a 32K budget** (a different
   configuration from the 256K one listed above) and **have not been re-measured under 256K**.
 * Neither model uses speculative decoding (random tokens are its worst case, and the draft layer competes
