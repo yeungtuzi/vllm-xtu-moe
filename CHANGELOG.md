@@ -183,3 +183,68 @@ step3 L=16384 C=1 N=1 : ok=1/1  TTFT 105602 ms  Δillegal=0
   **不在 vLLM main 上** —— 由本仓库 `patches/upstream/pr3-sm80-port.patch` 新增（3517 行）。
   本文件及 README 中与之相关的数字，测的都是**我们自己的 SM80 移植代码**。
   （曾据此误报上游 issue #57971，**已撤回并关闭**。）
+
+---
+
+## 2026-09-21 · 256K 长上下文显存排查（prefill 优化第二段）
+
+### 结论：256K 下 `MBT=16384` 的**全部已试杠杆均失败**，`MBT=8192` 仍是可用配置
+
+**本段没有提升吞吐**，但把「为什么 256K 下不能用更大的 MBT」查到了**实测根因**，
+并**关闭了四条会诱导后人重复尝试的路径**。
+
+### 根因（实测）
+
+**约束是 KDA 线性注意力的 chunk 状态 `h` 逐层累积，不是 MoE 权重 staging。**
+
+* **OOM 落在 `chunk_gated_delta_rule_fwd_h`**
+  （`flash_linear_attention/ops/chunk_delta_h.py:352` 的 `h = k.new_empty(B, NT, H, V, K)`；
+  `k` 是 bf16 ⇒ `h` 是 bf16）；
+* **设备显存在一次请求内单调爬升 21.65 GiB**（外部轮询 `nvidia-smi`，2 Hz，84 点：
+  18223 → 40395 MiB）⇒ ≈**0.62 GiB/层**，与 `h` 的 **0.5 GiB/层**
+  （NT = T/64 = 256，H=64，V=K=128，bf16）× **34 个 KDA 层**吻合；
+* **预算闭合**（单卡 39.49 GiB）：模型权重 11.10（日志）+ KV 4.76（日志）
+  + staging 5.62 + inter 0.50 + 其余 ~16.8。
+* **`h ∝ NT = T/BT`** ⇒ **MBT 减半即 `h` 减半（−8.5 GiB）** —— 这是 `MBT=8192` 能跑而 16384 不能的原因。
+
+### 已关闭的路径（不要再试）
+
+| 路径 | 实测结果 |
+|---|---|
+| 共享 `raw2` 与 `raw13` 的存储（省 1.12 GiB） | 分配层生效，但只让负载多跑 2 层 ⇒ 不够 |
+| `PYTORCH_CUDA_ALLOC_CONF=expandable_segments` | 与不设时数字**逐字相同** ⇒ 不是碎片问题 |
+| 调整 `GPU_UTIL` | util 上限不起作用（插件 staging 在 vLLM accounting 之外） |
+| **`FLA_CHUNK_SIZE` 64 → 128** | **引擎初始化失败** ⇒ 该常量被 GDN/KDA/Kimi 共用，128 不兼容 |
+
+### Fixed / Changed
+
+* `gpu_prefill_fp8.py`：新增 `XIAOTU_GPF_RAW2_SHARE`（**默认 0 = 关闭**）——
+  开启后 `raw2` 复用 `raw13` 存储，省 1.12 GiB 设备显存，且经
+  `scripts/test_gpu_prefill_fp8_assembly.py` **逐字节验证**。
+  **因在 256K 未兑现收益，默认关闭**（`=1` 可 opt-in）。
+  ⚠️ 开启时 w13 的转置被提前到 w2 的 DMA **之前**，否则 w2 的 DMA 会覆盖 `raw13`。
+* `gpu_prefill_fp8.py`：MoE GEMM tile 参数改为环境变量可覆盖
+  （`XIAOTU_GPF_GEMM_{BM,BN,BK,BH,STAGES,WARPS}`，**默认值 64/64/64/64/2/4 不变**）。
+* 新增 `patches/upstream/fla-chunk-size-env.patch`：把 `FLA_CHUNK_SIZE` 做成环境变量可覆盖
+  （默认 64 不变）。**⚠️ 该 patch 经 B73 实测证明：设为 128 会导致引擎初始化失败，
+  故它只是诊断工具，不是可用修法。**
+
+### 验证与判据（本段新增）
+
+* **`scripts/test_gpu_prefill_fp8_assembly.py`** —— 逐字节验证装配逻辑，**秒级，不需加载模型**；
+  它在几秒内抓出了我第一版共享实现的守卫 bug（`w13t_bytes_equal=False`）。
+* **`gate_up_kernel_fp8` 的独立测试台**（合成输入，不加载模型）：线上默认参数 60.6 ms，
+  而线上 profile 的 2.57 s 是**42 层总和**（每层 61 ms）—— **吻合到 1%**。
+  ⇒ 核本身 **8.1% 达峰，属正常水平**（先前"0.19% 达峰"是把一层的 FLOPs 除以 42 层的时间）。
+* **外部显存轮询**（`nvidia-smi`，零改树）：本段唯一无风险且一次成功的测量手段。
+
+### 已知未解
+
+* `h` **为何逐层不释放**（结构上它应在层内释放）——机制未查；
+* 约 **14 s** 的未归属时间（GPU median 98% 忙，而叶子核只加出 17.81 s）；
+* pr4 的端到端数值与 `head_mask` 分支仍未验证。
+
+### 下一步
+
+**256K 下 `MBT=16384` 需要动激活/KDA 侧的结构**（让 `h` 更早释放 / 把 KDA prefill 再分块 /
+换用不累积 `h` 的实现），**而不是继续调参**。三条都需改核且改前必须做数值 A/B。
