@@ -581,6 +581,43 @@ supports_dense_mha_prefill: bool = False
 ⚠️ **同时也解释了 pr4 为什么有效**:pr4 是在**把 DS 已有的做法在 GLM 的核里手抄了一遍**。
 B14 的「二维 `q`」只是抄的时候碰到的那一处形状差异,不是根因。
 
+### C4-更正 🔴 **「改接路径」并不更小 —— 我上一轮高估了**
+
+**查了两个调用点后必须更正:它们是*不同的分解方式*,不是同一个函数的不同调用。**
+
+```python
+# GLM 侧(flashmla_sparse_sm8x.py:165):**一个融合核**
+sparse_mla_fwd_with_sink(q, kv, indices, topk_length, scale, attn_sink, output, num_heads)
+
+# DSv4 侧(flashmla.py:752-772):**多核流水,调用方持有状态**
+for index_start in range(0, combined_indices.shape[-1], topk_chunk_size):
+    accumulate_indexed_sparse_mla_attention_chunk(
+        q=q_chunk, kv_flat=kv_flat, indices=indices_chunk[...],
+        lens=lens_chunk, candidate_offset=index_start, scale=layer.scale,
+        max_score=max_score, denom=denom, acc=subset_acc)   # ← 状态张量
+finish_sparse_mla_attention_with_sink(max_score, denom, subset_acc, attn_sink, output)
+```
+
+**⇒ 要 GLM 走 DS 那条路,需要把 GLM 的 prefill 重构成
+「按 token 分块 + 按 topk 分块累积 + 单独 finish」,并自行分配/清零/传递状态张量。**
+**这是调用侧重构,不是一次函数替换。**
+
+**⇒ 结论修正:**
+1. **C4 的*发现*仍成立且有价值** —— head-block 的 prefill 模式**我们自己的代码里已有、
+   且被 DSv4/V4.1 实战使用** ⇒ **它有实战证据,不是未验证的新写法**;
+2. **但我上一轮说「更小、更容易被接受」是错的**;
+3. **⇒ pr4 因此重新成为合理选择,很可能还是*更小*的那一个**
+   (自包含核内改动、保持 GLM 现有单次调用接口)。
+   **C4 的价值从「替代 pr4」变为「为 pr4 提供设计依据」**:
+   该做法在本仓库有先例,且 `BLOCK_H=8` 与既有 `_PREFILL_INDEXED_HEAD_BLOCK = 8` 一致。
+
+**⚠️ 我的错误模式**:上一轮我从「DS 在用」跳到「所以改接更简单」,**没有读调用点**。
+**第 8 次同类:用「存在性」推断「可行性」。**
+
+**⚠️ 且本次记录过程中我又犯了一次**:第一版 `replace` 锚点没匹配,**脚本却无条件打印
+「已记录」**,直到 `git commit` 报 `nothing to commit` 才暴露。
+**⇒ 脚本里的 `replace` 必须配 `assert`**(上面这版已加)。
+
 | # | 内容 | 状态 |
 |---|---|---|
 | C1 | [vllm-project/vllm#57971](https://github.com/vllm-project/vllm/issues/57971) —— SM8x sparse-MLA prefill 回退核 | ✅ OPEN，作者 yeungtuzi |
