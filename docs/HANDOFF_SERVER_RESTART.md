@@ -27,7 +27,7 @@
 
 | 任务 | 状态 | 重启后如何处理 |
 |---|---|---|
-| **V4.1 长/C=2**（`/tmp/v81c2.sh`，PORT 8701） | **仍在加载**（GPU 各 9.5 GB），未出结果 | **需重跑**。命令见 §4；判据：`Successful` 与 `OOM` |
+| ~~**V4.1 长/C=2**（`/tmp/v81c2.sh`，PORT 8701）~~ | **已由我主动停掉**（未出结果）。原因：它只为一格 README 数据，而 CED 子代理要用 GPU0/1 验证 1500 行实现 —— 优先级明确 | **需重跑**（若仍要那格数据）。命令见 §4 |
 | 所有 256K 测量 | ✅ 已完成并写入 README/CHANGELOG | 无需重跑 |
 
 **README 里「长/C=2」两格仍标 `待测 †`** —— GLM 与 V4.1 各一格，**均未取得**。
@@ -191,6 +191,13 @@ for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do kill -
   检查点实际存在（`/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master`，**476 GB**），
   且我在 22:25 用它跑通了 256K 请求。**我已在会话中发出更正。**
 * 其验证三件套（生成等价性 / 加速比 / 端到端不崩）**尚未做** —— 重启后可用真权重做。
+* **子代理补充的两条事实（有用，已采纳）**：
+  1. **CED 复用 `CacheConfig.swa_bounded_replay`（默认 `True`），没有单独 flag** ⇒ A/B 要用 `--no-swa-bounded-replay`；
+  2. `serve_v41.sh` 的 **`--load-format` 默认 `dummy`** ⇒ `dummy` 只能证明「kernel/服务不崩」与 A/B 确定性，
+     **要评生成等价性需 `LOAD=auto`**。
+* **资源状态（写本文件时）**：三张卡**全空**（`0/0/0 MiB`），主机内存 `available 1493 GB`。
+  ⇒ CED 的 `GPUS=2 TP=1` 或 `GPU0,1 TP=2` 都能起。
+  ⚠️ **但服务器重启会杀掉任何在跑的服务** ⇒ 子代理的验证宜在**重启后**进行，或只跑「短时间能出结论且可立刻重来」的项。
 
 ---
 
