@@ -548,8 +548,38 @@ VLLM_TRITON_MLA_SPARSE            (总开关)
 3. ⚠️ **`assert head_block_size in (1, 2, 4)` 可能过紧** —— 我的二分实测 **`BLOCK_H=8` 最好**
    (108.2 ms vs 1/2 的 ~110 ms,4 的 135.9 ms)。**若采纳 pr4,应一并讨论是否放宽到 8。**
 
-**⇒ 这也意味着 pr4 的正确形态可能是「把已有的 head-block 机制接到 prefill 上」,
-而不是「新写一个 kernel」—— 那是更小、更易被接受的改动。**
+### C4 最终结论(已查到头):**GLM 的 prefill 应该改接到 DeepSeek 那条已有的 head-blocked 路径**
+
+**完整调用图(实测):**
+
+```
+accumulate_indexed_sparse_mla_attention_chunk        ← head-blocked 多-head prefill wrapper
+   └ 内部:head_block = _PREFILL_INDEXED_HEAD_BLOCK = **8**
+           if num_heads >= 8: grid=(num_tokens, cdiv(num_heads,8))
+              → _accumulate_indexed_attention_chunk_multihead_kernel[grid](HEAD_BLOCK=8)
+   ← vllm/models/deepseek_v4/nvidia/flashmla.py:755     ← **DSv4 在用**
+   ← vllm/models/deepseek_v41/nvidia/flashmla.py:569    ← **DSv4.1 在用**
+GLM: vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py:165
+   → sparse_mla_fwd_with_sink (per-token,**无 head 分块**)
+```
+
+**且 GLM 的 SM8x backend 里明写:**
+```
+supports_dense_mha_prefill: bool = False
+# Force every token (prefill included) through the sparse-MQA gather path;
+# the dense/masked MHA prefill would fall back to FlashAttention (SM90+).
+```
+
+**⇒ 三条结论:**
+1. **head-blocked 的 prefill 路径早已存在,而且 DeepSeek-V4/V4.1 已在用**
+   ⇒ **它已经过实战检验**,不是新代码;
+2. **GLM 只是没接上它** —— SM8x backend 主动把 prefill 塞进了 per-token gather 路径;
+3. **⇒ pr4 的正确形态不是"新写 head 分块 kernel",而是"把 GLM 的 prefill 改接到
+   `accumulate_indexed_sparse_mla_attention_chunk`"。** 这比 pr4 **更小、复用已验证代码、
+   且与两份 DS 实现的调用方式一致** —— 明显更容易被接受。
+
+⚠️ **同时也解释了 pr4 为什么有效**:pr4 是在**把 DS 已有的做法在 GLM 的核里手抄了一遍**。
+B14 的「二维 `q`」只是抄的时候碰到的那一处形状差异,不是根因。
 
 | # | 内容 | 状态 |
 |---|---|---|
