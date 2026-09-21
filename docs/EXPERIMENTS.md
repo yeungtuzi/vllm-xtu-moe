@@ -1061,6 +1061,43 @@ raw2  = (E, H,  I) = 288×4096×1024 = **1.12 GiB**
 3. **正确性**:必须在同一流上保证「raw13 的转置完成」先于「raw2 的 DMA 写入」,
    否则 **权重静默错位**。**⇒ 必须做数值 A/B,不能只看"能跑起来"。**
 
+### B43 ⭐⭐ **找到 ②c 的专用安全网:逐字节装配测试(秒级,不需加载模型)**
+
+**代码自己的注释指向了它**:
+```python
+# Getting the source stride wrong silently reads the up rows as gate rows for the next expert
+# (caught by scripts/test_gpu_prefill_fp8_assembly.py).
+```
+
+**`scripts/test_gpu_prefill_fp8_assembly.py` 实测可用(干净树,秒级):**
+```
+E=4 H=512 I=256 shards ns=8 w13_crows=32 w13_cbytes=16384 w2_crows=64 w2_cbytes=16384
+[OK ] assembly: w13t_bytes_equal=True  w2t_bytes_equal=True  shapes_ok=True
+              scale_maxdiff=(0.0e+00, 0.0e+00)
+```
+**它建真实分片 MOE_FP8 引擎(合成 e4m3 权重),调装配,与期望的 K-major 转置
+**逐字节**比较 —— **不需要加载模型**。**
+
+**⇒ 这把 ②c 的风险从"静默损坏权重、需 9 分钟/次验证"降到"改完秒级即可判定"。**
+
+**⇒ ②c 的精确编辑方案(已读清两分支,供后续执行):**
+1. `gpu_prefill_fp8.py:275` `w2_raw = _buf("raw2", (E, H, I), device)`
+   → 改为 `w13_raw` 存储上的视图(`w13_raw.view(-1)[:E*H*I].view(E, H, I)`)
+   (**依据**:`raw13` = 288×2048×4096 = 2.25 GiB,`raw2` = 288×4096×1024 = 1.12 GiB,
+   2I×H 恰为 H×I 的 2 倍 ⇒ raw2 装得进 raw13 ⇒ **省 1.12 GiB**)
+2. **必须同时把 w13 的转置提前**:现在两次 DMA 排在一起(293-323),转置在 352-359;
+   共享后必须变成「DMA w13 → **转置 w13** → DMA w2 → 转置 w2」,否则 **w2 的 DMA 会覆盖 raw13**
+   ⇒ 在 `_hit("w13")` 之后(`_dma2d` 分支,**行 314 后**)**与** `else` 分支的 w13 循环之后
+   (行 331 后)**各插入一次 w13 转置**,并在原 352-359 处加守卫跳过重复调用。
+3. 代价:两段流水串行化(可能使 `[fp8-asm] total` 的 163.3 ms/层上升)。**需实测权衡。**
+
+**⚠️ 我为何**没有**执行这次编辑**:
+它需要 4+ 处插入点,而**我的上下文已接近耗尽**;若在编辑中途力竭,会留下
+**脏树**(正是 B20 那次的事故形态)。**⇒ 记为可执行方案,而非半成品。**
+
+**⇒ 下一段的第一步应当是:先跑一次 `test_gpu_prefill_fp8_assembly.py` 确认基线,
+再做 ②c 的编辑,再跑一次该测试(`w13t_bytes_equal` 必须仍为 True),最后才上服务测 256K。**
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
