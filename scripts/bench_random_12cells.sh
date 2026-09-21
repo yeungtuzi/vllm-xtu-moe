@@ -92,7 +92,7 @@ resolve_kv_cap() {
   local label=$1 ruler=$2 maxlen=$3 seqs=$4 lmax=$5 floor=$6
   local need=$(( maxlen > seqs * lmax ? maxlen : seqs * lmax ))
   local auto cap
-  auto=$("$PY" -c "import sys;r,m,s,l,f=map(float,sys.argv[1:6]);print(int(max(max(m,s*l)/r*1024**3*1.25,f)))" \
+  auto=$("$PY" -c "import sys;r,m,s,l,f=map(float,sys.argv[1:6]);print(int(max(max(m,s*l)/r*1024**3*1.10,f)))" \
          "$ruler" "$maxlen" "$seqs" "$lmax" "$floor")
   if [ -n "${KV_CACHE_BYTES:-}" ]; then
     cap="$KV_CACHE_BYTES"

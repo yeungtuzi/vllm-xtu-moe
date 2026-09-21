@@ -75,22 +75,32 @@ Every performance number below was taken on this machine:
 ## Performance
 
 * Metric: `prefill (tok/s) = prompt_tokens / TTFT`, `decode (tok/s) = 1000 / TPOT` (both converted from the same `vllm bench serve` run).
-* Dataset: real ShareGPT conversations, filtered into a "short" and a "long" band; **prefix caching on**; C=1 and C=4 use **disjoint prompt slices** (otherwise C=4 reads the cache the C=1 run left behind); every cell is warmed up first.
+* Dataset: **random tokens**, with `--random-input-len` pinned to short 128 / long 16384 and output 128; **prefix caching on**; **a distinct seed per cell** (otherwise C=2 reads the cache C=1 left behind); 8 requests per cell.
+  > Two differences from the previous revision: (1) ShareGPT was replaced by the random dataset -- the goal is prefill/decode throughput at a **controlled input length**, and ShareGPT's length distribution cannot produce a "long = 16384" column; (2) the concurrency bands changed from C=1/C=4 to **C=1/C=2**.
+  > Note the random dataset is **random tokens**, the worst case for speculative decoding (predictability ~0), so this table does **not** represent the real gain from enabling MTP.
+* "actual tokens" = `total_input_tokens / completed` (includes a small chat-template overhead).
 
 | Model (optimal config) | prompt | actual tokens | conc. | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
-| **GLM-5.3-Flash**<br>TP=2 · util 0.82 · GPU prefill<br>KV capped 2 GiB · MBT 4096 | short | 151 | 1 | **114.8** | **21.7** |
-| | short | 126 | 4 | **36.5** | 8.2 |
-| | long | 4,538 | 1 | **178.3** | 21.3 |
-| | long | 4,518 | 4 | **92.9** | 2.2 |
-| **MiMo-V2.5**<br>1×A100 · maxlen 16K · KV capped 4 GiB<br>MTP k=1 · GPU prefill | short | 179 | 1 | **70.9** | 17.1 |
-| | short | 151 | 4 | **34.5** | 5.6 |
-| | long | 4,661 | 1 | **156.2** | 15.6 |
-| | long | 4,819 | 4 | **83.2** | 1.9 |
-| **DeepSeek-V4.1-Flash**<br>TP=2 · dspark k=5 · GPU prefill<br>KV capped 0.5 GiB · MBT 8192 | short | 129 | 1 | **226.0** | **33.8** |
-| | short | 106 | 4 | **102.5** | 14.9 |
-| | long | 4,554 | 1 | **286.3** | 27.7 |
-| | long | 4,447 | 4 | **190.4** | 3.1 |
+| **GLM-5.3-Flash**<br>TP=2 · util 0.82 · GPU prefill<br>KV capped 2 GiB · MBT 4096 · MTP off | short | 140 | 1 | **115.2** | **22.0** |
+| | short | 140 | 2 | **70.4** | 13.9 |
+| | long | 16,396 | 1 | **155.3** | **21.5** |
+| | long | 16,396 | 2 | **119.5** | 1.7 |
+| **MiMo-V2.5**<br>1×A100 · maxlen 20K · KV capped 8.5 GiB<br>MTP k=1 · GPU prefill | short | 152 | 1 | **64.2** | **16.7** |
+| | short | 152 | 2 | **48.1** | 9.6 |
+| | long | — | 1 | pending † | pending † |
+| | long | — | 2 | pending † | pending † |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · dspark k=5 · GPU prefill<br>KV capped 1.0 GiB · MBT 16384 | short | 128 | 1 | **254.3** | **19.8** |
+| | short | 128 | 2 | **175.2** | 14.0 |
+| | long | — | 1 | pending † | pending † |
+| | long | — | 2 | pending † | pending † |
+
+> † **The four long-prompt cells are not yet available**: both models hit a **VRAM budget**
+> problem on long prompts (MiMo OOMs because the KV cap I derived was too generous;
+> DeepSeek-V4.1 fails an `aten::new_empty` allocation inside the assembly). This is **not**
+> the same root cause as the GLM side-stream illegal access that has been fixed.
+> Diagnosis in `dev-docs/RND_CAMPAIGN_DIAGNOSIS.md` §18/§19; the budget method is in
+> `docs/TUNING_GUIDE.md`.
 
 ## Quick start
 

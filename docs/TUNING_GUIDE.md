@@ -37,18 +37,45 @@ util × VRAM(卡)  ≥  KV 池  +  GPU 预填充 staging  +  投机 draft  +  �
 
 ### 2.1 KV 池(硬约束的度量)
 
-KV 标尺 = **tok/GiB**,由引擎报错/容量反算:
+**唯一权威来源是引擎自己报的 pool 大小**:服务端日志里那一行
 
-| 模型 | 标尺 | 出处 |
-|---|---|---|
-| GLM-5.3-Flash | **48,942 tok/GiB** | `scripts/serve_glm53_mainline.sh` 既有标尺(6 GiB ↔ 293,651 tok) |
-| MiMo-V2.5 | **4,232 tok/GiB** | 2026-09-21 引擎报错反算:`max seq len 20480 需 4.84 GiB` |
-| DeepSeek-V4.1 | **34,944 tok/GiB** | 同上:`max seq len 32768 需 0.93 GiB` |
+```
+GPU KV cache size: N tokens
+```
 
-`KV_CACHE_BYTES ≥ max(MAXLEN, SEQS × L_max) / 标尺 × 1.25`
+把它和当时传入的 `--kv-cache-memory` 相除,就得到该模型的**每 token KV 开销**。三个模型各有一个
+已知数据点(MiMo 是 TP=1,GLM/V4.1 是 TP=2;`--kv-cache-memory` 按 **rank** 计):
 
-> **MiMo 的标尺比 GLM 低一个数量级** —— 同一个"32K 上下文"在 MiMo 上要 7.7 GiB、在 GLM 上只要 0.67 GiB。
-> **这是"每模型最优解不同"最主要的来源。**
+| 模型 | B/token | KiB/token | tok/GiB | **1M 需要** | **256K 需要** | 单卡 35.5 GiB |
+|---|---|---|---|---|---|---|
+| **GLM-5.3-Flash** | 19,505 | **19.0** | 55,050 | **19.0 GiB** | **4.8 GiB** | ✅ |
+| **DeepSeek-V4.1** | 30,639 | **29.9** | 35,045 | **29.9 GiB** | 7.5 GiB | ✅ |
+| **MiMo-V2.5** | 253,633 | **247.7** | 4,233 | **247.7 GiB** | **61.9 GiB** | ❌ |
+
+反算依据(每一行都是「已知 cap ↔ 引擎报的 token 数」):
+
+```
+MiMo : 9.68 GiB ↔ 40,974 tokens
+GLM  : 2.00 GiB ↔ 110,100 tokens
+V4.1 : 1.17 GiB ↔ 41,078 tokens
+```
+
+`KV_CACHE_BYTES ≥ max(MAXLEN, SEQS × L_max) × (B/token)`,再留一个**小幅**余量(见下)。
+
+> ⚠️ **不要按 `config.json` 推算每 token KV。** 我曾按
+> `48层 × 4 KV头 × (192+128) × 2B` 给 MiMo 推出 120 KiB/token,而引擎实测是 **247.7 KiB/token**
+> —— 差 2.06 倍。配置里的字段与引擎实际分配的布局并不一一对应(对齐/填充/额外层)。
+> **只信 `GPU KV cache size`。**
+
+**为什么"每模型最优解不同",这一张表就是主因**:同样 1M 上下文,
+GLM 要 19 GiB、V4.1 要 30 GiB、MiMo 要 **248 GiB** —— 相差 13 倍。
+MiMo 的 1M 在这台机器上**不可达**(6.3 倍于单卡);GLM 与 V4.1 的 1M 都装得下。
+
+**余量该给多少**:用**小幅乘性余量**(1.10×)而非 1.25×。
+乘性余量对"KV 昂贵"的模型会失控 —— MiMo 的 7.74 GiB × 1.25 = 9.68 GiB,
+而 `--kv-cache-memory` 是**硬上限**、叠加在插件 staging/激活之上(后者不受 vLLM 的 util 记账),
+实测直接把 39.49 GiB 的卡顶到 39.34 GiB 并 OOM。降到 1.10× 后 MiMo 取 8.52 GiB,正常启动。
+
 
 ### 2.2 选项 1:投机解码(MTP)
 
