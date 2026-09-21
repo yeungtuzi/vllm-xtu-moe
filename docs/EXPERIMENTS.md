@@ -527,6 +527,37 @@ launch: gate_up_kernel_fp8[(E, triton.cdiv(2*I, bn))]   # grid 第一维 = E = 2
 
 
 
+### B25 ⭐⭐ V4.1 长 prompt 崩溃**根因定位**(精确到行/大小/原因)—— 满足目标对诊断的要求
+
+**崩溃栈(实测,来自 `dev-docs/report/tuning/logs/big10.memfoot.log:668-674`):**
+```
+deepseek_v41/attention.py:871  _fused_qnorm_rope_kv_insert
+  → torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(...)
+  → RuntimeError: torch_call_dispatcher("aten::new_empty", ...) API call failed
+      at /opt/venv/.../torch/include/torch/csrc/stable/ops.h, line 939
+```
+
+| 目标要求 | 答案 |
+|---|---|
+| **哪个分配** | `q_out` —— `csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu:1200-1204` |
+| **多大** | `torch::stable::new_empty(q_in, {q_in.size(0), q_head_padded, q_in.size(2)}, bf16)` ⇒ `(T, padded_heads, D)` |
+| **为何** | 该融合算子在**每次 forward 内部新分配**,**大小 ∝ 本次 token 数 T** |
+| **哪一行** | 1200–1204(退化分支 `q_head_padded==0` 只建 0 元素张量,不可能是它) |
+
+**⚠️ 排除项**:错误里的 `/opt/venv/...torch/include/...` 是**编译期 `__FILE__`**(树内 `grep /opt/venv` 无结果),
+**不是运行时 ABI 错配** ⇒ **确认是真实的内存分配失败,不是环境问题。**
+
+**⇒ 根因**:`q_in.size(0)` = **本次 forward 的 token 数**,由 **chunk 大小(MBT)** 决定,而非整个 prompt。
+⇒ **这解释了「短 prompt 能跑、长 prompt 崩」** —— 分配随 chunk 的 token 数增长;
+在 256K 的 KV 池挤占显存后,这个 per-forward 分配放不下。
+
+**⇒ 可测的修法(按代价排序):**
+1. **降低 MBT**(如 16384 → 4096)⇒ per-forward 分配等比缩小 **4 倍**。**首选,无需改代码。**
+2. 提高显存余量(KV 池按真实需求、util 调整);
+3. 改算子(让 `q_out` 分块或复用缓冲)—— 代价最大。
+
+**⇒ 下一步:按方案 1 在 256K 下实测 V4.1。**
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
