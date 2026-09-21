@@ -241,7 +241,7 @@ ValueError: Cannot use chat template functions because tokenizer.chat_template i
   util 0.82 下非专家权重 + KV + staging + draft 已占 ~25 GiB,留给激活的只有 ~7 GiB。
 * **排查顺序(踩过两次)**:长 prompt OOM 时 → **先降 `MBT`**,再考虑**降 KV 池**,
   然后才关投机/关 GPU 预填充。
-* **配套改动**:显存优先级已补上"激活工作区"这一档,见 README §目标与愿景 3、`RUNBOOK.md` §5.2。
+* **配套改动**:显存优先级已补上"激活工作区"这一档,见 README「项目特色」第 3 条、`RUNBOOK.md` §5.2。
 
 ### 9.3 GLM 的投机解码**已改为默认关闭**(2026-09-20 用户裁定)
 

@@ -40,26 +40,25 @@
 
 ---
 
-## Goals
+## Project highlights
 
-1. **Any MoE model.** Not tied to one architecture generation. DeepSeek-V4 / V4.1 work
+1. Any MoE model. Not tied to one architecture generation. DeepSeek-V4 / V4.1 work
    end to end; GLM-5.3-Flash runs end to end too with an FP8 GPU prefill path; MiMo-V2.5
    runs end to end on a single card.
-2. **Any x86 ISA.** `scalar → AVX2 → AVX-512 (base/VNNI/BF16/VBMI)`, selected at import
+2. Any x86 ISA. `scalar → AVX2 → AVX-512 (base/VNNI/BF16/VBMI)`, selected at import
    time from `/proc/cpuinfo`.
-3. **A fixed VRAM priority order.** `KV pool → GPU prefill staging → speculative draft → activation workspace (∝ MBT)`.
-   > **Revised 2026-09-20**: (a) **expert-layer residency is dropped** — it measured poorly
+3. A fixed VRAM priority order: `KV pool → GPU prefill staging → speculative draft → activation workspace (∝ MBT)`.
+   No feature may push that order back.
+   > Revised 2026-09-20: (a) expert-layer residency is dropped — it measured poorly
    > (3.36 GiB per layer, and the gain does not justify the squeeze it puts on 32K prefill, so
-   > the user retired it from the priority list); (b) **the activation workspace is added** — it
+   > the user retired it from the priority list); (b) the activation workspace is added — it
    > scales with the chunk (i.e. MBT) and was the real cause of two consecutive long-prompt OOMs,
    > yet it had never been listed.
-   No feature may push that order back.
-4. **Exactly one copy of the weights in host memory** (not "source tensors + engine copy").
-5. **Engine efficiency benchmarked against the best available.** `xiaotu_moe` is compared with
-   `lk_moe` **on the same machine, same weights, same thread count**; the target is ≥90% of it.
+4. Exactly one copy of the weights in host memory (not "source tensors + engine copy").
+5. Engine efficiency benchmarked against the best available. `xiaotu_moe` is compared with
+   `lk_moe` on the same machine, same weights, same thread count; the target is at least 90% of it.
 
 ---
-
 ## Measurement host
 
 Every performance number below was taken on this machine:
