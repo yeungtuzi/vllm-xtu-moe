@@ -73,6 +73,85 @@ def _xtu_load_env_file() -> int:
 
 _xtu_env_filled = _xtu_load_env_file()
 
+
+def _xtu_death_debug() -> None:
+    """`XIAOTU_DEATH_DEBUG=1`:给 SIGTERM/SIGINT/SIGHUP/SIGUSR1 装栈 dump 处理器。
+
+    为什么要它(2026-09-21,长 prompt worker 静默死亡排查):
+
+    * 长 prompt 走 GPU 预填充之后,worker 会在 ~30–220 s 内**静默消失**;
+    * `PYTHONFAULTHANDLER=1` 只为 SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL 打印,
+      而实测**一声不吭** ⇒ 不是这几类致命信号;
+    * cgroup `/sys/fs/cgroup/.../memory.events` 的 `oom_kill` 全树为 **0**,
+      `MemAvailable` 1.56 TB ⇒ 不是 OOM-kill(本也非 SIGKILL 不可捕获);
+    * `Mlocked` 全程 27 MiB(上限 188.93 GiB)⇒ 不是 RLIMIT_MEMLOCK。
+
+    剩下唯一没被排除的解释是 **SIGTERM**:`faulthandler` 默认**不注册**它,
+    而 SIGTERM 的默认处置就是静默终止 —— 没有 traceback、没有 core、没有日志。
+    这里显式注册,既能看到死亡瞬间的线程栈,也能当作判定实验:
+    **若注册后不再死亡,即证明有代码在向 worker 发 SIGTERM。**
+    """
+    if _os.environ.get("XIAOTU_DEATH_DEBUG") != "1":
+        return
+    import faulthandler as _fh
+    import signal as _sig
+    import sys as _sys
+    import threading as _th
+    import time as _time
+
+    _pid = _os.getpid()
+    _path = _os.environ.get("XIAOTU_DEATH_LOG") or f"/tmp/xtu_sig_{_pid}.log"
+    try:
+        # 专用文件:worker 的 sys.stderr 可能被 vLLM 的日志层重定向/缓冲,
+        # 2026-09-21 第一版把 dump 写 stderr,结果「没崩」但也没有 dump,无法分辨
+        # 是「信号没来」还是「dump 丢了」。写自有 fd 才能分辨。
+        _fp = open(_path, "a", buffering=1)
+    except OSError:
+        _fp = _sys.stderr
+
+    _fh.enable()
+
+    def _log(_msg: str) -> None:
+        print(f"[vllm-xtu-moe/death pid={_pid}] {_msg}", file=_fp, flush=True)
+
+    _log(f"diagnostics ON  ({_time.strftime('%H:%M:%S')})")
+    for _name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGUSR1", "SIGUSR2"):
+        _s = getattr(_sig, _name, None)
+        if _s is None:
+            continue
+        try:
+            _fh.register(_s, file=_fp, all_threads=True, chain=False)
+            _log(f"faulthandler registered {_name}")
+        except Exception as _e:  # noqa: BLE001
+            _log(f"faulthandler register {_name} failed: {_e}")
+
+    # SIGTERM 再叠一个 Python 处理器:faulthandler 的 dump **不写信号编号**,
+    # 而我们需要知道到底是哪个信号(以及它到达的准确时刻)。
+    # 注意:Python 处理器会**覆盖**同一信号的 faulthandler 注册;这里是有意的。
+    def _on_sigterm(_signum, _frame):  # pragma: no cover - 诊断路径
+        _log(f"*** 收到 SIGTERM({_signum}) at {_time.strftime('%H:%M:%S')} ***")
+        _fh.dump_traceback(file=_fp, all_threads=True)
+        _fp.flush()
+
+    try:
+        _sig.signal(_sig.SIGTERM, _on_sigterm)
+        _log("python handler installed for SIGTERM")
+    except Exception as _e:  # noqa: BLE001
+        _log(f"python handler install failed: {_e}")
+
+    _t0 = _time.time()
+
+    def _beat() -> None:
+        while True:
+            _time.sleep(10.0)
+            _log(f"alive +{_time.time() - _t0:.0f}s threads={_th.active_count()}")
+
+    if _os.environ.get("XIAOTU_DEATH_BEAT", "1") == "1":
+        _th.Thread(target=_beat, daemon=True).start()
+
+
+_xtu_death_debug()
+
 """vllm-xtu-moe: vLLM 主线混合推理插件(CPU 专家 + GPU 注意力/长 prefill)。
 
 本包是 vLLM 主线的 OOT 插件,通过官方 `vllm.general_plugins` 入口加载。
