@@ -745,6 +745,14 @@ curl -s http://127.0.0.1:8070/metrics | grep -E "num_requests_running|spec_decod
 
 ### 5.1b ⭐ 显存预算的正确设法学(2026-09-20 定案)
 
+> **2026-09-21 补充**:如何在**固定上下文长度**(硬约束)下,把剩余显存分配给
+> 「投机解码 / long prefill / 常驻 MoE」三者,见 **[`docs/TUNING_GUIDE.md`](TUNING_GUIDE.md)**。
+> 该文给出预算恒等式、三个选项的**实测单位代价/收益**(例如常驻 MoE:
+> **1.59 GiB/rank/层**换 **0.70 ms/token @C=1**、1.70 @C=4,TP=2 上限 11 层)、
+> 决策算法,以及一个算好的 2×A100-40GB 例子(结果与实测的 11 层上限吻合)。
+> **结论:每硬件 × 每模型都有自己的最优解,不是一组万能参数。**
+> 常驻层曲线的本机复核用 `scripts/bench_resident_sweep.sh`。
+
 ```
 留给 staging + 激活工作区 = util × VRAM − 非专家权重 − KV 池
 ```
