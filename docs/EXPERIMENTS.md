@@ -18,6 +18,10 @@
 
 | # | 实验 | 目的 | 判据 | 状态 |
 |---|---|---|---|---|
+| **A12** | 查 `VLLM_TRITON_MLA_SPARSE*` 系列开关的语义 | **C4**:判断 `HEAD_BLOCK_SIZE` 是否已提供 B14 的二维收益 | 若能,则 pr4 补丁可废 | **待登记** |
+
+| # | 实验 | 目的 | 判据 | 状态 |
+|---|---|---|---|---|
 | **A11** | `/tmp/numab.sh`(自主完成 A/B 并自行回滚树) | **pr4 的端到端数值验证** —— 交付物里最后的大缺口 | 同一 prompt、`temperature=0`,原核与 pr4 核的**输出 token 序列应一致**;并记录 logprob 差 | **RUNNING** |
 
 | # | 实验 | 目的 | 判据 | 状态 |
@@ -474,6 +478,78 @@ H2D 也可与计算并行)⇒ **「核求和」不构成墙钟**,两者不能直
 说明采样窗口几乎没抓到东西),然后用**区间并集**算真实 GPU 忙碌时间。
 
 ## C. 上报上游
+
+### 🔴 C3 **#57971 已撤回并关闭** —— 我对着**本项目自己的补丁**报了上游 bug
+
+**维护者回应**（jahnclawdmonet, 15:24）:
+> The path in your report is not on main. `.../sparse_mla_kernels.py` returns **404 at main**,
+> and a code search for `_sparse_mla_fwd_with_sink_kernel` returns **no hits**.
+
+**查证结果(实测):**
+
+```
+31e3396f73 2026-09-14 xtu-upgrade snapshot: local SM80/mixed-mode patch set   ← 引入该文件
+patches/upstream/pr3-sm80-port.patch:
+  sparse_mla_kernels.py   new file mode 100644   @@ -0,0 +1,3517 @@
+pr3_body.md:  "...sparse_mla_kernels.py (3517 lines): the sparse-MLA decode/prefill kernels
+               and the env switches (VLLM_TRITON_MLA_SPARSE, ..._TOPK_CHUNK_SIZE,
+               ..._QUERY_CHUNK_SIZE, ..._HEAD_BLOCK_SIZE, ..._MATMUL_DECODE)"
+```
+
+**⇒ `sparse_mla_kernels.py` 与 `flashmla_sparse_sm8x.py` 是 `pr3-sm80-port.patch`（我们自己）
+新增的 SM80 移植,不在 vLLM main 上。**
+
+**⇒ 我犯的错:** 把**自己的移植代码**当成上游代码,
+并把自己代码的性质("上游为让 SM8x 能跑而写的便携回退核")**归因给上游**。
+**根本原因:我在报 bug 前没有先确认那个路径在 `main` 上存在** —— 而这是我本可以一条
+`gh api` 就查掉的事。目录结构与上游一致,我就默认了它是上游。
+
+**⇒ 处理:已发撤回评论([issuecomment-5763547800](https://github.com/vllm-project/vllm/issues/57971#issuecomment-5763547800))
+并关闭 issue。**
+
+**⚠️ 连带含义(重要):** 测量数据本身是真的,但**测的是我们自己的代码**
+⇒ 那些数字（22.3 s / 58.8% / 二维 tile 后 7.7 s）**属于本项目仓库,不属于上游**。
+
+### 🎯 C4 **由查证翻出的新线索:pr4 补丁可能根本不必要**
+
+`pr3_body.md` 明说 `sparse_mla_kernels.py` 自带一组**我们自己的调优开关**:
+
+```
+VLLM_TRITON_MLA_SPARSE            (总开关)
+..._TOPK_CHUNK_SIZE
+..._QUERY_CHUNK_SIZE
+..._HEAD_BLOCK_SIZE      ← 若它本来就是 head 分块,可能直接给出 B14 的 2.8×
+..._MATMUL_DECODE
+```
+
+### C4 结论:**pr4 既不多余,也不新颖**(已查证)
+
+**`HEAD_BLOCK` 机制在我们自己的移植里*早就实现了* —— 但是给 DECODE 用的:**
+
+```python
+# sparse_mla_kernels.py:412-427(已有 kernel)
+    HEAD_BLOCK: tl.constexpr,
+    head_block_idx = tl.program_id(1)
+    head_offsets = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+    running_acc = tl.zeros((HEAD_BLOCK, BLOCK_D), tl.float32)   # ← 与 pr4 同构
+# :652
+    assert head_block_size in (1, 2, 4)
+# sparse_mla_env.py:17-27
+    def sparse_mla_decode_head_block_size(num_decode_tokens): ...   # 只有 decode 的入口
+```
+
+**而 PREFILL 的 launch(:3639)仍是** `_sparse_mla_fwd_with_sink_kernel[(num_tokens, active_heads)]`
+—— **head 分块没有被用到 prefill 上。**
+
+**⇒ 三条结论:**
+1. **pr4 不多余** —— 没有哪个环境变量能把 head 分块开到 prefill 上(只有 decode 的入口);
+2. **但 pr4 也不新颖** —— 这个模式**本项目自己已经写过一次**(给 decode);
+   ⇒ **pr4 的写法应与那份实现对齐**,且 `sparse_mla_decode_head_block_size()` 是天然的接入点;
+3. ⚠️ **`assert head_block_size in (1, 2, 4)` 可能过紧** —— 我的二分实测 **`BLOCK_H=8` 最好**
+   (108.2 ms vs 1/2 的 ~110 ms,4 的 135.9 ms)。**若采纳 pr4,应一并讨论是否放宽到 8。**
+
+**⇒ 这也意味着 pr4 的正确形态可能是「把已有的 head-block 机制接到 prefill 上」,
+而不是「新写一个 kernel」—— 那是更小、更易被接受的改动。**
 
 | # | 内容 | 状态 |
 |---|---|---|
