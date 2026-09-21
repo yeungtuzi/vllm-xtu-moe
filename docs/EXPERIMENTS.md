@@ -1981,3 +1981,58 @@ EngineCore 恰好自己退出了。**我把「恰好观察到 0」当成了「�
 
 **⇒ 测量方案不变(各层前后打 `memory_allocated()`),但**现在有了一个 1.1% 的定量靶子**:
 若测得台阶 ≈ 0.5 GiB/层,则 B58 成立;若远小于此,则 B58 错、需另找那 16.8 GiB。**
+
+### B63 ❌ G-10 失败:我的探针写坏了模型,且**回滚迟到了 ~10 分钟**(树一度脏)
+
+**两件事,第二件更重要:**
+
+**① 探针注入错误**
+```
+AttributeError: 'Glm5NextLinearAttention' object has no attribute '_forward'
+```
+我的做法是「把 `def _forward(` 改名为 `def _orig_forward(` + 插入新的 `_forward` 包装」,
+**但注入后对象上根本没有 `_forward`** ⇒ 该替换破坏了类定义(可能匹配到了错误的
+`def _forward(` 或缩进/上下文不符)。**⇒ 我没有用语法校验之外的方式验证注入语义**
+(语法 OK 但语义坏了 —— **又一次"检查通过≠正确"**)。
+
+**② ⚠️ 回滚迟到了 ~10 分钟,树一度处于修改状态**
+脚本的流程是「注入 → 起服务 → 等就绪(最多 25 分钟)→ bench → 回滚」。
+**服务在加载期就死了,而脚本仍在 `for i in $(seq 1 300)` 等就绪 ⇒ 回滚被推迟到最多 25 分钟后。**
+**⇒ 是我手动 `cp /tmp/kda_orig.py` 回滚的,三重校验通过:**
+```
+md5 678b139a0ace0d22eebb5755a6537ffe(与原始一致) / 与备份逐字节一致 / git status 空
+```
+
+**⚠️ 而这正是 B20 的教训原文:「把回滚做成 `trap`」—— 我写了这条规则,却没写进这个脚本。**
+**⇒ 已确定为硬要求:任何改 rebase 树的脚本,回滚必须挂在 `trap ... EXIT` 上,
+**不得放在流程末尾**(因为流程可能在任意一步中断)。**
+
+**⇒ G-10 的结论:探针方法无效,但**测量问题仍然存在**。
+下一步应先验证注入语义(例如在 `_forward` 内加一行 `print` 而**不改方法名**),
+或改用不改源码的手段(`torch.cuda.memory_allocated` 的**外部采样**:另起进程在请求期间
+轮询显存,看是否有约 0.5 GiB/层的台阶 —— **完全不碰 rebase 树**)。**
+**⭐ 后者明显更优:外部轮询同样能区分"台阶 vs 持平",而且零改树风险。**
+
+"""
+git add docs/EXPERIMENTS.md && git commit -q -m "docs(experiments): B63 -- the G-10 probe broke the model, and the rollback arrived ten minutes late
+
+Two failures, the second more important. The injection broke the class: renaming def _forward to
+def _orig_forward and inserting a wrapper left the object with no _forward at all, so a
+syntax-checked edit was semantically wrong -- the same 'checked but not correct' pattern as before.
+
+Worse, the tree sat modified for about ten minutes. The script injects, starts the server, waits up
+to 25 minutes for readiness, benchmarks, and only then rolls back. The server died during load while
+the script was still in its readiness loop, so the rollback was deferred until the loop expired. I
+reverted manually from the backup and verified three ways: md5 678b139a0ace0d22eebb5755a6537ffe
+matching the original, byte-for-byte against the backup, and an empty git status.
+
+This is precisely B20's own lesson -- put the rollback in a trap -- which I wrote down and then
+failed to apply in this script. Making it a hard rule: any script that touches the rebase tree must
+hang its rollback on trap ... EXIT, never place it at the end of the flow, because the flow can be
+interrupted at any step.
+
+G-10's measurement question remains open. Before retrying, either verify the injection semantically
+(adding a print inside _forward without renaming the method) or avoid source changes entirely by
+sampling memory_allocated from a separate process during the request, looking for a per-layer step
+of about 0.5 GiB. The latter is clearly better: it answers the same question with zero risk of a
+dirty tree." && git log --oneline -1
