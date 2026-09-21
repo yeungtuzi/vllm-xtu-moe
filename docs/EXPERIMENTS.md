@@ -1397,6 +1397,41 @@ T= 8192 BT=64  ⇒ NT=128  h = 0.50 GiB / 0.25 GiB      ← **MBT 减半 ⇒ h �
 ③`h` 是否真占 22 GiB(B52 的算术仍是推断)。
 **⇒ 但"OOM 在 KDA 而非 MoE"这一条是**读栈得到的硬事实**,足以推翻本段前面对 ② 的全部投入方向。**
 
+### B54 ⭐⭐ KDA chunk size 的杠杆**存在且是一行常量** —— 但代价与风险需评估
+
+**追到源头(代码事实):**
+```
+chunk_delta_h.py:  BT = chunk_size
+kda/kernels.py:416 chunk_size: int = FLA_CHUNK_SIZE
+kda/kernels.py    chunk_size = FLA_CHUNK_SIZE        (fwd 内局部赋值,不可传参)
+⇒ vllm/third_party/flash_linear_attention/ops/utils.py:31
+   **FLA_CHUNK_SIZE = 64**                            ← **硬编码模块常量**
+```
+
+**⇒ `NT = cdiv(T, FLA_CHUNK_SIZE) = T/64`;把 64 改成 128 即让 `h` **减半**。**
+**⇒ 在 256K/MBT=16384 下,这可能恰好补上那"差 120 MiB"的缺口(B53 的机制)。**
+
+**⚠️ 风险(必须先评估,不可直接改):**
+1. **全局影响**:`FLA_CHUNK_SIZE` 被 **GDN / KDA / Kimi-K3** 等多个 FLA 系模型共用
+   (`gdn_attn.py:186`、`kimi_k3/.../kda/chunk.py:21`)⇒ **改它会影响所有用 FLA 的模型**;
+2. **数值**:分块线性注意力的 chunk size 会**轻微改变结果**(不同于纯并行归约),
+   ⇒ **必须做数值 A/B**(判据:逐字节装配测试不适用于此,要用 token_ids/logprobs 对照,见 `/tmp/ab_one.sh`);
+3. **Triton 核约束**:`BT` 是 `constexpr`,核内 tile 可能假设 64(`assert K <= 256` 之类的约束未必覆盖 BT)
+   ⇒ 改成 128 **可能编译失败或性能变差**;
+4. **性能**:chunk 变大 ⇒ 每 chunk 计算量变大、并行度下降 ⇒ **可能拖慢 KDA prefill**。
+
+**⇒ 因此这不是"发现即改"的改动,而是"有了明确靶子"。**
+**⇒ 正确的下一步顺序:**
+1. **先读 config 确认 KDA 的 `H/V/K`**(把 B53 的 `h` 绝对大小从估算变成实数);
+2. **读 vLLM 的显存账本**(`determine_available_memory` 后的日志行),确认那 22 GiB 的归属;
+3. **再决定改 `FLA_CHUNK_SIZE` 还是降 MBT** —— 后者已在用且无风险,只是每 chunk 代价 8.7 s。
+
+**⚠️ 而我要指出本段的元教训(第 7 次同类):**
+**我在 MoE staging 上做了 8 轮(②c 实现、逐字节验证、4 次 256K 运行、5 次口径错误),
+而"OOM 在哪个子系统"这个问题的答案,**一直在日志里**(OOM 栈)** —— 我第 38 轮才去读它。**
+**⇒ 规则:任何"缺资源"类问题,第一步永远是**读失败点的栈**,而不是从差值去推测该省什么。**
+**⇒ 这条规则的代价对比很直接:读栈 = 1 次 grep;不读 = 8 轮 + 4 次 9 分钟运行。**
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
