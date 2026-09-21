@@ -1758,6 +1758,17 @@ class _XiaotuExpertsMixin:
                     K=int(self.moe_config.experts_per_token),
                     device=_dev, swiglu_limit=_limit,
                 )
+                # 【诊断补齐·2026-09-21】torch profiler 钩子原先只挂在 MXFP4 路径
+                # (`hybrid_model.py:1301` 的 `gpu_moe_layer` 调用点之后),**FP8 路径没有**
+                # ⇒ `XIAOTU_TORCH_PROFILE` 对 GLM 等 FP8 模型**静默失效**(trace 空、
+                # 无表格、也不报错),两次 kernel 级观测都因此拿不到数据。
+                # 这里与 MXFP4 路径对齐。`_maybe_profile` 自带 `_capture_guard()`,
+                # 捕获期会自动退出(见 R101:捕获期启动 profiler 会作废整个捕获)。
+                try:
+                    from vllm_xiaotu_moe.hybrid_model import _maybe_profile as _mp
+                    _mp()
+                except Exception:
+                    pass
                 if _side_ok:
                     # Publish "these buffers are free to be overwritten" for the
                     # next layer's side-stream assembly.

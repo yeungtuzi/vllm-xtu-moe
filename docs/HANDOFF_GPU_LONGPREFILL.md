@@ -828,3 +828,187 @@ if self.shared_experts is not None: ...
 `nsys` 不需要插件配合,但输出大、需 `nsys stats` 后处理。
 
 **⇒ ④ 的直接观测目前卡在"钩子挂错路径"这一处,已有明确修法,不是死路。**
+
+---
+
+## 21. 调研:NVFP4 的 GPU 端反量化与「要不要自己写算子」(2026-09-21)
+
+### 21.1 vLLM / SGLang **已经实现**了 GPU 端 NVFP4,且 SM80 有人在推
+
+| 项目 | 支持 | 出处 |
+|---|---|---|
+| **vLLM** | ✅ `vllm.model_executor.kernels.linear.nvfp4`(cutlass `nvfp4_gemm` / marlin 版 / `.../nvfp4/pytorch` 兜底) | [vLLM API 文档](https://docs.vllm.ai/en/latest/api/vllm/model_executor/kernels/linear/nvfp4/pytorch/) |
+| **vLLM × Ampere** | ✅ **进行中** | [PR #45306 "Support modelopt_mixed on Ampere (SM80/SM86)"](https://github.com/vllm-project/vllm/pull/45306) —— **与我们的处境完全对口** |
+| **SGLang** | ✅ | [Quantization 文档](https://docs.sglang.io/docs/advanced_features/quantization) |
+| **TileLang** | ✅ 专门模块 | [Quantization/Dequantization](https://deepwiki.com/tile-ai/tilelang/10.4-quantization-and-dequantization)、[`tilelang.contrib.cutedsl.quantize`](https://tilelang.com/autoapi/tilelang/contrib/cutedsl/quantize/index.html) |
+
+**⇒ 不必从零手搓。可直接参考/抄,按适配度排序:**
+
+1. **`marlin_utils_fp4`**(vLLM 内)—— **它就是 group-16 的 NVFP4**。
+   ⚠️ **`gpu_prefill.py` 的注释反过来给了我们一条好消息**:它说
+   「`marlin_utils_fp4` 只支持 **NVFP4 group-16**、不支持 MXFP4 block-32,所以 vLLM 的 Marlin MoE
+   不能复用」—— **换成 NVFP4 之后,这条路就通了**,不必再自写 in-kernel dequant。
+2. **`nvfp4/pytorch` 兜底实现** —— 读起来最快,可作 scale 布局语义参考
+   (E2M1 nibble + group-16 e4m3 scale + **per-tensor fp32 global scale**)。
+3. **CUTLASS NVFP4 示例** + **NVIDIA ModelOpt**(`nvidia/GLM-5.3-Flash-NVFP4` 即由 v0.47.0 产出)。
+4. **TileLang quantize contrib**(若走 IR 路线)。
+
+### 21.2 直接写 CUDA 还是用 TileLang?**先抄,不要先写**
+
+* **第一步(几十行,不需要新算子)**:把 NVFP4 的**解包+缩放语义**移植进现有
+  `moe_v2_packed4.hpp` / `gpu_prefill_fp8.py` 框架 —— 插件本来就是
+  「in-kernel dequant 到 BF16 + BF16 GEMM」,换 scale 布局即可。
+  **CPU 引擎已经支持 NVFP4**(`moe_v2.hpp:12`),只有 **GPU 路径**(写死 MXFP4 group-32 e8m0)要改。
+* **第二步**:只有当 dequant **融合进 GEMM** 成为瓶颈时,才考虑写独立算子。
+  那时 **TileLang 值得用**(已内建 quantize/dequant 原语,能把 dequant 融进 GEMM 的 IR,
+  省掉手写 tile/寄存器分配);**但必须先确认它支持 SM70**(若将来落到 V100)。
+
+### 21.3 ⚠️ SM80 上「反量化算子」的真实意义
+
+**A100(SM80)既无 FP4 也无 FP8 张量核。** 所以 SM80 上的反量化算子
+**只能是把 4-bit 解成 BF16/FP16 供普通张量核用** —— 与插件现在对 FP8 做的一样。
+**不要指望 SM80 上有硬件 FP4 加速。**
+
+### 21.4 顺带:`nvidia/GLM-5.3-Flash-NVFP4` 的两个待核实点
+
+* 卡片写的量化范围是「**shared experts** and dense MLP」,而 recipe 名是
+  `nvfp4_experts_dense_mlp` —— **两种读法冲突**。若被量化的**不是 routed experts**,
+  则本项目唯一关心的 H2D 与显存**一分不省**。**必须看 `model.safetensors.index.json` 才能定。**
+* 卡片声明硬件为 **Blackwell**(测试机 GB200),官方 vLLM 命令用 **TP=4 + arm64 容器**;
+  **本机是 SM80、2 张可用 A100** ⇒ 不能照搬。
+
+---
+
+## 22. 调研:硬件降到 **V100** 的性能损失(2026-09-21)
+
+### 22.1 先说最要紧的:**可能根本跑不起来**
+
+V100 是 **SM70(Volta)**,而插件最低验证到 **SM80**
+(文档记有「SM80 的必需回退:`TRITON_ATTN_DIFFKV`」这类适配)。**SM70 是否被支持需先查**;
+若不支持,讨论性能损失没有意义。
+
+### 22.2 若假设能跑,理论账(V100-SXM2-32GB vs A100-40GB)
+
+| 维度 | A100-40GB | V100-SXM2 | 比值 |
+|---|---|---|---|
+| **BF16 张量核** | 312 TFLOPS | **无 BF16**(Volta 只有 FP16 TC,125 TFLOPS) | **~2.5×** |
+| HBM 带宽 | 1,555 GB/s | 900 GB/s | **1.73×** |
+| 显存 | 40 GB | 32 GB | **1.25×** |
+| PCIe 锁页 H2D | 26.86 GB/s | ≈同(同为 PCIe Gen4 ×16) | **≈1×,不变** |
+| NVLink | A100-PCIE 无 | V100-SXM2 有 300 GB/s | 对 EP 合并**有利** |
+
+**按 §19 实测出的分段加权:**
+
+```
+每层 413 ms(MBT=16384,实测)
+  H2D 装配      165 ms × 1.0  = 165     ← PCIe 限速,V100 上基本不变
+  MoE 内核     ~224 ms × 2.0  = 448     ← 计算+带宽混合
+非 MoE attention/indexer
+               ~846 ms × 1.7  = 1438    ← 带宽为主
+加权 ⇒ (165+448+1438)/(165+224+846) ≈ **1.63×**
+⇒ **prefill 理论慢约 1.6–2 倍**
+```
+
+### 22.3 但两个更硬的天花板会先撞上
+
+1. **显存 32 GB**:util 0.90 ⇒ 28.8 GiB 可用,而 **1M 的 KV 就要 19.05 GiB**,
+   加 staging 7.59 = 26.6 GiB ⇒ **preflight 要的 11.4 GiB 空闲给不出来**
+   ⇒ **GPU 预填充再次被禁用**(与 §11 同因),退回 CPU 路径 ~145 tok/s。
+   **这一条比「慢 2 倍」严重得多。**
+2. **无 BF16 张量核**:插件大量 BF16 in-kernel 反量化 + BF16 GEMM 的设计在 V100 上
+   要整体改成 FP16 —— 这是**代码工作量**,不是性能数字。
+
+**⇒ 判断:降到 V100 不是「损失 2 倍」,而是「要重做一遍 SM70 适配 + 大概率失去 GPU 预填充」。
+若目标是保住 1M 上下文 + GPU 预填充,V100 属方向性倒退。**
+
+---
+
+## 23. ✅✅ ④ 结案:**逐 kernel 表已拿到,注意力核占 58.8%**(2026-09-21 13:42)
+
+**关键修法**:上一次没打表的原因是 `XIAOTU_TORCH_PROFILE_CALLS=45` **大于实际调用次数**
+(MBT=16384 ⇒ 1 chunk × 42 层),**profiler 永远到不了阈值 ⇒ 不退出 ⇒ 不打印**。
+设成 **`CALLS=40`**(< 42)后立刻打出表格。**另**:FP8 路径原先**没有** `_maybe_profile()`
+调用点(只挂在 MXFP4 路径,`hybrid_model.py:1301`) —— 已在
+`mixed_experts.py` 的 FP8 分支补齐(见 §20.2,已提交)。
+
+### 23.1 逐 kernel CUDA 时间占比(TTFT 55,965 ms)
+
+```
+_sparse_mla_fwd_with_sink_kernel   22.325 s  58.80%   (9 calls)   ← 稀疏 MLA 注意力
+vllm::moe_forward_shared           11.628 s  30.28%   (39)
+  Memcpy HtoD (Pageable -> Device)  6.157 s  16.22%   (546)      ← ⚠️ Pageable
+  down_kernel_fp8                   2.879 s   7.58%   (39)
+  gate_up_kernel_fp8                2.549 s   6.71%   (39)
+  vllm::all_reduce                  2.084 s   5.49%   (78)
+  _ktranspose_bytes_kernel          0.220 s   0.58%   (78)
+其余全部 < 1%(aten::mm/bmm/linear、marlin_gemm、elementwise、mhc tilelang 等)
+```
+
+**⇒ 与 §19.2 的算术推断一致(我当时推「attention/indexer 约 2/3」,实测 58.8% + all_reduce 等)。**
+**⇒ 装配的 GPU 转置确实很小**(0.58%),印证「H2D 是主要装配成本、转置不是」。
+
+### 23.2 🆕 白捡的机会:**6.16 s 的 Pageable H2D**
+
+`Memcpy HtoD (**Pageable** -> Device)` = **16.22%**,而插件自己的 engine host 分片
+**已经锁页**(日志:`引擎 host 分片锁页 10 个缓冲(DMA 16-21 → 26.85 GB/s)`)。
+⇒ 这 6.16 s **是另一批未锁页的传输**(cache 构建?draft?KV?),**锁页极可能直接省下大部分**。
+**这是当前已知的最低风险、最高确定性收益点。**
+
+---
+
+## 24. 回答:换成 `nvidia/GLM-5.3-Flash-NVFP4` 在修完注意力之后**仍有较大收益吗?**
+
+**答:没有。** 现在可以用 §23 的占比定量回答:
+
+| NVFP4 能影响什么 | 占比 | 减半后省 |
+|---|---|---|
+| `down_kernel_fp8` + `gate_up_kernel_fp8`(权重带宽受限) | **14.29%** | ~**7%** |
+| `Memcpy HtoD`(权重字节减半) | 16.22% | ~**8%** |
+| **合计** | | **~15%** |
+| **`_sparse_mla_fwd_with_sink_kernel`(注意力)** | **58.80%** | **0%** ← NVFP4 完全不碰 |
+
+**⇒ 换 NVFP4 的天花板约 15%,而且**完全不动**那个 58.8% 的注意力核。
+即使先修完注意力,剩下的 MoE 只占 30%,NVFP4 仍只能吃其中一半左右。**
+
+**另外两条使收益更小的因素:**
+1. **§21.4 的两个待核实点**(量化范围是否含 routed experts;第 45 层 MTP 是否在),
+   若 routed experts 未被量化,收益**直接归零**;
+2. **SM80 无 FP4 张量核** ⇒ 只能「解成 BF16 再算」,**算力不变**,省的只是访存。
+
+**⇒ 结论:优先级应是 ①锁页那 6.16 s(确定、低风险)→ ②注意力核(58.8%,真瓶颈)→
+③NVFP4(~15%,且要先核实权重范围)。**
+
+---
+
+## 25. 回答:如果有很多**廉价 V100**(如一台 8 块、免费)?
+
+### 25.1 聚合资源其实**优于** 2×A100
+
+| | 8×V100-SXM2-32GB | 2×A100-40GB | 比值 |
+|---|---|---|---|
+| FP16/BF16 张量算力 | 8 × 125 = **1000 TFLOPS** | 624 TFLOPS(BF16) | **1.6×** |
+| HBM 带宽 | 8 × 900 = **7200 GB/s** | 3110 GB/s | **2.3×** |
+| 显存 | **256 GB** | 80 GB | **3.2×** |
+| NVLink | 有(300 GB/s/卡) | A100-PCIE **无** | 对 EP 合并**有利** |
+
+**⇒ 单看聚合,8×V100 在算力、带宽、显存、互联四项上全面优于 2×A100。**
+
+### 25.2 但三个硬阻塞
+
+1. **SM70 支持未知**:插件最低验证到 **SM80**。**V100 = SM70**,是否被支持**必须先查**。
+2. **`cp.async` 是 SM80+ 指令,Volta 没有**。而**瓶颈正是**
+   `_sparse_mla_fwd_with_sink_kernel`(vLLM 的 sparse MLA)—— 这类核普遍依赖 `cp.async`
+   做异步流水。**要为 Volta 重写注意力核,这是硬工作量。**
+3. **无 BF16 张量核**:插件的 BF16 in-kernel 反量化 + BF16 GEMM 要整体改 FP16。
+
+### 25.3 若这三个都解决,理论收益
+
+* 瓶颈是注意力(58.8%),它**带宽受限**;V100 单卡带宽低 1.73×,
+  但 **8 卡可做 TP/CP 分片 ⇒ 聚合带宽高 2.3×** ⇒ **这一项会变快**;
+* MoE 的 H2D 走 **PCIe**,与卡数无关 ⇒ **不变**(且 §23.2 的锁页收益依旧适用);
+* **⇒ 乐观估算:prefill 可比 2×A100 快 1.5–2 倍,但前提是把注意力核移植到 SM70。**
+* **「免费」改变了约束性质**:成本不再是限制,**工程投入**才是。
+
+**⇒ 结论:8×V100(免费)在聚合资源上是升级而非降级,值得评估;
+但它的门槛是「注意力核能否移植到 Volta(cp.async 缺失)」,而不是算力或显存。**
+**建议先做一件事:查 vLLM 的 `_sparse_mla_fwd_with_sink_kernel` 是否有 SM70 变体或回退路径。**
