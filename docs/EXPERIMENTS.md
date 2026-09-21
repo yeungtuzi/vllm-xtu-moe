@@ -617,6 +617,31 @@ value_error: 0     ← 不再报错
 **⇒ 规则(与 B26 同类,再记一次):传参前读服务脚本的接口与 `--served-model-name`;
 查日志前确认脚本的 `$OUTDIR`。**
 
+### B28 ✅✅ **GLM @256K long prefill 成功（交付阶段第一个 GLM 数字）**
+
+```
+配置: TP=2 MAXLEN=262144 SEQS=1 GPU_UTIL=0.85
+      KV_CACHE_BYTES=5113807360 (4.76 GiB 真实需求,无乘性余量)
+      MBT=**8192**   SPEC_K=0   单条 16384 prompt / C=1
+结果: Successful=**1**
+      Mean TTFT=**70,202.52 ms** ⇒ prefill **233.6 tok/s**
+      Mean TPOT=**46.75 ms**     ⇒ decode **21.4 tok/s**
+判据: [fp8-asm]=**252**  DISABLED=0  illegal=0  OOM=0   ← 四项全达标
+```
+
+**⇒ `[fp8-asm]=252` = 42 层 × 3 chunk × 2 rank ⇒ 与 MBT=8192 完全自洽,装配确实在跑**
+
+**⇒ 而 MBT=16384 在 256K 下 OOM(差 120 MiB)、MBT=8192 成功** —— 与 V4.1 的修法同源:
+**降 MBT 同时解决两件事**(激活工作区 ∝ MBT;V4.1 的 `q_out` ∝ T)。
+
+### 交付阶段成绩汇总(256K / 16384 prompt / C=1)
+
+| 模型 | prefill | decode | 配置 | 判据 |
+|---|---|---|---|---|
+| **GLM-5.3-Flash** | **233.6 tok/s** | **21.4 tok/s** | TP=2, MBT=8192, KV 4.76 GiB | `[fp8-asm]=252`, DISABLED=0, illegal=0 |
+| **DeepSeek-V4.1-Flash** | **115.8 tok/s** | **18.7 tok/s** | TP=2, MBT=4096, KV 7.48 GiB | DISABLED=0, new_empty=0, illegal=0 |
+| MiMo-V2.5 | — | — | 按指示不复测 | README 删性能数据 |
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
