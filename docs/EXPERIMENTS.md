@@ -2073,6 +2073,47 @@ def _flashkda_prefill(self, ..., initial_state, cu_seqlens, ...):
 3. `trap` 保护 + 改前记 md5;
 4. 端到端 A/B(默认 vs 2 块 vs 4 块)⇒ `token_ids`/`logprobs` 必须一致;
 5. 一致后再测 256K/MBT=16384 能否成立。
+
+### B78 ✅ B77 第 1 步完成:`cu_seqlens` 的语义已确认(标准 vLLM `query_start_loc`)
+
+**读代码:**
+```
+kda.py:469   non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
+             ↑ 来自 GDNAttentionMetadata,即标准 vLLM 的 `query_start_loc`
+             = 每条序列 query 长度的**累加和**,形状 (num_seqs+1,)
+```
+**⇒ 取值(推断,基于标准语义):**
+| 场景 | `cu_seqlens` |
+|---|---|
+| **单条 16384(我们的实验场景)** | **`[0, 16384]`** —— 2 个元素,切分简单 |
+| C=2 | `[0, L1, L1+L2]` —— 3 个元素,**须逐序列切分** |
+
+**⇒ 结论:**
+1. **B77 的复杂度成立**(它确实是 batch-aware,跨序列切分会混状态);
+2. **但**最常见情形(单条长请求,即 256K 实验的 C=1)切分是平凡的** ——
+   只需把 `[0, T]` 换成 `[0, T/N, 2T/N, ..., T]`;
+3. **⇒ 因此实现可以分两步:先只支持"单序列时切分,多序列时退化为不切分"**
+   (即 `if len(cu_seqlens)==2 and cu_seqlens[1]-cu_seqlens[0] > 阈值: 切分 else: 原路`),
+   **这样**不会触碰多序列路径** ⇒ 风险面从"全部场景"缩到"单条长 prompt" ⇒ 更安全。**
+
+**⇒ 这使实现量显著下降(B77 担心的 batch-aware 复杂度可以**推迟**到需要时再处理)。**
+
+**⇒ 修改后的编辑方案(更小、更安全):**
+```python
+# 在 _flashkda_prefill 的单次调用处外包一层,env 开关默认 1(=不切分 ⇒ 零行为变化)
+CH = int(os.getenv("XIAOTU_KDA_PREFILL_CHUNKS", "1"))
+if CH > 1 and len(cu_seqlens) == 2:          # **仅单序列**
+    for i in range(CH):
+        s0 = i * L // CH;  e0 = (i+1) * L // CH
+        <用 slice 调用同一融合核,chunk 边界内用 cu_seqlens=[0, e0-s0],
+         传 running state,输出写回 out[..., s0:e0, ...]>
+        running_state = 本轮的 final_state
+else:
+    <原路径不变>
+```
+**⚠️ 仍需端到端 A/B(默认 1 vs 2 vs 4)⇒ `token_ids`/`logprobs` 必须一致。**
+
+**⚠️ 我停手:上下文已尽。但**入口现在比 B77 时清晰得多**(单序列分支 + 默认关闭)。**
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
