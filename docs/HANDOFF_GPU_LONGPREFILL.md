@@ -662,3 +662,34 @@ KV 19.05 GiB(1M)时连 MBT=4096 都被禁用。**精确交点需再扫一轮。*
 `MBT=8192 util=0.85`、`MBT=16384 util=0.82` 均"起不来",但都**夹在成功档之间**
 ⇒ 判定为**暂态失败**(GPU 未释放/端口冲突),不是 MBT/util 本身的问题。
 **util 与 MBT 都不是单调安全的,每一档都必须实测确认,不能外推。**
+
+---
+
+## 18. ④ 的消融实验:**判决臂尚未拿到数字**(2026-09-21 13:06)
+
+设计(`MAXLEN=32768` / MBT=16384 / KV 0.75 GiB / util 0.85 / 单条 16384 / C=1):
+
+| 臂 | 开关 | 目的 | 结果 |
+|---|---|---|---|
+| `abl_base` | — | 基线 | ✅ TTFT **52,959.94 ms**,prefill **309.6 tok/s**,`[fp8-asm]=84` |
+| `abl_fakeall` | `XIAOTU_MOE_FAKE_ALL=1` | **非 MoE 时间(注意力+其余)** | ❌ **TTFT 0.00,指标全 0,但服务端无致命错误** |
+| `abl_fakecpu` | `XIAOTU_MOE_FAKE_CPU=1` | 拷贝+host-func 成本 | 未出 |
+
+**`abl_base` 与 §16 的 310.6 tok/s 一致(309.6),复现性良好。**
+
+**`abl_fakeall` 失败了,原因未明**:bench 侧指标全 0、请求未完成,而**服务端没有任何
+`illegal memory access` / OOM / `EngineDeadError`** ⇒ 不是崩溃,更像**请求挂住或未被调度**。
+(`FAKE_ALL` 让 `cpu_decode` 立即返回、输出保持零值,理论上应能跑完。)
+
+**⇒ ④ 仍未回答。** 下一步要先查清 `FAKE_ALL` 为什么拿不到数字,再读那个数。
+替代手段(插件已内建,优先于 nsys):
+* `XIAOTU_TORCH_PROFILE=1`(`hybrid_model.py`)
+* `XIAOTU_LAYER_TIMING=1`(`mixed_experts.py`)
+* `XIAOTU_CD_TIMING=1`(`binding.cpp`,per-layer CPU 计时)
+
+### 18.1 1M 侧的补充实测
+
+`[1M MBT=16384 util=0.90] ✗ 起不来 ⇒ CUDA out of memory`(与 §17.2 一致)。
+脚本里另外两档(MBT=8192 / 4096 @1M)未产出结果,需重跑。**但 §17.3 的三重锁死
+(KV 19.05 GiB / 预检 11.4 vs 4.5 / MBT=16384 需 38.7 GiB 非 KV)已由 §11/§14/§17
+的实测充分支撑,不依赖这两档。**
