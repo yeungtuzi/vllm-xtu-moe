@@ -713,3 +713,56 @@ grep -ic "nan|inf|invalid"          logs/abl_fakeall.log  →  7      ← 启动
 2. `XIAOTU_TORCH_PROFILE=1`(`hybrid_model.py`)—— torch profiler,输出较小;
 3. `XIAOTU_CD_TIMING=1`(`binding.cpp`)—— per-layer CPU 计时;
 4. 最后才是 nsys。
+
+---
+
+## 19. 🎯 ④ 的答案:**瓶颈不在 MoE,在 attention/indexer**(2026-09-21 13:15)
+
+### 19.1 `[layer-timing]` 的实测(MBT=16384,单条 16384 / C=1)
+
+```
+[layer-timing] n=414 pre=336–389 ms  eng=24–75 ms  post=0.04 ms  total=411–413 ms
+```
+
+`_lt_record` 的定义(`mixed_experts.py:1908-1911`):
+* `pre  = _lt_t1 - _lt_t0` —— MoE 计算全程(GPU 预填充路径下含装配 + GPU MoE 内核)
+* `eng  = _lt_t2 - _lt_t1` —— `engine.cpu_decode(...)`
+* `post = _lt_t3 - _lt_t2` —— 收尾
+
+**两个直接推论:**
+
+1. **CPU 引擎几乎不在路径上**:`eng` 只有 **24 ms**,而 `pre` 是 **389 ms**。
+   (我先前按文档 R17 估的「~315 ms/层是 CPU MoE」在这里**不成立** —— 因为 GPU 预填充
+   真的在跑,MoE 不在 CPU 上。那个估值对应的是纯 CPU 路径。)
+2. **装配只占 `pre` 的 40%**:`[fp8-asm] total = 165 ms`,而 `pre = 389 ms`
+   ⇒ **还有 ~224 ms/层在装配之外、MoE 之内**(GPU MoE 内核 + 等待)。
+
+### 19.2 决定性的一除法:2/3 的时间**不在 MoE 层里**
+
+```
+每层 MoE 总计 = 413 ms
+42 层 × 413 ms = **17.3 s**
+实测 TTFT      = **52.8 s**
+⇒ **35.5 s(67%)根本不在 MoE 层内**
+⇒ 35.5 / 42 = **~846 ms/层 是 attention + indexer(KDA sparse 路径)**
+```
+
+**⇒ `attention/indexer` 约为 MoE 的 2 倍。这就是「装配之外那 ~436 ms/层」的归属** ——
+它既不是装配,也不是 MoE,而是**每层的注意力与稀疏 indexer**。
+
+### 19.3 这条结论改变了优化方向
+
+| 原以为 | 实际 |
+|---|---|
+| 瓶颈在 MoE 权重流式(H2D 135 ms/层) | H2D 只占 **413 ms 的 33%**;MoE 全部只占 TTFT 的 **33%** |
+| 提升 MBT 就能接近 DMA 下界 | 提升 MBT 把 MoE 那 1/3 压小(310.6 tok/s 已拿到),但**剩下 2/3 动不了** |
+| 上 NVFP4 能大幅提速 | 它只把 H2D 减半 ⇒ 只影响那 1/3 里的部分,**天花板有限** |
+
+**⇒ 下一步该查的是 GLM 的 attention/indexer 路径**(`glm5next/nvidia/sparse_indexer.py`
+与 `kpool_compress.py`),而不是继续压 MoE/H2D 或换量化格式。
+
+### 19.4 待办
+
+- [ ] 用 `XIAOTU_TORCH_PROFILE=<path>` 拿到**逐 kernel 表格**,证实 attention/indexer 的占比
+      (本轮那次因请求失败未产出:TTFT 0.00,原因待查);
+- [ ] 那条 `pre` 里 ~224 ms/层(GPU MoE 内核 + 等待)也要归属 —— 但优先级低于 19.2 的 2/3。
