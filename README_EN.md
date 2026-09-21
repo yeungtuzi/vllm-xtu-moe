@@ -100,14 +100,15 @@ C=1, prefix caching on.**
 
 | Model | prefill (tok/s) | decode (tok/s) | TTFT | Key config | Criteria |
 |---|---|---|---|---|---|
-| **GLM-5.3-Flash** | **233.6** | **21.4** | 70,203 ms | TP=2 · util 0.85 · **MBT 8192** · `KV_CACHE_BYTES=5113807360` (4.76 GiB) | `[fp8-asm]=252`, `DISABLED=0`, `illegal=0` |
+| **GLM-5.3-Flash** | **266.3** | **21.4** | 61,562 ms | TP=2 · util 0.85 · **MBT 12288** · `KV_CACHE_BYTES=5113807360` (4.76 GiB) | `[fp8-asm]=168`, `DISABLED=0`, `illegal=0` |
 | **DeepSeek-V4.1-Flash** | **115.8** | **18.7** | 141,618 ms | TP=2 · util 0.85 · **MBT 4096** · `KV_CACHE_BYTES=8031830016` (7.48 GiB) | `DISABLED=0`, `aten::new_empty=0`, `illegal=0` |
 
 * The KV cap is set to the **engine-derived requirement** (GLM 19,505 B/token, V4.1 30,639
   B/token) with **no multiplicative margin** -- at 256K a 10% margin is 0.48 GiB and was measured
   to OOM.
-* **MBT is the critical knob at 256K**: GLM OOMs at `MBT=16384` by 120 MiB and succeeds at
-  `MBT=8192`; V4.1 hits an `aten::new_empty` allocation failure at `MBT=16384` and succeeds at
+* **MBT is the critical knob at 256K**: GLM OOMs at `MBT=16384` and succeeds at
+  **`MBT=12288`** (two chunks, the first larger and so more efficient); `MBT=8192` also works but
+  is 14% slower; V4.1 hits an `aten::new_empty` allocation failure at `MBT=16384` and succeeds at
   `MBT=4096`. Mechanism in `docs/PREFILL_KNOWN_ISSUES.md`.
 * Neither model uses speculative decoding here (random tokens are its worst case, and the draft
   layer competes with long prefill for VRAM).

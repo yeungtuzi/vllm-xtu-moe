@@ -83,12 +83,12 @@
 
 | 模型 | prefill (tok/s) | decode (tok/s) | TTFT | 关键配置 | 判据 |
 |---|---|---|---|---|---|
-| **GLM-5.3-Flash** | **233.6** | **21.4** | 70,203 ms | TP=2 · util 0.85 · **MBT 8192** · `KV_CACHE_BYTES=5113807360`（4.76 GiB） | `[fp8-asm]=252`、`DISABLED=0`、`illegal=0` |
+| **GLM-5.3-Flash** | **266.3** | **21.4** | 61,562 ms | TP=2 · util 0.85 · **MBT 12288** · `KV_CACHE_BYTES=5113807360`（4.76 GiB） | `[fp8-asm]=168`、`DISABLED=0`、`illegal=0` |
 | **DeepSeek-V4.1-Flash** | **115.8** | **18.7** | 141,618 ms | TP=2 · util 0.85 · **MBT 4096** · `KV_CACHE_BYTES=8031830016`（7.48 GiB） | `DISABLED=0`、`aten::new_empty=0`、`illegal=0` |
 
 * KV 上限按**引擎反算的真实需求**配置（GLM 19,505 B/token、V4.1 30,639 B/token），**不加乘性余量** ——
   256K 下 10% 余量就是 0.48 GiB，实测会 OOM。
-* **MBT 是 256K 下的关键旋钮**：GLM 在 `MBT=16384` 时因显存只差 120 MiB 而 OOM，`MBT=8192` 成功；
+* **MBT 是 256K 下的关键旋钮**：GLM 在 `MBT=16384` 时因显存不足而 OOM，**`MBT=12288` 成功**（2 chunks，首块更大 ⇒ 效率更高）；`MBT=8192` 亦可用但慢 14%；
   V4.1 的 `MBT=16384` 会撞上装配期 `aten::new_empty` 分配失败，`MBT=4096` 成功。
   机理见 `docs/PREFILL_KNOWN_ISSUES.md`。
 * 两个模型都未开投机解码（random 数据集对投机是最坏情况，且会挤占 long prefill 的显存）。
