@@ -178,3 +178,76 @@ MiMo 的 1M 在这台机器上**不可达**(6.3 倍于单卡);GLM 与 V4.1 的 1
 * `dev-docs/report/tuning/TRIED_AND_REVERTED.md` R15/R16/R17(不要再试的方向);
 * `scripts/bench_random_12cells.sh`(12 格)、`scripts/bench_resident_sweep.sh`(常驻层扫描);
 * `CHANGELOG.md` —— 2026-09-21 的旁路流非法访存修复(**代价 +17% 长 prompt TTFT**)。
+
+---
+
+## 7. 🔑 规则:**遇到稀疏注意力模型,先找稠密/absorbed 路径,再谈优化**
+
+> 2026-09-21 由 GLM-5.3-Flash 的 prefill 事故得出。**这是一条通用排查规则,不只对 GLM。**
+
+### 7.1 为什么
+
+稀疏注意力(DSA/topk 类)的**稀疏选择是按 query 各不相同的索引**。
+这导致一个结构性问题:**同一个 program 内的多个 query 无法共享 KV tile ⇒ 无法用 `tl.dot`/张量核**。
+上游对此的实现通常是一个 **per-token、逐元素 FMA、按索引 gather 的"便携 Triton"回退核** ——
+它的存在意义是「**让这一档硬件能跑起来**」,而不是「跑得快」。
+
+**实测代价(GLM-5.3-Flash,L=16384,C=1,A100):**
+
+```
+_sparse_mla_fwd_with_sink_kernel   22.325 s   58.80% 的 CUDA 时间
+⇒ 该核比 FLOPs 下界慢约 **12,800 倍**     ← 不是算力受限
+标度律:O(L^1.42)(L 4096→16384 增 4×,时间增 7.13×)
+   对照:稀疏预期 5.0× / 稠密 L² 预期 16×
+⇒ **稀疏确实在限制工作量,问题纯粹是"单位工作量效率"(无张量核)** —— 归一化后 0.71 ns/key-attend
+```
+
+**而修法往往不需要写核 —— 上游很可能已经为这个模型准备好了稠密路线:**
+
+```
+稠密 vs 稀疏的盈亏平衡:稠密多算 4.27×(topk=2048 vs L=16384)
+  ⇒ 只要稠密每次效率优于 0.71/4.27 = **0.18 ns**,稠密就赢
+  而 tensor-core flash attention 通常 0.01–0.05 ns/次 ⇒ **好 4–18 倍**
+```
+
+### 7.2 排查清单(按顺序,前两步是"零成本")
+
+| # | 查什么 | 命令/位置 | 若成立 |
+|---|---|---|---|
+| **1** | 该模型的 attention 是否**调用** `get_mla_prefill_backend`? | `grep -rn get_mla_prefill_backend vllm/models/` | ✅ 只需设配置项 `mla_prefill_backend`(`vllm/config/attention.py:76`),**零代码** |
+| **2** | 稠密 prefill 后端的**维度白名单**是否覆盖该模型? | `vllm/v1/attention/backends/mla/prefill/*.py` 的 `supports_mla_dimensions()` | ✅ 上游已适配,只差路由 |
+| **3** | 本档算力上选择器选谁? | `prefill/selector.py:_get_mla_prefill_backend_priorities` | SM90 及更老 ⇒ `[FLASH_ATTN]`;Blackwell ⇒ TRTLLM_RAGGED/FLASHINFER/... |
+| **4** | 若不满足 ⇒ **改路由(打补丁),而不是写核** | 模型侧硬绑稀疏后端的那几行 | 例:GLM-5.3 在 `glm5next/common/attention.py` |
+
+### 7.3 GLM-5.3-Flash 的实测结论(作为范例)
+
+| 检查 | 结果 |
+|---|---|
+| 模型是否调用选择器? | ❌ **不调用**。`get_mla_prefill_backend` 全树只被 `kimi_k3/nvidia/mla.py:103` 调用 |
+| 白名单是否覆盖 GLM? | ✅ **覆盖,而且上游专门为它加了注释**:`flash_attn.py:313-331` 里有 `MLADimensions(256, 0, 256)`,注释写「GLM5Next NoPE layout ... run the same kernels as the (192, 64, 256) DeepSeek-V3.2 layout」 |
+| SM80 选择器选谁? | ✅ `selector.py`:`else: # Hopper(SM90) and older → [FLASH_ATTN]` |
+| 结论 | **稠密路线齐备,唯一障碍是 DSA(v32) 分支硬绑 `FlashMLASparseSM8XBackend`** |
+
+**目标形态:**
+```
+prefill → FLASH_ATTN(分块、张量核、GLM NoPE 布局已白名单)
+decode  → FlashMLASparseSM8XBackend(per-token gather —— **在那里是合理形态**)
+```
+
+**应落成 `patches/upstream/` 下的新补丁**(仓库已有 `pr2-fp8-sm80-o-proj.patch` 先例),
+**不要直接改 rebase 树**。
+
+### 7.4 换之前必须确认的四件事(否则是"提速了但变味了")
+
+1. **prefill 会丢掉稀疏选择** ⇒ 前 `topk` 个 token 完全等价;更长的位置**看得更多**。
+   **这是行为改变,必须做质量回归,不能只看速度。**
+2. **indexer 在 prefill 可能仍需运行**(kpool 边界池的播种、`KpoolTailSpec` 跨 PD 传输)
+   ⇒ 「注意力走稠密」≠「关掉 indexer」,两者分开处理。
+3. **KV dtype**:SM8x 稀疏路径要求 bf16 KV;换稠密后该约束可能松动,需确认。
+4. **decode 必须仍走稀疏** —— 那里 per-token 是正确形态,别一起改掉。
+
+### 7.5 一句话
+
+**稀疏注意力模型的 prefill 慢,先怀疑"走了回退核",而不是"硬件不行"。
+上游往往已有稠密/absorbed 路线;先查模型是否调用选择器,再查维度白名单,
+最后才考虑改路由或写核。**
