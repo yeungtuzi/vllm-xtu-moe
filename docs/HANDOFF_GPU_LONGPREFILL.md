@@ -693,3 +693,23 @@ KV 19.05 GiB(1M)时连 MBT=4096 都被禁用。**精确交点需再扫一轮。*
 脚本里另外两档(MBT=8192 / 4096 @1M)未产出结果,需重跑。**但 §17.3 的三重锁死
 (KV 19.05 GiB / 预检 11.4 vs 4.5 / MBT=16384 需 38.7 GiB 非 KV)已由 §11/§14/§17
 的实测充分支撑,不依赖这两档。**
+
+### 18.2 `FAKE_ALL` 失败原因已查明:**请求根本没到服务端**
+
+```
+grep -c "POST /v1/chat/completions" logs/abl_fakeall.log  →  0      ← 无请求
+grep -ic "nan|inf|invalid"          logs/abl_fakeall.log  →  7      ← 启动期出现 NaN
+```
+
+**⇒ 不是"挂住",而是服务端在 bench 之前就无法接受请求**:
+`FAKE_ALL=1` 让 MoE 输出保持**全零**,在启动/预热阶段就产生 NaN,
+服务端很可能在就绪检查通过之后、bench 之前就死掉了。**该臂无效 —— 不是"测出 0"。**
+
+**教训:`FAKE_ALL` 在这个配置下不可用作消融手段。**
+它跳过所有 MoE 计算,输出语义已被破坏,下游(采样/归一化)会崩。
+
+**⇒ ④ 的替代手段(按优先级):**
+1. `XIAOTU_LAYER_TIMING=1`(`mixed_experts.py`)—— 逐层计时,语义不破坏;
+2. `XIAOTU_TORCH_PROFILE=1`(`hybrid_model.py`)—— torch profiler,输出较小;
+3. `XIAOTU_CD_TIMING=1`(`binding.cpp`)—— per-layer CPU 计时;
+4. 最后才是 nsys。
