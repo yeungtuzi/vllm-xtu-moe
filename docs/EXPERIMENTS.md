@@ -783,6 +783,32 @@ chrome trace 只有 64 事件、G-4 不出表)。**
 **⇒ 下一轮起不再追 ③,转而做 ②(唯一已量化的杠杆)。**
 若 ② 落地后 256K 的 H2D 从 11.3→5.7 s,TTFT 70.2→~64.6 s ⇒ prefill 233.6→**~254 tok/s**。
 
+### B34 ② 的移植评估(可执行说明)—— 结论:**可行,但不是"复用现成实现"**
+
+**现成的是 MXFP4 版本**(`gpu_prefill.py:713 _pinned_kmajor` + `:1203 prebuild_pinned_kmajor`),
+**FP8 版本的源数据不同,必须新写**:
+
+| 项 | MXFP4(现成) | FP8(需做) |
+|---|---|---|
+| 源 | `t`:torch 模型参数 | **`xiaotu_moe` 引擎的 NUMA 分片**(自定义分配器) |
+| host 转置 | `_pinned_kmajor(t)` 已缓存 | **需新写**:从分片取 FP8 字节 → host 转置 → 锁页缓存 |
+| 一次性成本 | 启动时 prebuild | **42 层 × 2.25 GiB = 94 GiB CPU 转置**(启动时 1–2 min)+ **3.37 GiB 锁页 host**(内存充裕) |
+| 收益 | 省 ~3.4 GiB/层设备读写 | **省 `raw13`(2.25)+`raw2`(1.12)=3.37 GiB 设备显存** |
+
+**移植点(精确)**:
+`gpu_prefill_fp8.py:kmajor_from_engine_shards_fp8` 当前路径是
+「DMA 到设备 `raw13` → `_kmajor_bytes` 在 **GPU** 上转置 → `km13`」;
+**改为**「**host 侧**转置 + 锁页 → 直接 DMA 进 `km13`」⇒ `raw13`/`raw2` 可从 `prealloc_fp8_buffers` 删除
+⇒ `fp8_staging_bytes` 从 7.59 → ~4.2 GiB。
+
+**预期收益(已核实口径)**:256K 下 MBT 8192→16384 ⇒ chunks 2→1 ⇒ H2D 11.3→5.7 s
+⇒ TTFT 70.2→~64.6 s ⇒ prefill **233.6 → ~254 tok/s(+9%)**。
+**外加**:省掉每层 GPU 转置(profile 记 `_ktranspose_bytes_kernel` 0.22 s,是小头)。
+
+**⚠️ 未开工的原因(如实记录)**:这是一个需要多轮迭代的改动,而**每次验证要 9 分钟加载**;
+我剩余的能力不足以支撑它,勉强开工的产物会是又一个半成品补丁。
+**⇒ 写成可执行说明留给后续,而不是半途而废。**
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
