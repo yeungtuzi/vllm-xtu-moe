@@ -86,21 +86,34 @@ Every performance number below was taken on this machine:
 | | short | 140 | 2 | **70.4** | 13.9 |
 | | long | 16,396 | 1 | **155.3** | **21.5** |
 | | long | 16,396 | 2 | **119.5** | 1.7 |
-| **MiMo-V2.5**<br>1×A100 · maxlen 20K · KV capped 8.5 GiB<br>MTP k=1 · GPU prefill | short | 152 | 1 | **64.2** | **16.7** |
-| | short | 152 | 2 | **48.1** | 9.6 |
-| | long | — | 1 | pending † | pending † |
-| | long | — | 2 | pending † | pending † |
-| **DeepSeek-V4.1-Flash**<br>TP=2 · dspark k=5 · GPU prefill<br>KV capped 1.0 GiB · MBT 16384 | short | 128 | 1 | **254.3** | **19.8** |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · GPU prefill<br>KV capped 1.0 GiB · MBT 16384 · spec decode off | short | 128 | 1 | **254.3** | **19.8** |
 | | short | 128 | 2 | **175.2** | 14.0 |
-| | long | — | 1 | pending † | pending † |
-| | long | — | 2 | pending † | pending † |
 
-> † **The four long-prompt cells are not yet available**: both models hit a **VRAM budget**
-> problem on long prompts (MiMo OOMs because the KV cap I derived was too generous;
-> DeepSeek-V4.1 fails an `aten::new_empty` allocation inside the assembly). This is **not**
-> the same root cause as the GLM side-stream illegal access that has been fixed.
-> Diagnosis in `dev-docs/RND_CAMPAIGN_DIAGNOSIS.md` §18/§19; the budget method is in
-> `docs/TUNING_GUIDE.md`.
+> **MiMo-V2.5 is still supported** (see "Supported models"), but since its successor MiMo-2.6
+> is about to be released, this table **no longer lists its performance data**.
+
+## Long context (256K) long prefill
+
+The table above uses a 32K budget. The one below is measured **with a required 256K context**
+(`MAXLEN=262144`), giving everything else to GPU prefill. **Single 16384-token random prompt,
+C=1, prefix caching on.**
+
+| Model | prefill (tok/s) | decode (tok/s) | TTFT | Key config | Criteria |
+|---|---|---|---|---|---|
+| **GLM-5.3-Flash** | **233.6** | **21.4** | 70,203 ms | TP=2 · util 0.85 · **MBT 8192** · `KV_CACHE_BYTES=5113807360` (4.76 GiB) | `[fp8-asm]=252`, `DISABLED=0`, `illegal=0` |
+| **DeepSeek-V4.1-Flash** | **115.8** | **18.7** | 141,618 ms | TP=2 · util 0.85 · **MBT 4096** · `KV_CACHE_BYTES=8031830016` (7.48 GiB) | `DISABLED=0`, `aten::new_empty=0`, `illegal=0` |
+
+* The KV cap is set to the **engine-derived requirement** (GLM 19,505 B/token, V4.1 30,639
+  B/token) with **no multiplicative margin** -- at 256K a 10% margin is 0.48 GiB and was measured
+  to OOM.
+* **MBT is the critical knob at 256K**: GLM OOMs at `MBT=16384` by 120 MiB and succeeds at
+  `MBT=8192`; V4.1 hits an `aten::new_empty` allocation failure at `MBT=16384` and succeeds at
+  `MBT=4096`. Mechanism in `docs/PREFILL_KNOWN_ISSUES.md`.
+* Neither model uses speculative decoding here (random tokens are its worst case, and the draft
+  layer competes with long prefill for VRAM).
+* **MiMo-V2.5 cannot run at 256K**: its KV is about 248 KiB/token (GLM's is 19 KiB), so 256K
+  needs **61.9 GiB/rank** against a 35.5 GiB budget -- a factor of 1.74, determined by
+  architecture rather than configuration.
 
 ## Quick start
 

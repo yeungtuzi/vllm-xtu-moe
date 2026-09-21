@@ -122,3 +122,64 @@ step3 L=16384 C=1 N=1 : ok=1/1  TTFT 105602 ms  Δillegal=0
 4. **开关设了没生效**:`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` 会被 `serve_*` 脚本写入的
    env-bridge 文件**覆盖**,`GPU_PREFILL=0` 也不会映射到它。**任何开关都必须先在日志里
    确认实际生效值。**
+
+---
+
+## 2026-09-21 · prefill 优化与 256K long prefill 交付
+
+### Fixed
+
+- **DeepSeek-V4.1-Flash（LTS）长 prompt 崩溃**：装配期 `aten::new_empty` 分配失败 ⇒ `EngineDeadError`。
+  **根因定位到行**：`csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu:1200-1204`
+  在**每次 forward 内部**新建 `q_out = (q_in.size(0), q_head_padded, q_in.size(2))`（bf16），
+  **大小 ∝ 本次 forward 的 token 数 `T`**。长 prompt 下该临时张量在 KV 池挤占显存后放不下。
+  **修法（无需改代码）**：`MBT 16384 → 4096`，chunk 小 4 倍 ⇒ 该分配小 4 倍。
+  **验证**：256K 下单条 16384 prompt `Successful=1`、`aten::new_empty=0`、`illegal=0`；
+  prefill **115.8 tok/s**、decode **18.7 tok/s**。
+
+- **GLM-5.3-Flash 在 256K 下 OOM**：满卡（39.40/39.49 GiB）后仅差 **120 MiB** 失败。
+  修法同样是降 MBT（`16384 → 8192`，激活工作区 ∝ MBT）。**验证**：256K 下
+  `Successful=1`、`[fp8-asm]=252`（= 42 层 × 3 chunk × 2 rank，自洽）、`DISABLED=0`、`illegal=0`；
+  prefill **233.6 tok/s**、decode **21.4 tok/s**。
+
+- **SM8x 稀疏 MLA prefill 慢 2.88×**：`_sparse_mla_fwd_with_sink_kernel` 在单条 16384 prefill 上
+  占 **22.3 s / 58.8%** 的 CUDA 时间。二分定位：**全部收益来自把 `q` 载入为二维 `(1, BLOCK_D)` tile**
+  （`BLOCK_H=1` 即 2.78×，KV 复用只再贡献 ~3%）。见 `patches/upstream/pr4-*.patch`。
+  **验证**：该核 22.3 → **7.739 s**（占比 58.8% → 33.15%），端到端 TTFT 55,954 → **36,894 ms（1.52×）**。
+
+### Changed
+
+- **256K 及以上的 KV 上限必须按引擎反算的真实需求配置，不加乘性余量**：
+  GLM 19,505 B/token、V4.1 30,639 B/token。256K 下 10% 余量 = 0.48 GiB，**实测直接 OOM**。
+  （小 KV 场景如 32K/0.6 GiB 时该余量无害，因此这条只在长上下文暴露。）
+- `gpu_prefill_fp8.py` 的 MoE GEMM tile 参数改为可覆盖：
+  `XIAOTU_GPF_GEMM_{BM,BN,BK,BH,STAGES,WARPS}`，**默认值不变（64/64/64/64/2/4）**，
+  使调优从「改源码+跑+回滚」变成「设环境变量+跑」。
+- README / README_EN：性能表**移除 MiMo-V2.5 的数据**（后继 MiMo-2.6 即将发布；模型仍受支持），
+  并新增**「长上下文（256K）long prefill」**一节记录 GLM 与 DeepSeek-V4.1-Flash 的成绩。
+
+### Added
+
+- `docs/PREFILL_KNOWN_ISSUES.md`：性能点总表、未解决项、**已证伪的 5 个假设（不要再试）**、
+  测量方法上的 4 个坑、有效做法、上游关系澄清。
+- `docs/EXPERIMENTS.md`：逐实验台账（B1–B28），含**我犯过并已更正的错误**与操作纪律。
+- `patches/upstream/pr4-sm8x-sparse-mla-2d-tile.patch` + `pr4_body.md`。
+- `docs/SM70_VOLTA_VERDICT.md`、`docs/SM70_VOLTA_FORK_PLAN.md`（V100/SM70 可行性调研）。
+
+### 测量陷阱（本轮发现，影响判读）
+
+- **`GPU prefill ACTIVE` 横幅在每请求 preflight 失败（slack 为负）时照样打印。**
+  可靠判据只有两个：`XIAOTU_GPF_STAGE=1` 下 **`[fp8-asm]` 行数 > 0**，或 **`DISABLED` 未出现**。
+  **注意**：`[fp8-asm]` 是 **GLM/FP8 路径**的标记，**V4.1（MXFP4）不打印它**，不能用它判定 V4.1。
+- **profiler 的 `Self CUDA` 对 Python 层级 op 包含其子内核** ⇒ 父子行相加会重复计数
+  （实测求和 48.34 s > 墙钟 36.86 s）。且各核**异步重叠**，故「核求和」不是墙钟。
+- **清场必须杀 `VLLM::EngineCore` 子进程**：它不在任何 pidfile 里；验收判据是
+  `nvidia-smi` **读到 0**，而不是 kill 命令返回成功。
+- **`pgrep -f` / `pkill -f` 会匹配到自己的命令行**；`kill -9 -PGID` 会波及自己的进程组。
+
+### 澄清
+
+- `vllm/v1/attention/backends/mla/sparse_mla_kernels.py` 与 `flashmla_sparse_sm8x.py`
+  **不在 vLLM main 上** —— 由本仓库 `patches/upstream/pr3-sm80-port.patch` 新增（3517 行）。
+  本文件及 README 中与之相关的数字，测的都是**我们自己的 SM80 移植代码**。
+  （曾据此误报上游 issue #57971，**已撤回并关闭**。）
