@@ -180,6 +180,20 @@ python scripts/tiny_moe_equiv.py         # CPU/GPU 专家端到端等价性
 
 ### 8.3 回归 3:GPU 流式预填充**偶发** `illegal memory access`(未修,最高优先)
 
+> **2026-09-21 重要更新**:本条原先把这个报错点归给「上游新 indexer ↔ 我们 SM80
+> `kpool_compress.py` 的交互面」。**单变量实验否定了该归属**:
+> 根因是 **FP8 装配的那条 pitched 2-D DMA 跑在未同步的旁路流上**,见
+> `CHANGELOG.md` 的事故复盘与 `dev-docs/RND_CAMPAIGN_DIAGNOSIS.md`。
+> `byte_transpose.py:71` 只是**粘性错误的浮出点**(`load_binary` 不碰显存)。
+>
+> * 单变量证据:仅置 `XIAOTU_GP_ASM_SIDE_STREAM=0`,必崩序列即干净,
+>   且 `GPU prefill ACTIVE=84`(装配确实跑了,不是"没走这条路");
+> * 已修:`gp_side_stream_enabled()` 默认改为关 + 新增 `gp_capturing()`;代价 +17% 长 prompt TTFT;
+> * 已在真实 campaign 验证:`glm L=16384 C=1` 由 `completed=0/8` 变为 **`8/8`**。
+>
+> **但本条不因此关闭**:上面那段"新 indexer 调用链"的分析仍是独立线索,
+> 可能与本次已修的是**两个不同 bug 共用同一个报错面**。保留待查。
+
 * 现象:util 0.82 下 GPU prefill 被放行后,`vllm_xiaotu_moe/byte_transpose.py:71
   _ktranspose_bytes_kernel` 报 `Triton Error [CUDA]: an illegal memory access was encountered`,
   随后 `EngineDeadError`。**同配置另一次 32k+并发却跑过了 ⇒ 非确定**。
