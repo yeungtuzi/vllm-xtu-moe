@@ -196,7 +196,10 @@ def prealloc_fp8_buffers(device, n_experts: int, hidden: int, inter: int) -> Non
     """
     E, H, I = int(n_experts), int(hidden), int(inter)
     _buf("raw13", (E, 2 * I, H), device)
-    _buf("raw2", (E, H, I), device)
+    # 【②c】共享模式下 raw2 是 raw13 上的视图(w2_raw = w13_raw.view(...)),
+    # 不再单独分配 —— 省 1.12 GiB 设备显存。`XIAOTU_GPF_RAW2_SHARE=0` 退回独立缓冲。
+    if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "1") != "1":
+        _buf("raw2", (E, H, I), device)
     _buf("km13", (E, H, 2 * I), device)
     _buf("km2", (E, I, H), device)
 
