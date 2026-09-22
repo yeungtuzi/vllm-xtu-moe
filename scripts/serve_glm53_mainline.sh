@@ -66,7 +66,7 @@ MBT="${MBT:-4096}"
 # sequences are guaranteed by construction, with ~40% of the pool left as headroom
 # for the activation workspace. (The pool itself reports 3.51x concurrency for
 # 262,144-token requests, so 3 would also be admitted; 2 is the deliberate choice.)
-SEQS="${SEQS:-2}"
+SEQS="${SEQS:-4}"   # 用户 2026-09-22 定:所有模型默认 seqs=4(原为 2)
 THREADS="${THREADS:-60}"
 KV_DTYPE="${KV_DTYPE:-bfloat16}"
 # 投机解码(MTP,2026-09-20)。GLM-5.3-Flash 的检查点自带 **1 层 MTP**

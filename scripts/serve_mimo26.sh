@@ -18,7 +18,7 @@
 #   TP      tensor parallel                        默认 2
 #   MAXLEN  --max-model-len                        默认 1048576(用户口径)
 #   MBT     --max-num-batched-tokens               默认 4096(用户口径)
-#   SEQS    --max-num-seqs                         默认 1
+#   SEQS    --max-num-seqs                         默认 4(并发必须 ≥2;见 B124)
 #   UTIL    --gpu-memory-utilization               默认 0.85
 #   LOAD    --load-format                          默认 auto(dummy = 骨架冒烟)
 #   SPEC_K  MTP num_speculative_tokens             默认 1(0 = 关掉投机)
@@ -35,7 +35,7 @@ GPUS="${GPUS:-0,1}"
 TP="${TP:-2}"
 MAXLEN="${MAXLEN:-1048576}"
 MBT="${MBT:-4096}"
-SEQS="${SEQS:-1}"
+SEQS="${SEQS:-4}"   # 用户 2026-09-22 定:**所有模型默认 seqs=4**(seqs=1 会让 C≥2 退化成串行,见 EXPERIMENTS B124)
 UTIL="${UTIL:-0.85}"
 LOAD="${LOAD:-auto}"
 SPEC_K="${SPEC_K:-1}"

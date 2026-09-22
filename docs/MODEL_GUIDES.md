@@ -36,6 +36,12 @@ Using CPU Fp8 MoE backend out of potential backends: ['CPU', 'AITER', ...]   # �
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py
 ```
 
+> 📌 **`--max-num-seqs` 默认必须是 4(用户 2026-09-22 定,含以后新接入的模型)**
+> **不要用 1**:`max_num_seqs=1` 时引擎同时只能持有一个序列,第二个并发请求会 `Waiting` 到第一个结束
+> ⇒ C≥2 的 TTFT 与聚合吞吐**全部变成串行口径**(实测:短 C=2 的聚合 prefill 从 236 掉到 54,
+> 而同一批里 seqs=2 的模型是 115.8 → 129.6 **上升**)。判据见 `EXPERIMENTS.md` **B124**。
+> 生产脚本可以给更大值(如 64/128),但**默认值不得低于 4**。
+
 > ⚠️ **`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` 的「0 = 关闭」陷阱(2026-09-22 实测,B120)**
 > 判定在 `mixed_experts.py`:`_gp_min = gpu_prefill_min_tokens()`、**`_gp_on = _gp_min > 0`**
 > ⇒ **门槛为 0(或干脆不设)表示「关闭 GPU 预填」**,而不是"永不拒绝"(与 `gpu_prefill.py` docstring 的字面读法相反)。

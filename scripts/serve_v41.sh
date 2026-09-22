@@ -66,7 +66,8 @@ SPEC_CONFIG="${SPEC_CONFIG:-{\"method\":\"dspark\",\"num_speculative_tokens\":5,
 # MAXSEQS(默认 1):并发批大小上限。**实测关键**:=1(原值)时 vLLM 同时只调度一个
 #   序列,并发请求被完全串行化 —— 聚合吞吐恒定 ~13 tok/s、与并发无关,而单请求延迟
 #   线性变差(C=8 时 64 token 要 21 s)。见 dev-docs/report/tuning/NOTES.md §400。
-#   默认仍为 1 以保持既有行为不变;做吞吐测试时用 MAXSEQS=8/16 覆盖。
+#   默认 **4**(用户 2026-09-22 定:所有模型默认 seqs=4)。**不要用 1**:seqs=1 时 C≥2 会退化成串行,
+#   C=2 的 TTFT/聚合数会被污染(见 EXPERIMENTS B124)。/16 覆盖。
 #
 # License: Apache-2.0
 set -uo pipefail
@@ -290,7 +291,7 @@ nohup env \
   numactl --interleave=all "$PY" -m vllm.entrypoints.openai.api_server \
     --model "$CKPT" --served-model-name dsv41 \
     --load-format "$LOAD" \
-    --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-1}" \
+    --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-4}" \
     $( [ "${MBT}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
     --gpu-memory-utilization "$GPU_UTIL" \
     $( [ -n "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ] && printf -- '--kv-cache-memory %s' "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ) \
