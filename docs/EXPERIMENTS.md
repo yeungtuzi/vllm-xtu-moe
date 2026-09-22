@@ -3136,6 +3136,30 @@ P5 要求"含 pr4 生产树确认"。树 `vllm-up-133b71e0b` 现为
 
 ⚠️ 注意边界:这是**代码级**确认(改动在、且未被扰动)。pr4 的**性能数字**来自 B91 当时那批实测,
 本次 P5 **不重测 pr4 的收益**,只确认它仍在生产树上且未被后续改动污染 —— 与用户"性能先不测、保证 pr4 正确性"的指示一致。
+
+### B110 ⭐ DS-V4.1-Flash **确实是多模态的**,而且 vLLM 已实现 —— 待测正确性
+
+**用户提问**:DS-V4.1-Flash 是不是多模态?我们实现了吗?⇒ **是;上游已实现;接下来要测正确性**(用户指示:已实现就测)。
+
+**(1) 它是多模态(检查点证据,非 config 传闻)**
+* `config.json`:`architectures=['DeepseekV41ForCausalLM']`、**`image_token_id = 129264`**、
+  **`vision_config = {model_type: deepseek_v41_vision, num_hidden_layers: 32, hidden_size: 1024, num_attention_heads: 16, intermediate_size: 2816, patch_size…}`**;
+* 权重索引 **96,085 个张量中 262 个是视觉张量**:`vision.patch_embed.proj.{weight,bias}`、
+  `vision.blocks.0..31.{norm1,attn.wqkv,attn.wo,norm2,mlp.w1,mlp.w2}` ⇒ **32 层 ViT 真权重在盘上**。
+
+**(2) vLLM 已实现(我们的树里就有)**
+* `vllm/models/deepseek_v41/nvidia/vl_model.py:118`
+  `class DeepseekV41ForCausalLM(nn.Module, **SupportsMultiModal**, SupportsPP, …)`;
+* 处理器 `DeepseekV4VLMultiModalProcessor` + `common/mm_preprocess.py`(按 `image_token_id` 聚合图像 span);
+* **变体选择是按平台、不是按 SM**:`deepseek_v41/__init__.py` 里 `is_rocm() → amd/` 否则 `nvidia/`
+  ⇒ **A100 走 `nvidia/vl_model.py`**;
+* 该包**本身 SM 感知**:`common/engram.py` 导入 `is_ampere_or_ada()` 并用它决定 `use_u8`。
+
+**(3) ⇒ 本次要做的测试(与 MiMo 的多模态测试同构,答案已知)**
+服务 DS-V4.1-Flash **真权重 + 不加 `--language-model-only`**(`serve_v41.sh` 默认是关掉多模态的,要覆盖),
+`--limit-mm-per-prompt '{"image":1,"video":0}'`,TP=2,maxlen 小(8192),然后把渲染好已知字符串
+(`ZQ7K42`)的图送 `/v1/chat/completions`,看能否读对 —— 与 B102 同一把尺子,便于跨模型比较。
+⇒ **待 P5 的 MiMo 阶段结束再做**(避免与它争磁盘/内存:V4.1 是 476 GB,MiMo 是 161 GB)。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
