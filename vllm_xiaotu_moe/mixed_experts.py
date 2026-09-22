@@ -1211,12 +1211,31 @@ class _XiaotuExpertsMixin:
             I = int(w13.shape[1] // 2)
             H = int(w2w.shape[1])
             int4 = self._engine_attr == "MOE_WNA16" and w13.dtype == torch.uint8
+            # MXFP4 uses the same uint8 packing shape as INT4 but a different code and
+            # its own e8m0 block scales. Convention taken from `gpu_prefill.py`, which
+            # states it matches the CPU engine (moe_v2_packed4.hpp): low nibble = even k,
+            # high nibble = odd k, and scale = 2**(byte-127) per 32-element block along k.
+            mxfp4 = (not int4) and self._engine_attr == "MOE_MXFP4" \
+                and w13.dtype == torch.uint8
+            _E2M1 = None
 
             def _unpack4(w):   # [N, K/2] u8 -> [N, K] f32 with value = nibble - 8
                 b = w.to(torch.int16)
                 lo = (b & 0x0F) - 8
                 hi = ((b >> 4) & 0x0F) - 8
                 return torch.stack((lo, hi), dim=-1).reshape(w.shape[0], -1).float()
+
+            def _unpack_mxfp4(w):   # [N, K/2] u8 -> [N, K] f32 e2m1 code
+                nonlocal _E2M1
+                if _E2M1 is None:
+                    _E2M1 = torch.tensor(
+                        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                        dtype=torch.float32)
+                b = w.to(torch.int64)
+                lo = _E2M1[b & 0x0F]
+                hi = _E2M1[(b >> 4) & 0x0F]
+                return torch.stack((lo, hi), dim=-1).reshape(w.shape[0], -1)
 
             x = hidden_states[0].float().cpu()
             ref = torch.zeros(H, dtype=torch.float32)
@@ -1225,12 +1244,18 @@ class _XiaotuExpertsMixin:
                 w = float(topk_weights[0, r])
                 if w == 0.0:
                     continue
-                w13_e = _unpack4(w13[e]) if int4 else w13[e].float()
-                if unquant:
-                    deq13 = w13_e
+                if mxfp4:
+                    # e8m0 scales are [2I, H//32] u8 -> 2**(s-127), one per 32 columns.
+                    s13_full = torch.pow(2.0, s13[e].float() - 127.0)
+                    deq13 = _unpack_mxfp4(w13[e]) * \
+                        s13_full.repeat_interleave(32, dim=1)[: 2 * I, :H]
                 else:
-                    s13_full = s13[e].float().repeat_interleave(gn, 0).repeat_interleave(gk, 1)
-                    deq13 = w13_e * s13_full[: 2 * I, :H]
+                    w13_e = _unpack4(w13[e]) if int4 else w13[e].float()
+                    if unquant:
+                        deq13 = w13_e
+                    else:
+                        s13_full = s13[e].float().repeat_interleave(gn, 0).repeat_interleave(gk, 1)
+                        deq13 = w13_e * s13_full[: 2 * I, :H]
                 gate = deq13[:I] @ x
                 up = deq13[I:] @ x
                 if self.swiglu_limit or self.swiglu_alpha or self.swiglu_beta:
@@ -1244,12 +1269,18 @@ class _XiaotuExpertsMixin:
                 else:
                     act = (gate / (1 + torch.exp(-gate))) * up
                 act = act.to(torch.bfloat16).float()
-                w2_e = _unpack4(w2w[e]) if int4 else w2w[e].float()
-                if unquant:
+                if mxfp4:
+                    s2_full = torch.pow(2.0, s2[e].float() - 127.0)
+                    w2_e = _unpack_mxfp4(w2w[e]) * \
+                        s2_full.repeat_interleave(32, dim=1)[: H, :I]
                     down = w2_e @ act
                 else:
-                    s2_full = s2[e].float().repeat_interleave(gn, 0).repeat_interleave(gk, 1)
-                    down = (w2_e * s2_full[:H, :I]) @ act
+                    w2_e = _unpack4(w2w[e]) if int4 else w2w[e].float()
+                    if unquant:
+                        down = w2_e @ act
+                    else:
+                        s2_full = s2[e].float().repeat_interleave(gn, 0).repeat_interleave(gk, 1)
+                        down = (w2_e * s2_full[:H, :I]) @ act
                 ref += w * down
             got = out[0].float().cpu()
             rms = float(torch.sqrt(torch.mean(ref * ref)))
