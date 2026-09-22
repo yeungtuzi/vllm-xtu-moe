@@ -2685,6 +2685,35 @@ SGLang "MTP uses SWA ⇒ 不给全长 KV" 那条实现细节的依据。
 **⇒ P4 算 1M 显存时可直接用这套账,但要显式扣掉 15.38% 的补齐浪费。**
 
 **⇒ 用户定的三条口径里,已有两条在骨架级达成**:TP=2 ✅、**1M ✅**;多模态待真输入验证(P4)。
+
+### B95 ⭐ MiMo-V2.6 P1c:MTP k=1 建得起来,且**MTP 层不吃全长 KV**(实测证实 SGLang 那条)
+
+命令 = B93 原样 + `--speculative-config '{"method":"mtp","model":"<ckpt>","num_speculative_tokens":1}'`
+(maxlen 保持 4096,便于与 P1 **直接对比**)。**140 s 起服务,0 错误**,日志 `/tmp/mimo26_mtp.log`。
+
+日志证据:
+* `[model.py:691] Resolved architecture: **MiMoV2MTPModel**` ⇒ 草稿模型被正确解析
+  (与我们 `eddc6d0eb7` 的"MTP 层不该被当普通层落 CPU"的判定一致);
+* `[speculative.py:1653] Overriding draft model max model len from 1048576 to 4096`。
+
+**与 P1(无 MTP)同 maxlen 对比 —— 这是本次的判据:**
+
+| 项 | 无 MTP(B93) | **MTP k=1** | 差 |
+|---|---|---|---|
+| `GPU KV cache size` | 224,039 token | **221,079 token** | **−2,960(−1.3%)** |
+| `Available KV cache memory` | 26.53 GiB | 26.18 GiB | −0.35 GiB |
+| 补齐层与浪费 | 6 层 / **15.38%** | **5 层 / 12.50%** | **反而更少** |
+
+**⇒ 结论:MTP 层**没有**拿全长 KV。** 若它按 maxlen=4096 拿全长,池至少要少 4096 token(≈1.8%),
+而且补齐只会更糟;实测只少 **1.3%**,补齐层还从 6 降到 5
+⇒ **MTP 层的 KV 是窗口级(按 SWA 处理)**,与 SGLang [PR #15207](https://github.com/sgl-project/sglang/pull/15207)
+的 "MiMoV2MTP uses SWA, so set full KV cache to 0" **一致**。
+**⇒ P4 算 1M 预算时,MTP 不额外占全长 KV**(这条直接来自上游实现细节的核对,不是我们的猜测)。
+
+⚠️ **一条坑**:`max_num_scheduled_tokens is set to 2048 based on the speculative decoding settings.
+... Consider increasing max_num_batched_tokens to accommodate the additional draft token slots`。
+本次我显式传的是 `MBT=2048` 才触发;**P4 用 `MBT=4096` 时要复核这条是否消失**(若不消失,
+说明 spec decode 会把调度上限压到某个与 MBT 无关的值,k>1 时更需要放大 MBT)。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
