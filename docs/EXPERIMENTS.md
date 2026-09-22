@@ -3995,6 +3995,39 @@ V4.1 走 **MLA**(存的是压缩 latent,不是 K/V 全量),MiMo 有 **39/48 层�
 **⇒ 多模态验证的最终结论**:图片 ✅(B102)、**视频 ✅**(B132,连时序都对)、**组合 ✅**(B133,图+长文本+MTP)、
 **音频 ✅ 通路可用**(B138,自由描述正确;数字探针受域限制)。
 
+
+### B139 🔴 **更正 B131(用户指出)**:ping/pong 双缓冲**早已实现且启用** —— 我说的"H2D 未与计算重叠"是错的
+
+**用户指出**:"这个不是以前做过吗?ping/pong" —— **核对后:用户对,我 B131 的结论错了。**
+
+**代码证据**(`vllm_xiaotu_moe/gpu_prefill.py`):
+
+| 位置 | 内容 |
+|---|---|
+| L1243 | 注释原文 **"Prefetch-ahead: overlap layer L+1's H2D with layer L's compute."** |
+| L1250 / L1313 | `PrefetchSlot` / `prefetch_layer()` |
+| L1288,L1338 | `XIAOTU_MOE_PREFETCH_SLOTS`(默认 **2** ⇒ 真 ping/pong) |
+| L1300-1313 | `_PREFETCH_STREAMS`:**独立 CUDA stream** |
+| L1360-1366 | `with torch.cuda.stream(st): buf.copy_(src, non_blocking=True)` ⇒ **异步拷贝** |
+| L1357-1358 | `if slot.busy is not None: st.wait_event(slot.busy)` ⇒ **只等同一个槽上次的事件**(标准双缓冲语义) |
+| L1349-1355 | **降级分支**:显存放不下槽时才 `falling back to synchronous H2D (no overlap)` |
+| L1336-1338 | ⚠️ 硬约束:槽数**必须 ≥2**,否则会拿到**下一层的权重**(`err_vs_L=17.5` vs `err_vs_L+1=0.096`)⇒ **正确性 bug**;"想省这 ~3GB 请改 `XIAOTU_MOE_RESIDENT_BUDGET_GB`,不要动这里" |
+
+**运行时证据**:**三份日志(glm_stage / v41s4 / mimo_s4)都没有**那条降级消息
+(日志里唯一含 "prefetch" 的行是 **vLLM 自己权重加载器**的 `Auto-prefetch is disabled ... EXT4 ...`,与本机制无关)
+⇒ **ping/pong 是启用状态,没有因为显存不足退化** ✓
+
+**⇒ 更正后的准确结论(替换 B131 的"未重叠")**:
+1. **重叠机制存在且生效**,但**流水线深度只有 1 层**(第 L+1 层的 H2D 藏在第 L 层的**计算**之下);
+2. `[gpf-stage] total ≈ dma + tr` **只是分段计时之和,不能推出"串行"** —— 这是我当时的推理错误;
+3. **停顿之所以仍在**,正确的解释是:**每层 H2D(533 ms)远大于每层 GPU 计算**(量级 ~几十 ms),
+   所以**可被藏起来的只是计算那一小块**,暴露出来的仍是 ~`dma − compute`/层 ⇒ 42–45 层 ≈ **13–20 s/step**
+   —— 这与实测 p99 ITL **13.6–14.0 s** 吻合 ✓;也**再次解释了 B127 的"与 MBT 无关"**(
+   每 step 的成本 = 该 step 触及的**全部层**的暴露 H2D,与 chunk 大小无关);
+4. **⇒ 优化方向因此也要改**(B131 的"双缓冲是最大杠杆"不成立,**它已经有了**):真正的杠杆是
+   **减少要传的字节 / 减少重复上传次数** —— 即 ①**加大 MBT**(每个 prompt 的 chunk 数↓ ⇒ 总 DMA↓)、
+   ②**更多常驻层**(策略实测上限 2–3 层)、③**层主序 prefill**(同一层只传一次,而不是每个 chunk 各传一遍)。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

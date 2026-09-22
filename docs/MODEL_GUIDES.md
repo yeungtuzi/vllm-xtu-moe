@@ -73,7 +73,10 @@ MM=1 PROMPTS=1 MM_LIMITS='{"image":1,"video":1,"audio":1}' bash scripts/serve_mi
 ```
 
 * **`dma` 占 98.8%** ⇒ 成本就是**上传本身**(≈6.4 GB/s,PCIe 带宽瓶颈);`tr`(转置)**已缓存**;`asm` 为 0;
-* **`total ≈ dma + tr` ⇒ 当前 H2D 没有与计算重叠**;
+* ⚠️ **更正(EXPERIMENTS B139)**:`total ≈ dma + tr` 只是**分段计时之和**,**不能**推出"没有重叠" ——
+  **ping/pong 双缓冲早已实现且启用**(`prefetch_layer` + `PrefetchSlot` + 独立 CUDA stream +
+  `XIAOTU_MOE_PREFETCH_SLOTS=2`,且日志里没有出现"no VRAM for ping-pong"的降级);
+  真正的情况是**流水线深度只有 1 层,而每层 H2D(533 ms)远大于每层计算(几十 ms)**,所以**能藏起来的只是一小部分**;
 * ⇒ **每一个"带预填充的 step"要付 `MoE 层数 × ~540 ms`**(GLM ≈ **24 s**)。
 
 **收益**:长 prefill 显著更快 —— MiMo-V2.6 实测 **313 → 811 tok/s**(TTFT 52.3 → 20.2 s)。
