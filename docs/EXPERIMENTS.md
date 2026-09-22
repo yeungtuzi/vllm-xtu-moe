@@ -3412,6 +3412,32 @@ ValueError: To serve at least one request with the model's max seq len (131072),
 **另记一个未解释但有利的差异**:本条 C=2 的 decode **正好翻倍**(19.3 → 38.7,median TPOT 51.75 → 51.63 ms 几乎不变),
 而公布的 CED A/B 里 C=2 反而退化(19.3 → 15.4)⇒ **那次 C=2 的退化在本配置下不复现**(与 B115/B116 里 GLM 的 C=2 异常可能同源,待查)。
 
+
+### B120 🔴 **MiMo 的 GPU 预填从未启用** —— 因为"门槛 = 0"的语义是**关闭**(反直觉),而脚本没设过它
+
+**现象(用户 2026-09-22 让我按 MBT=8192/128K 重测时暴露)**:
+把 MiMo 的 MBT 从 4096 提到 **8192** 后,prefill **几乎没变**:302.5(B112,MBT 4096)→ **313.4**(本条,MBT 8192);
+而且整轮 bench 里 **`GPU prefill ACTIVE` 出现 0 次**(V4.1 同配置下有 **42 次**)。
+
+**根因(读代码定位,`mixed_experts.py`)**:
+```python
+:1485   _gp_min = gpu_prefill_min_tokens()   # 未设 ⇒ gpu_prefill.py:82 返回 "0"
+:1486   _gp_on  = _gp_min > 0                # ← **0 表示关闭**,不是"永不拒绝"!
+```
+*`gpu_prefill.py` 的 docstring 写的是"当层的 token 数 >= 门槛时走 GPU",按字面 0 应该表示"总是走";
+但实现把 0 当成**关闭开关**(`_gp_on = _gp_min > 0`)。*
+*而 `serve_mimo26.sh` **从未设置** `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` ⇒ 取默认 0 ⇒ **GPU 预填永久关闭**。
+(V4.1/GLM 的脚本显式设了 4096,所以它们**有** GPU 预填 —— 这也解释了 B119 里 V4.1 的 907.7。)*
+
+**⇒ 结论**:
+1. **MiMo 的 prefill 一直是"纯 CPU"口径** —— 之前 README 里那行(302.5)和 B112 的数字都受此影响;
+2. **修复**:给 `serve_mimo26.sh` 加 `GPU_PREFILL_MIN` 旋钮并**显式设 4096**(本轮已加,已核实进入 env 文件:
+   `/tmp/mimo26.env` 里出现 `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=4096`);
+3. **这个"0=关"的语义是个陷阱**,值得写进 `docs/MODEL_GUIDES.md`/`RUNBOOK`:新模型接入时**必须显式给正数门槛**。
+
+**顺带**:`GPU prefill ACTIVE` 这个日志行(B96 记录过)是**判断 GPU 预填是否真的生效的唯一直接证据** ——
+以后每次测 prefill 性能都应先 grep 它,而不是只看数字。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
