@@ -2611,6 +2611,56 @@ GPU 预填充 ACTIVE:`first 15232 tokens >= threshold 1500`)。TTFT **47.44 s**;
 * ⚠️ 具体用例 `mxfp4-dsv4` 报 `AssertionError: Current vLLM config is not set` ——
   **这是探针自身的脚手架缺口**(在 `set_current_vllm_config()` 之外构造 `FusedMoEConfig`),
   不是插件或模型问题。**⇒ P2 写门禁时要带 `default_vllm_config` 上下文**(或直接走真实层构建)。
+
+### B93 ⭐⭐ MiMo-V2.6 P1:dummy 骨架在 SM80 上**一次通过**(110 s 起服务)—— R1 的实测半过了
+
+**命令(可复现)**
+```
+PYTHONPATH=/home/user/lvllm/vllm-up-133b71e0b \
+VLLM_EXPERTS_LOAD_DEVICE=cpu XIAOTU_MOE_THREADS=60 CUDA_VISIBLE_DEVICES=0,1 \
+VLLM_USE_FLASHINFER_SAMPLER=0 HF_HUB_OFFLINE=1 \
+python -m vllm.entrypoints.openai.api_server \
+  --model /home/user/.cache/modelscope/models/MiMo-V2.6-Flash-RL --served-model-name mimo26 \
+  --tensor-parallel-size 2 --dtype bfloat16 --kv-cache-dtype bfloat16 \
+  --max-model-len 4096 --max-num-batched-tokens 2048 --max-num-seqs 1 \
+  --gpu-memory-utilization 0.85 --language-model-only --trust-remote-code \
+  --load-format dummy            # 日志 /tmp/mimo26_p1.log
+```
+
+**四条结论(全部来自日志,不是推断)**
+
+1. ✅ **多模态不需要 `--hf-overrides`** —— P0 §8① 的悬案解决:
+   `[model.py:691] Resolved architecture: MiMoV2OmniForCausalLM`
+   (检查点 `architectures` 明明写的是纯文本的 `MiMoV2ForCausalLM`,**vLLM 自己解析成了 omni 类**)。
+   同批还有 `[registry.py:129] All limits of multimodal modalities ... set to 0, running in text-only mode.`
+   与 `[model.py:899] Disabled mm_prefix attention mode ... Attention backends without mm_prefix support may now be selected.`
+   ⇒ `--language-model-only` 不仅省权重,还**解除了 mm_prefix 对后端选择的限制**。
+2. ✅ **R1 的实测半过了**:`[mimo_v2.py:319] Using TRITON_ATTN_DIFFKV for attention`
+   ⇒ **hybrid SWA(9 GA + 39 SWA)+ DiffKV + sink 在 SM80 上把 48 层建起来了**,
+   与 B92-6 的代码层结论(核里真有 `SLIDING_WINDOW` 与 `init_softmax_M(sink_ptr)`)合起来,R1 从"缺证据"变成"已跑通"。
+3. ✅ **MXFP4 引擎被正确选中**:
+   `[vllm-xtu-moe] xiaotu MOE_MXFP4 engine: E=256 H=4096 I=1024 topk=8 group=1x32 scales=yes
+   routing=sigmoid/grouped1x1/bias swiglu=plain`
+   ⇒ E/topk 与 config 完全一致;**`I=1024` 是 TP=2 分片后的每 rank 值**(config `moe_intermediate_size=2048`);
+   **`swiglu=plain`**(MiMo `hidden_act=silu`,无 clamp —— 对比 V4.1/GLM 是 `clamp@10.0`);
+   `routing=sigmoid/grouped1x1/bias` 对应 `topk_method=noaux_tc`、`n_group=1/topk_group=1`。
+   ⇒ **P2 门禁要覆盖的就是这一组语义**(sigmoid + bias + 1x1 分组 + 无 clamp + 归一化)。
+4. ✅ **真请求能返回**:`POST /v1/completions` 正常回 `choices[0].text`(dummy 权重,内容无意义),
+   全程 **0 个 `illegal memory` / `CUDA error` / `NaN`**;`GPU KV cache size: 224,039 tokens`(maxlen=4096)。
+
+**两条要带进 P4 的观察**
+
+* ⚠️ **`Add 6 padding layers, may waste at most 15.38% KV cache memory`**(两个 rank 都报)
+  ⇒ 混合层型的 KV 池需要按组**补齐 6 层**,浪费 15.38%。**算 1M 预算时必须把这 15.38% 计进去**,
+  否则会低估显存(这与 SGLang "MTP 不给全长 KV" 那条是同一类账)。
+* 本次 `compilation_config.mode = VLLM_COMPILE`、`enable_jit_warmup=True`、`cudagraph_capture_sizes=[1,2]`
+  ⇒ **dummy 骨架只花 110 s 是因为权重是 dummy;P4 上 1M + 真权重时启动时间要另算**
+  (可照 `serve_v41.sh` 的做法加 `--kernel-config '{"enable_jit_warmup": false}'`)。
+
+**未覆盖(下一轮)**:① **MTP 的 KV 是否按 SWA 处理** —— 本次 `speculative_config=None`,要加
+`--speculative-config '{"method":"mtp","model":"<ckpt>","num_speculative_tokens":1}'` 才看得到;
+② **1M** —— 本次 maxlen=4096,按用户口径要到 1048576 并配 `MBT=4096`;
+③ 多模态真输入(本次是 text-only)。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
