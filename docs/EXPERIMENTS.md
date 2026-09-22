@@ -2863,6 +2863,34 @@ SGLang "MTP uses SWA ⇒ 不给全长 KV" 那条实现细节的依据。
   (缺陷在我们补丁里;上游硬编码 1 是安全的)。
   **唯一例外**:若将来出现"深度 1/2 接受率低是**上游多模块链路接线 bug**"的证据(见 B98 末尾),
   那才是另一件事;在那之前不重启此议题。
+
+### B101 SGLang #37983 评估:**问题是真的,但 PR 已经存在 ⇒ 不提竞争 PR,改为支持 #38142**
+
+材料:`dev-docs/SGLANG_37983_ASSESSMENT.md` + `sglang_37983_option_b_backend_guard.patch` +
+`sglang_37983_kernel_demo.py`(subagent 产出;**GitHub 全程只读**;GPU 只用 GPU2)。
+
+**① bug 是真的,而且是"静默默认路径"**:上游 main `877a293`(2026-09-22)里
+`VisionTritonAttention.forward` 收了 `**kwargs` 却只传 `is_causal`/`sm_scale`(`vision.py:508-518`),
+`context_attention_fwd`(`prefill_attention.py:170-172`)**没有** `window_size`/`sinks`,核里只 mask 边界+causal。
+**A100(SM80)与 SM120 的默认后端正是 `triton_attn`** ⇒ 默认走的就是坏路径。
+
+**② 本机量化了"静默错"有多大**(kernel 级,GPU2):核与**全注意力**参考一致(rel err **0.26%**),
+但对 **window(64,64)** 偏 **76.8%**、对 **window+sink** 偏 **79.5%**,且 `window_size=`/`sinks=` 直接 `TypeError`。
+
+**③ 查重结果(关键)**:修好的 PR **已经存在** ——
+**#38142**(Liu-congo,issue 次日提):OPEN、MERGEABLE、`+665/−18`,自带参考实现测试、精度(~75% 误差 → ~0.2%)
+与 1.00× 无回退微基准;**0 条评审**,**只卡在一个 taxonomy lint**(测试要放到
+`test/registered/kernels/ops/attention/`,**一个文件搬移**)+ CI 没跑。另有 #38872(FA4 那一半)、
+#24706(SDPA 回退 ≈ 我们的 option b)**已 stale 关闭 116 天** ⇒ 说明"回退/守卫"路线在他们那边**拿不到支持**。
+
+**④ 结论(与用户"值不值得做 PR"的问题对应)**:
+**不提竞争 PR**(违反他们与我们的查重纪律),改成**支持 #38142**:
+推动 Codeowner/Mergoncall 评审 + **把那个一文件测试路径的修法作为建议提供**(我们只读,推不到他们分支)。
+**若 #38142 被关闭或再停 ~2 周**,才自己照 option (a) 提,并注明前作。
+**option (b)(守卫)只适合作为配合性加固,不单方面提** —— 因为它在 SM80/SM120 上会把"错输出"变成"起不来"。
+* **顺带一条对本目标有用的情报**:他们的 **#40448「MiMo-V2.6 day0 support」已于 09-20 合并** ⇒ SGLang 已支持 MiMo-2.6。
+* 过程纪律收获:本地 `_research/lsglang` 是 **fork 克隆**(`guqiong96/Lsglang` @60edaeb,上游查无此仓),
+  subagent 改用 `gh api` 取**上游**文件核对后才下的结论 —— 这正是"不凭本仓推断"该有的样子。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
