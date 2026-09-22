@@ -3825,6 +3825,45 @@ GLM 脚本默认 `SEQS=2` 所以正常;README 里 V4.1 那组来自更早的并�
 `pip install vllm[audio]`(或至少 `soundfile`)并确保 **`torchaudio`** 可用;否则音频请求会 500,
 而**图片/视频不受影响**(视频只需 PyAV/FFmpeg 路径,本环境用 soundfile+av 已通过)。
 
+
+### B134 `vram_policy.py` 的 KV 预算 bug:**完整诊断(三处缺陷)+ 修法**,主因是"每 token KV"模型不对
+
+用户判语:"看来计算 vram 分配策略的脚本有很大问题"。**已用代码直接验证**(`plan(maxlen=131072)`):
+
+| 量 | 实测值 |
+|---|---|
+| 策略算出的 `kv_gib`(131072 token) | **0.2753 GiB** |
+| **引擎实际要求**(报错原文) | **0.66 GiB** ⇒ **策略低估 ≈ 2.4×** |
+| `kv_gib × 1.15`(本应给的余量) | 0.3166 GiB(**仍 < 0.5 下限** ⇒ 修死变量也救不了) |
+| 实际下发 `p['kv_bytes']` | **0.5 GiB**(下限生效)⇒ 服务**起不来** |
+
+**三处缺陷(按重要性)**:
+
+1. ⭐ **`kv_gib` 的模型不对(主因)**:策略按 **0.2753 GiB / 131072 token ≈ 2.2 KiB/token** 估算,
+   而 vLLM 对**同一配置**要求 **5.3 KiB/token**。原因:该文件的常量是**按 V4.1(MLA 压缩 KV)标定的**
+   (例如 `WEIGHTS_GIB = 9.78`),却被 GLM/MiMo 这类 **GQA(无 MLA 压缩)** 复用 ⇒ **每 token KV 被系统性低估**;
+   ⇒ 这解释为什么"1M 时要显式传 `KV_CACHE_BYTES` 才起得来",也解释用户说的"脚本有很大问题";
+2. **0.5 GiB 下限低于引擎最低需求**:`if _kv_bytes < (1 << 29): _kv_bytes = 1 << 29` —— 0.5 GiB 对
+   任何 `kv_gib < 0.66` 的配置都会产出**起不来**的值(128K、32K、8K 全部中招,不只是 128K);
+3. **死变量**:`_kv_bytes = kv_gib × XIAOTU_KV_CACHE_SLACK(默认 1.15)` **算完从未使用**,
+   下发行的却是 `p['kv_bytes']` ⇒ **设计好的 15% 余量一直没生效**(即使它生效,见上表也仍 < 下限)。
+
+**修法(建议,需用户点头后实施)**:
+* **① 让 KV/token 从 checkpoint 的 config 现算**:`num_hidden_layers` × `2`(K+V)×
+  `num_key_value_heads` × `head_dim` × dtype 字节 / TP(**MLA 模型走压缩后的 `kv_lora_rank`**;
+  **hybrid/SWA 层按其窗口或按其真实 KV 形状**),再乘 `maxlen × seqs` ⇒ 取代硬编码常量;
+  策略里**已有**读 config 的机制(`_ckpt_shapes` 读 `n_routed_experts` 等)⇒ 复用即可;
+* **② 下发 `_kv_bytes` 而不是 `p['kv_bytes']`**(让 slack 生效);
+* **③ 下限按"引擎最低需求"取**,而不是写死 0.5 GiB:最低需求 ≈ `层数 × 2 × block_size × kv_heads × head_dim × dtype`
+  ⇒ 或至少抬到 **1 GiB** 并保留 `XIAOTU_KV_CACHE_BYTES` 覆盖。
+* **④ 加自检**:若最终下发值 < ①算出的引擎最低需求,直接**打印警告并给出可执行出路**(这与文件里已有的
+  "容量自检"风格一致)。
+
+**⚠️ 现状与缓解**:目前该 bug **不会静默出错** —— 它会以
+`ValueError: To serve at least one request (N tokens), X GiB KV cache is needed` **在启动时明确失败**
+(实测当时**空闲显存 38.75 GiB**,即纯粹是**预算值给错**,不是真的不够)。**临时缓解**:显式传
+`KV_CACHE_BYTES`(如 6 GiB),这也是当前 1M 长上下文实测所用的方式(B112 起)。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
