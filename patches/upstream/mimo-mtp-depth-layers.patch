@@ -1,0 +1,277 @@
+diff --git a/tests/config/test_speculative_draft_hf_overrides.py b/tests/config/test_speculative_draft_hf_overrides.py
+index 8505172da3..807898f5ca 100644
+--- a/tests/config/test_speculative_draft_hf_overrides.py
++++ b/tests/config/test_speculative_draft_hf_overrides.py
+@@ -117,6 +117,46 @@ def test_inkling_override_exposes_all_mtp_depths():
+     assert out.local_layer_ids == [0, 2, 4]
+ 
+ 
++@pytest.mark.cpu_test
++@pytest.mark.parametrize(
++    ("architecture", "expected_arch"),
++    [
++        ("MiMoV2ForCausalLM", "MiMoV2MTPModel"),
++        ("MiMoV2FlashForCausalLM", "MiMoV2MTPModel"),
++        ("MiMoV2OmniForCausalLM", "MiMoV2OmniMTPModel"),
++    ],
++)
++def test_mimo_v2_override_exposes_checkpoint_depths(
++    architecture: str, expected_arch: str
++):
++    """MiMo-V2 exposes the checkpoint's own MTP depth count instead of a
++    fixed constant, so the draft can build the layers the checkpoint has."""
++    config = _make_hf_config(
++        architectures=[architecture],
++        model_type="mimo_v2",
++        num_nextn_predict_layers=3,
++    )
++
++    out = SpeculativeConfig.hf_config_override(config)
++
++    assert out.model_type == "mimo_v2_mtp"
++    assert out.architectures == [expected_arch]
++    assert out.n_predict == 3
++    assert out.num_nextn_predict_layers == 3
++
++
++@pytest.mark.cpu_test
++def test_mimo_v2_override_without_depths_fails_closed():
++    config = _make_hf_config(
++        architectures=["MiMoV2ForCausalLM"],
++        model_type="mimo_v2",
++        num_nextn_predict_layers=0,
++    )
++
++    with pytest.raises(ValueError, match="num_nextn_predict_layers >= 1"):
++        SpeculativeConfig.hf_config_override(config)
++
++
+ def _module_level_shrink(hf_config: PretrainedConfig) -> PretrainedConfig:
+     hf_config.num_hidden_layers = 1
+     return hf_config
+diff --git a/tests/models/test_mimo_v2_mtp_depth.py b/tests/models/test_mimo_v2_mtp_depth.py
+new file mode 100644
+index 0000000000..cd15e8d888
+--- /dev/null
++++ b/tests/models/test_mimo_v2_mtp_depth.py
+@@ -0,0 +1,56 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU-only tests for MiMo-V2 MTP depth-layer selection.
++
++The checkpoint ships ``num_nextn_predict_layers`` trained depth layers
++(``model.mtp.layers.{0..N-1}``). The draft must build only the depths a run can
++reach, and must fail closed when the checkpoint does not actually carry a depth
++it was asked to build.
++"""
++
++import pytest
++
++from vllm.model_executor.models.mimo_v2_mtp import (
++    _resolve_num_mtp_layers,
++    _verify_mtp_depths_loaded,
++)
++
++pytestmark = pytest.mark.cpu_test
++
++
++@pytest.mark.parametrize(
++    ("checkpoint_depths", "num_speculative_tokens", "expected"),
++    [
++        (3, 1, 1),  # k < depth: a k=1 run must not pay for depths 1..2
++        (3, 3, 3),  # k == depth: use every trained depth
++        (3, 5, 3),  # k > depth: clamp to the checkpoint and reuse its last depth
++        (1, 4, 1),  # single-depth checkpoints keep the upstream layer-0 reuse
++        (3, None, 3),  # unset k uses every checkpoint depth
++    ],
++)
++def test_num_mtp_layers_is_capped_by_checkpoint_and_k(
++    checkpoint_depths: int, num_speculative_tokens: int | None, expected: int
++):
++    assert (
++        _resolve_num_mtp_layers(checkpoint_depths, num_speculative_tokens) == expected
++    )
++
++
++def test_checkpoint_without_depth_layers_fails_closed():
++    with pytest.raises(ValueError, match="at least one depth layer"):
++        _resolve_num_mtp_layers(0, 3)
++
++
++def test_missing_depth_weights_fail_closed():
++    loaded = {
++        "model.embed_tokens.weight",
++        "model.mtp.layers.0.enorm.weight",
++    }
++    missing = r"missing weights for depth layer\(s\) \[1, 2\]"
++    with pytest.raises(ValueError, match=missing):
++        _verify_mtp_depths_loaded(3, loaded)
++
++
++def test_all_depth_weights_loaded_passes():
++    loaded = {f"model.mtp.layers.{depth}.enorm.weight" for depth in range(3)}
++    _verify_mtp_depths_loaded(3, loaded)
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index ef9a16f903..e961a51782 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -723,18 +723,21 @@ class SpeculativeConfig:
+             "MiMoV2ForCausalLM",
+             "MiMoV2OmniForCausalLM",
+         ):
+-            from vllm.model_executor.models.mimo_v2_mtp import (
+-                _MIMO_V2_PRO_NUM_MTP_LAYERS,
+-            )
+-
+             mtp_arch_maps = {
+                 "MiMoV2ForCausalLM": "MiMoV2MTPModel",
+                 "MiMoV2OmniForCausalLM": "MiMoV2OmniMTPModel",
+             }
+ 
+             hf_config.model_type = "mimo_v2_mtp"
+-            # vLLM currently supports only the first MiMo-V2 MTP layer.
+-            n_predict = _MIMO_V2_PRO_NUM_MTP_LAYERS
++            # Expose the checkpoint's own MTP depth count; the draft model
++            # clamps it to num_speculative_tokens when it builds layers.
++            text_config = getattr(hf_config, "text_config", hf_config)
++            n_predict = getattr(text_config, "num_nextn_predict_layers", None)
++            if n_predict is None or n_predict < 1:
++                raise ValueError(
++                    "MiMo-V2 MTP requires the checkpoint to declare its MTP "
++                    "depth count (num_nextn_predict_layers >= 1)."
++                )
+             hf_config.update(
+                 {
+                     "num_hidden_layers": 0,
+@@ -745,13 +748,16 @@ class SpeculativeConfig:
+             )
+ 
+         if hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
+-            from vllm.model_executor.models.mimo_v2_mtp import (
+-                _MIMO_V2_FLASH_NUM_MTP_LAYERS,
+-            )
+-
+             hf_config.model_type = "mimo_v2_mtp"
+-            # vLLM currently supports only the first MiMo-V2 MTP layer.
+-            n_predict = _MIMO_V2_FLASH_NUM_MTP_LAYERS
++            # Expose the checkpoint's own MTP depth count; the draft model
++            # clamps it to num_speculative_tokens when it builds layers.
++            text_config = getattr(hf_config, "text_config", hf_config)
++            n_predict = getattr(text_config, "num_nextn_predict_layers", None)
++            if n_predict is None or n_predict < 1:
++                raise ValueError(
++                    "MiMo-V2 Flash MTP requires the checkpoint to declare its "
++                    "MTP depth count (num_nextn_predict_layers >= 1)."
++                )
+             hf_config.update(
+                 {
+                     "num_hidden_layers": 0,
+diff --git a/vllm/model_executor/models/mimo_v2_mtp.py b/vllm/model_executor/models/mimo_v2_mtp.py
+index ba47820f81..2e7f584e0b 100644
+--- a/vllm/model_executor/models/mimo_v2_mtp.py
++++ b/vllm/model_executor/models/mimo_v2_mtp.py
+@@ -37,6 +37,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+     VocabParallelEmbedding,
+ )
++from vllm.model_executor.model_loader.mtp_validation import (
++    is_mtp_completeness_check_enabled,
++)
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.sequence import IntermediateTensors
+ 
+@@ -48,13 +51,58 @@ from .interfaces import (
+ from .mimo_v2 import MiMoV2Attention, MiMoV2MLP, _shard_fp8_qkv_proj
+ from .utils import _merge_multimodal_embeddings, maybe_prefix
+ 
+-# MiMo-V2.5 ships 3 MTP depth layers (`model.mtp.layers.{0,1,2}`, 48 tensors in
+-# `model_mtp.safetensors`; verified against the published weight index). vLLM
+-# used to build only the first one, which makes k>1 pure overhead. The predictor
+-# now builds min(checkpoint_layers, num_speculative_tokens) layers, so k=1 keeps
+-# the old single-layer cost while k=3 unlocks the full chain.
+-_MIMO_V2_PRO_NUM_MTP_LAYERS = 3
+-_MIMO_V2_FLASH_NUM_MTP_LAYERS = 3
++
++def _resolve_num_mtp_layers(
++    checkpoint_depths: int, num_speculative_tokens: int | None
++) -> int:
++    """Number of MTP depth layers to instantiate for a MiMo-V2 checkpoint.
++
++    The checkpoint ships ``num_nextn_predict_layers`` trained depths, but a run
++    only reaches the first ``num_speculative_tokens`` of them, so build the
++    smaller of the two. Requests deeper than the checkpoint reuse its last
++    layer through ``spec_step_idx % num_mtp_layers``.
++
++    Args:
++        checkpoint_depths: ``num_nextn_predict_layers`` of the checkpoint.
++        num_speculative_tokens: Requested draft depth; ``None`` uses every
++            checkpoint depth.
++
++    Returns:
++        The number of ``model.mtp.layers.*`` modules to build.
++
++    Raises:
++        ValueError: If the checkpoint declares no MTP depth layer.
++    """
++    if checkpoint_depths < 1:
++        raise ValueError(
++            "MiMo-V2 MTP requires a checkpoint with at least one depth layer "
++            "(num_nextn_predict_layers >= 1)."
++        )
++    if not num_speculative_tokens:
++        return checkpoint_depths
++    return min(checkpoint_depths, num_speculative_tokens)
++
++
++def _verify_mtp_depths_loaded(num_mtp_layers: int, loaded_params: set[str]) -> None:
++    """Fail closed when a built depth layer received no checkpoint weights.
++
++    A checkpoint whose config declares more depths than its weight files hold
++    would otherwise leave the extra layers randomly initialized and silently
++    draft garbage.
++    """
++    if not is_mtp_completeness_check_enabled():
++        return
++    loaded_depths = {
++        int(name.split(".")[3])
++        for name in loaded_params
++        if name.startswith("model.mtp.layers.")
++    }
++    missing = [depth for depth in range(num_mtp_layers) if depth not in loaded_depths]
++    if missing:
++        raise ValueError(
++            "MiMo-V2 MTP checkpoint is missing weights for depth layer(s) "
++            f"{missing}; it does not ship the requested MTP depths."
++        )
+ 
+ 
+ class MiMoV2MTPLayer(nn.Module):
+@@ -173,16 +221,10 @@ class MiMoV2MultiTokenPredictor(nn.Module):
+         config = vllm_config.model_config.hf_config
+         spec_cfg = vllm_config.speculative_config
+         assert spec_cfg is not None
+-        # Build only min(checkpoint layers, k): a k=1 run must not pay for (or
+-        # try to load) layers 1..N-1, while k=3 uses the full chain.
+-        n_checkpoint = int(getattr(config, "num_nextn_predict_layers", 1) or 1)
+-        n_spec = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
+-        num_mtp_layers = min(n_checkpoint, n_spec) if n_spec else n_checkpoint
+-        if num_mtp_layers <= 0:
+-            raise ValueError(
+-                "MiMo MTP requires num_nextn_predict_layers and "
+-                "num_speculative_tokens to select at least one depth layer."
+-            )
++        num_mtp_layers = _resolve_num_mtp_layers(
++            int(getattr(config, "num_nextn_predict_layers", 0) or 0),
++            spec_cfg.num_speculative_tokens,
++        )
+ 
+         self.num_mtp_layers = num_mtp_layers
+ 
+@@ -393,6 +435,7 @@ class MiMoV2MTP(nn.Module):
+             direct_weight_loader(param, loaded_weight)
+             loaded_params.add(name)
+ 
++        _verify_mtp_depths_loaded(self.model.num_mtp_layers, loaded_params)
+         return loaded_params
+ 
+ 
