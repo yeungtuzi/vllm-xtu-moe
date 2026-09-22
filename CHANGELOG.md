@@ -42,6 +42,16 @@
 
 ### Changed
 
+- **pr4 已打进生产树 `vllm-up-133b71e0b`,并验证正确性**(性能按用户要求留到 MiMo-2.6 适配后统一重测):
+  * 该树由 detached HEAD 切到分支 **`xtu/glm53-sm80-pr4` @ `43aef91579`**(提交而非留脏工作区 ——
+    这棵树是 8070 的生产部署树,脏改动会被一次 `git checkout` 抹掉);
+  * `sparse_mla_kernels.py` md5 `fdf1908b… → dbaa8a54…`(与独立树 `/home/user/lvllm/vllm-pr4` 逐字节相同);
+  * **核级 8/8 用例 OK,且 1-D 核与 pr4 2-D 核的 `max_abs` 到最后一个有效位都相同**
+    (`test_sparse_mla_fwd_sink.py`,如 1.9527e-03 对 1.9527e-03),确定性也都 bit-identical
+    ⇒ **2-D tiling 没有改变数值**;
+  * **端到端贪心对拍**:3 条自然长 prompt **首 token 全一致**;跨臂差异(1/3)**小于**同臂噪声(2/3),
+    且 10128 token 上跨臂**逐字节相同** ⇒ 差异属既有长文本非确定性,不是 pr4。
+  详见 `docs/EXPERIMENTS.md` B91。
 - **生产口径:回到 `MBT=4096`,保证 DeepSeek **1M** 与 GLM-5.3 **512K**(都已实测启动通过)**:
   * `serve_glm53_mainline.sh` 默认 `MAXLEN 262144 → 524288`、`MBT 8192 → 4096`
     (实测 `/v1/models=524288`、KV 池 **952,107 token**);

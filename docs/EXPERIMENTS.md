@@ -2501,6 +2501,53 @@ GPU 预填充 ACTIVE:`first 15232 tokens >= threshold 1500`)。TTFT **47.44 s**;
 反推 KV ≈ 2–4 KB/token,而文档里 V4.1 一直用的是 **30,639 B/token**(B27/B83 的账)。
 两者差一个量级 ⇒ **V4.1 的 KV 标尺本身需要复核**(可能把 engram/indexer 的账混进去了)。
 这不影响本次结论(池只多不少),但会影响"KV 到底占多少显存"的所有旧核算。
+
+### B91 ✅ pr4 **打进生产树** + **正确性通过**(性能按用户要求留到 MiMo-2.6 适配后统一重测)
+
+**动作**(按铁律:先备份/记 md5、`git apply --check` 先试、改后三重校验、失败即回滚):
+
+* 备份 `/tmp/pr4chk/sparse_mla_kernels.py.pre`,并与 `HEAD:` 版本 `cmp` **逐字节一致**(证明备份可信)。
+* 生产树 `vllm-up-133b71e0b` 由 **detached HEAD 切到新分支 `xtu/glm53-sm80-pr4`**,再 `git apply` 打上 pr4。
+* `md5 fdf1908b9c80951132bf88384fba6201 → dbaa8a5497c69729885b11ab193ea389`
+  (与独立树 `/home/user/lvllm/vllm-pr4` 里那份**逐字节相同**)。
+* 改后:仅 **1** 个文件被改、`py_compile` 通过、新核与 launch 都在 ⇒ 提交为 **`43aef91579`**,工作区干净。
+* **提交而不是留脏工作区**:这棵树是 8070 的生产部署树(靠 `PYTHONPATH`),脏工作区会被一次
+  `git checkout` 悄悄抹掉。**⇒ 文档里凡是写"生产树在 `eddc6d0eb7`(detached)"的,现在都应改成
+  "分支 `xtu/glm53-sm80-pr4` @ `43aef91579`"。**
+
+**正确性证据(两道,都是 A/B):**
+
+**(a) 核级数值对拍** —— `scripts/test_sparse_mla_fwd_sink.py`(与 fp32 torch 参考实现比,8 个用例),
+未打补丁(`vllm-ced` 树的 1-D 核)vs 打补丁(pr4 的 2-D 核):
+
+| 用例 | 1-D `max_abs` | pr4 `max_abs` |
+|---|---|---|
+| glm nope head 512, full | 1.9527e-03 | **1.9527e-03** |
+| glm nope head 512, partial | 1.9515e-03 | **1.9515e-03** |
+| v3.2 head 576 (nope+rope) | 3.9010e-03 | **3.9010e-03** |
+| index_topk=2048 | 8.5047e-04 | **8.5047e-04** |
+| single token, single head | 3.6722e-03 | **3.6722e-03** |
+| many tokens | 7.8001e-03 | **7.8001e-03** |
+| heads padded (actual<H) | 1.9482e-03 | **1.9482e-03** |
+| sink = −1e30 (no sink) | 3.7050e-03 | **3.7050e-03** |
+| determinism(3 次同输入) | bit-identical | **bit-identical** |
+
+⇒ **8/8 OK,且两个变体的误差到最后一个有效位都相同** ⇒ **2-D tiling 没有改变数值**
+(这比 pr4 自己记的「max|diff| ≈ 2.8e-05」更硬)。
+
+**(b) 端到端贪心对拍**(3 条自然长 prompt = 2144 / 5191 / 10128 token,`temperature=0 max_tokens=32`)
+—— 并且**特意多跑一次同臂**,拿本机噪声当尺子(B85 的教训):
+
+| 对比 | sg0(2144) | sg1(5191) | sg2(10128) | 首 token |
+|---|---|---|---|---|
+| **未打补丁 vs 打补丁** | SAME | TEXT-DIFF | **SAME** | **全相同** |
+| 打补丁后**同臂** r1 vs r2(噪声基线) | **TEXT-DIFF** | SAME | **TEXT-DIFF** | 全相同 |
+
+⇒ **同臂自相矛盾(2/3)比跨臂差异(1/3)更大**,且跨臂在 **10128 token 上逐字节相同**
+⇒ 那些差异归因于本机既有的长文本非确定性(与 B85 同一现象),**不是 pr4**。
+
+**⇒ 结论:pr4 正确性通过**(核级逐位一致 + 首 token 全一致 + 跨臂不劣于同臂噪声)。
+**⚠️ 性能本次不测**(用户要求:Mmio-2.6 适配完成后统一重测);本次运行只确认**不崩**。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
