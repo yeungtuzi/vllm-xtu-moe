@@ -386,9 +386,16 @@ def emit_env(p: dict) -> str:
     # 作为上限,超出的显存全部留给工作区/激活。上限可用 XIAOTU_KV_CACHE_BYTES 覆盖(便于实测标定)。
     _slack = _env_gib("XIAOTU_KV_CACHE_SLACK", 1.15)
     _kv_bytes = int(p.get("kv_gib", 0.0) * _slack * (1 << 30))
-    if _kv_bytes < (1 << 29):          # 至少 0.5 GiB,避免极端 maxlen 下把 KV 压到不可用
-        _kv_bytes = 1 << 29
-    lines.append(f"XIAOTU_KV_CACHE_BYTES={p.get('kv_bytes', 0)}")
+    # 【B134 修复】下限必须**高于引擎的最低需求**,否则服务会以
+    #   ValueError: To serve at least one request (N tokens), X GiB KV cache is needed
+    # 直接起不来(实测:vLLM 对 131072 token 要 0.66 GiB,而原下限 0.5 GiB < 它)。
+    # 另:原来算出 _kv_bytes 却下发 p['kv_bytes'] ⇒ 设计好的 slack 从未生效,这里一并修掉。
+    # ⚠️ 这仍是**保底**;每-token KV 的模型常量(KV_GIB_PER_MTOKEN)按 V4.1 标定,对 GQA 系模型
+    #   会低估(见 EXPERIMENTS B134/B135),把长上下文容量算准是独立工作项。
+    _kv_floor = max(1 << 30, int(_env_gib("XIAOTU_KV_CACHE_FLOOR", 1.0) * (1 << 30)))
+    if _kv_bytes < _kv_floor:
+        _kv_bytes = _kv_floor
+    lines.append(f"XIAOTU_KV_CACHE_BYTES={_kv_bytes}")
     return "\n".join(lines)
 
 
