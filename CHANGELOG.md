@@ -59,9 +59,14 @@
   口径/判据/`MBT` 取舍/CED A/B 等细节移入 `docs/EXPERIMENTS.md` 与 `docs/TUNING_GUIDE.md`。
 - README(中/英)口径补充:**decode 取 median TPOT**。CED 开臂的 `mean` TPOT 被少数(p99≈185 ms)
   离群解码步拉高(69.76 vs median 51.84 ms),照抄 mean 会误判「CED 让 decode 慢 26%」。
-- **删除 MiMo-V2.5 的「256K 不可行」说明**(README 中/英 + `docs/PREFILL_KNOWN_ISSUES.md` §5b)。
-  原结论是 **TP=1** 的核算却写成 "61.9 GiB/rank",且**从未实测**;现在检查点已删、无法补测,
-  用户也已转 MiMo-2.6 ⇒ 不再对 MiMo 的上下文上限做任何断言。
+- **撤回「MiMo 在 256K 下不可行」并给出正确的账**(README 中/英 + `docs/PREFILL_KNOWN_ISSUES.md` §5b)。
+  原结论错在两处:①61.9 GiB 是 **TP=1** 的数却写成 "/rank"(TP=2 减半 ⇒ 本来就放得下);
+  ②**主因**——MiMo 是**混合 SWA** 模型(`hybrid_layer_pattern`:48 层里**只有 9 层全注意力**,
+  其余 39 层窗口 128、不随上下文增长),而旧账把**每层都按全长度**数,还用了 SWA 的 8 个 KV 头
+  ⇒ 253,633 B/token ≈ **99 层**,比实际层数还多一倍。
+  **正确的账:长上下文增量 ≈ 30 KiB/token(旧账 248 KiB,差 8 倍)⇒ 256K 总 7.5 GiB(3.8 GiB/rank)、
+  1M 总 30 GiB(15 GiB/rank,TP=2)—— 两者都放得下。**
+  教训:混合注意力模型估 KV **必须按层型加权**,否则会高估一个量级,并写成"架构限制"这种硬结论。
 - `gp_side_stream_enabled()` 默认值由「开」改为**「关」**
   (`XIAOTU_GP_ASM_SIDE_STREAM=1` 仍可显式打开,仅供性能实验)。
   **代价:长 prompt TTFT +17%**(实测 89.8 s → 105.4–108.8 s),待用正确的流间同步换回。
