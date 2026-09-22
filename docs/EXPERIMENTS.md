@@ -3923,6 +3923,27 @@ V4.1 走 **MLA**(存的是压缩 latent,不是 K/V 全量),MiMo 有 **39/48 层�
 **长上下文的预算正确性**需要"vLLM spec 现算"或"逐模型标定",两者都**不属于本次 MiMo 接入目标的范畴**,
 已作为**独立工作项**记录(附证据与设计),供后续决定。
 
+
+### B136 MiMo 的音频模态**架构与输入规格**(取自 checkpoint,非推断)
+
+来自 checkpoint 自带文档/配置(`MiMo-V2.6-Flash-RL/README.md`、`audio_tokenizer/config.json`、`config.json`):
+
+| 项 | 值 |
+|---|---|
+| **Audio Encoder** | **308M AudioTokenizer + 127M audio patch encoder** |
+| AudioTokenizer | **24 层(12 SWA / 12 GA),hidden 1024,20 个 RVQ codebook** |
+| 梅尔特征 | `n_mels=128`,`hop_length=240`,`window_size=960` |
+| 最长音频 | `max_audio_seconds = 300` |
+| 通道 | `audio_config.audio_channels = 20`(= 20 个 RVQ codebook) |
+
+**⇒ 三条推论**:
+1. **音频走"梅尔 → 神经音频分词器 → RVQ codes"这条路**,与"**必须 `torchaudio.transforms.MelSpectrogram`**"
+   (B132/B133 的依赖链)**完全自洽** —— 即依赖不是随便加的,是模型结构决定的;
+2. **纯合成提示音很可能在训练域之外**(AudioTokenizer 是在真实音频上训练的),所以"数提示音"这类测试
+   **即使答案不对,也不能直接判"接入失败"** —— 结果必须带这个保留;B136 给出规格后,
+   **更可靠的判据是用真实语音**(如 vLLM 测试素材 `nvidia/AudioSkills`,需联网下载);
+3. 影像侧同样有据可查:**Vision Encoder = 681M MiMo ViT(28 层:24 SWA + 4 Full)** —— 与视频测试通过(B132)一致。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
