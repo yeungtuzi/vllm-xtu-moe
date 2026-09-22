@@ -2891,6 +2891,46 @@ SGLang "MTP uses SWA ⇒ 不给全长 KV" 那条实现细节的依据。
 * **顺带一条对本目标有用的情报**:他们的 **#40448「MiMo-V2.6 day0 support」已于 09-20 合并** ⇒ SGLang 已支持 MiMo-2.6。
 * 过程纪律收获:本地 `_research/lsglang` 是 **fork 克隆**(`guqiong96/Lsglang` @60edaeb,上游查无此仓),
   subagent 改用 `gh api` 取**上游**文件核对后才下的结论 —— 这正是"不凭本仓推断"该有的样子。
+
+**⑤ 已执行的一步(2026-09-22,用户明确授权后)**:以 `yeungtuzi` 在 **#38142** 发了一条**实质性**评论
+(<https://github.com/sgl-project/sglang/pull/38142#issuecomment-5771541146>,05:13:54Z,1458 字符),
+内容是**独立架构验证(A100/SM80)**:补丁内核在全/window(64,64)/window+sink/causal/GQA/varlen/单边 window
+七种用例上都是 **0.26–0.27% 相对误差**,而修复前在 window/sink 用例上偏 **64.9–94.9%**;
+**full-attention 新旧内核逐位相同(max abs diff = 0.0)** ⇒ 作者的"零回归"在 SM80 上也成立。
+同时指出唯一 CI 阻塞(测试挪到 `test/registered/kernels/ops/attention/`)并 @ 了 @BBuf / @Fridge003。
+⚠️ **纪律备注**:本条是**用户授权**的写操作;我交给该 subagent 的任务书原本是"GitHub 只读"
+——**它是在用户另行指示后才发的**。**结论:授权链要在一开始就写清"谁能授权写操作"**,否则事后无法从日志判断是否越权。
+
+### B102 ⭐⭐⭐ P4 完成:**多模态在 SM80 上端到端可用** —— 用户三条口径全部达成
+
+服务 = B93 配方 + 真权重,但**不加** `--language-model-only`(maxlen 65536,TP=2,util 0.85,
+MTP k=1,`--limit-mm-per-prompt '{"image":1,"video":0}'`,端口 8120):**300 s READY**,
+KV 池 876,503 token,补齐 5 层/12.50%。日志三行给出关键分工:
+`Resolved architecture: MiMoV2OmniForCausalLM`、
+`Using AttentionBackendEnum.FLASH_ATTN for vit attention` / `for MMEncoderAttention`、
+`[mimo_v2.py:319] Using TRITON_ATTN_DIFFKV for attention`
+⇒ **视觉塔与 MM encoder 走 FLASH_ATTN,语言模型走我们的 DiffKV Triton,各走各的,无 mm_prefix 冲突**。
+
+**测法(与针测试同构,答案已知)**:PIL 渲染 640×200 白底黑字 **`ZQ7K42`**,转 base64 data URL
+送 `/v1/chat/completions`,两种问法,`temperature=0`:
+
+| 问法 | 用时 | tokens | finish | 命中 |
+|---|---|---|---|---|
+| "What text is shown in this image? Answer with just the text." | 3.4 s | 185 | stop | **✅** |
+| "Read the characters in the image and repeat them exactly." | 3.2 s | 172 | stop | **✅** |
+
+模型逐字符推理("First character: Z, Second: Q, …")后给出 `ZQ7K42`。
+**⇒ 视觉塔 + MM encoder + 融合 + 语言模型(hybrid SWA / DiffKV / sink)+ MXFP4 专家引擎,
+在 A100/SM80 上整条链语义正确。**
+**⇒ 用户三条口径全部达成:TP=2 ✅、1M ✅(B94)、多模态 ✅。**
+
+**⚠️ 两个坑(记下来省得再踩)**:
+1. **MiMo-2.6 是推理模型、会先吐 `<think>`**:第一次我用 `max_tokens=32`,输出**全是思考过程、
+   答案根本没轮到** ⇒ 我一度误报"❌ 未命中"。**⇒ 必须给足 token(本次 400),或关掉思考;
+   判"多模态是否工作"绝不能只看前 32 个 token。**(这条也是我本轮第二次"差点误报",与 B97 的
+   "grep 到被捕获的 Traceback 就喊 FAILED" 同类:工具/口径没设对,不是被测对象的问题。)
+2. `--language-model-only` 会**关掉 mm_prefix**(那时日志打 "Disabled mm_prefix attention mode…");
+   **开多模态后不再 disabling,而两个后端仍各自选得出** ⇒ 我之前担心的"mm_prefix 会卡住 SM80 后端"**不成立**。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
