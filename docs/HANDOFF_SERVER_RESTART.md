@@ -225,6 +225,7 @@ for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do kill -
 | # | 规则 | 代价 |
 |---|---|---|
 | 1 | **`pgrep -f`/`pkill -f` 绝不用会出现在自己命令行里的字符串**（用 `[V]LLM` 括号技巧） | 4 次自杀 |
+| 1b | ⚠️ **括号技巧救不了"杀+启写在同一条命令里"**：启动行必然含 `vllm.entrypoints.openai.api_server` 这个**未加括号**的字符串，于是 `pgrep -f '[v]llm.entrypoints.openai.api_server'` 会匹配到**自己这条 shell** ⇒ 自杀，且**死在启动之前**（2026-09-22 实测：连日志都没生成）。**⇒ 清理与启动必须分成两次调用**；清理只用 pidfile / `nvidia-smi`，不用 `-f` 匹配入口脚本 | 又中一次 |
 | 2 | **绝不 `kill -9 -PGID`**（会波及自己的进程组） | 1 次杀死自己的组 |
 | 3 | **改 `rebase` 树必须挂 `trap ... EXIT` 回滚**，不能把回滚写在流程末尾 | 2 次脏树（各约 10 分钟） |
 | 4 | **「失败即退出」的检查必须留启动宽限期**（服务启动需 ~340 s，EngineCore 前 60 s 可能还不存在） | 1 次误杀健康实验 |
