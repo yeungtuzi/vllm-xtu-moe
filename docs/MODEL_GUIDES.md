@@ -36,6 +36,16 @@ Using CPU Fp8 MoE backend out of potential backends: ['CPU', 'AITER', ...]   # �
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py
 ```
 
+> ⚠️ **`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` 的「0 = 关闭」陷阱(2026-09-22 实测,B120)**
+> 判定在 `mixed_experts.py`:`_gp_min = gpu_prefill_min_tokens()`、**`_gp_on = _gp_min > 0`**
+> ⇒ **门槛为 0(或干脆不设)表示「关闭 GPU 预填」**,而不是"永不拒绝"(与 `gpu_prefill.py` docstring 的字面读法相反)。
+> 不设它 ⇒ 长 prefill 全走 CPU ⇒ **只有 ~310 tok/s,而不是 ~900**(MiMo 曾长期如此,见 `EXPERIMENTS.md` B120)。
+> **⇒ 接入任何新模型时必须显式给正数**(V4.1/GLM 用 4096 或策略算出的值)。
+>
+> **验证方式(唯一直接证据)**:日志里必须出现
+> `[vllm-xtu-moe] GPU prefill ACTIVE: first <N> tokens >= threshold <T>`。
+> **⇒ 测 prefill 性能之前先 grep 这一行**;没有它,得到的数字是 **CPU 口径**,不能与 GPU 口径的数字放在同一张表里比较。
+
 ### 0.2 资源估算
 
 | 资源 | 估算方式 |
