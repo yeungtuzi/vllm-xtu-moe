@@ -9,6 +9,22 @@
 
 ### Added
 
+- **MiMo-V2.6-Flash-RL 接入(进行中,P0–P4 已过)** — 事实与判据见 `docs/EXPERIMENTS.md` B92–B100、
+  配方与 KV 账见 `docs/MODEL_GUIDES.md` §3b。要点:
+  * **专家是 MXFP4(e8m0 block-32)**,即 V4.1 那条已在生产跑的 `MOE_MXFP4` 路径
+    ⇒ V2.5 分析里「官方只有 FP8、非 FP8 路径没接线」的缺口**不存在**;体积 **161 GiB**(V2.5 是 293);
+  * **A100/SM80 上 hybrid SWA(9 GA + 39 SWA)+ DiffKV + sink 一次跑通**:dummy 骨架 110 s 起服务,
+    `Using TRITON_ATTN_DIFFKV`,MXFP4 引擎 `E=256 H=4096 I=1024 topk=8 swiglu=plain`;
+  * **1M 上下文达成**(dummy):`max_model_len=1048576`、KV 池 2,078,802 token、1.98× 并发,
+    且**与混合 KV 预测对账吻合**(GA 线性 + SWA 封顶);⚠️ 算预算要扣掉引擎补齐 6 层浪费的 **15.38%**;
+  * **真权重端到端可用**:65/65 分片(64 个 EP 分片 + MTP)加载无误、gate/up 融合与 e8m0 scale 读对;
+    **长上下文针测试命中**(6,277 token 上下文、答案埋在中段 60% 处,19–23 s 取回)⇒ 整套语义正确;
+  * **多模态不需要 `--hf-overrides`**(vLLM 自己解析成 `MiMoV2OmniForCausalLM`);真输入待 P4;
+  * **投机只用 MTP k=1**:k=1 首位接受率 68.5%,而 k=3 的第 2/3 位仅 9.7%/0.7% ⇒ 每步仅多 4%,
+    不划算;多深度补丁 `eddc6d0eb7` **已回退**(B100),⛔ 不再追多深度 MTP;
+  * ⚠️ **已知缺陷**:插件自带的 `XIAOTU_VERIFY_LAYER=1` 在 **MXFP4** 上不可用
+    (`_verify_once` 只给 INT4/WNA16 走了 `_unpack4`,MXFP4 掉进 `w13[e].float()`)⇒ 数值门禁修好前,
+    P2/P3 的数值判据**以针测试与真权重端到端替代**,不得声称"数值门禁通过"。
 - **DeepSeek-V4.1-Flash 的 CED(decoder-side SWA bounded replay)验收数据**:承接上游
   [PR #56752](https://github.com/vllm-project/vllm/pull/56752)(`ced/pr56752` = 生产树 +3 commits)。
   同批**配对 A/B**(256K / L=16384 / MBT=8192 / TP=2 / 两臂同 seed,仅 `--no-swa-bounded-replay` 不同):

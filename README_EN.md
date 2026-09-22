@@ -45,6 +45,10 @@
 1. Any MoE model. Not tied to one architecture generation. DeepSeek-V4 / V4.1 work
    end to end; GLM-5.3-Flash runs end to end too with an FP8 GPU prefill path; MiMo-V2.5
    runs end to end on a single card.
+   **MiMo-V2.6-Flash-RL also runs on A100/SM80**: the skeleton, a 1M context and real-weight
+   long-context generation have all been measured (multimodal input and throughput pending).
+   It takes the same **MXFP4** engine path as V4.1 and is 161 GiB -- see `docs/MODEL_GUIDES.md`
+   section 3b and `docs/EXPERIMENTS.md` B92-B100.
 2. Any x86 ISA. `scalar → AVX2 → AVX-512 (base/VNNI/BF16/VBMI)`, selected at import
    time from `/proc/cpuinfo`.
 3. A fixed VRAM priority order: `KV pool → GPU prefill staging → speculative draft → activation workspace (∝ MBT)`.

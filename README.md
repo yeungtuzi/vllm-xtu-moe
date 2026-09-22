@@ -32,6 +32,9 @@
 
 1. 任意 MoE 模型:不绑死某一代架构。已跑通 DeepSeek-V4 / V4.1 系列、
    GLM-5.3-Flash(含 A100 / SM80 的注意力后端)与 MiMo-V2.5。
+   **MiMo-V2.6-Flash-RL 也已在 A100/SM80 上跑通**:骨架 / 1M 上下文 / 真权重长文本端到端均已实测通过
+   (多模态真输入与吞吐待补)。它走的是与 V4.1 相同的 **MXFP4** 引擎路径,体积 161 GiB ——
+   见 `docs/MODEL_GUIDES.md` §3b 与 `docs/EXPERIMENTS.md` B92–B100。
 2. 任意 x86 指令集:`scalar → AVX2 → AVX-512(base/VNNI/BF16/VBMI)`,
    运行时按 `/proc/cpuinfo` 自动选最高可用变体。
 3. 显存优先级固定不变:`KV 池 → GPU 预填充 staging → 投机解码 draft → 激活工作区(∝ MBT)`;
