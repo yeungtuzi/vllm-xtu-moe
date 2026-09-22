@@ -3796,6 +3796,35 @@ GLM 脚本默认 `SEQS=2` 所以正常;README 里 V4.1 那组来自更早的并�
    ⇒ **vLLM 在 import 时绑定占位模块,必须先装依赖再启动服务**。
    **⇒ 运维结论(写入 MODEL_GUIDES):要用音频,先 `pip install vllm[audio]`(或至少 `soundfile`)再启动。**
 
+
+### B133 ⭐ **组合配置通过**(多模态 × 长上下文 × MTP),音频依赖链查清(差 `torchaudio`)
+
+**组合配置测试**(同一次请求/同一次前向里三种能力共存):
+
+| 测试 | 结果 |
+|---|---|
+| 图片 + **5,444 token** 长文本(针埋在 60% 处)+ **MTP k=1** | ✅ 针命中 **ZQ7K42**(14.0 s) |
+| 同会话再问图片内容 | ✅ **ZQ7K42**(2.8 s) |
+
+⇒ **多模态 × 长上下文 × 投机解码三者可同时工作** ✓。
+
+**音频依赖链(逐层剥开,全是环境依赖,不是接入问题)**:
+
+1. `HTTP 500: Please install vllm[audio] for audio support`
+   ⇒ vLLM 音频解码需要 **soundfile / torchcodec / PyAV** 之一 ⇒ 装 `soundfile`;
+2. 重启后 ⇒ `PlaceholderModule should not be used when the original module can be imported`
+   ⇒ **vLLM 在 import 时绑定占位模块 ⇒ 依赖必须在启动前装好**;
+3. 再重启后 ⇒ `No module named 'torchaudio'`
+   ⇒ 查代码:**MiMo 自己的音频处理器** `vllm/transformers_utils/processors/mimo_v2_omni.py` 需要
+   **`torchaudio.transforms.MelSpectrogram`(梅尔特征)+ `Resample`(重采样)** —— 这是**模型侧硬依赖**;
+4. **torchaudio 没有匹配 torch 2.13.0 的构建**(PyPI 最高 2.11.0)
+   ⇒ 装 **torchaudio 2.11.0+cu130** 实测**可用**(`MelSpectrogram` 输出 `(1,80,101)` 且全 finite、`Resample` 正常)
+   —— 属**跨版本组合**,已在台账标注为潜在风险。
+
+**⇒ 运维结论(写入 MODEL_GUIDES)**:要用**音频**输入,必须在**启动服务之前**:
+`pip install vllm[audio]`(或至少 `soundfile`)并确保 **`torchaudio`** 可用;否则音频请求会 500,
+而**图片/视频不受影响**(视频只需 PyAV/FFmpeg 路径,本环境用 soundfile+av 已通过)。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
