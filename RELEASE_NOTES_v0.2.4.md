@@ -99,6 +99,8 @@
 4. **层内 `pre` 远大于 `eng`**:`XIAOTU_LAYER_TIMING` 实测每层 `pre`(我们的 Python 编排)中位 **228 ms**、
    `eng`(引擎调用)仅 **12 ms** ⇒ **编排层是主成本**,是后续优化方向(与 §515 的旧结论同向)。
 
+   **更正(2026-09-22,EXPERIMENTS B139)**:本节初稿曾写"根治=双缓冲让 H2D 与计算重叠" —— **这是错的**:ping/pong 预取**早已实现且启用**(`prefetch_layer`/`PrefetchSlot`/独立 CUDA stream/`XIAOTU_MOE_PREFETCH_SLOTS=2`,日志中也没有 "no VRAM for ping-pong" 的降级)。真实情况是**流水线只有 1 层深、而每层 H2D(533 ms)远大于每层计算(几十 ms)**,所以只能藏掉一小部分;**优化方向应是减少 H2D 的字节量/重复次数**(加大 MBT、更多常驻层、层主序 prefill),而不是"加双缓冲"。
+
 ---
 
 ## 四、上游动向(只读核对,不新增竞争 PR)
