@@ -3017,6 +3017,36 @@ decode_agg  = C × 每流,其中 每流 = 1000 / median_tpot_ms
 (GLM-512K / V4.1-1M / MiMo-1M → 逐格 bench → 直接打印**这个口径**的对照表),
 协议与 `ced_v41_ab.sh` 完全一致(`random` / `random-output-len 128` / `num-prompts 8` /
 `seed = L*7+C*131+17`)。按仓库约定它留在 gitignored 的 `dev-docs/`,属本地工具。
+
+### B106 ⭐ dflash 调研结论(按用户口径**只调研、不实现**):卡在**草稿模型的 EAGLE3 接口**,不是卡在 SM80
+
+**背景**:MiMo-2.6 检查点带 `dflash/`(5 层 `DFlashDraftModel`、qwen3 底、`is_causal=false`、SWA-1024、
+`block_size=8`、`attention_sink_bias=True`、`target_layer_ids=[0,11,23,35,47]`、2.9 GB 权重)。
+
+**① 静态核对:vLLM 上游本来就有 dflash 通道(不是"要从零写")**
+`vllm/config/speculative.py:67` 有 `DFlashModelTypes = Literal["dflash"]` 与 `DSparkModelTypes = Literal["dspark"]`,
+1143 行有 `method == "dspark"` 分支,另有 `DFlashQwen3Model` / `Qwen3OmniDSparkModel` / `_validate_qwen3_omni_dspark`。
+
+**② go/no-go 实测**(GPU2,dummy 权重,TP=1,maxlen 4096,`--speculative-config {method: dflash, model: <ckpt>/dflash, k=2}`):
+
+| 观察 | 结果 |
+|---|---|
+| 草稿解析 | ✅ `[model.py:691] Resolved architecture: **DFlashDraftModel**`;`method: dflash` 被接受 |
+| 目标模型注意力 | ✅ 仍是 `Using TRITON_ATTN_DIFFKV`(开 dflash **不影响**已验证的注意力路径) |
+| 构建 | ❌ **80 s 失败**:`RuntimeError: Model does not support EAGLE3 interface` |
+
+**失败点精确定位**:`vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py:20`,
+由 `gpu_model_runner.py:5515` 调用 `set_eagle3_aux_hidden_state_layers(model, spec_config)`;
+该函数第一行就是 `if not supports_eagle3(model): raise RuntimeError(...)`
+⇒ **vLLM 的 dflash 草稿复用 EAGLE3 那套契约,而 MiMo 的 remote-code `DFlashDraftModel` 不实现 `SupportsEagle3`。**
+
+**⇒ 结论(即 objective 要的"调研 + 计划,不做实功")**:
+1. **阻塞点不是注意力 / SWA / 非因果 / SM80** —— 这些我们的后端都声明支持(非因果那条早前已核过);
+   真正缺的是**草稿模型的接口契约**(EAGLE3 aux hidden states);
+2. ⇒ 要做 dflash 只有两条路:**(a) 上游原生加一个 MiMo DFlash speculator**(上游的工作,且属大改);
+   **(b) 让 MiMo 的草稿实现 EAGLE3 契约**(需要知道 aux hidden states 的精确期望,**属于实现工作 —— 用户明确排除**);
+3. ⇒ **按用户口径:到此为止,不做实现**。若上游将来出现原生 MiMo dflash 支持,我们再回来(那时我们的活只是"起服务 + 验收");
+4. 与 MTP 那条结论**互不干扰**:MTP 走 `MiMoV2MTPModel`(k=1 已定案),dflash 走 EAGLE3 契约失败 —— 两条路独立。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
