@@ -3876,6 +3876,31 @@ GLM 脚本默认 `SEQS=2` 所以正常;README 里 V4.1 那组来自更早的并�
   ⇒ **长上下文仍会拒绝启动,仍需显式 `KV_CACHE_BYTES`**。**真正的修复是从每个 checkpoint 的几何算 KV/token**(B134 ①)。
 * **待做**:端到端验证(用策略值、不显式传 `KV_CACHE_BYTES` 起 V4.1)—— **需 GPU 空闲**(当前被 MiMo 多模态运行占用)。
 
+
+### B135 KV 预算的**正确修法**:别自己推几何,直接复用 **vLLM 自己的 KV spec**
+
+**做法**:读各模型 config,按"教科书几何公式"算每-token KV,与实测对照(V4.1 实测 0.66 GiB @131072 ⇒ **5.04 GiB/Mtoken**):
+
+| 模型 | 几何公式预测(fp8 / bf16) | **实测** | 偏差 |
+|---|---|---|---|
+| DeepSeek-V4.1(40 层, kv_heads=1, head_dim=512, rope=64) | 19.07 / 38.15 GiB/M | **5.04** | **高估 3.8–7.6×** |
+| MiMo-V2.6(48 层, 4 头, head_dim=192;39 层 SWA) | 34.33 / 68.66 GiB/M | **≈6.4**(由 1M 那次池 1,844,560 token 反推) | **高估 5–10×** |
+
+**⇒ 说明教科书公式**($L × 2 × kv\_heads × head\_dim × dtype ÷ TP$)**在这两个模型上都不成立**,原因各不同:
+V4.1 走 **MLA**(存的是压缩 latent,不是 K/V 全量),MiMo 有 **39/48 层是 SWA**(长序列下按窗口计,**不随 token 增长**),
+此外还有 KV 量化、block 粒度、TP 切分方式等细节 —— **自己重推必然出错**(上面的偏差就是证据)。
+
+**⇒ 正确设计(替代 B134 的"几何化"提议)**:让策略**直接调用 vLLM 自己的 KV spec 计算**
+(`ModelConfig` + `get_kv_cache_shape` / `KVCacheSpec` 那条路径)—— **引擎启动时用的就是这套代码**,
+所以按定义一致,并且**自动**覆盖 MLA / SWA-hybrid / 量化 / TP 切分,不需要我们再维护任何常数。
+策略已有"读 checkpoint 的 config"的机制,扩展成"构建 vLLM 的 ModelConfig"即可,**且不需要 GPU**。
+
+**⇒ 修复优先级(供用户定夺)**:
+1. **保底**(已在分支 `fix/vram-kv-floor`):下限抬到 1 GiB + 让 slack 生效 ⇒ 小 maxlen 不再"起不来";
+2. **根治**(本条的 vLLM-KV-spec 方案):把 `KV_GIB_PER_MTOKEN` 这个硬编码常量换成**由 vLLM 现算**,
+   可同时修好 V4.1 与 MiMo 的长上下文预算;
+3. 保留 `XIAOTU_KV_CACHE_BYTES` 覆盖与自检提示。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
