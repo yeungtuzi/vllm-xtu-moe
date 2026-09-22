@@ -3343,6 +3343,43 @@ KV 池 **1,165,160 token**(`1.11×` 一次完整 1M 请求);加载 ~9 min(页缓
 
 **⇒ 两个模型的图像路径现在都验过了**(MiMo B102、DS-V4.1 本条),而且**用的是同一个刺激与判据**,可直接对比。
 
+
+### B118 🔴 **VRAM 策略脚本有真 bug**:会产出"起不来"的配置(用户 2026-09-22 指出)
+
+**触发(可复现)**:`serve_v41.sh` 用 `MAXLEN=131072`(128K)启动 ⇒ 策略下发
+`XIAOTU_KV_CACHE_BYTES=536870912`(**0.5 GiB**)⇒ 引擎**拒绝启动**:
+```
+ValueError: To serve at least one request with the model's max seq len (131072),
+(0.66 GiB KV cache is needed, which is larger than the available KV cache memory (0.5 GiB).
+ Based on the available memory, the estimated maximum model length is 33280.
+```
+**而那一刻日志显示 `Initial free memory 38.75 GiB`** ⇒ **不是显存不够,是策略算出来的 KV 太小**。
+
+**代码级定位(`vllm_xiaotu_moe/vram_policy.py`,433 行)**:
+```python
+:293   kv_bytes  = int(max(0.5, min(kv_gib, free_for_kv)) * 2**30)      # 0.5 GiB 下限
+:388   _kv_bytes = int(p.get("kv_gib", 0.0) * _slack * (1 << 30))       # 算了 15% 余量(_slack=1.15)
+:389   if _kv_bytes < (1 << 29): _kv_bytes = 1 << 29                    # 又按 0.5 GiB 兜底
+:391   lines.append(f"XIAOTU_KV_CACHE_BYTES={p.get('kv_bytes', 0)}")   # ← 发的却是 p['kv_bytes']
+```
+* **bug ①(死变量)**:`:388-390` 精心算出的 `_kv_bytes`(含 15% 余量、且是"按 maxlen 真正需要多少再给余量"的设计)
+  **从未被使用** —— 下发的是 `:293` 那个**没有余量**的值。设计意图与实现不一致。
+* **bug ②(致命的低估)**:KV 模型用 `KV_GIB_PER_MTOKEN ≈ 2.1 GiB/Mtoken`,而这个常量是**按 maxlen=1M 标定**的。
+  **文件自己的 §592 注释已经写明"每 token 成本随 maxlen 变化,不是常数"**:
+  `maxlen=1M ⇒ 2.25 KiB/tok`,而 `maxlen=8192 ⇒ 16.79 KiB/tok`(**7.5×**),并标注"**未解释,疑似 hybrid allocator 在短 maxlen 下没走 KV 共享**"。
+  **但它随后把这条异常"判为不影响"**——理由是"两者都远小于 0.5 GiB 的下限"。
+  **⇒ 这个判断就是 bug**:128K 时引擎实际要 **0.66 GiB > 0.5 GiB**,于是策略产出**不可启动**的配置。
+
+**影响**:任何让 `kv_gib` 落到 0.5 GiB 下限附近的 maxlen(如 128K)都会**启动失败**;
+即使能启动,pool 也可能小到只能容纳极少并发(实测 0.5 GiB 只支持 maxlen≈33K)。
+
+**修法(建议,待批)**:下发的 KV **必须不低于引擎"一个 maxlen 序列"的最低要求** ——
+用实测口径(128K ⇒ 0.66 GiB ≈ 5.3 KiB/tok;8K ⇒ 16.8 KiB/tok)取**较坏档**或按 maxlen 分档估算,
+并把 `:391` 改为下发 `_kv_bytes`(让那 15% 余量真正生效);
+或在算出的值低于最低要求时**干脆不下发 `--kv-cache-memory`**,交给 vLLM 用 util 自动定容
+(本次实测:显式 6 GiB 后即得 **1,184,945 token**,启动正常)。
+**⇒ 这条改的是生产启动行为,我不擅自改**,先记录 + 待你决定。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
