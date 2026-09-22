@@ -2601,6 +2601,16 @@ GPU 预填充 ACTIVE:`first 15232 tokens >= threshold 1500`)。TTFT **47.44 s**;
 ② MTP 层按 SWA 处理(`mimo_v2_mtp.py:81,88,98` 明确 "MTP uses the SWA attention configuration"),
 与 SGLang [PR #15207](https://github.com/sgl-project/sglang/pull/15207) 的
 "MiMoV2MTP uses SWA, so set full KV cache to 0" 一致 —— **最终判据是启动时 KV 池大小**。
+
+**9. oracle 自检(零卡时)**:`scripts/probe_oracle.py mxfp4` ⇒
+* ✅ 插件加载并应用 **33 条 shim**,其中含 **MXFP4 专用接线**:
+  `cpu_moe.prepare_mxfp4_moe_layer_for_cpu`、`mxfp4._get_priority_backends`、
+  `mxfp4.convert_weight_to_mxfp4_moe_kernel_format`、`Mxfp4MoEMethod.apply_monolithic/create_weights/
+  process_weights_after_loading`;
+* ✅ `XiaotuCPUExpertsMxfp4` 的 activation guard 通过(packed-only:SILU + SWIGLUOAI_UNINTERLEAVE);
+* ⚠️ 具体用例 `mxfp4-dsv4` 报 `AssertionError: Current vLLM config is not set` ——
+  **这是探针自身的脚手架缺口**(在 `set_current_vllm_config()` 之外构造 `FusedMoEConfig`),
+  不是插件或模型问题。**⇒ P2 写门禁时要带 `default_vllm_config` 上下文**(或直接走真实层构建)。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
