@@ -299,7 +299,7 @@ nohup env \
     $( [ "${SPEC:-0}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" ) \
     $( [ -n "$CC_JSON" ] && printf -- '--compilation-config %s' "$CC_JSON" ) \
     $( [ "${PREFIX_CACHE:-1}" = "1" ] || echo --no-enable-prefix-caching ) --trust-remote-code \
-    --limit-mm-per-prompt '{"image":0,"video":0}' \
+    $( [ "${MM:-0}" = "1" ] && printf -- '--limit-mm-per-prompt {"image":%s,"video":0}' "${PROMPTS:-1}" || printf -- '--limit-mm-per-prompt {"image":0,"video":0}' ) \
     --kernel-config '{"enable_jit_warmup": false}' \
     --port "$PORT" > "$LOG" 2>&1 &
 echo $! > "$OUTDIR/$TAG.pid"

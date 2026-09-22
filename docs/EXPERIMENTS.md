@@ -3322,6 +3322,27 @@ KV 池 **1,165,160 token**(`1.11×` 一次完整 1M 请求);加载 ~9 min(页缓
 **⇒ P5 完成度**:✅ pr4 生产树确认(B109)　✅ MiMo(B112)　✅ GLM(B115)　✅ **V4.1(本条)**
 ⇒ 三模型在同一协议、同一聚合口径下的**统一表**已齐(原始 JSON 在 `dev-docs/report/tuning/raw/p5_unified/`)。
 
+
+### B117 ⭐⭐ DS-V4.1-Flash **多模态正确性通过**(用户新加项)
+
+**服务**:`serve_v41.sh`(**真权重** `load=auto`,TP=2,MAXLEN **32768**,`MM=1` ⇒ `--limit-mm-per-prompt {"image":1,"video":0}`,
+**不加** `--language-model-only`),端口 8133;KV 池 58,685 token;加载 **310 s**。
+> 为此给 `serve_v41.sh` 加了 **`MM` 旋钮**(默认 0 = 保持原行为)。原来那行 `--limit-mm-per-prompt '{"image":0,"video":0}'`
+> 是**硬编码**的,没法开多模态;现在与 `serve_mimo26.sh` 的设计一致。
+
+**测试**(与 MiMo 的 B102 **同一把尺子**,答案已知):PIL 渲染 640×200 白底黑字 **`ZQ7K42`** → base64 送
+`/v1/chat/completions`,两种问法,`temperature=0`:
+
+| 问法 | 用时 | tokens | 命中 |
+|---|---|---|---|
+| "What text is shown in this image? Answer with just the text." | 3.9 s | 75 | **✅** |
+| "Read the characters in the image and repeat them exactly." | 3.4 s | 77 | **✅** |
+
+输出尾:`'I can read it directly: "ZQ7K42" … </think>ZQ7K42'`
+⇒ **视觉塔 + MM encoder + 融合 + 语言模型(SM80 DSA/sparse-MLA)+ CPU 专家引擎整条链语义正确。**
+
+**⇒ 两个模型的图像路径现在都验过了**(MiMo B102、DS-V4.1 本条),而且**用的是同一个刺激与判据**,可直接对比。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
