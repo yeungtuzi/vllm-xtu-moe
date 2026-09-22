@@ -37,15 +37,17 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 if [ "$MODE" = "fast" ]; then
   exec env \
     GPUS="${GPUS:-2}" TP=1 EP=0 MODE=dsv4 PORT="$PORT" TAG="$TAG" \
-    MAXLEN=262144 SEQS=128 MAX_NBT=8192 \
+    MAXLEN=262144 SEQS=128 MAX_NBT=4096 \
     KV_DTYPE=fp8_ds_mla GPU_UTIL=0.90 KV_MEM_BYTES=12884901888 \
     THREADS=192 OMP=96 EAGER=1 PREFILL_MIN=384 \
     SPEC="$SPEC" SERVED=DeepSeek-V4-Flash-xiaotu \
     scripts/tune_serve.sh
 else
+  # 【2026-09-21 用户定的生产口径】**1M 上下文 + MBT=4096**:激活工作区 ∝ MBT,
+  # 1M 的 KV 约 29.5 GiB ⇒ 必须把 MBT 压到 4096 才给 KV 留得下。
   exec env \
     GPUS="${GPUS:-0,1}" TP=2 EP=0 MODE=dsv4 PORT="$PORT" TAG="$TAG" \
-    MAXLEN=1048576 SEQS=64 MAX_NBT=8192 \
+    MAXLEN=1048576 SEQS=64 MAX_NBT=4096 \
     KV_DTYPE=fp8_ds_mla GPU_UTIL=0.90 KV_MEM_BYTES=19327352832 \
     THREADS=96 OMP=48 EAGER=1 PREFILL_MIN=384 \
     ENV_EXTRA="XIAOTU_MOE_EP=0" \

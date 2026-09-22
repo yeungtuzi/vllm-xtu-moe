@@ -55,8 +55,12 @@ GPU_UTIL="${GPU_UTIL:-0.90}"
 # The pool SHRINKS as maxlen grows because the KDA state pools scale with it, so the
 # per-request limit and the total token capacity trade against each other. 256K is the
 # safe default; raise it deliberately.
-MAXLEN="${MAXLEN:-262144}"
-MBT="${MBT:-8192}"
+# 【2026-09-21 用户定的生产口径】**512K 上下文 + MBT=4096**:
+#   要 512K 就必须把 `MBT` 压到 4096 —— 激活工作区 ∝ MBT,而 KV 池与之争同一份显存。
+#   代价是 prefill 变慢(256K 下实测 MBT 4096 比 12288 慢 34%,见 TUNING_GUIDE §8),
+#   换来的是"512K 一定起得来"。要速度优先的格子再显式传 `MBT=12288 MAXLEN=262144`。
+MAXLEN="${MAXLEN:-524288}"
+MBT="${MBT:-4096}"
 # Admission limit. 256K context x 2 concurrent sequences = 524,288 tokens, and the
 # KV pool at this maxlen is 919,520 tokens (measured, util 0.88) => two full-length
 # sequences are guaranteed by construction, with ~40% of the pool left as headroom
@@ -150,14 +154,17 @@ ARGS=(
 # 【RUNBOOK §5.8 铁律】开 GPU 预填充时**必须**显式封顶 KV 池,否则 vLLM 会把 util 填满、
 # 让 staging/投机/长 prefill 激活没地方放 ⇒ 长 prompt 直接 CUDA OOM。
 # 用法:KV_CACHE_BYTES=6442450944(6 GiB) bash scripts/serve_glm53_mainline.sh
-# cap 未显式给定时,**按 maxlen × 并发 自动推算**(留 1.10 余量)。
+# cap 未显式给定时,**按 maxlen 自动推算**(**不乘 SEQS、不留乘性余量**)。
 # 标尺:GLM 实测 6 GiB ↔ 293,651 token ⇒ **48,942 token/GiB**(分毫不差)。
-# 例:MAXLEN=262144、SEQS=2 ⇒ 524,288×1.10=576,717 tok ⇒ ~11.8 GiB。
+# 例:MAXLEN=262144 ⇒ 262,144 tok ⇒ 5.36 GiB;MAXLEN=524288 ⇒ 10.71 GiB。
+#   ⚠️ 【2026-09-21 实测踩到】原公式是 `MAXLEN × SEQS × 1.10`。512K + SEQS=2 时它给出
+#   **23.56 GiB**,引擎在装配期**一次性**要这么多 ⇒ 直接 CUDA OOM(只剩 22.94 GiB 空闲)。
+#   池**不需要**同时装下 SEQS 条满长序列 —— vLLM 按池容量自行准入,装不下就排队。
+#   要"SEQS 条满长"就显式传 `KV_CACHE_BYTES`,别改默认。
 if [ -z "${KV_CACHE_BYTES:-}" ]; then
-  _tok=$(( MAXLEN * SEQS * 11 / 10 ))
-  KV_CACHE_BYTES=$(( _tok * 1073741824 / 48942 ))
+  KV_CACHE_BYTES=$(( MAXLEN * 1073741824 / 48942 ))
   echo "[glm53] KV 池自动封顶: ${KV_CACHE_BYTES} bytes(~$(( KV_CACHE_BYTES / 1073741824 )) GiB) "\
-       "for maxlen=${MAXLEN} × seqs=${SEQS}"
+       "for maxlen=${MAXLEN}(不乘 seqs=${SEQS};要更多并发请显式传 KV_CACHE_BYTES)"
 fi
 ARGS+=(--kv-cache-memory "$KV_CACHE_BYTES")
 if [ -n "${SPEC_CONFIG:-}" ]; then

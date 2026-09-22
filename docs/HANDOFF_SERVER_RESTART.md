@@ -45,6 +45,18 @@
    配 `XIAOTU_LAYER_TIMING=1 XIAOTU_LAYER_TIMING_EVERY=1` 可逐层反解 `pre/eng/post` + 层间墙钟，
    解析器 `dev-docs/report/tuning/probes/attrib_layer_timing.py`。**这是 ③ 现在最便宜的一步。**
 
+**③ 已按此做完(见 §3 顶部、EXPERIMENTS B87/B88):缺口 = 稀疏 MLA 注意力被记进 MoE 的 `pre`;闭合账无残差。**
+
+**pr4 已实测(B89)**:独立树 `/home/user/lvllm/vllm-pr4`(生产树 `git worktree` + 编译产物,生产树未动)
+打上 `patches/upstream/pr4-sm8x-sparse-mla-2d-tile.patch` ⇒ **TTFT 47.44 → 31.18 s(1.52×)**、
+稀疏 MLA 核 **24.80 → 8.60 s(2.89×)**,其余各项不变。**是否打进生产树待用户定。**
+
+**⭐ 生产口径已改并实测通过(B90):`MBT=4096` + GLM-5.3 **512K** + DeepSeek-V4.1 **1M**。**
+* GLM:默认 `MAXLEN=524288`/`MBT=4096`(实测 `/v1/models=524288`、KV 池 952,107 token)。
+* V4.1:默认 `MBT=4096`;1M 用 `GPUS=0,1 TP=2 MAXLEN=1048576 MBT=4096 SEQS=64 LOAD=auto`
+  (实测 `/v1/models=1048576`)。
+* ⚠️ GLM 的 KV 自动封顶**不再乘 SEQS** —— 512K+SEQS=2 时它会一次要 23.56 GiB ⇒ CUDA OOM(差 0.6 GiB)。
+
 ---
 
 ## 2. 重启会打断的任务

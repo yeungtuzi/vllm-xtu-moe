@@ -14,14 +14,22 @@
   同批**配对 A/B**(256K / L=16384 / MBT=8192 / TP=2 / 两臂同 seed,仅 `--no-swa-bounded-replay` 不同):
   * **prefill:C=1 434.5 → 903.9 tok/s(2.08×)、C=2 334.6 → 602.1 tok/s(1.80×)**;
   * **decode:C=1 持平(median TPOT 51.91 → 51.84 ms)、C=2 快 1.99×(257.3 → 129.4 ms)**;
-  * **零失败(0/16,含两路并发)**。
-  README 的 V4.1「长」两行已改用 CED 开的数据,并补上原「待测」的「长/C=2」。
-  详见 `docs/EXPERIMENTS.md` B84/B85。
+  * **零失败(0/16,含两路并发)**;生成等价性:3 条自然长 prompt **首 token 全一致**。
+  README 的 V4.1「长」两行已改用 CED 开的数据。详见 `docs/EXPERIMENTS.md` B84/B85。
+- **③「~13.95 s 未归属时间」结案**:它不是"插件看不到的前向",而是**稀疏 MLA 注意力被记进了 MoE 的 `pre`**。
+  逐层计时 `pre`(apply 内)= **98.9%**、`other`(apply 外,含注意力/层间)= **1.1%**;慢层**精确等于 DSA 层**
+  (`layer_types` 周期 4)。chrome trace 给出**无残差**的闭合账:稀疏 MLA **24.80 s(59.8%)**、
+  MoE GEMM 5.80 s、NCCL 2.08 s、其余核 2.11 s、**非核空隙(H2D DMA)6.71 s** = 41.49 s。
+  详见 `docs/EXPERIMENTS.md` B87/B88。
+- **pr4(`pr4-sm8x-sparse-mla-2d-tile.patch`)端到端复现**:独立树(生产树 `git worktree` + 编译产物,
+  生产树 md5 未变)实测 **TTFT 47.44 → 31.18 s(1.52×)**、
+  `_sparse_mla_fwd_with_sink_kernel(_hb)` **24.80 → 8.60 s(2.89×)**,其余各项(MoE GEMM / NCCL / H2D)**一个都没动**。
+  与 pr4 自测的 1.52× / 2.88× 吻合。详见 B89。
 - `scripts/serve_v41.sh` 的 `CED=0/1` 开关(默认 1 = 树默认):`CED=0` 加 `--no-swa-bounded-replay`,
   因为上游复用 `CacheConfig.swa_bounded_replay` 且**没有独立 CED 旗标**、启动后不可改 ⇒ A/B 必须两臂各起一次。
-- 插件 `[layer-timing]` 行新增**墙钟时间戳**(`XIAOTU_LAYER_TIMING=1` 时才有该行,只改打印):
-  配合 `XIAOTU_LAYER_TIMING_EVERY=1` 可**逐层**反解 `pre/eng/post` 并得到层间墙钟,
-  用于定位「~13.95 s 未归属时间」。解析器 `dev-docs/report/tuning/probes/attrib_layer_timing.py`。
+- 插件 `[layer-timing]` 行新增**墙钟时间戳与层名**(`XIAOTU_LAYER_TIMING=1` 时才有该行,只改打印):
+  配合 `XIAOTU_LAYER_TIMING_EVERY=1` 可**逐层**反解 `pre/eng/post` 并得到层间墙钟。
+  解析器 `dev-docs/report/tuning/probes/attrib_layer_timing.py`、`attrib_trace.py`。
 - `gp_capturing()`(`vllm_xiaotu_moe/mixed_experts.py`):CUDA graph 捕获期判定;
   捕获期**强制不用旁路流**,落到「当前流 + 不建跨流事件」的保守路径。
 - `XIAOTU_DEATH_DEBUG=1`(`vllm_xiaotu_moe/__init__.py`,默认关闭):给
@@ -34,8 +42,21 @@
 
 ### Changed
 
+- **生产口径:回到 `MBT=4096`,保证 DeepSeek **1M** 与 GLM-5.3 **512K**(都已实测启动通过)**:
+  * `serve_glm53_mainline.sh` 默认 `MAXLEN 262144 → 524288`、`MBT 8192 → 4096`
+    (实测 `/v1/models=524288`、KV 池 **952,107 token**);
+  * `serve_v41.sh` 默认 `MBT → 4096`(1M 的生产调用写在头部注释里;实测 `/v1/models=1048576`);
+  * `serve_prod_8070.sh` 两个 MODE 的 `MAX_NBT → 4096`。
+  * ⚠️ 同时修掉一个真实的坑:GLM 的 KV 自动封顶原为 `MAXLEN × SEQS × 1.10`,512K + `SEQS=2` 会算出
+    **23.56 GiB** 并被引擎**一次性**申请 ⇒ CUDA OOM(只差 0.6 GiB)。**池不需要装下 SEQS 条满长序列**,
+    改为 `MAXLEN × B/token`。详见 B90。
+- README(中/英)性能节**精简**:表格后只保留「两个模型都未开投机解码」一句;
+  口径/判据/`MBT` 取舍/CED A/B 等细节移入 `docs/EXPERIMENTS.md` 与 `docs/TUNING_GUIDE.md`。
 - README(中/英)口径补充:**decode 取 median TPOT**。CED 开臂的 `mean` TPOT 被少数(p99≈185 ms)
   离群解码步拉高(69.76 vs median 51.84 ms),照抄 mean 会误判「CED 让 decode 慢 26%」。
+- **删除 MiMo-V2.5 的「256K 不可行」说明**(README 中/英 + `docs/PREFILL_KNOWN_ISSUES.md` §5b)。
+  原结论是 **TP=1** 的核算却写成 "61.9 GiB/rank",且**从未实测**;现在检查点已删、无法补测,
+  用户也已转 MiMo-2.6 ⇒ 不再对 MiMo 的上下文上限做任何断言。
 - `gp_side_stream_enabled()` 默认值由「开」改为**「关」**
   (`XIAOTU_GP_ASM_SIDE_STREAM=1` 仍可显式打开,仅供性能实验)。
   **代价:长 prompt TTFT +17%**(实测 89.8 s → 105.4–108.8 s),待用正确的流间同步换回。

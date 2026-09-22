@@ -83,6 +83,11 @@ GPUS="${GPUS:-0}"
 # TP=1 每层 6.72 GiB ⇒ 只能放 1 层。TP=1 只在"单卡/没有第二张卡"时才用。
 TP="${TP:-2}"
 MAXLEN="${MAXLEN:-2048}"
+# 【2026-09-21 用户定的生产口径】**MBT=4096**(本脚本原默认 0 = 不传,由 vLLM 自选)。
+# 生产要保证 **1M 上下文**(MAXLEN=1048576):激活工作区 ∝ MBT,MBT=4096 才给 1M 的 KV 留得下。
+# 生产调用示例:`GPUS=0,1 TP=2 MAXLEN=1048576 MBT=4096 SEQS=64 LOAD=auto bash scripts/serve_v41.sh`
+# (本脚本默认 MAXLEN=2048 是**冒烟**口径,别拿默认值当生产。)
+MBT="${MBT:-4096}"
 LOAD="${LOAD:-dummy}"          # dummy = no disk read, exercises the kernels
 GPU_UTIL="${GPU_UTIL:-0.85}"
 EXTRA_ENV="${EXTRA_ENV:-}"
@@ -286,7 +291,7 @@ nohup env \
     --model "$CKPT" --served-model-name dsv41 \
     --load-format "$LOAD" \
     --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-1}" \
-    $( [ "${MBT:-0}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
+    $( [ "${MBT}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
     --gpu-memory-utilization "$GPU_UTIL" \
     $( [ -n "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ] && printf -- '--kv-cache-memory %s' "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ) \
     $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager ) \
