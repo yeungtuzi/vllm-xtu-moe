@@ -34,7 +34,7 @@
 1. 任意 MoE 模型:不绑死某一代架构。已跑通 DeepSeek-V4 / V4.1 系列、
    GLM-5.3-Flash(含 A100 / SM80 的注意力后端)与 MiMo-V2.5。
    **MiMo-V2.6-Flash-RL 也已在 A100/SM80 上跑通**:骨架 / 1M 上下文 / 真权重长文本端到端均已实测通过
-   **多模态**——图片 ✅（渲染 `ZQ7K42` 读对）、视频 ✅（红方块「出现又消失」，连**时序**都对）、**组合**（图 + 5,444 token 长文本 + MTP k=1）✅；**音频**需在**启动前**装好 `vllm[audio]`（含 `torchaudio`）才能用，见 `docs/MODEL_GUIDES.md` §0.1c。它走的是与 V4.1 相同的 **MXFP4** 引擎路径，体积 161 GiB ——
+   **多模态**——图片 ✅（渲染 `ZQ7K42` 读对）、视频 ✅（红方块「出现又消失」，连**时序**都对）、**音频 ✅**（3 声提示音被正确描述为 "three short, high-pitched electronic beeps"）、**组合**（图 + 5,444 token 长文本 + MTP k=1）✅；音频需**启动前**装好 `vllm[audio]`+`av`+`torchaudio`（见 `MODEL_GUIDES` §0.1c），且**数字计数类探针在合成音上不可靠**（域限制）。它走的是与 V4.1 相同的 **MXFP4** 引擎路径，体积 161 GiB ——
    见 `docs/MODEL_GUIDES.md` §3b 与 `docs/EXPERIMENTS.md` B92–B133。
 2. 任意 x86 指令集:`scalar → AVX2 → AVX-512(base/VNNI/BF16/VBMI)`,
    运行时按 `/proc/cpuinfo` 自动选最高可用变体。

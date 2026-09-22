@@ -52,7 +52,7 @@ MM=1 PROMPTS=1 MM_LIMITS='{"image":1,"video":1,"audio":1}' bash scripts/serve_mi
 |---|---|---|
 | 图片 | 无额外依赖 | ✅ 实测通过(`ZQ7K42` 渲染图读对) |
 | **视频** | vLLM 音频/视频解码需要 `soundfile`/`torchcodec`/**PyAV** 之一 | ✅ 实测通过(24 帧、中间 12 帧出现红方块 ⇒ 答 "Red",并描述 "appears … and then disappears",**说明真的处理了时间维**) |
-| **音频** | **`vllm[audio]`(至少 `soundfile`)且 `torchaudio` 可用** | ⚠️ **模型侧硬依赖**:MiMo 的处理器 `mimo_v2_omni.py` 需要 `torchaudio.transforms.MelSpectrogram` + `Resample` |
+| **音频** | **`vllm[audio]`(至少 `soundfile`)+ `av` + `torchaudio`** | ✅ **实测可用**(自由描述 3 声提示音 ⇒ "three short, high-pitched electronic beeps",数量/音色/时长全对);⚠️ **模型侧硬依赖**:MiMo 的处理器 `mimo_v2_omni.py` 需要 `torchaudio.transforms.MelSpectrogram` + `Resample`;⚠️ **数字计数类探针不可靠**(合成音在域外:静音也被答 "1"),要更强判据请用**真实语音** |
 
 **为什么必须"先装再启"**:vLLM 在 **import 时**绑定可选依赖的占位模块;服务已在跑之后再装依赖,请求会报
 `PlaceholderModule should not be used when the original module can be imported` ⇒ **只能重启**。
