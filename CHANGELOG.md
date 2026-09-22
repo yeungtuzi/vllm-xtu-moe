@@ -58,6 +58,12 @@
 
 ### Changed
 
+- **`--max-num-seqs` 默认统一为 4**(MiMo `1→4`、DeepSeek-V4.1 `1→4`、GLM-5.3 `2→4`)——
+  `seqs=1` 会让 C≥2 的请求退化成**串行**,把并发基准的全部数字污染成串行口径
+  (实测:同一格里 MiMo 短 C=2 聚合 prefill 236→**54**,而 seqs=2 的模型是 115.8→**129.6 上升**);
+  判据与证据见 `docs/EXPERIMENTS.md` **B124**。生产脚本可传更大值(64/128),但默认不得低于 4。
+- `docs/MODEL_GUIDES.md` §0.1 新增两条接入必读:**`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` 的「0=关闭」陷阱**
+  (不设会让 prefill 掉到 ~310 tok/s,见 **B120**)与 **`seqs=4` 默认规则**(见 **B124**)。
 - **pr4 已打进生产树 `vllm-up-133b71e0b`,并验证正确性**(性能按用户要求留到 MiMo-2.6 适配后统一重测):
   * 该树由 detached HEAD 切到分支 **`xtu/glm53-sm80-pr4` @ `43aef91579`**(提交而非留脏工作区 ——
     这棵树是 8070 的生产部署树,脏改动会被一次 `git checkout` 抹掉);
