@@ -2714,6 +2714,43 @@ SGLang "MTP uses SWA ⇒ 不给全长 KV" 那条实现细节的依据。
 ... Consider increasing max_num_batched_tokens to accommodate the additional draft token slots`。
 本次我显式传的是 `MBT=2048` 才触发;**P4 用 `MBT=4096` 时要复核这条是否消失**(若不消失,
 说明 spec decode 会把调度上限压到某个与 MBT 无关的值,k>1 时更需要放大 MBT)。
+
+### B96 上游核对(路线比较):#56752 只能贡献验收;**我们自己的 MTP 补丁有两个缺陷(已本机核实)**
+
+材料:`dev-docs/CED_56752_UPSTREAM_PACKAGE.md`(506 行,subagent 用**只读** gh 产出)。
+
+**(a) #56752 现状 —— 仍是"自动关闭",而且维护者自己挂着跟踪项**
+* `mergedAt: null`,closedAt `2026-09-18T22:01:27Z`;base **#56227 由 WoosukKwon 在 `22:01:24Z` 合并**
+  —— **早 3 秒** ⇒ 典型的"base 合并导致自动关闭",**零条维护者评审**(只有 3 条 Mergify rebase-bot)。
+* **维护者跟踪 issue #57448 仍 OPEN**,里面明确把 **"Decoder: #56752" 列为未勾选项**。
+* 同域新动向:**#57281(OPEN, DRAFT)** 是竞争实现;**#57906 已合并** —— 它因 ROCm 上 GPU fault
+  **关掉了 encoder 侧 replay**(⇒ 该特性已上线且真出过 bug)。
+* ⇒ **载体**:先在 **#57448** 评论 + ping 原作者,**不要冷启动 PR**;且**代码署名是 ivanium 的**,
+  我们这条路线**只能贡献验收证据,拿不到署名**。
+
+⚠️ **我 brief 里的一处错误已被 subagent 纠正**:我说"CED 在 10128 token 上逐字节相同" ——
+那个 **10128 是 B89/pr4 的语料**;CED 自然语料是 2160/5193/**10071**,跨臂逐字节相同发生在 **5193**(B85)。
+材料里已标为 integrity correction。**教训:引用自己台账的数字前要回去核对条目号。**
+
+**(b) Route 2(MiMo MTP)才是署名路线,而且上游前置已经合并**
+* **#41905 已合并**:只删掉 k≠1 的报错与 assert,**仍 `num_mtp_layers = 1`**(复用第 0 层)。
+* **#48892 与 #50062 都已合并**(MultiModuleMTPSpeculator + scheduler re-prefill + KV)
+  ⇒ **我们之前担心的"多模块 MTP 需要 re-prefill"已经是上游的事,不是我们的工作。**
+* 我们的 `eddc6d0eb7` = **1 文件 +17/−5**,与已合并的 Inkling `_select_mtp_depth_count` **同构**,
+  **不含任何 SM80/引擎特有内容** ⇒ **存在干净的独立补丁**。
+* 查重:没有 PR 在做 MiMo 的 depth 层构建(最近的是 #31180 陈旧 WIP、#46669 是个 OPEN bug:
+  k=7 + async scheduling 下 MiMo specdec 输出垃圾 —— **做 eval 时要避开这个组合**)。
+
+🔴 **但我们的补丁有两个缺陷(本机核实)**:
+1. **"min(检查点层数, k)" 名不副实**:`speculative.py:737/754` 把**我们硬编码的常量**写进
+   draft config 的 `num_nextn_predict_layers`,而 `mimo_v2_mtp.py:178` 又把这个字段读回来
+   ⇒ **读到的永远是常量 3,检查点里真实的层数从未被读过**。
+2. **硬编码 `_MIMO_V2_*_NUM_MTP_LAYERS = 3`**(上游是 `1`):对 V2.5/V2.6(都 3 层)恰好正确,
+   但**层数更少的检查点会静默跳过加载 ⇒ 第 1..2 层未初始化**。
+
+⇒ **修法**:`n_predict` 从**真实 config** 推导(而非常量),并对稀疏检查点 **fail-closed**。
+⇒ 这正好是一份**属于我们的、可上游的 ~17 行**;但**前提是先测 k=1 vs k=3 的接受长度与质量**
+(控制 #46669 的 async scheduling 组合),**若链条没收益就不提**。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
