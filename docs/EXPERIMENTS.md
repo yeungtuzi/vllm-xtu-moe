@@ -2661,6 +2661,30 @@ python -m vllm.entrypoints.openai.api_server \
 `--speculative-config '{"method":"mtp","model":"<ckpt>","num_speculative_tokens":1}'` 才看得到;
 ② **1M** —— 本次 maxlen=4096,按用户口径要到 1048576 并配 `MBT=4096`;
 ③ 多模态真输入(本次是 text-only)。
+
+### B94 ⭐⭐ MiMo-V2.6 P1b:**1M 上下文在 SM80 上达成**(dummy 骨架),且与混合 KV 预测**对账吻合**
+
+同 B93 的命令,只改两处:`--max-model-len 1048576`、`--max-num-batched-tokens 4096`(用户口径),另加
+`--kernel-config '{"enable_jit_warmup": false}'`。**160 s 起服务**,日志 `/tmp/mimo26_1m.log`。
+
+| 项 | 实测 |
+|---|---|
+| `/v1/models` | **`max_model_len: 1048576`** ✅ |
+| 注意力后端 | `[mimo_v2.py:319] Using TRITON_ATTN_DIFFKV for attention`(与 P1 一致) |
+| `Available KV cache memory` | **24.08 GiB** |
+| **`GPU KV cache size`** | **2,078,802 tokens** |
+| 官方口径 | **`Maximum concurrency for 1,048,576 tokens per request: 1.98x`** |
+| 混合层的代价 | `Add 6 padding layers, may waste at most 15.38% KV cache memory`(两 rank 都报) |
+
+**⇒ 与预测对账(这是本次最有价值的一条)**:B92/KV 模型预测**每 rank**的增量 KV 为
+`9 GA 层 × (4 KV 头 / TP=2) × (192+128) B × 2 = **11.25 KiB/token**`;
+实测 `24.08 GiB ÷ 11.25 KiB ≈ 2.19M token`,与引擎报的 **2.078M** 吻合
+(差额正是 39 个 SWA 层的固定 ~25.6 MB/序列 + 6 层补齐的 15.38% 浪费)
+⇒ **混合 KV 的账(GA 随上下文线性、SWA 封顶在窗口)被实测证实**,这也正是
+SGLang "MTP uses SWA ⇒ 不给全长 KV" 那条实现细节的依据。
+**⇒ P4 算 1M 显存时可直接用这套账,但要显式扣掉 15.38% 的补齐浪费。**
+
+**⇒ 用户定的三条口径里,已有两条在骨架级达成**:TP=2 ✅、**1M ✅**;多模态待真输入验证(P4)。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
