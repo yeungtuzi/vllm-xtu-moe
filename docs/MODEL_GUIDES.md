@@ -655,11 +655,12 @@ python -m vllm.entrypoints.openai.api_server \
 **vLLM 这条路已核过不成立**(`mimo_v2_omni._forward_window_attn` 与 `triton_prefill_attention` 里
 `SLIDING_WINDOW_Q/K`、`USE_SINKS`/`SINKS_BIAS_KEY0` 都有真实实现,不是"收了参数不用")。
 
-**MTP**:`--speculative-config '{"method":"mtp","model":"<CKPT>","num_speculative_tokens":k}'`。
-上游 #41905 已合并但**只复用第 0 层**;本树 `eddc6d0eb7` 会真的建 `min(3,k)` 层,
-⚠️ **但该补丁有两个已核实缺陷**(B96):层数读的是**硬编码常量**而非检查点真实值,
-且常量被硬编码为 3(层数更少的检查点会留下未初始化层)。
-**⇒ 修好并测出 k=3 有收益之前,只用 k=1。**
+**MTP**:`--speculative-config '{"method":"mtp","model":"<CKPT>","num_speculative_tokens":1}'`。
+**只用 k=1。** 真权重实测(B98):k=1 首位接受率 **68.5%**(自然文本),接受长度约 1.69;
+而 k=3 的第 2/3 位只有 **9.7% / 0.7%** ⇒ 每步仅多 **4%**,还要多算 2 个草稿 token(专家在 CPU)⇒ **不划算**。
+上游 #41905 只复用第 0 层;我们的多深度补丁 `eddc6d0eb7` 已于 2026-09-22 **回退掉**(B100)——
+k=1 下两者逐字等价,那 17 行零收益。
+⛔ **不要再追多深度 MTP**(用户决定,2026-09-22)。
 
 ---
 
