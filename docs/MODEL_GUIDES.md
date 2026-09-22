@@ -601,6 +601,68 @@ k=3 走多模块链。实测**结论明确:k=1 可用,k=3 不可用**:
 
 ---
 
+## 3b. MiMo-V2.6-Flash-RL(A100 / SM80:**骨架、1M、MTP k=1 已在 P1 通过**;完整端到端待 P4)
+
+> 2026-09-22 新增。事实来源 `docs/EXPERIMENTS.md` **B92–B95**;计划 `dev-docs/MIMO26_PLAN.md`。
+> 检查点:`/home/user/.cache/modelscope/models/MiMo-V2.6-Flash-RL`(166 GB;index `total_size` = **161 GiB**)。
+
+**与 V2.5 的关键差异(实测张量头,不是抄 config)**
+
+| 项 | V2.5 | **V2.6** |
+|---|---|---|
+| 专家精度 | FP8 E4M3 block-128 | **MXFP4**:gate/up `U8 [2048,2048]`、down `U8 [4096,1024]` + **e8m0 block-32** `weight_scale` |
+| 注意力 | FP8 | FP8 E4M3 block-128(`qkv_proj.weight_scale_inv` 为 F32) |
+| 体积 | 293 GiB | **161 GiB** |
+| 专家布局 | — | **gate/up 分离**(非 w13 融合)⇒ **加载期要融合** |
+| 分片 | — | **`model_pp0_ep{0..63}_shard0`**,每片含**每一层**的 4 个专家;元数据 `tp_size:4` 是虚惊(非专家权重未被切,TP=2 安全) |
+| 投机 | MTP 3 层 | MTP 3 层 + `dflash/` 草稿(**仅调研**) |
+
+**⇒ 最重要的一条**:专家是 **MXFP4 = V4.1 那条已在生产跑的 `MOE_MXFP4` 路径**
+⇒ V2.5 分析里"官方只有 FP8、非 FP8 路径都没接线"的缺口**不存在**;
+161 GiB(V2.5 293)⇒ 单流 decode 权重流量 ≈4.8 GB/token ⇒ 带宽天花板 **~77 tok/s**(V2.5 为 39)。
+
+**架构**:48 层(1 dense + 47 MoE)、256 专家 top-8、`moe_intermediate_size=2048`、
+`hybrid_layer_pattern` = **9 GA + 39 SWA(窗口 128)**、`max_position_embeddings = 1048576`;
+GA = 64 Q / **4 KV** / head_dim 192 / v_head_dim 128,SWA = 64 Q / **8 KV** / 192 / 128。
+
+**启动配方(dummy 骨架,已实测)**
+```bash
+VLLM_EXPERTS_LOAD_DEVICE=cpu CUDA_VISIBLE_DEVICES=0,1 \
+python -m vllm.entrypoints.openai.api_server \
+  --model <CKPT> --served-model-name mimo26 --tensor-parallel-size 2 \
+  --dtype bfloat16 --kv-cache-dtype bfloat16 \
+  --max-model-len 1048576 --max-num-batched-tokens 4096 --max-num-seqs 1 \
+  --gpu-memory-utilization 0.85 --language-model-only --trust-remote-code \
+  --kernel-config '{"enable_jit_warmup": false}' --load-format dummy
+```
+**P1 实测**:骨架 **110 s** 起服务;`Resolved architecture: **MiMoV2OmniForCausalLM**`
+⇒ **多模态不需要 `--hf-overrides`**;`[mimo_v2.py:319] Using **TRITON_ATTN_DIFFKV**`
+⇒ **hybrid SWA + DiffKV + sink 在 SM80 可用**;
+`MOE_MXFP4 engine: E=256 H=4096 I=1024 topk=8 scales=yes routing=sigmoid/grouped1x1/bias **swiglu=plain**`
+(`I=1024` 是 TP=2 分片值;`swiglu=plain` 即**无 clamp**,与 V4.1/GLM 的 `clamp@10.0` 不同);
+**1M**:`max_model_len=1048576`、KV 池 **2,078,802 token**、**1.98× 并发**(160 s)。
+
+**KV 账(已与实测对账,可直接用于预算)**
+* GA(9 层)= `9 × 4 × 320 × 2 B = 23,040 B/token`(全机);**TP=2 每 rank ≈ 11.25 KiB/token**;
+* SWA(39 层)= `39 × 8 × 320 × 2 B × 128` ⇒ **每序列常数 ~25.6 MB**,不随上下文增长;
+* ⚠️ 引擎**补齐 6 个 padding 层、浪费 15.38%** KV ⇒ **算 1M 显存时必须显式扣掉**;
+* **MTP 层按 SWA 处理,不吃全长 KV**(实测池只少 1.3%,与 SGLang "MTP 不给全长 KV" 一致)。
+
+**多模态**:检查点带 vision+audio 塔但 `architectures` 写纯文本 ⇒ **vLLM 自己解析成 omni 类**;
+`--language-model-only` 会关掉 mm_prefix(**反而放开后端选择**)。真输入待 P4。
+⚠️ SGLang 有一个 **open** issue([#37983](https://github.com/sgl-project/sglang/issues/37983)):
+其**视觉** Triton 路径丢 window+sink(静默算成全注意力)——
+**vLLM 这条路已核过不成立**(`mimo_v2_omni._forward_window_attn` 与 `triton_prefill_attention` 里
+`SLIDING_WINDOW_Q/K`、`USE_SINKS`/`SINKS_BIAS_KEY0` 都有真实实现,不是"收了参数不用")。
+
+**MTP**:`--speculative-config '{"method":"mtp","model":"<CKPT>","num_speculative_tokens":k}'`。
+上游 #41905 已合并但**只复用第 0 层**;本树 `eddc6d0eb7` 会真的建 `min(3,k)` 层,
+⚠️ **但该补丁有两个已核实缺陷**(B96):层数读的是**硬编码常量**而非检查点真实值,
+且常量被硬编码为 3(层数更少的检查点会留下未初始化层)。
+**⇒ 修好并测出 k=3 有收益之前,只用 k=1。**
+
+---
+
 ## 4. 数据来源与复现
 
 | 数据 | 来源 / 复现命令 |
