@@ -3944,6 +3944,31 @@ V4.1 走 **MLA**(存的是压缩 latent,不是 K/V 全量),MiMo 有 **39/48 层�
    **更可靠的判据是用真实语音**(如 vLLM 测试素材 `nvidia/AudioSkills`,需联网下载);
 3. 影像侧同样有据可查:**Vision Encoder = 681M MiMo ViT(28 层:24 SWA + 4 Full)** —— 与视频测试通过(B132)一致。
 
+
+### B137 核实:MTP 深度 **3 层**(不是 5);README 的 "5-layer" 指的是 **DFlash 草稿网络**
+
+**起因**:checkpoint README 写 "Multi-Token Prediction (MTP): **5-layer** speculative decoder" /
+"MTP / Speculative Decoder: **5 SWA layers, window 1024**",而 `config.json` 写 `num_nextn_predict_layers = **3**`,
+与我 B98/B100 的实测(3 层)不符 ⇒ **用磁盘上的实际张量判定**:
+
+| 判据 | 结果 |
+|---|---|
+| `model_mtp.safetensors` 里 `model.mtp.layers.N.*` 的层号 | **[0, 1, 2] ⇒ 3 层**(共 48 个张量)✓ |
+| `config.json` | `num_nextn_predict_layers = 3` ✓ |
+| **`dflash/config.json`** | **`architectures = ['DFlashDraftModel']`,`num_hidden_layers = 5`,`sliding_window = 1024`** |
+
+**⇒ 结论**:**两者说的不是同一件事** ——
+* **MTP 深度 = 3 层**(`model_mtp.safetensors`,即 B98 测的对象,**k=3 只比 k=1 多 4%** 的结论不受影响);
+* README 的 **"5-layer MTP drafter (DFlash-style)" 指的是 `dflash/` 里那个独立的草稿网络**
+  (`DFlashDraftModel`,5 层、窗口 1024,另有 `dflash_draft_model.safetensors` 与 `dflash.py`)——
+  README 自己写的是 "**DFlash-style**"、"predicts **7 subsequent tokens** per forward pass",都指向它。
+
+**⇒ 对"dflash 只做调研"这一项的价值**:现在**有了精确的草稿结构依据**(DFlashDraftModel / 5 层 / 窗口 1024 /
+`dflash_config` = {"target_layer_ids": [0, 11, 23, 35, 47], "mask_token_id": 151675, "num_anchors": 4096, "block_size": 8, "loss_decay_gamma": 7.0, "attention_value_scale": 0.612, "attention_sink_bias": true};`block_size` = 8),
+而我 B106 的结论(上游**有** `method: dflash` 通道,但失败在 `eagle3_utils.py:20` 的
+`supports_eagle3(self.get_model())`,因为 MiMo omni 未实现 `SupportsEagle3`)**与 B107**(上游 #45343 已占位)
+因此**更加确凿**:卡的**不是草稿模型缺失,而是接口未接**。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
