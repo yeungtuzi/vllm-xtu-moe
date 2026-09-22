@@ -2751,6 +2751,41 @@ SGLang "MTP uses SWA ⇒ 不给全长 KV" 那条实现细节的依据。
 ⇒ **修法**:`n_predict` 从**真实 config** 推导(而非常量),并对稀疏检查点 **fail-closed**。
 ⇒ 这正好是一份**属于我们的、可上游的 ~17 行**;但**前提是先测 k=1 vs k=3 的接受长度与质量**
 (控制 #46669 的 async scheduling 组合),**若链条没收益就不提**。
+
+### B97 ⭐ P3 真权重加载:分片/融合/布局**全部读对**;但**插件自带的数值门禁在 MXFP4 上是坏的**
+
+命令 = B93 配方 + `--load-format auto`(真权重)+ `XIAOTU_ENV_FILE=/tmp/mimo26.env`(内含
+`XIAOTU_VERIFY_LAYER=1`)+ `--speculative-config {mtp, k=3}`;日志 `/tmp/mimo26_p3.log`。
+
+**✅ R3 在加载器层面过关** —— 65/65 分片读完,引擎按层建起(日志里建到 `layers.20`),并打印:
+```
+[xtu-eng-shape] language_model.model.layers.20.mlp.experts
+   cfg(E=256 H=4096 I=1024 gN=1 gK=32) | w13 shape=(256, 2048, 2048) dtype=torch.uint8
+```
+⇒ **gate/up 融合成 w13(2I=2048 行)且按 MXFP4 打包(H 被 2 整除 ⇒ 2048)**;
+**64 个 EP 分片 + 分离的 gate/up + e8m0 scale 全被正确读取,0 个致命错误。**
+⇒ P0 里 **R3("gate/up 分离 + e8m0 布局能否被现有引擎吃下")从"待核"变成"加载层面已通过"**。
+
+**🔴 但数值门禁产出 0 个结果** —— 37 次:
+```
+[vllm-xtu-moe/verify] failed: RuntimeError: size mismatch,
+    got input (1024), mat (1024x2048), vec (4096)
+```
+**根因(读代码定位,不是猜)**:`_verify_once` 里
+`int4 = self._engine_attr == "MOE_WNA16" and w13.dtype == torch.uint8` ——
+**只有 INT4/WNA16 走 `_unpack4`;MXFP4 同样是 uint8 打包,却掉进 `w13[e].float()`**
+⇒ 把打包字节当浮点用,于是 `deq13[:I] @ x` 变成 `(1024×2048) @ (4096)` ⇒ 维度不匹配。
+⇒ **`XIAOTU_VERIFY_LAYER=1` 在 MXFP4 模型上不可用**;
+文档里那句"MXFP4 真实层 ≈ 5.6e-3"显然来自**另一条路径/另一种布局**(不是这套打包 w13),**不能照搬为 MiMo 的基准**。
+
+**⇒ 修法(小、且在我们自己代码里)**:给 `_verify_once` 补一条 MXFP4 解包
+(e2m1 nibble 查表 → float,再乘 e8m0 block-32 scale),或按 P2 原计划写独立层测试。
+**⇒ 在修好之前,P2/P3 的数值判据没有工具产出,不许声称"数值门禁通过"。**
+
+**⚠️ 我在本轮的一个误报(方法论)**:我先报了"FAILED at 430s",实际是**我的 grep 把被 try/except 包住的
+校验器 Traceback 当成了致命错** —— 服务当时仍在正常建引擎(进程在、引擎建到第 20 层、0 个致命错)。
+**⇒ 规则:判断"服务挂了"只能看 `Engine core initialization failed` / 进程存活 / `OutOfMemoryError`,
+不能 grep 泛化的 `Traceback`** —— 这个项目的日志里**本来就会**出现被捕获的 Traceback。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
