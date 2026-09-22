@@ -2987,6 +2987,36 @@ KV 池 **1,844,560** token)。测法与 B99 同构、**跨度放大 ~50 倍**:�
 **⚠️ 又一个我自己的小误判(如实记)**:等待期间我断言"我启动了两次、两个 256K 请求排队所以慢",
 **实测只有一个客户端**(`pgrep -c` 把 pgrep 自己的 shell 也算进去了)——
 **18.6 min 就是 312K prefill 的真实耗时**。⇒ 与 B103 同族:**先验证假设,再宣布**。
+
+### B105 ✅ "聚合口径"的公式**反推确认**(对着 README 已记录的数验证)—— 别再自己发明
+
+**背景**:用户早前纠正过我一次 —— 表格里的 prefill/decode 要用**聚合**(C=2 应当**大于** C=1),
+而我一度给的是**每流**。为了做 P5 的统一重测,这次把口径**反推确认**了:
+
+```
+prefill_agg = C × 每流,其中 每流 = (total_input_tokens / completed) / (mean_ttft_ms/1000)
+decode_agg  = C × 每流,其中 每流 = 1000 / median_tpot_ms
+```
+
+**验证方式(判据:能否复现已发布的数)**:用 `dev-docs/report/tuning/raw/ced_ab/` 的原始 JSON 复算,
+与 `README.md` 表格逐格对照:
+
+| 用例 | 复算 prefill_agg | 复算 decode_agg | README 记录 | 一致? |
+|---|---|---|---|---|
+| CED **on** C=1 | **903.9** | **19.3** | 903.9 / 19.3 | ✅ |
+| CED **on** C=2 | **1204.1** | **15.5** | 1204.2 / 15.4 | ✅ |
+| CED off C=1 | 434.5 | 19.3 | (B84 记录 434.5) | ✅ |
+
+**⇒ 三条可直接复用的事实**:
+1. **prefill 用 `mean_TTFT`、decode 用 `median_TPOT`**(README 用 median,不是 mean);
+2. **`total_token_throughput` 不是** README 的 prefill 口径(我先写成它,复算才对上);
+3. **decode_agg 在 C=2 反而变小是真实的并发回退**(V4.1 长上下文 19.3 → 15.4),
+   **不是口径错误** —— 这种格子必须**单独说明**,不能按"聚合应更大"去改数。
+
+**配套交付**:`dev-docs/report/tuning/probes/p5_unified.sh` —— P5 一条命令跑三模型
+(GLM-512K / V4.1-1M / MiMo-1M → 逐格 bench → 直接打印**这个口径**的对照表),
+协议与 `ced_v41_ab.sh` 完全一致(`random` / `random-output-len 128` / `num-prompts 8` /
+`seed = L*7+C*131+17`)。按仓库约定它留在 gitignored 的 `dev-docs/`,属本地工具。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
