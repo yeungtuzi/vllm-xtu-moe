@@ -22,21 +22,12 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.2.3** (2026-09-20) — **upstream tracking + MTP for GLM and MiMo**:
-> the patch stack is rebased onto upstream `133b71e0b` (11 patches / 40 files);
-> **GLM-5.3-Flash MTP is wired up and ON by default** (`SPEC_K=1`; accept 1.46,
-> decode 21.9 → 22.6 tok/s, at the cost of a 27% smaller KV pool);
-> **MiMo-V2.5 (310B/15B) now runs end-to-end on a single A100-40GB**, where
-> **MTP k=1 measures +10% decode**. GLM production `GPU_UTIL` drops to **0.82**.
->
-> Previous, **v0.2.2** (2026-09-19) — **GLM-5.3-Flash support**: FP8 GPU prefill wired up
-> (4K-prompt TTFT **29.3 s → 22.8 s**), delivered as **256K context × 2 concurrent
-> sequences**; also fixed an **e4m3 subnormal-decode defect** and added an all-codeword gate.
->
-> **v0.2.1** (2026-09-18) — **major CPU-engine performance work**:
-> the CPU MoE engine now **beats the reference `lk_moe` implementation on every real shape**;
-> DeepSeek-V4-Flash benefits as well.
-> Release notes: [`RELEASE_NOTES_v0.2.3.md`](RELEASE_NOTES_v0.2.3.md) · [`RELEASE_NOTES_v0.2.2.md`](RELEASE_NOTES_v0.2.2.md) · [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md)
+> **📌 Current release: v0.2.4** (2026-09-22) — **MiMo-V2.6-Flash-RL support + performance work**:
+> **MiMo-V2.6-Flash-RL is supported** — its experts are MXFP4, so it reuses V4.1's engine path, and TP=2,
+> 1M context, multimodal input and MTP k=1 have all been measured. The **GPU prefill "zero means off" trap is
+> fixed** (long prefill 313 -> **811** tok/s), **`--max-num-seqs` now defaults to 4** so C>=2 no longer degrades
+> to serial execution, and the **decode metric is now median ITL** (real contention is only 1.13-1.77x).
+> Release notes: [`RELEASE_NOTES_v0.2.4.md`](RELEASE_NOTES_v0.2.4.md)
 
 ---
 

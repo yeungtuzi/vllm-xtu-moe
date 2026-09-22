@@ -21,10 +21,11 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 当前版本:v0.2.3**(2026-09-20)—— **跟进上游 + GLM/MiMo 的 MTP**:
-> 补丁栈 rebase 到上游 `133b71e0b`;**GLM-5.3-Flash 的 MTP 落地并默认开**;
-> **MiMo-V2.5(310B/15B)单卡端到端跑通**;GLM 显存契约重标定(`GPU_UTIL` → **0.82**)。
-> 发行说明:[`RELEASE_NOTES_v0.2.3.md`](RELEASE_NOTES_v0.2.3.md)
+> **📌 当前版本：v0.2.4**（2026-09-22）—— **支持 MiMo-V2.6-Flash-RL + 性能优化**：
+> **MiMo-V2.6-Flash-RL 接入**（专家是 MXFP4 ⇒ 复用 V4.1 那条引擎路径；**TP=2 / 1M 上下文 / 多模态 / MTP k=1** 全部实测）；
+> **GPU 预填充「0=关闭」陷阱修复**（MiMo 长 prefill **313 → 811 tok/s**）；**`--max-num-seqs` 默认统一为 4**（修掉 C≥2 被退化成串行）；
+> **decode 口径改为 median ITL**（真实解码争用只有 **1.13–1.77×**）。
+> 发行说明：[`RELEASE_NOTES_v0.2.4.md`](RELEASE_NOTES_v0.2.4.md)
 
 ---
 
@@ -62,11 +63,11 @@
 
 ## 性能
 
-* 口径：**聚合吞吐**——`prefill (tok/s) = 并发数 × prompt_tokens / TTFT`、`decode (tok/s) = 并发数 × 1000 / median(TPOT)`
+* 口径：**聚合吞吐**——`prefill (tok/s) = 并发数 × prompt_tokens / TTFT`、`decode (tok/s) = 并发数 × 1000 / median(ITL)`
+  > `decode` 取 **median ITL**(相邻 token 间隔中位数)而不是 median TPOT:`median TPOT` 是**每请求平均**,会把**同一 step 里混进来的 prefill 工作**算进解码时间,导致长上下文 C=2 时被严重低估(实测同一批数据:median TPOT 口径下 MiMo 长 C=2 = 9.8,而 median ITL 口径 = **39.6**,真实争用只有 **1.36×**;GLM 更极端:2.9 vs **29.6**)。详见 `docs/EXPERIMENTS.md` B126。
   （C=1 时即单流速率；等价于「该阶段的总 token 数 ÷ 该阶段墙钟」）。均由同一次 `vllm bench serve` 换算；
-  `decode` 取 **median** TPOT（`mean` 会被极少数离群解码步拉高）。
-  > ⚠️ **长/C=2 的 decode 聚合值仍低于 C=1** —— 那是**实测的并发退化**（V4.1 单流 median TPOT 51.8 → 129.4 ms），
-  > 不是口径问题；它的 prefill 则如预期更高（903.9 → 1204.2）。
+  `decode` 取 **median ITL**（`mean` 会被极少数离群步拉高,`median TPOT` 会被混入的 prefill 拉低）。
+  > ℹ️ **decode 与 C 的关系**:真实解码争用很小(倍率 **1.13–1.77×**,按 median ITL);早期表里曾出现「长 C=2 的 decode 明显低于 C=1」,那是 **median TPOT 被混入的 prefill 步污染**所致,另一部分来自把 `--max-num-seqs` 设成 1 导致 C=2 退化为串行。两者均已修正,判据见 `docs/EXPERIMENTS.md` **B124/B126**。
 * 数据集：**random 随机 token**，`--random-input-len` 固定为短 128 / 长 16384，输出 128；前缀缓存开；每格 8 个请求、**每格不同 seed**。
 * 表中「实际 token」= `total_input_tokens / completed`（含 chat template 的少量开销）。
   配置细节、判据与 `MBT` 取舍见 `docs/TUNING_GUIDE.md` §8 与 `docs/EXPERIMENTS.md`。
@@ -84,7 +85,7 @@
 | **MiMo-V2.6-Flash-RL**<br>TP=2 · util 0.85 · **MAXLEN 131072**<br>MBT 8192 · **seqs 4** · **MTP k=1** · **GPU 预填开(门槛 4096)** · 含形状预热 | 短 | 128 | 1 | **232.0** | **30.5** |
 | | 短 | 128 | 2 | **367.5** | **40.7** |
 | | 长 | 16,384 | 1 | **811.3** | **27.3** |
-| | 长 | 16,384 | 2 | **1455.3** | 9.8 ⚠️ |
+| | 长 | 16,384 | 2 | **1455.3** | **39.6** |
 
 GLM / DeepSeek-V4.1 未开投机解码（random 数据集对投机是最坏情况，且会挤占长上下文的显存）；**MiMo-V2.6 开了 MTP k=1**。MiMo 的 prefill 数字是 **GPU 预填开启后**的口径（`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=4096`；该变量不设或为 0 表示**关闭**，会让 prefill 掉到 ~310，见 `docs/MODEL_GUIDES.md` §0.1）。
 > ⚠️ **长上下文 C=2 的 decode(9.8)是实测到的并发争用**:median TPOT 从 36.6 跳到 **203.6 ms**(同族的 GLM 长 C=2 更严重,45.9 → 700.8 ms;见 `docs/EXPERIMENTS.md` B115/B125)。
@@ -117,6 +118,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 
 | 版本 | 主题 |
 |---|---|
+| **v0.2.4** | **支持 MiMo-V2.6-Flash-RL + 性能优化** —— 新模型接入（MXFP4/TP=2/1M/多模态/MTP k=1，**层内数值门禁 94/94 层通过**、312K 针测试命中、多模态真图通过）；**GPU 预填充「0=关闭」陷阱修复**（长 prefill 313→**811** tok/s）；**`--max-num-seqs` 默认统一为 4**（短 C=2 prefill 236→**367**）；**decode 口径改为 median ITL**（真实争用 1.13–1.77×）；修好 MXFP4 上的层内数值门禁 |
 | **v0.2.3** | **跟进上游 + GLM/MiMo 的 MTP** —— 补丁栈 rebase 到上游 `133b71e0b`(11 补丁/40 文件);**GLM-5.3-Flash 的 MTP 落地**(draft 层识别 + GPU 常驻,`SPEC_K=1..4`);**MiMo-V2.5(310B/15B)单卡端到端支持**,MTP k=1 decode +10%;显存契约重标定(GLM `GPU_UTIL` 0.85 → **0.82**) |
 | **v0.2.2** | **支持 GLM-5.3-Flash** —— FP8 GPU 预填充接线(4K prompt TTFT 29.3 → 22.8 s)、256K × 2 路并发交付配置;修掉 e4m3 次正规数解码缺陷 + 新增全码字门禁 |
 | **v0.2.1** | **针对引擎的显著性能优化** —— CPU MoE 引擎在全部真实形状上**反超 `lk_moe`**;DeepSeek-V4-Flash 同步受益 |
@@ -124,7 +126,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 | v0.1.0 | 首个公开版:混合模式(CPU 专家 + GPU 其余)、AVX2 / AVX-512 多 ISA、DeepSeek-V4 系列 |
 
 改动清单、性能对照与运行参数变更:
-[**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
+[**v0.2.4**](RELEASE_NOTES_v0.2.4.md) · [**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
 (归档:[v0.2pre](RELEASE_NOTES_v0.2pre.md))
 
 ---

@@ -5,6 +5,38 @@
 
 ---
 
+## [0.2.4] — 2026-09-22
+
+**主题:支持 MiMo-V2.6-Flash-RL、性能优化。**
+
+### Added
+
+- **MiMo-V2.6-Flash-RL 接入**(专家是 MXFP4 ⇒ 复用 V4.1 的 `MOE_MXFP4` 引擎路径,无需新引擎):
+  **TP=2 / 1M 上下文 / 多模态 / MTP k=1** 四条均实测;新增 `scripts/serve_mimo26.sh`(含 KV 账与陷阱提示)。
+  实测(128K / MBT=8192 / `seqs=4` / GPU 预填充开 / 含形状预热):短 C=1 **232.0/30.5**、短 C=2 **367.5/40.7**、
+  长 C=1 **811.3/27.3**、长 C=2 **1455.3/39.6**。
+- **层内数值门禁在 MXFP4 上修好**(此前 `_verify_once` 未解包 MXFP4):MiMo 实测 **94/94 层通过**,
+  `rel_rms` 中位 **9.25e-08**、最大 1.67e-04、无离群层。
+
+### Changed
+
+- **`--max-num-seqs` 默认统一为 4**(MiMo `1→4`、V4.1 `1→4`、GLM-5.3 `2→4`):`seqs=1` 会让 C≥2 请求退化成串行、
+  污染全部并发基准(同格短 C=2 聚合 prefill:MiMo 236→**54**,而 `seqs=2` 的模型 115.8→**129.6 上升**);见 B124。
+- **README 的 decode 口径改为 `median ITL`**:`median TPOT` 会把混入同一步的 prefill 算进解码,长 C=2 被严重低估
+  (真实争用只有 **1.13–1.77×**;MiMo 9.8→**39.6**、GLM 2.9→**29.6**)。见 B126。
+- `docs/MODEL_GUIDES.md` §0.1 新增两条接入必读:`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS` 的「0=关闭」陷阱与 `seqs=4` 默认规则。
+
+### Fixed
+
+- **MiMo 的 GPU 预填充此前从未启用**(启动脚本未设门槛,而 `_gp_on = _gp_min > 0` 把 0 当关闭)⇒ 长 prefill **313→811 tok/s**、TTFT 52.3→20.2 s。
+- `serve_v41.sh` 增加 `MM` 旋钮(原先 `--limit-mm-per-prompt` 硬编码为 0,无法开多模态);`serve_glm53_mainline.sh` 增加 `RESIDENT_LAYERS` 旋钮。
+
+### Known Issues
+
+- `vram_policy.py` 在 128K 下会算出 **0.5 GiB** KV 而让引擎起不来(最低需 0.66 GiB),另有"算了 15% 余量却没用"的死变量,**待修**。
+- **间歇性解码停顿**(约 2/5 次,`p99 ITL` 10–14 s);已排除 chunk 大小/KV 压力/抢占/MTP/内存/外部争用,隔离重复 3/3 未复现,**待定位**。
+- 专家层常驻 GPU:prefill **+4%** 但 decode **−2~6%**,净收益抵消,**不作默认**。
+
 ## [Unreleased]
 
 ### Added
