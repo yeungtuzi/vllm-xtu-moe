@@ -63,21 +63,30 @@ MM=1 PROMPTS=1 MM_LIMITS='{"image":1,"video":1,"audio":1}' bash scripts/serve_mi
 **组合能力(实测通过)**:同一次请求里 **图片 + 5,444 token 长文本(含针)+ MTP k=1** ⇒ 针命中、图片也读对
 ⇒ **多模态 × 长上下文 × 投机解码可同时工作**。
 
-### 0.1b GPU 预填充的取舍:**prefill 更快,但每一步都要付「层数 × 上传时间」**(实测)
+### 0.1b GPU 预填充的取舍:**prefill 更快,但每一步都要付「层数 × 上传时间」**(实测,口径已校准)
 
 **机制(实测,不是推断)**:GPU 预填充把**每层权重**在每次 prefill 时 H2D 上传一遍。
-插件自带分解(`XIAOTU_GPF_STAGE=1`)在 GLM-5.3(FP8,~3.4 GiB/层)上实测:
+GLM-5.3(FP8,每 rank 每层 **3.38 GiB**)实测 —— ⚠️ **必须用无 sync 口径**:
 
 ```
-[gpf-stage] n=40  dma=533.5ms  asm=0.0ms  tr=6.4ms  total=539.9ms/层
+[gpf-stage] n=40 dma=159.1ms asm=0.0ms tr=5.9ms total=164.9ms/层 (CUDA event,**无 sync**)
+[gpf-stage] n=40 dma=197.2ms asm=0.0ms tr=5.8ms total=203.0ms/层 (CUDA event,**无 sync**)
+[fp8-asm]   w13=133.7 w2= 65.1 scales=0.16 tr=6.0 total=205.0 ms   ← 独立口径,同一运行
 ```
 
-* **`dma` 占 98.8%** ⇒ 成本就是**上传本身**(≈6.4 GB/s,PCIe 带宽瓶颈);`tr`(转置)**已缓存**;`asm` 为 0;
-* ⚠️ **更正(EXPERIMENTS B139)**:`total ≈ dma + tr` 只是**分段计时之和**,**不能**推出"没有重叠" ——
-  **ping/pong 双缓冲早已实现且启用**(`prefetch_layer` + `PrefetchSlot` + 独立 CUDA stream +
-  `XIAOTU_MOE_PREFETCH_SLOTS=2`,且日志里没有出现"no VRAM for ping-pong"的降级);
-  真正的情况是**流水线深度只有 1 层,而每层 H2D(533 ms)远大于每层计算(几十 ms)**,所以**能藏起来的只是一小部分**;
-* ⇒ **每一个"带预填充的 step"要付 `MoE 层数 × ~540 ms`**(GLM ≈ **24 s**)。
+* **真实 staging = 165–205 ms/层**(w13 107–134 + w2 53–65 + tr ~6 ms)⇒ 折算 **17.7–22.0 GB/s**
+  = 本机 PCIe 能力(微基准 **26.18 GB/s**)的 **~70–85%** ⇒ **已接近上限,不是带宽瓶颈**;
+* 🔴 **旧数字作废**:早期 `[gpf-stage] dma=533–537 ms/层` 是**同步口径的产物** ——
+  `_stage_mark` 原本每个子相都 `torch.cuda.synchronize()`,而 `synchronize()` **等的是设备上所有工作**
+  (含并发的 prefill 计算),把真实值放大了 ~3.2×。**该仪表已改成 CUDA event、无 sync**,并与
+  独立口径 `[fp8-asm]` **交叉验证一致(±2%)**(EXPERIMENTS **B141/B142/B143**);
+* **ping/pong 双缓冲确实存在且启用**(`prefetch_layer` + `PrefetchSlot` + 独立 CUDA stream,
+  `XIAOTU_MOE_PREFETCH_SLOTS=2`,日志中无 "no VRAM for ping-pong" 降级);
+  但它**最多只能藏掉每层的计算那一小块**(`eng` 中位 ~12 ms),相对 165–205 ms 的传输**几乎无感**
+  ⇒ **"加双缓冲"不是解法**(该建议已撤回)。
+* ⇒ **每一个"带预填充的 step"约付 `MoE 层数 × (pre ≈ 240–275 ms)`**:
+  `pre` 里绝大部分就是那次真实 H2D ⇒ 42 层 ≈ **11–12 s**(GLM),**与实测 10–14 s 的 ITL 尖峰量级吻合**;
+  且**与 chunk 大小无关**(一个 step 会触及**全部层**,每层都要传)。
 
 **收益**:长 prefill 显著更快 —— MiMo-V2.6 实测 **313 → 811 tok/s**(TTFT 52.3 → 20.2 s)。
 
@@ -91,7 +100,7 @@ MM=1 PROMPTS=1 MM_LIMITS='{"image":1,"video":1,"audio":1}' bash scripts/serve_mi
 |---|---|
 | 吞吐优先 / 低并发长 prefill | **开** GPU 预填(收益大) |
 | **尾延迟敏感**的并发长上下文 | **`GPU_PREFILL_MIN=0` 关掉**(已验证可消除 10–14 s 尖峰;代价:prefill 变慢,GLM 8K 预热 TTFT 37→57 s) |
-| 想两者兼得 | 增大 **MBT**(总 DMA ∝ chunk 数;**但单步尖峰不变**)、或**常驻层** `RESIDENT_LAYERS`(收益 = N/层数;实测 2 层 ⇒ prefill **+4.4%**,但 decode −2~6%) |
+| 想两者兼得 | 增大 **MBT**(**减少 chunk 数 ⇒ 减少总上传次数**,总 H2D ∝ chunk 数)(总 DMA ∝ chunk 数;**但单步尖峰不变**)、或**常驻层** `RESIDENT_LAYERS`(收益 = N/层数;实测 2 层 ⇒ prefill **+4.4%**,但 decode −2~6%) |
 
 **诊断命令(定位这类问题只用这两条)**:
 ```bash
