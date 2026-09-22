@@ -36,6 +36,33 @@ Using CPU Fp8 MoE backend out of potential backends: ['CPU', 'AITER', ...]   # �
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py
 ```
 
+### 0.1c 多模态:开法与**启动前**必须装好的依赖(实测)
+
+**开法**:`MM=1` ⇒ 写 `--limit-mm-per-prompt`;各模态的上限用 **`MM_LIMITS`** 覆盖(默认只开图片):
+
+```bash
+MM=1 PROMPTS=1 MM_LIMITS='{"image":1,"video":1,"audio":1}' bash scripts/serve_mimo26.sh
+```
+⚠️ 不要把 JSON 默认值直接塞进 `${VAR:-{...}}` —— bash 的 `}` 会与展开冲突而多出一个 `}`(vLLM 会以
+`cannot be converted to <function loads>` 拒绝)。脚本里已按"先赋值再拼接"的写法绕开。
+
+**依赖(必须在启动服务之前装好)**:
+
+| 模态 | 依赖 | 说明 |
+|---|---|---|
+| 图片 | 无额外依赖 | ✅ 实测通过(`ZQ7K42` 渲染图读对) |
+| **视频** | vLLM 音频/视频解码需要 `soundfile`/`torchcodec`/**PyAV** 之一 | ✅ 实测通过(24 帧、中间 12 帧出现红方块 ⇒ 答 "Red",并描述 "appears … and then disappears",**说明真的处理了时间维**) |
+| **音频** | **`vllm[audio]`(至少 `soundfile`)且 `torchaudio` 可用** | ⚠️ **模型侧硬依赖**:MiMo 的处理器 `mimo_v2_omni.py` 需要 `torchaudio.transforms.MelSpectrogram` + `Resample` |
+
+**为什么必须"先装再启"**:vLLM 在 **import 时**绑定可选依赖的占位模块;服务已在跑之后再装依赖,请求会报
+`PlaceholderModule should not be used when the original module can be imported` ⇒ **只能重启**。
+
+**版本注意**:torchaudio 目前**没有匹配 torch 2.13 的构建**(PyPI 最高 2.11.0);实测 **torchaudio 2.11.0+cu130 与 torch 2.13.0+cu130 可共存**
+(`MelSpectrogram` 输出 `(1,80,101)` 全 finite、`Resample` 正常),但属**跨版本组合**,升级 torch 时需重新验证。
+
+**组合能力(实测通过)**:同一次请求里 **图片 + 5,444 token 长文本(含针)+ MTP k=1** ⇒ 针命中、图片也读对
+⇒ **多模态 × 长上下文 × 投机解码可同时工作**。
+
 ### 0.1b GPU 预填充的取舍:**prefill 更快,但每一步都要付「层数 × 上传时间」**(实测)
 
 **机制(实测,不是推断)**:GPU 预填充把**每层权重**在每次 prefill 时 H2D 上传一遍。
