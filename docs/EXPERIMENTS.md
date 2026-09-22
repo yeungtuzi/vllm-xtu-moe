@@ -4106,6 +4106,38 @@ K-major 转置(已是 Triton 内核 ~600 GB/s 且**只在缓存构建时做一�
 **⇒ 附**:诊断分支 `diag/h2d-real-time`(63e6cec)已实现"读 `prefetch_layer` 槽的 CUDA 事件并打印 `[gp-h2d-real]`",
 但**GLM 不走 `prefetch_layer`**(它走通用 staging)⇒ 该补丁对 GLM 无效,留给走 prefetch 路径的模型用。
 
+
+### B142 ⭐⭐⭐ **干净口径拿到真实数字**:staging **167–206 ms/层**,我们已跑在 PCIe 能力的 ~70–83%(B140 的"3.8× 缺口"撤回)
+
+**怎么拿到的**:`[gpf-stage]`(perf_counter + **device-wide synchronize**)是污染口径;
+而 **`[fp8-asm]`** 用 **CUDA event、无 sync**(`gpu_prefill_fp8.py` 的 `_hit`/`elapsed_time`),
+在本次 GLM 运行(`XIAOTU_GPF_STAGE=1`,8000-token prefill)打印出:
+
+```
+[fp8-asm] w13= 107.7  w2=  53.3  scales= 0.16  tr=   6.2  total= 167.4 ms
+[fp8-asm] w13= 134.5  w2=  65.4  scales= 0.16  tr=   6.2  total= 206.2 ms
+```
+
+| 口径 | 每层 | 相对传输下限 |
+|---|---|---|
+| **干净(CUDA event,无 sync)** | **167–206 ms** | 1.20–1.48× |
+| 传输理论下限(3.38 GiB ÷ 26 GB/s,微基准) | ~139 ms | 1.00× |
+| 旧口径 `[gpf-stage] dma` | **537 ms** | 3.86×(**口径放大约 3×**) |
+
+**⇒ 结论**:
+1. **真实 staging 成本 ≈167–206 ms/层,已接近 PCIe 上限**(~70–83% 效率)⇒
+   **没有任何"3.8× 效率缺口"** —— 那个缺口完全来自 `_stage_mark` 的 `synchronize()`
+   (它等的是**设备上所有工作**,把并发的 prefill 计算时间也算进了 dma);
+2. **用户的两次更正都成立**:PCIe 是 25 GB/s 级别(微基准 26.18 GB/s);且这个数字**不能**用来推"带宽瓶颈";
+3. **撤回**:B140 的"差 3.8×、每层可省 388 ms、45 层 ≈ 17.5 s"**全部撤回**;
+   B131 的"533 ms/层"仍是**口径产物**(B141 已更正);
+4. **停顿的重新估算(用干净数字)**:42 个 MoE 层 × ~180 ms ≈ **7.5 s/step** 的 staging
+   (ping/pong 会遮掉一部分)⇒ 与实测 p99 ITL 13.6 s **同一量级但仍非完整解释**;
+   **精确归因需要把干净 staging 数字与 `XIAOTU_LAYER_TIMING` 的 pre/eng 联合分析**,不宜再用旧数字下结论。
+
+**⇒ 教训(已写进纪律)**:`XIAOTU_GPF_STAGE` 的 dma/asm/tr 是**诊断用的同步口径**,**不得**当作传输耗时引用;
+要看真实 staging 用 **`[fp8-asm]`**(FP8 路径)/ CUDA event 口径。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
