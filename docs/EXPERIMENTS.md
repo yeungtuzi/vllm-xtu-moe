@@ -3775,6 +3775,27 @@ GLM 脚本默认 `SEQS=2` 所以正常;README 里 V4.1 那组来自更早的并�
 **⇒ 结论**:B126→B131 这条链把"10–14 秒停顿"从"不明异常"追到了**"每层 533 ms 的未重叠 H2D 上传"**,
 并给出了按收益排序的四个靶点。**这是 0.2.5 的首选工作项。**
 
+
+### B132 ⭐ MiMo 多模态**广度测试**:视频 ✅ 通过;**音频卡在可选依赖**(`vllm[audio]`)
+
+**服务**:`serve_mimo26.sh` 加 `MM_LIMITS` 旋钮后以**全模态**启动
+(`MM_LIMITS='{"image":1,"video":1,"audio":1}'`,MAXLEN 65536,MBT 8192,seqs 4,GPU 预填开);
+日志 `Resolved architecture: MiMoV2OmniForCausalLM` ✓,KV 池 417,284。
+
+| 测试 | 刺激物(内容已知) | 结果 |
+|---|---|---|
+| 图片(基线) | 渲染 `ZQ7K42` | ✅ 读对(3.6 s) |
+| **视频·颜色** | 24 帧、**中间 12 帧**出现红方块 | ✅ **"Red"**(2.9 s) |
+| **视频·描述** | 同上 | ✅ **"A red square appears on a white background and then disappears."** —— **连时序动态都对** ✓ |
+| **音频** | 3 声 1 kHz 提示音 | ❌ `HTTP 500: Please install vllm[audio] for audio support` |
+
+**⇒ 两条结论**:
+1. **视频模态通过**,且"appears … then disappears"证明它**真的处理了时间维**(不是只取一帧);
+2. **音频缺的是可选依赖,不是接入问题**:vLLM 音频路径需要 **soundfile / torchcodec / PyAV** 之一,本环境**三者都没有**。
+   装上 `soundfile` 后错误变成 `PlaceholderModule should not be used when the original module can be imported`
+   ⇒ **vLLM 在 import 时绑定占位模块,必须先装依赖再启动服务**。
+   **⇒ 运维结论(写入 MODEL_GUIDES):要用音频,先 `pip install vllm[audio]`(或至少 `soundfile`)再启动。**
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
