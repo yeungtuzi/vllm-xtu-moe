@@ -189,6 +189,8 @@ XTU_ENV_FILE="${XTU_ENV_FILE_OVERRIDE:-$OUTDIR/$TAG.envfile}"
   # Only the FILE is authoritative (XIAOTU_ENV_FILE is set explicitly below),
   # so the threshold has to be written here to reach the EngineCore child.
   echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=$GPU_PREFILL_MIN"
+  # 专家层常驻 GPU(逗号+区间,如 "20-21";空=不常驻)。用户 2026-09-22 要求按需驻留。
+  [ -n "${RESIDENT_LAYERS:-}" ] && echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=$RESIDENT_LAYERS"
   [ -n "${XIAOTU_MOE_NSLICE_SMALL:-}" ] && echo "XIAOTU_MOE_NSLICE_SMALL=$XIAOTU_MOE_NSLICE_SMALL"
   [ -n "${XIAOTU_MOE_ASYNC:-}" ] && echo "XIAOTU_MOE_ASYNC=$XIAOTU_MOE_ASYNC"
   [ -n "${XIAOTU_MOE_RANK_SPLIT:-}" ] && echo "XIAOTU_MOE_RANK_SPLIT=$XIAOTU_MOE_RANK_SPLIT"
