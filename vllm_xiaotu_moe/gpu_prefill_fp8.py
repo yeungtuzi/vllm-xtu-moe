@@ -37,6 +37,7 @@ from vllm_xiaotu_moe.gpu_prefill import (
     _dma_hostbuf,
     _kmajor_bytes,
     _pin_engine_hostbufs,
+    _stage_begin,
     _stage_mark,
 )
 
@@ -271,7 +272,7 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
     # every DMA in the layer to wait for the previous copy.
     import time as _time
 
-    _t_dma = _time.perf_counter()
+    _t_dma = _stage_begin()
     w13_raw = _buf("raw13", (E, 2 * I, H), device)
     c13 = int(geo["w13_cbytes"])
     cr13 = int(geo["w13_crows"])

@@ -950,30 +950,67 @@ def _dma_hostbuf(engine, which: int, node: int, nbytes: int, device) -> torch.Te
 
 _STAGE_ACC = {"n": 0, "dma": 0.0, "asm": 0.0, "tr": 0.0}
 
+_STAGE_EV = {"pend": []}   # 【B142】待收割的 (key, start_ev, end_ev)
 
-def _stage_mark(t0: float, key: str) -> float:
-    """[§594 诊断] 把 `kmajor_from_engine_shards` 的三个子相累加起来。
+def _stage_begin():
+    """相**开始**处记一个 event,返回值交给下一次 `_stage_mark` 当 `t0`。
 
-    `XIAOTU_GPF_STAGE=1` 时,每 40 次(一层一次)打印一次平均,用来回答
-    "asm 的 220~283 ms/层 里,DMA / 跨步组装 / K-major 转置 各占多少"。
-    **每个子相后面都要 sync**,否则测到的是"发射耗时"而不是"完成耗时";
-    诊断模式下多 2 次 sync 可以接受(它只在 env 打开时生效)。
+    【B142 口径修正】旧实现靠 `perf_counter` + 每个子相 `torch.cuda.synchronize()`,
+    而 `synchronize()` 等的是**设备上所有工作**(含与之并发的 prefill 计算),
+    于是把 dma 量成 **537 ms/层**,而同一批数据用 CUDA event 只有 **167–206 ms/层**
+    (`[fp8-asm]`),**差 ~3×**。现在改为:**不 sync**,每相记 event,靠
+    `event.query()` 在后续调用里收割已完成的那一段 —— 既不污染被测对象,
+    读数也与 `[fp8-asm]` 同口径,两者可互相交叉验证。
     """
-    import time as _t
-    import torch as _torch
     if os.environ.get("XIAOTU_GPF_STAGE") != "1":
-        return t0
-    _torch.cuda.synchronize()
-    now = _t.perf_counter()
-    _STAGE_ACC[key] += (now - t0) * 1e3
-    _STAGE_ACC["n"] += 1 if key == "tr" else 0
-    if key == "tr" and _STAGE_ACC["n"] % 40 == 0:
-        n = _STAGE_ACC["n"]
-        d, a, r = _STAGE_ACC["dma"], _STAGE_ACC["asm"], _STAGE_ACC["tr"]
-        print(f"[gpf-stage] n={n} dma={d/40:.1f}ms asm={a/40:.1f}ms tr={r/40:.1f}ms "
-              f"total={(d+a+r)/40:.1f}ms/层", flush=True)
-        _STAGE_ACC.update({"dma": 0.0, "asm": 0.0, "tr": 0.0})
-    return now
+        import time as _t
+        return _t.perf_counter()
+    try:
+        e = torch.cuda.Event(enable_timing=True)
+        e.record(torch.cuda.current_stream())
+        return e
+    except Exception:  # noqa: BLE001
+        import time as _t
+        return _t.perf_counter()
+
+
+def _stage_mark(t0, key: str):
+    """相**结束**处记 event,并在 `key == "tr"`(一层结束)时收割已完成的分相。
+
+    与 `_stage_begin` 配对;`t0` 是上一相/本相开始的 event(诊断关闭时是 float)。
+    返回本相的 event,供下一次调用当 `t0` —— 调用点因此**无需改动**。
+    """
+    if os.environ.get("XIAOTU_GPF_STAGE") != "1":
+        import time as _t
+        return _t.perf_counter()
+    try:
+        e = torch.cuda.Event(enable_timing=True)
+        e.record(torch.cuda.current_stream())
+        if isinstance(t0, torch.cuda.Event):
+            _STAGE_EV["pend"].append((key, t0, e))
+        if key == "tr":
+            keep = []
+            for k, a, b in _STAGE_EV["pend"]:
+                try:
+                    if not (a.query() and b.query()):
+                        keep.append((k, a, b))
+                        continue
+                    _STAGE_ACC[k] = _STAGE_ACC.get(k, 0.0) + a.elapsed_time(b)
+                except Exception:  # noqa: BLE001
+                    pass
+            _STAGE_EV["pend"] = keep[-8:]
+            _STAGE_ACC["n"] += 1
+            n = _STAGE_ACC["n"]
+            if n % 40 == 0:
+                d, a_, r = _STAGE_ACC["dma"], _STAGE_ACC["asm"], _STAGE_ACC["tr"]
+                print(f"[gpf-stage] n={n} dma={d/40:.1f}ms asm={a_/40:.1f}ms "
+                      f"tr={r/40:.1f}ms total={(d+a_+r)/40:.1f}ms/层 "
+                      f"(CUDA event,**无 sync**)", flush=True)
+                _STAGE_ACC.update({"dma": 0.0, "asm": 0.0, "tr": 0.0})
+        return e
+    except Exception:  # noqa: BLE001
+        import time as _t
+        return _t.perf_counter()
 
 
 def kmajor_from_engine_shards_v2(engine, device, hidden: int, inter: int,
@@ -1142,7 +1179,7 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
     if os.environ.get("XIAOTU_GPF_STAGE") == "1":
         import torch as _t0
         _a0 = _t0.cuda.memory_allocated(device)
-    _t_dma = _time.perf_counter()
+    _t_dma = _stage_begin()
     w13_raw = _reuse(("raw13",), (E, 2 * I, rb13), device)
     c13 = int(geo["w13_cbytes"])
     cr13 = int(geo["w13_crows"])
