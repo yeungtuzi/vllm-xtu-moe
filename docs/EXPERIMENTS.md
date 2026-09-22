@@ -2548,6 +2548,59 @@ GPU 预填充 ACTIVE:`first 15232 tokens >= threshold 1500`)。TTFT **47.44 s**;
 
 **⇒ 结论:pr4 正确性通过**(核级逐位一致 + 首 token 全一致 + 跨臂不劣于同臂噪声)。
 **⚠️ 性能本次不测**(用户要求:Mmio-2.6 适配完成后统一重测);本次运行只确认**不崩**。
+
+### B92 ⭐ MiMo-V2.6-Flash-RL 接入 P0:静态核对全部完成,**最大风险 R1 在代码层被排除**
+
+模型:`/home/user/.cache/modelscope/models/MiMo-V2.6-Flash-RL`(166 GB;index `total_size` 172,923,364,096 B = **161 GiB**)。
+口径(用户 2026-09-22 定):**TP=2 / 1M 上下文 / 多模态 / 投机先用 MTP(k=1–3)**,dflash 只做调研。
+纪律:**多搜索、多核上游与 SGLang**。详细计划见 `dev-docs/MIMO26_PLAN.md`。
+
+**1. 与 V2.5 的关键差异:专家从 FP8 变成 MXFP4(对我们更有利)**
+实测张量头(非抄 config):`down_proj.weight` **U8 [4096,1024]**、`weight_scale` **U8 [4096,64]**
+⇒ **打包 MXFP4 + e8m0 block-32**;`qkv_proj.weight_scale_inv` **F32 [116,32]** ⇒ 注意力是 FP8 E4M3 block-128。
+⇒ 专家正是 **V4.1 那条已在生产、已调优的 `MOE_MXFP4` 路径**;V2.5 分析里「只有 FP8 可行」的缺口**消失**。
+体积 161 GiB(V2.5 是 293 GiB)⇒ 单流 decode 权重流量 ≈ **4.8 GB/token**(V2.5 9.46)⇒ 天花板 **~77 tok/s**(V2.5 39)。
+
+**2. `tp_size: 4` 是虚惊** ✅ —— 889 个非专家张量**全部**在 `model_pp0_ep0_shard0`、每个名字只出现一次
+(`qkv_proj`/`embed_tokens`/`lm_head`/`mlp.gate` 均无第二副本)⇒ **非专家权重未被 TP 切过,TP=2 安全**。
+⚠️ 分片后果:64 个 `ep{0..63}` 分片**各含每层的 4 个专家** ⇒ 无法用子集拼出一层(但 161 GiB 已全在本地)。
+
+**3. MTP 权重齐全** ✅ —— `model_mtp.safetensors` 48 张量 = 36 真实权重 + 12 `*_scale_inv`。
+本树 `mimo_v2_mtp.py` 是**上游文件 + 我们的补丁**(`eddc6d0eb7`):上游把 `num_mtp_layers` 硬编码为 1,
+我们改成 `min(检查点层数, k)` ⇒ **k=1–3 可配**。
+
+**4. 上游核对(vLLM PR #41905,diff 逐行读)** —— **我们比上游激进**:
+上游该 PR 只**删掉 k>1 的报错与 assert**,`num_mtp_layers` **仍是 1**(复用第 0 层);
+我们**真的建 3 层并循环**。⚠️ 代价:多模块 MTP 需要 **re-prefill 清被拒草稿的脏 KV**(上游 PR #48892),
+复用第 0 层没有这个问题 ⇒ **纪律:先测 k=1(与上游同构),k=2/3 作为实验项并专验 dirty-KV**。
+
+**5. 🔴→✅ 多模态的最大疑点被排除**:SGLang issue **#37983(open)**报告 `VisionTritonAttention`
+**不把 `window_size`/`s_aux` 传给 Triton 核** ⇒ 模型照跑但视觉特征按"全注意力+无 sink"算 ⇒ **静默错**,
+且明说是在 **MiMo-V2.5 风格视觉模型**上发现的。**核到 vLLM 这条路上不成立**:
+* `mimo_v2_omni.py:223-264` 的 `_forward_window_attn` 自己实现窗口+sink,调
+  `context_attention_fwd(..., sliding_window_q=w, sliding_window_k=w, sinks=sinks, sinks_bias_key0=True)`;
+* `triton_prefill_attention.py` 里这四个 constexpr **真的被实现**(`SLIDING_WINDOW_Q/K` 在 128-153 行做 mask、
+  `USE_SINKS`/`SINKS_BIAS_KEY0` 在 99-170 行参与分数)—— **不是"收了参数不用"**。
+
+**6. ⭐ R1(SM80 的 hybrid SWA + DiffKV + sink)在代码层排除** —— 我们自己的核就实现了:
+`triton_unified_attention_diffkv.py` 里 `SLIDING_WINDOW`(86/255-258 行,真 mask)、
+`sink_ptr`(63 行)被 **`init_softmax_M(...)`**(159-161 行)用来初始化 online-softmax 的 `M`
+—— 正是 MiMo 的 sink 语义(额外一个 logit,值贡献为 0)。
+⇒ 后端 `triton_attn_diffkv` 继承 `TritonAttentionBackend` 的 `supports_non_causal/supports_sink = True`,
+且**核里有实现**。**⇒ 剩下的是数值与性能的实测,不是"缺代码"。**
+
+**7. dflash(仅调研,不做实功)** —— 材料已修:`dflash/config.json` **原本是非法 JSON**
+(第 55 行 `"use_cache": true,` 尾多一个逗号,严格 `json.load` 直接失败),已按备份改好(差异恰好 1 行);
+内容是 5 层 `DFlashDraftModel`(`model_type: qwen3`,`is_causal=false`,SWA-1024,`block_size=8`,
+`target_layer_ids [0,11,23,35,47]`,`attention_sink_bias: true`)。
+**结论(静态)**:草稿要 **非因果 + sink**,而 A100 上 `flashinfer.supports_sink()` 为 False;
+但 `triton_attn` 两者皆 True ⇒ 后端不是硬障碍;**Go/No-Go 仍需一次 dummy 实测**。
+
+**8. 待核(留给 P1)**:① 多模态要用 `MiMoV2OmniForCausalLM`(检查点 `architectures` 写的是纯文本的
+`MiMoV2ForCausalLM`,但权重含 vision/audio 塔)⇒ 大概率需 `--hf-overrides`;
+② MTP 层按 SWA 处理(`mimo_v2_mtp.py:81,88,98` 明确 "MTP uses the SWA attention configuration"),
+与 SGLang [PR #15207](https://github.com/sgl-project/sglang/pull/15207) 的
+"MiMoV2MTP uses SWA, so set full KV cache to 0" 一致 —— **最终判据是启动时 KV 池大小**。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
