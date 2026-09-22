@@ -1246,7 +1246,14 @@ class _XiaotuExpertsMixin:
                     continue
                 if mxfp4:
                     # e8m0 scales are [2I, H//32] u8 -> 2**(s-127), one per 32 columns.
-                    s13_full = torch.pow(2.0, s13[e].float() - 127.0)
+                    # MXFP4 subclasses leave _scale_dtype None, so self._scales stays
+                    # (None, None) and the scales never reach this method; resolve them
+                    # from the layer exactly like the engine build does.
+                    _s13 = s13 if s13 is not None else \
+                        self._find_scale(layer, (self._scale_attrs[0],))
+                    if _s13 is None:
+                        raise RuntimeError("MXFP4 verify: w13 block scales not found")
+                    s13_full = torch.pow(2.0, _s13.float().cpu()[e] - 127.0)
                     deq13 = _unpack_mxfp4(w13[e]) * \
                         s13_full.repeat_interleave(32, dim=1)[: 2 * I, :H]
                 else:
@@ -1270,7 +1277,11 @@ class _XiaotuExpertsMixin:
                     act = (gate / (1 + torch.exp(-gate))) * up
                 act = act.to(torch.bfloat16).float()
                 if mxfp4:
-                    s2_full = torch.pow(2.0, s2[e].float() - 127.0)
+                    _s2 = s2 if s2 is not None else \
+                        self._find_scale(layer, (self._scale_attrs[1],))
+                    if _s2 is None:
+                        raise RuntimeError("MXFP4 verify: w2 block scales not found")
+                    s2_full = torch.pow(2.0, _s2.float().cpu()[e] - 127.0)
                     w2_e = _unpack_mxfp4(w2w[e]) * \
                         s2_full.repeat_interleave(32, dim=1)[: H, :I]
                     down = w2_e @ act
