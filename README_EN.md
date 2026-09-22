@@ -74,8 +74,11 @@ Every performance number below was taken on this machine:
 
 ## Performance
 
-* Metric: **per-stream (per-request)** -- `prefill (tok/s) = prompt_tokens / TTFT`, `decode (tok/s) = 1000 / median(TPOT)`,
-  both converted from the same `vllm bench serve` run; `decode` uses the **median** TPOT (`mean` is inflated by a few outlier decode steps).
+* Metric: **aggregate throughput** -- `prefill (tok/s) = concurrency x prompt_tokens / TTFT`, `decode (tok/s) = concurrency x 1000 / median(TPOT)`
+  (at C=1 this is just the per-stream rate; equivalently "total tokens of that phase / that phase's wall clock"), both from the same `vllm bench serve` run; `decode` uses the **median** TPOT.
+  > **The long/C=2 decode aggregate is still below C=1** -- that is a **measured concurrency regression**
+  > (V4.1 per-stream median TPOT 51.8 -> 129.4 ms), not a metric artefact; its prefill does rise as expected
+  > (903.9 -> 1204.2).
 * Dataset: **random tokens**, with `--random-input-len` pinned to short 128 / long 16384 and output 128; prefix caching on; 8 requests per cell with **a distinct seed per cell**.
 * "actual tokens" = `total_input_tokens / completed` (includes a small chat-template overhead).
   Configuration details, criteria and the `MBT` trade-off live in `docs/TUNING_GUIDE.md` section 8 and `docs/EXPERIMENTS.md`.
@@ -83,13 +86,13 @@ Every performance number below was taken on this machine:
 | Model (optimal config) | prompt | actual tokens | conc. | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
 | **GLM-5.3-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 12288 · MTP off | short | 140 | 1 | **115.2** | **22.0** |
-| | short | 140 | 2 | **70.4** | 13.9 |
+| | short | 140 | 2 | **140.8** | **27.8** |
 | | long | 16,396 | 1 | **266.3** | **21.4** |
-| | long | 16,396 | 2 | pending † | pending † |
+| | long | 16,396 | 2 | pending | pending |
 | **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 8192 · **CED on** (long rows) · spec decode off | short | 128 | 1 | **254.3** | **19.8** |
-| | short | 128 | 2 | **175.2** | 14.0 |
+| | short | 128 | 2 | **350.4** | **28.0** |
 | | long | 16,384 | 1 | **903.9** | **19.3** |
-| | long | 16,384 | 2 | **602.1** | **7.7** |
+| | long | 16,384 | 2 | **1204.2** | **15.4** |
 
 Neither model uses speculative decoding (random tokens are its worst case, and the draft layer competes
 with long context for VRAM).

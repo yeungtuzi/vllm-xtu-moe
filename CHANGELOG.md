@@ -50,6 +50,11 @@
   * ⚠️ 同时修掉一个真实的坑:GLM 的 KV 自动封顶原为 `MAXLEN × SEQS × 1.10`,512K + `SEQS=2` 会算出
     **23.56 GiB** 并被引擎**一次性**申请 ⇒ CUDA OOM(只差 0.6 GiB)。**池不需要装下 SEQS 条满长序列**,
     改为 `MAXLEN × B/token`。详见 B90。
+- README(中/英)性能表的**口径由「单流」改为「聚合吞吐」**(用户要求):`prefill = 并发数 × prompt_tokens / TTFT`、
+  `decode = 并发数 × 1000 / median(TPOT)`(C=1 时两者相同)。因此 **C=2 各行整体上移**(如 V4.1 长:
+  602.1/7.7 → **1204.2/15.4**;GLM 短:70.4/13.9 → **140.8/27.8**)。**无需重测** —— 聚合数就是 C×单流。
+  ⚠️ 唯二例外是 **V4.1 长/C=2 的 decode(15.4 < C=1 的 19.3)**:这是**实测的并发退化**
+  (单流 median TPOT 51.8 → 129.4 ms),不是口径问题,已在口径行里注明。
 - README(中/英)性能节**精简**:表格后只保留「两个模型都未开投机解码」一句;
   口径/判据/`MBT` 取舍/CED A/B 等细节移入 `docs/EXPERIMENTS.md` 与 `docs/TUNING_GUIDE.md`。
 - README(中/英)口径补充:**decode 取 median TPOT**。CED 开臂的 `mean` TPOT 被少数(p99≈185 ms)

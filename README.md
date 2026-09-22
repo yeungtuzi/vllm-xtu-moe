@@ -59,8 +59,11 @@
 
 ## 性能
 
-* 口径：**单流（每请求）**——`prefill (tok/s) = prompt_tokens / TTFT`、`decode (tok/s) = 1000 / median(TPOT)`，
-  均由同一次 `vllm bench serve` 换算；`decode` 取 **median** TPOT（`mean` 会被极少数离群解码步拉高）。
+* 口径：**聚合吞吐**——`prefill (tok/s) = 并发数 × prompt_tokens / TTFT`、`decode (tok/s) = 并发数 × 1000 / median(TPOT)`
+  （C=1 时即单流速率；等价于「该阶段的总 token 数 ÷ 该阶段墙钟」）。均由同一次 `vllm bench serve` 换算；
+  `decode` 取 **median** TPOT（`mean` 会被极少数离群解码步拉高）。
+  > ⚠️ **长/C=2 的 decode 聚合值仍低于 C=1** —— 那是**实测的并发退化**（V4.1 单流 median TPOT 51.8 → 129.4 ms），
+  > 不是口径问题；它的 prefill 则如预期更高（903.9 → 1204.2）。
 * 数据集：**random 随机 token**，`--random-input-len` 固定为短 128 / 长 16384，输出 128；前缀缓存开；每格 8 个请求、**每格不同 seed**。
 * 表中「实际 token」= `total_input_tokens / completed`（含 chat template 的少量开销）。
   配置细节、判据与 `MBT` 取舍见 `docs/TUNING_GUIDE.md` §8 与 `docs/EXPERIMENTS.md`。
@@ -68,13 +71,13 @@
 | 模型(最优配置) | prompt | 实际 token | 并发 | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
 | **GLM-5.3-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 12288 · MTP 关 | 短 | 140 | 1 | **115.2** | **22.0** |
-| | 短 | 140 | 2 | **70.4** | 13.9 |
+| | 短 | 140 | 2 | **140.8** | **27.8** |
 | | 长 | 16,396 | 1 | **266.3** | **21.4** |
-| | 长 | 16,396 | 2 | 待测 † | 待测 † |
+| | 长 | 16,396 | 2 | 待测 | 待测 |
 | **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 8192 · **CED 开**（长两行） · 投机解码关 | 短 | 128 | 1 | **254.3** | **19.8** |
-| | 短 | 128 | 2 | **175.2** | 14.0 |
+| | 短 | 128 | 2 | **350.4** | **28.0** |
 | | 长 | 16,384 | 1 | **903.9** | **19.3** |
-| | 长 | 16,384 | 2 | **602.1** | **7.7** |
+| | 长 | 16,384 | 2 | **1204.2** | **15.4** |
 
 两个模型都未开投机解码（random 数据集对投机是最坏情况，且会挤占长上下文的显存）。
 
