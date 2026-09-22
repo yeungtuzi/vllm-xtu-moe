@@ -3047,6 +3047,47 @@ decode_agg  = C × 每流,其中 每流 = 1000 / median_tpot_ms
    **(b) 让 MiMo 的草稿实现 EAGLE3 契约**(需要知道 aux hidden states 的精确期望,**属于实现工作 —— 用户明确排除**);
 3. ⇒ **按用户口径:到此为止,不做实现**。若上游将来出现原生 MiMo dflash 支持,我们再回来(那时我们的活只是"起服务 + 验收");
 4. 与 MTP 那条结论**互不干扰**:MTP 走 `MiMoV2MTPModel`(k=1 已定案),dflash 走 EAGLE3 契约失败 —— 两条路独立。
+
+### B107 ⭐ 上游机会评估:「原生 MiMo DFlash」这条路**已被占**,但有一条**未被覆盖**的窄缝
+
+**问题(用户问)**:B106 里"上游原生加 MiMo DFlash speculator"是不是我们的 PR 机会?机会多大?
+
+**① 查重(AGENTS.md 强制,只读 gh)**:`vllm-project/vllm`
+* **#45343 `[Model][Spec Decode] MiMo-V2.5-Pro-FP4 DFlash speculative decoding + AL fix`(@pst2154)就是这条路**:
+  **OPEN 但 `isDraft=true`**,创建 2026-06-12、**最后更新 2026-08-19(停 5 周)**,`mergeable=UNKNOWN`,
+  `+1565/−123`、15 文件,新增 `vllm/v1/spec_decode/dflash.py` 与
+  `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py`(新增行约 **1580**)。
+  ⇒ **按 AGENTS.md「已有 open PR 覆盖同一件事就不要另开」,这一步不能重复**(违反可能被封禁)。
+* 它**没有**覆盖的地方(真正的空隙):**文件列表里没有 `mimo_v2_omni.py`**,正文也没提 omni / eagle3 / v2.6。
+* 顺带查到的有用情报:**#57784 `support bf16 MoE router and mxfp4 MoE for MiMo V2` 已合并**
+  ⇒ 上游已在原生支持 MiMo 的 MXFP4 MoE(与我们 B97 的引擎结论同向)。
+
+**② 缺口精确定位(我们发现的)**:
+* 失败判据就是一行:`supports_eagle3(model)` = **`isinstance(model, SupportsEagle3)`**(`interfaces.py:1738`);
+* MiMo-2.6 的检查点**总解析成 `MiMoV2OmniForCausalLM`**(即使加 `--language-model-only`,B102 实测),
+  而该类声明为 `nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant` —— **没有 `SupportsEagle3`**;
+* 对照:**`mimo_v2.py:920` 的 `MiMoV2FlashForCausalLM` 实现了 `SupportsEagle3`**,并且**真的**有 aux hidden state 机制
+  (`_maybe_add_hidden_state(...)`,`mimo_v2.py:690-709` 返回 `(hidden_states, aux_hidden_states)`)。
+
+**③ 修法很小(有现成范本)**:omni 类**内部就是把 Flash 类当 `self.language_model` 包起来**
+(`mimo_v2_omni.py:60` 导入、`:1267` 实例化,`:1538` forward 里调 `self.language_model.model(...)`)
+⇒ 基本就是**给 omni 类加上 `SupportsEagle3` 并让 forward 在需要时透出 `aux_hidden_states`**,十几行。
+
+**④ 诚实的机会评估:中偏低,而且不该以"冷启动 PR"提。**
+* 有利:缺口真实且**专属 MiMo-2.6**;修法小且有范本;上游明显关心这个模型族;我们**有 166GB 真检查点 + A100**,
+  能做别人做不了的验证。
+* 不利(关键):(a) 它**不是特性而是前置** —— 单独提等于"声明一个接口、背后没有能跑的 dflash",
+  正撞 AGENTS.md 的 **no low-value busywork PRs**;(b) 它的价值**取决于 #45343 是否落地**,
+  而那个 PR **停了 5 周还是 draft**,若它死掉我们的补丁就成了孤儿;
+  (c) #45343 作者将来可能顺手自己补 omni 侧;(d) omni 是多模态包装,**aux hidden state × mm_prefix 未测**。
+
+**⑤ 建议动作(与 SGLang #38142 同一套打法)**:
+1. **不开冷启动 PR**;
+2. **先在独立工作树里做便宜实验**(不动正在加载的验证服务):给 omni 类打补丁 → 重跑 dflash go/no-go
+   → 看是否越过 `supports_eagle3`、**下一个失败点是什么**;这把"中偏低"变成实测答案,并产出可交给他人的证据;
+3. 若实验证明"omni 补好后 aux hidden states 确实流通、草稿能建起来",**再带证据去 #45343 或开 issue**,
+   把补丁作为**叠在其上的贡献**提 —— 这是命中率最高的形式;
+4. 只有 #45343 被关闭/继续停滞,才考虑自己做完整路线(那时照 `qwen3_dflash.py` 的范本,约 900 行级别)。
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
