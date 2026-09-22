@@ -36,6 +36,40 @@ Using CPU Fp8 MoE backend out of potential backends: ['CPU', 'AITER', ...]   # �
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py
 ```
 
+### 0.1b GPU 预填充的取舍:**prefill 更快,但每一步都要付「层数 × 上传时间」**(实测)
+
+**机制(实测,不是推断)**:GPU 预填充把**每层权重**在每次 prefill 时 H2D 上传一遍。
+插件自带分解(`XIAOTU_GPF_STAGE=1`)在 GLM-5.3(FP8,~3.4 GiB/层)上实测:
+
+```
+[gpf-stage] n=40  dma=533.5ms  asm=0.0ms  tr=6.4ms  total=539.9ms/层
+```
+
+* **`dma` 占 98.8%** ⇒ 成本就是**上传本身**(≈6.4 GB/s,PCIe 带宽瓶颈);`tr`(转置)**已缓存**;`asm` 为 0;
+* **`total ≈ dma + tr` ⇒ 当前 H2D 没有与计算重叠**;
+* ⇒ **每一个"带预填充的 step"要付 `MoE 层数 × ~540 ms`**(GLM ≈ **24 s**)。
+
+**收益**:长 prefill 显著更快 —— MiMo-V2.6 实测 **313 → 811 tok/s**(TTFT 52.3 → 20.2 s)。
+
+**代价(尾延迟)**:若这个"带预填的 step"里**同时有解码 token**,该步的 ITL 会变成 10–14 s
+(实测 GLM 长 C=2 `p99 ITL` **13.6–14.0 s**;而典型解码步 `median ITL` 只有 66 ms)。
+**⇒ 并发长上下文服务的尾延迟会被它毁掉**,且此现象**与 MBT 无关**(单步成本是每-chunk 常数)。
+
+**判断与规避**:
+
+| 场景 | 建议 |
+|---|---|
+| 吞吐优先 / 低并发长 prefill | **开** GPU 预填(收益大) |
+| **尾延迟敏感**的并发长上下文 | **`GPU_PREFILL_MIN=0` 关掉**(已验证可消除 10–14 s 尖峰;代价:prefill 变慢,GLM 8K 预热 TTFT 37→57 s) |
+| 想两者兼得 | 增大 **MBT**(总 DMA ∝ chunk 数;**但单步尖峰不变**)、或**常驻层** `RESIDENT_LAYERS`(收益 = N/层数;实测 2 层 ⇒ prefill **+4.4%**,但 decode −2~6%) |
+
+**诊断命令(定位这类问题只用这两条)**:
+```bash
+XIAOTU_LAYER_TIMING=1 ...      # 每层 pre/eng/post;pre 大 ⇒ 编排/staging 问题,eng 大 ⇒ 引擎内部
+XIAOTU_GPF_STAGE=1  ...        # staging 三段 dma/asm/tr;dma 大 ⇒ 上传带宽瓶颈
+```
+**⇒ 已知的根治方向(0.2.5 首选)**:让 H2D **与计算重叠(双缓冲)** —— 理论上能把 540 ms/层的大部分藏掉。
+
 > 📌 **`--max-num-seqs` 默认必须是 4(用户 2026-09-22 定,含以后新接入的模型)**
 > **不要用 1**:`max_num_seqs=1` 时引擎同时只能持有一个序列,第二个并发请求会 `Waiting` 到第一个结束
 > ⇒ C≥2 的 TTFT 与聚合吞吐**全部变成串行口径**(实测:短 C=2 的聚合 prefill 从 236 掉到 54,
