@@ -26,6 +26,8 @@
 #   VERIFY  1 = 打开逐层数值自校验(经 env 文件传给子进程)默认 0
 #   PORT    API 端口                               默认 8130
 #   PROMPTS 多模态每 prompt 允许的图片数           默认 1
+#   RESIDENT_LAYERS 常驻 GPU 的专家层(逗号+区间,如 "20-21")默认空=不常驻
+#   GPU_PREFILL_MIN GPU 预填充门槛(低于它走 CPU)  默认由 env 桥决定
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CKPT="${CKPT:-/home/user/.cache/modelscope/models/MiMo-V2.6-Flash-RL}"
@@ -51,7 +53,9 @@ ENVF="${ENVF:-/tmp/mimo26.env}"
 mkdir -p "$(dirname "$ENVF")"
 { [ "$VERIFY" = "1" ] && echo "XIAOTU_VERIFY_LAYER=1"
   echo "XIAOTU_MOE_THREADS=${XIAOTU_MOE_THREADS:-60}"
-  echo "XIAOTU_MOE_SPIN_IDLE_US=${XIAOTU_MOE_SPIN_IDLE_US:-300}"; } > "$ENVF"
+  echo "XIAOTU_MOE_SPIN_IDLE_US=${XIAOTU_MOE_SPIN_IDLE_US:-300}"
+  [ -n "${RESIDENT_LAYERS:-}" ] && echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=${RESIDENT_LAYERS}"
+  [ -n "${GPU_PREFILL_MIN:-}" ] && echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=${GPU_PREFILL_MIN}"; } > "$ENVF"
 
 ARGS=(--model "$CKPT" --served-model-name mimo26
       --host 127.0.0.1 --port "$PORT"
