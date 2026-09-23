@@ -4415,6 +4415,43 @@ GPU 的优势不大,是因为 **MBT=4096 时 staging 要按 chunk 反复付**(16
 **⇒ GPU2 的正解:单独跑"256K + GPU 预填"快档** —— 这正是生产脚本既有设计
 (`MODE=fast`:`GPUS=2 TP=1` 256K;`MODE=1m`:`GPUS=0,1 TP=2` 1M)✅ 两个需求都不放弃。
 
+
+### B153 ⭐ 上下文长度与 **YaRN factor** 的耦合:**应当同步降**,但有两个硬约束(beta 字段 + draft 一致性)
+
+**用户提出的信息**(转述社区/文档):vLLM 已不用 `--rope-scaling`,改用 `--hf-overrides` 配 YaRN;
+且**投机草稿可能丢主模型的 `--hf-overrides`**。**逐条核对结果**:
+
+| 核对项 | 结论 |
+|---|---|
+| 我们树里有没有 `--rope-scaling` CLI | ❌ **没有** ⇒ "旧参数已废弃"成立 |
+| `rope_parameters` 是否被消费 | ✅ 是(多个模型把 `config.rope_parameters` 传进 RoPE 层)⇒ `--hf-overrides` 是正确机制 |
+| **V4.1 的实际配置** | `rope_scaling={rope_type: yarn, factor: **16**, beta_fast: **32**, beta_slow: **1**, original_max_position_embeddings: **65536**}`;`max_position_embeddings=1048576` |
+| draft 是否继承 dict 覆盖 | ❌ **不继承** —— 代码原文:"**Dict overrides … are not applied to the draft**" |
+
+⇒ **4×64K=256K / 8×64K=512K / 16×64K=1M** —— factor 与目标窗口的匹配关系明确 ✓
+⇒ 上游同证:[#37435](https://github.com/vllm-project/vllm/issues/37435)、
+[#58080](https://github.com/vllm-project/vllm/issues/58080)(后者更狠:**draft 超 `max_model_len` 后 dummy-0 草案会静默杀死接受率**);
+修复 [PR #37443](https://github.com/vllm-project/vllm/pull/37443)/[PR #58094](https://github.com/vllm-project/vllm/pull/58094) **我们树里还没有**;
+但 `_maybe_override_draft_max_model_len` **在**(第 1541 行)⇒ #58080 的"长度门"那一半可能已有 ✓
+
+**⚠️ 两个必须先解决的硬约束**:
+1. **不要漏 `beta`**:模型自带 `beta_fast=32/beta_slow=1`,只给 `rope_type/factor/original_max_position_embeddings`
+   会**丢掉这两项** ⇒ YaRN 插值形状改变 ✗。正确写法要带上:
+   `{"rope_parameters":{"rope_type":"yarn","factor":4.0,"beta_fast":32,"beta_slow":1,"original_max_position_embeddings":65536}}`;
+2. **dspark 的 target/draft 一致性**:只改 factor ⇒ **target=4、draft=16** ⇒ 草案在错误的旋转下生成 ⇒ **接受率很可能崩** ✗
+   ⇒ 要用新 factor 又保投机,必须**同步改草稿的 config**(或改 factor 时关投机,或用含修复的版本)。
+
+**⇒ 推荐(按场景)**:
+| 场景 | 建议 |
+|---|---|
+| 256K/512K **+ 关投机** | ✅ **同步降 factor(256K→4、512K→8)并保留 beta** |
+| 256K/512K **+ 要投机** | ①不动 factor(接受过度拉伸的潜在精度损失,但两端一致)或 ②改 factor **且同步改 draft config** |
+| 1M | 保持 16 |
+
+**⚠️ 尚未证实的前提**:"更匹配 ⇒ 精度更好"目前是**原理推断**;若模型**后训练已按 factor=16 训过长上下文**,
+改小可能反而变差 ⇒ **必须实测**。**待办**:factor 16 vs 4 的 A/B(3 档深度针 + 短问答 + `Mean acceptance length`);
+第一次尝试因服务启动失败(日志被截断)已清理,需重做。(`serve_v41.sh` 已加 `HF_OVERRIDES` 旋钮 `90775bd`。)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
