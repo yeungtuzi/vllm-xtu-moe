@@ -5227,6 +5227,35 @@ dispatcher 又只在 `transfer_intermediate_tensors`(实验的 `TRANSFER_QUERY`)
 
 **⇒ 目标另一半(rebase)不受影响,应并行推进** ✓(R1 轨道:独立 worktree 重放 10 个 SM80 提交 ✓)
 
+
+### B178 ⭐⭐⭐ **两条重要纠正**:(1)rebase 早已完成并已进生产树 ✓ (2)但 V4.1/GLM 的启动脚本实际仍跑在**旧树**上 ✗
+
+**纠正 1:rebase 不是"待办",而是"已完成且已进生产"** ✓
+* **生产树 = `/home/user/lvllm/vllm-up-133b71e0b`** ✓(分支 `xtu/glm53-sm80-pr4` @ `c7d9f7b9c5` ✓)
+  基点 `133b71e0be`(**上游提交,带 PR 号 `#52500`** ✓)⇒ **只落后 `origin/main` 185 个提交** ✓
+* 而 `process_data/ref/repos/vllm-mainline` 是 **rebase 前的旧树** ✗(落后 **499** ✓)
+  —— 仓库自己的 `scripts/bench_random_12cells.sh:21` 就注明"**旧树,数据不能用来**" ✓;
+  `scripts/*` 里 `XTU_TREE` 默认值 = **生产树** ✓
+* 该生产树已带全部 SM80 提交(13 个 ✓:快照/mHC/V4.1 Triton prefill+decode/Engram/GLM kpool/topk 流/
+  MiMo MTP + 一条稀疏 MLA 2-D tile **性能提交** ✓ + 一条 Revert ✓)
+⇒ **⇒ 目标里的"rebase 到上游较新版本"事实上已达成的部分:较旧基点 → `133b71e0b`(新 314 个提交 ✓)**
+
+**纠正 2:但 `serve_v41.sh` / `serve_prod_8070.sh` / `serve_glm53_mainline.sh` / `tune_serve.sh`
+都没有设 `PYTHONPATH`** ✗ ⇒ 它们走 **editable 安装**,而 `pip show vllm` 的 editable 位置
+= **旧树** ✗ ⇒ **V4.1/GLM 的生产路径实际运行在旧树上** ✗(只有 `serve_mimo26.sh` 设了
+`PYTHONPATH=$VLLM_TREE` = 生产树 ✓)
+* **⇒ 这是一处真实的"配置漂移"** ✓:文档说"已进生产树" ✓,但实际启动路径没指向它 ✗
+* ⚠️ 同时 `docs/EXPERIMENTS.md:2437` 有**铁律**:"**不要改 `vllm-up-133b71e0b`(生产树)**" ✓
+  ⇒ 因此**不直接改它** ✓;任何移植都走**新 worktree / 新分支** ✓,由用户决定何时并入 ✓
+
+**本轮因此产生的行动项**:
+1. **修正启动脚本**:给 `serve_v41.sh`/`serve_glm53_mainline.sh`/`tune_serve.sh` 加
+   `PYTHONPATH="$XTU_TREE"`(默认 = 生产树 ✓,可用 env 覆盖 ✓)—— 与 `serve_mimo26.sh` 一致 ✓
+   **但需用户确认**(这会改变生产实际运行的代码树 ✓)
+2. **把 LMCache 的 V4.1 钩子移植到生产树**(在新分支/worktree 上 ✓,不碰生产树本体 ✓)
+   —— 旧树上我的 4 个提交(`5c45e42e1a`/`3a4b9cd637`/`62fe9b400c`/`70f8d42499`)应**压成 1 个干净提交** ✓
+3. rebase 目标若还要更进一步(追平 `origin/main`,再 185 个提交 ✓)⇒ 作为**独立任务**评估 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
