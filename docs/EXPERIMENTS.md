@@ -5189,6 +5189,44 @@ Checking memory allocator consistency
 ⇒ 重启后看:①它**是否被调用** ②`block_ids` 有几组 ③是否 early-return ⇒ 直接定位"服务端驱动"为何不拉取 ✓
    (这条路**理论上无性能损失** ✓:服务端经 CUDA IPC 直读 GPU 块 ✓,见 B173 ✓)
 
+
+### B177 ⭐⭐⭐ **LMCache 侧的结论定案**:两条 store 路都走不通 ⇒ **必须动 LMCache/vLLM 上游**
+
+**决定性证据(服务端驱动路径,`LMCACHE_XFER=false`)** ✓:
+```
+[lmc-finish] called req=cmpl-… groups=6 dispatcher=NONE      ← store 入口被调用 ✓,但 dispatcher 未建 ✗
+[lmc-save] 条数 = 2                                          ← 逐层钩子仅在 XFER 模式才有 dispatcher ✓
+total_object_count = 0 / 服务端 "Total allocated size: 0.000000 MB"   ← 服务端从未分配 ✗
+```
+**关键代码**(外部 connector)✓:
+```python
+def request_finished_all_groups(self, request, block_ids):
+    """HMA request-finished entry point; cleanup is request-id based."""
+    return self.request_finished(request, block_ids[0] if block_ids else [])   # ← 只取第 0 组 ✗
+```
+⇒ **HMA 入口只把第 0 组的 block_ids 传下去** ✗ —— 对 V4.1 这类**多组 KV**(实测 6 个 engine 组 / 9 个 kernel 组 ✓)
+**其余组的块全被丢弃** ✗;而 `request_finished` 内部只做**清理与统计**(`free_blocks`/`end_session`/`cached_token_stats` ✓),
+**不含存储提交** ✓ —— 存储提交依赖 worker 侧 `save_kv_layer` ⇒ **而它需要 dispatcher** ✗,
+dispatcher 又只在 `transfer_intermediate_tensors`(实验的 `TRANSFER_QUERY`)下创建 ✗,
+且该路径下**服务端 L1 仍零分配** ✗
+
+**⇒ 定案(回答用户"改谁"的问题)**:
+> **只改我们自己的代码不够** ✗。我们补的 V4.1 注意力钩子是**必要的**(没有它连 `save_kv_layer` 都不会被调 ✓),
+> 但**不充分**:`lmcache 0.5.5` 的外部 MP connector 在 **HMA 多组 + dev 版 vLLM** 下**从未把 KV 送进缓存** ✗
+> ⇒ **必须改 LMCache(或换匹配的 vLLM 版本)** ✓ —— 这正是文档警告的"**dev 构建不受支持**" ✓
+> (而 V4.1 **没有**任何 tagged release ✓,所以官方配方对我们**不可直接套用** ✓)
+
+**⇒ 上游化的具体诉求(具备通用性 ✓,正是用户要的那类改动 ✓)**:
+1. **`request_finished_all_groups` 必须按 HMA 语义处理全部组的 `block_ids`**(而非 `block_ids[0]` ✗)
+   —— 这是**所有多组/HMA 模型**共有的问题 ✓,不是 V4.1 特判 ✓
+2. **服务端驱动的 store 不应依赖 `TRANSFER_QUERY` 实验 dispatcher**(当前非 XFER 时 `dispatcher=NONE` ⇒ 不提交 ✗)
+3. **内置 connector 需支持异构多组 KV**(`Failed to promote … one unified type` ✗,见 B170)
+   ⇒ 或明确文档说明"HMA 模型请用外部 connector" ✓
+**性能**:①的修法在**请求结束时**由服务端异步搬运 ✓(**经 CUDA IPC 直读** ✓,不进解码热路径 ✓)
+⇒ **符合用户"不损失性能 + 通用"的标准** ✓✓
+
+**⇒ 目标另一半(rebase)不受影响,应并行推进** ✓(R1 轨道:独立 worktree 重放 10 个 SM80 提交 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
