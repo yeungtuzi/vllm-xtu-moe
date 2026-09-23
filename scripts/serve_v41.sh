@@ -108,7 +108,9 @@ HF_OVERRIDES="${HF_OVERRIDES:-}"
 # 且拿不到 reasoning_content ⇒ DSH 的"思考强度"选项会消失。置空可关。
 # KV 显存类型:`fp8_ds_mla` 可让同容量显存减半(V4-Flash 生产口径)⇒ 给 GPU 预填腾出余量;
 # 缺省 auto = 不传该参数(保持模型默认)。⚠️ 1M + GPU 预填必须留够余量,否则 prefill 的 MLA logits 缓冲会 OOM。
-KV_DTYPE="${KV_DTYPE:-auto}"
+# 【LMCache】LMCACHE=1 时启用外部 KV 缓存(需先跑 scripts/serve_lmcache.sh)。
+# L1=CPU 内存、L2=SSD ⇒ **服务重启后 prefix cache 仍在**(见 EXPERIMENTS B164)。
+LMCACHE="${LMCACHE:-0}"
 TOOL_PARSER="${TOOL_PARSER:-deepseek_v41}"
 REASONING_PARSER="${REASONING_PARSER:-deepseek_v3}"
 # 【DSH 思考强度】解析器在**服务启动时**初始化,必须显式告诉它"思考是开的",否则不会切分 reasoning_content。
@@ -327,6 +329,7 @@ nohup env \
     $( [ -n "$REASONING_PARSER" ] && printf -- '--reasoning-parser %s' "$REASONING_PARSER" ) \
     $( [ -n "$DEFAULT_CHAT_KWARGS" ] && printf -- '--default-chat-template-kwargs %s' "${DEFAULT_CHAT_KWARGS// /}" ) \
     $( [ "$KV_DTYPE" != "auto" ] && printf -- '--kv-cache-dtype %s' "$KV_DTYPE" ) \
+    $( [ "$LMCACHE" = "1" ] && printf -- '--enable-prefix-caching --kv-transfer-config %s' '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}' ) \
     $( [ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && echo --enable-prompt-tokens-details ) \
     $( [ "${EAGER:-1}" = "1" ] && echo --enforce-eager )  \
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \

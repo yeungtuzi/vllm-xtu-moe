@@ -4774,6 +4774,38 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate **382.00 MiB**
    `if not enable_prompt_tokens_details: return` ✓)
    —— **旁证**:`serve_glm53_mainline.sh` 一直带这个参数 ⇒ 这正是**当年 GLM 能显示缓存命中**的原因 ✓
 
+
+### B164 ⭐ LMCache 落地(**0.2.5 发布要点:支持 LMCache 持久化输入缓存**)
+
+**用户目标**:服务重启后,DSH 的巨大重复前缀仍能命中 prefix cache(不再重新 prefill)✓
+
+**三问取证结论**:
+1. **rebase 上游?→ 不需要(但可以且应该做)**:
+   * 树里**已有** `vllm/models/deepseek_v41/` ✓ 与 **MLA 感知的 LMCache MP connector** ✓(`mla_enabled`/`use_mla` ✓);
+   * 但我们的树(`xtu/glm53-sm80`,HEAD `af3e7c14d7`)**落后上游 499 个提交**,并带 **10 个本地 SM80 补丁** ✓
+     (= V4.1/GLM 能在 A100 上跑的全部原因 ✗);
+   * 分叉面:最大的 V4.1 补丁所在文件 `deepseek_v41/nvidia/flashmla.py`(**+178/+226**)**上游 0 次改动** ✓
+     ⇒ 可干净重放;其余 ~15 个小补丁文件上游改动 1–12 次 ⇒ 会有冲突但**不阻塞** ✓;
+   * ⇒ 策略:**独立 worktree 里 rebase**,并把 SM80 那套补丁**上游化**(尤其 flashmla 的可移植 Triton 实现 ✓)
+2. **改 lmcache?→ 原则上不需要**:V4.1 官方 **validated** ✓;多 KV 几何由 `--chunk-size 256 --separate-object-groups` 处理 ✓;
+   ⚠️ 两个**未验证点**:**SM80 的 KV 记录格式** ✗、**V4.1 的 MTP** ✗(文档明确 not validated)
+3. **可否上游化?→ 可以** ✓(改动落在 LMCache/vLLM 既有扩展点;我们**不需要 fork** ✓)
+
+**P1 已完成**:
+* `pip install lmcache` ⇒ **0.5.5** ✓(`mla_enabled` 接口在 ✓)
+  ⚠️ **副作用已修**:它不锁版本 ⇒ 把 vLLM **硬钉**的 `numba`/`nvtx` 升了 ✗ ⇒ 已钉回 `numba==0.65.0`/`nvtx==0.2.15` ✓
+  (`pip check` 剩余 6 条都是**安装前就存在**的缺失项,与本次无关 ✓)
+* **`scripts/serve_lmcache.sh`** ✓:L1=100 GB 内存 + **L2=`fs_native`** 磁盘(`/home/user/.cache/lmcache_l2`,100 GB ✓)
+  + V4.1 必需的 `--chunk-size 256 --separate-object-groups` ✓
+* **`serve_v41.sh` 新增 `LMCACHE=1` 旋钮** ✓(自动带 `--enable-prefix-caching`
+  + `--kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}'` ✓)
+
+**用户提问的那次 timeout 定性**:✅ **是 prefill 太慢,不是错误** ——
+服务健康 ✓、日志 **0 条** timeout/abort/disconnect/OOM ✓;prefill 500–2,470 tok/s ✓ 而 generation ≈0.1 tok/s
+⇒ 请求**只走完 prefill 就被客户端超时中断** ✓;768K 冷前缀需 **5–25 分钟** ✗ ⇒ 必然超时 —— **正是 LMCache 要解决的** ✓
+
+**0.2.5 发布要点(用户已定)**:⭐ **支持 LMCache 持久化输入缓存**(服务重启后前缀仍命中)✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
