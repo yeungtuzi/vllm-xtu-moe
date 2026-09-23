@@ -363,7 +363,7 @@ def emit_env(p: dict) -> str:
     #  ⇒ 因此这里**保持 4096**(不基于未经证实的读数改动),需要更激进可用
     #    `XIAOTU_GPU_PREFILL_SWITCH_TOKENS=384` 显式覆盖。**要定 V4.1 的甜点,需重做一次
     #    去尖峰、每长度先预热、更多重复的扫描**(已列入下一步)。
-_gpm = _env_gib("XIAOTU_GPU_PREFILL_SWITCH_TOKENS", 384)
+    _gpm = _env_gib("XIAOTU_GPU_PREFILL_SWITCH_TOKENS", 4096)
     lines.append(f"VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS={int(_gpm) if p['gpu_prefill'] else 0}")
     lines.append(f"XIAOTU_GPU_RESIDENT_LAYERS={p.get('resident_spec','')}")
     # 【§508 更正】draft 上不上 GPU **不需要新旋钮**:hybrid_model.py:669-686 里
