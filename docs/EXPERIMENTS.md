@@ -5020,6 +5020,39 @@ def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
 **现场状态**:8070 已恢复到**可用的外部 connector 配置**(调试态:`SPEC=0` + CPU 预填 ✓,不写 LMCache ✗)
 ⇒ 用户如需恢复生产口径(dspark + GPU 预填)随时可用固化默认 ✓
 
+
+### B171 ⭐ 两个决定性新事实 + **完整方案文档**(回答"改谁")
+
+**① LMCache 服务端有**配对开关** ✓:
+```
+lmcache server --supported-transfer-mode {lmcache_driven, engine_driven, auto}
+  lmcache_driven = 服务端驱动(STORE/RETRIEVE,支持 CUDA IPC 与 CPU SHM)   ← 我们当前是它 ✓
+  engine_driven  = 引擎驱动(PREPARE/COMMIT)
+  auto           = 两者皆可
+```
+⇒ 打开 `transfer_intermediate_tensors` 后报 **`Connector enables transfer_query but server does not`** ✗
+⇒ **说明 `transfer_query` 是"实验模块",必须 connector 与服务端同时开** ✓ ⇒ **典型的配置配对问题** ✗(未必是缺陷 ✓)
+
+**② 服务端驱动 store 的触发点确实到 connector** ✓:
+vLLM `scheduler.py` 对 `SupportsHMA` 的 connector 调 **`request_finished_all_groups(request, block_ids)`** ✓
+(非 HMA 才走旧的 `request_finished` ✓);外部 connector **已实现该方法** ✓(B168 ✓)
+
+**⇒ 因此"是否必须改上游"目前**不能断言** ✓:
+* **我们侧必需且已就位** ✓:V4.1 注意力的 KV-connector 钩子(§1 第 1/2 项,树内 3 个提交 ✓)
+* **LMCache 侧**:当前阻塞点(dispatcher 门控 / `transfer_query` 配对)可能**纯配置** ✓ ⇒ 走通则**无需改上游** ✓
+* **vLLM 内置 connector** 无法处理 V4.1 异构多组 KV ✗(B170 ✓)⇒ 但**可绕开**(用外部 connector ✓)
+
+**③ 完整方案已落地**:`dev-docs/LMCACHE_PLAN.md` ✓(内部文档 ✓)包含:
+* **§1 "改谁"矩阵**(7 项,逐项标注归属/是否必需/现状)✓
+* §2 已完成清单(含证据编号)✓;§3 阶段计划与**验收判据**(P2 判据 = `/status.total_object_count > 0` ✓,
+  P3 判据 = **重启后首次 TTFT < 5 s** ✓)✓
+* §4 下一步(含"判谁的对错"的办法:补 `request_finished_all_groups` 诊断 ✓、实验模块配对 ✓、
+  版本兼容页 ✓、**V4-Flash 基线对照** ✓)
+* §5 现场开关与**进程纪律** ✓;§6 上游化硬约束(人类主导 ✓、重复检查 ✓、测试与评测 ✓、AI 声明 ✓)与候选清单 ✓
+* §7 rebase 轨道现状(落后 499 ✓、10 个 SM80 补丁 ✓、`flashmla.py` 可干净重放 ✓)
+
+**现场**:8070 已恢复到**可用的外部 connector 配置**(`LMCACHE=1`、无 `LMCACHE_XFER` ✓,调试态 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

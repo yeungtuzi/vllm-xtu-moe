@@ -111,6 +111,11 @@ HF_OVERRIDES="${HF_OVERRIDES:-}"
 # 【LMCache】LMCACHE=1 时启用外部 KV 缓存(需先跑 scripts/serve_lmcache.sh)。
 # L1=CPU 内存、L2=SSD ⇒ **服务重启后 prefix cache 仍在**(见 EXPERIMENTS B164)。
 LMCACHE="${LMCACHE:-0}"
+if [ "$LMCACHE" = "1" ]; then
+  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555,\"lmcache.mp.transfer_intermediate_tensors\":${LMCACHE_XFER:-false}}}"
+else
+  KV_TRANSFER_JSON=""
+fi
 TOOL_PARSER="${TOOL_PARSER:-deepseek_v41}"
 REASONING_PARSER="${REASONING_PARSER:-deepseek_v3}"
 # 【DSH 思考强度】解析器在**服务启动时**初始化,必须显式告诉它"思考是开的",否则不会切分 reasoning_content。
@@ -329,7 +334,8 @@ nohup env \
     $( [ -n "$REASONING_PARSER" ] && printf -- '--reasoning-parser %s' "$REASONING_PARSER" ) \
     $( [ -n "$DEFAULT_CHAT_KWARGS" ] && printf -- '--default-chat-template-kwargs %s' "${DEFAULT_CHAT_KWARGS// /}" ) \
     $( [ "$KV_DTYPE" != "auto" ] && printf -- '--kv-cache-dtype %s' "$KV_DTYPE" ) \
-    $( [ "$LMCACHE" = "1" ] && printf -- '--enable-prefix-caching --kv-transfer-config %s' '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5555}}' ) \
+    $( [ "$LMCACHE" = "1" ] && echo --enable-prefix-caching ) \
+    $( [ -n "$KV_TRANSFER_JSON" ] && printf -- '--kv-transfer-config %s' "$KV_TRANSFER_JSON" ) \
     $( [ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && echo --enable-prompt-tokens-details ) \
     $( [ "${EAGER:-1}" = "1" ] && echo --enforce-eager )  \
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
