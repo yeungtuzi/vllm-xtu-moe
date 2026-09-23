@@ -310,7 +310,7 @@ export XIAOTU_ENV_FILE
 #   SPEC=1 ⇒ dspark k=5
 #   ⚠️ 这些注释必须在 nohup env 语句**之外** —— 续行链里出现 # 会打断链,后续参数会变成新命令(2026-09-23 踩过)
 nohup env \
-  PYTHONPATH="${XTU_TREE:-/home/user/lvllm/vllm-up-133b71e0b}" \
+  PYTHONPATH="${XTU_TREE:-/home/user/lvllm/vllm-consolidated}" \
   HF_HUB_OFFLINE=1 \
   VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   VLLM_HANDSHAKE_TIMEOUT_MINS=120 \

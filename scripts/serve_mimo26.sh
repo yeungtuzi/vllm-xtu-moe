@@ -45,7 +45,7 @@ MM="${MM:-0}"
 VERIFY="${VERIFY:-0}"
 PORT="${PORT:-8130}"
 PROMPTS="${PROMPTS:-1}"
-VLLM_TREE="${VLLM_TREE:-/home/user/lvllm/vllm-up-133b71e0b}"
+VLLM_TREE="${VLLM_TREE:-/home/user/lvllm/vllm-consolidated}"
 PY="${PY:-/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python}"
 ENVF="${ENVF:-/tmp/mimo26.env}"
 
