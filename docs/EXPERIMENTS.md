@@ -5351,6 +5351,64 @@ vLLM  :--kv-cache-dtype fp8_ds_mla --enable-prefix-caching \
 6. **vLLM 的 V4.1 注意力钩子另案处理** ✓(它只对"逐层连接器"有用 ✓;若上游化需清理:
    用 `maybe_transfer_kv_layer` 装饰器 ✓、传**层名**而非组键 ✓、去掉调试代码 ✓、覆盖各后端 ✓)
 
+
+### B182 ⭐⭐⭐ **LMCache 不存储的真正根因(埋点实测,已定位)**
+
+**在官方配方 + 干净环境 + 生产树(有 `.so`)+ 真路径埋点下的实测** ✓:
+```
+[lmc-store-meta] groups=6 allocated_blocks={0:128, 1:128, 2:128, 3:128, 4:32, 5:1}
+                 tokens_per_block=[32,32,32,32,128,8] allocated_tokens=8 computed=4096
+                 min_available=8 staged=8 chunks=0
+[lmc-store-wait] store_ops=0
+total_object_count = 0
+```
+⇒ **第 5 组(每块仅 8 token 的索引器/小块组)只分到 1 个块** ✗
+⇒ `GetStoreMetadata` 对**所有组**取 `min(已分配块 × 每组 tokens_per_block)` ⇒ 被拖到 **8 token** ✗
+⇒ `num_staging_tokens = 8` < 一个 chunk(256)⇒ **`num_chunks = 0` ⇒ 永不产生 STORE** ✗✓
+
+**⇒ 结论**:这是 **LMCache 对"异构多组 KV 模型"的真实设计缺口** ✓(不是我们的配置问题 ✓):
+只要**任一组**的已分配块数对应的 token 数**小于一个 chunk** ⇒ 整条存储链**静默不产出** ✗。
+它是**通用**的(所有 HMA/多组模型 ✓),且修复点在**请求结束时**(不进解码热路径 ⇒ **无性能损失** ✓)
+—— 符合用户的标准 ✓ ⇒ **是一个有价值的上游 issue/PR** ✓(但**必须先有本次干净复现** ✓,而不是先前 B177 的错误论断 ✗)
+
+**⇒ 正确的上游诉求**:`GetStoreMetadata` 的"storable prefix"计算需按**组能力**处理
+(例如以**能覆盖 chunk 的组集合**为准,而非对全部组取 min ✗),或在组覆盖不足时给出**显式告警** ✓
+
+**其余修正(见 B181)**:`request_finished` 不用 `block_ids` ✗;store 真路径是 `wait_for_save` ✓;
+V4.1 注意力钩子对 MP connector 非必需 ✓(仅对逐层连接器有用 ✓)
+
+---
+
+### B183 ⭐ **树合并:7 个 worktree → 1 棵(基于最新上游)**(用户 2026-09-23 要求)
+
+**用户指示**:"我们现在有多少个树了?我希望按照上游最新版本合并成一个树,不然以后更困难了。"
+
+**盘点(合并前 7 个)**:
+| 树 | 内容 | 处置 |
+|---|---|---|
+| `vllm-rebase-latest` | 最新上游 + 14 | ✅ 作为基底 |
+| `vllm-up-133b71e0b` | **生产树**(上游-185 + 13) | 待新树验证后弃 |
+| `vllm-mainline` | **editable 安装指向**(上游-499) | 重指向后弃 |
+| `vllm-ced` | ✗ **独有 3 提交**(SWA bounded replay/DSpark KV 界/数据并行) | ✅ **已并入** |
+| `vllm-mtp2` | ✗ **独有未提交**(MiMo MTP 深度 +174) | ✅ **已并入** |
+| `vllm-pr4` | 内容与新树相同 | 弃 |
+| `vllm-lmcache` | 空(仅基点) | 弃 |
+
+**合并结果** ✓:`/home/user/lvllm/vllm-consolidated`(分支 **`xtu/consolidated-latest`** ✓)
+= **最新 `origin/main`(0 落后 ✓)+ 18 个提交**:
+* 13 个 SM80 补丁 ✓(快照/mHC/V4.1 Triton prefill+decode/Engram/GLM kpool/topk 流/GLM SM8x 绑定/
+  MiMo MTP + 稀疏 MLA 2-D tile + 1 Revert ✓)
+* V4.1 的 **KV-connector 钩子**(上游缺失 ✓,上游化候选 ✓)
+* **MiMo MTP 深度解析**(`_resolve_num_mtp_layers` ✓ 含新测试 ✓)
+* **CED 三提交**(SWA bounded replay ✓ + DSpark drafter KV 界 ✓ + 数据并行 ✓;**12+ 文件 ✓**)
+* 冲突处理:CED 第 1 个在 `deepseek_v41/nvidia/model.py` 冲突 1 处 ✓ ⇒ **两边互补**
+  (`if layer is not None:` 分支为我们所有 ✓,CED 追加同一 `if` 的 `else:` 分支 ✓)⇒ **都保留** ✓
+* `.so` 复用:新增提交**仅改 Python** ✓ ⇒ 与 `vllm-rebase-latest` **C++/CUDA 源码相同** ✓
+  ⇒ 其编译产物可直接复用 ✓
+
+**待办**:①编译完成后把 `.so` 复制/就地编译 ✓ ②把 `XTU_TREE` 默认指向合并树 ✓
+③验证 V4.1/GLM/MiMo 功能不回归 ✓ ④再退休其余 worktree(保留分支作档案 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
