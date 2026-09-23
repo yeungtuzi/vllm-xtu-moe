@@ -4212,6 +4212,23 @@ bench `p99 ITL = 13,680.2 ms`(median ITL 66.2 ms),**而这次 `GPF_STAGE` 与 `L
 治本方案候选:用 vLLM 自身 spec(需 worker)或**逐模型实测标定**(已备 `/tmp/kv_calib.sh`:故意给极小 KV,
 让引擎报出真实需求,从而得到 GiB/Mtoken)。
 
+
+### B146 MBT 杠杆的 A/B(**第一版有缺陷,已修正**)+ **MBT=32768 会 OOM 的边界**
+
+**第一版 A/B 的缺陷(我自己造的)**:先跑预热、再跑两次"测量",但**两次测量用的是同一条 prompt**
+⇒ 第二次**命中前缀缓存**(实测 67.7 s → **5.9 s**,那个 5.9 s 是"读缓存 + 解码 8 token",**不是 prefill**)
+⇒ **只有 rep1 有效**。**修正**:① 先预热(**不同 prompt**);② 每次测量**注入不同 nonce**(`[a1b2c3d4] ...`)
+⇒ 彻底避免缓存命中。修正后 MBT=8192 三次读数 **67.8 / 67.7 / 67.6 s**(237 tok/s)⇒ **稳定可复现** ✓
+
+**第二臂 MBT=32768 直接 OOM**(`CUDA out of memory. Tried to allocate 256.00 MiB. GPU 0 has 175 MiB free`,
+`Engine core initialization failed`)⇒ **"加大 MBT"这条路有显存硬上限**:vLLM 按 `--gpu-memory-utilization`
+把卡填满,MBT 越大工作区越大,32768 在 GLM(FP8,TP=2,util 0.85,KV 1 GiB)下**放不下**。
+⇒ 结论:**MBT 只能加到显存允许为止**;要更大 MBT 必须同时压缩 KV 预算或降 util。
+
+**基线(可靠)**:GLM,16,008-token prompt,MBT=8192(**2 个 chunk**),预热后 **67.7 s = 237 tok/s**。
+按 B143 的干净 staging(42 层 × 185 ms ≈ 7.8 s/次全层上传)预测:若把 chunk 数从 2 降到 1,
+**总 H2D 减半 ⇒ 省约 7.8 s(约 12%)**,而不是数量级的提升 —— **这也说明"减少 pass 次数"改善的是尾延迟的发生率,不是把 prefill 提速一倍**。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
