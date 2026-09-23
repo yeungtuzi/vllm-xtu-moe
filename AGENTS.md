@@ -42,3 +42,12 @@
 - **跨树运行 vLLM 的硬约束**:`PYTHONPATH=<另一棵树>` **只能换 Python 代码,换不了已编译扩展** ✗
   ⇒ 目标树必须**树内有 `.so`**(即就地 `setup.py build_ext --inplace` 过 ✓);
   否则报 `vllm_flash_attn requires the CUDA flash attention extensions` ✗(见 EXPERIMENTS B179 ✓)。
+
+## ⛔ 工作树纪律(用户 2026-09-23 指示)
+
+**任何需要"再开一个临时 worktree"的情况,必须先警告用户,由用户取舍**:
+* 立即关闭生产服务腾出主树 ✓,或
+* 延后这项开发 ✓
+**不得自行另开工作树** ✗ —— 历史教训:分叉出 7 棵树(每棵树各有独立 `.so`、生产又靠 `PYTHONPATH`
+指向具体路径 ✗),收敛成本极高 ✓。**默认保持"一棵指定树"** ✓;确需预演时,先在 `/tmp` 下做、
+用完即删 ✓,并事先告知用户 ✓。
