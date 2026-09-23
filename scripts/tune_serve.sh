@@ -31,6 +31,14 @@ SEQS="${SEQS:-8}"
 MAX_NBT="${MAX_NBT:-8192}"
 GPU_UTIL="${GPU_UTIL:-0.90}"
 KV_DTYPE="${KV_DTYPE:-auto}"
+# 【LMCache】LMCACHE=1 时启用外部 KV 缓存(需先跑 scripts/serve_lmcache.sh)
+# LMCACHE_XFER=true 会打开逐层传输实验特性(需服务端同开 transfer_query,见 EXPERIMENTS B169-B171)
+LMCACHE="${LMCACHE:-0}"
+if [ "$LMCACHE" = "1" ]; then
+  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555,\"lmcache.mp.transfer_intermediate_tensors\":${LMCACHE_XFER:-false}}}"
+else
+  KV_TRANSFER_JSON=""
+fi
 EP="${EP:-0}"
 CPU_OFFLOAD_GB="${CPU_OFFLOAD_GB:-0}"
 EAGER="${EAGER:-1}"
@@ -119,7 +127,9 @@ TOOL_PARSER="${TOOL_PARSER:-deepseek_v4}"
 REASONING_PARSER="${REASONING_PARSER:-deepseek_v3}"
 CHAT_TEMPLATE_KWARGS="${CHAT_TEMPLATE_KWARGS-{\"thinking\":true}}"
 [ "$EAGER" = "1" ] && ARGS+=(--enforce-eager)
-[ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && ARGS+=(--enable-prompt-tokens-details)   # DSH 的"缓存命中%"需要 usage.prompt_tokens_details.cached_tokens
+[ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && ARGS+=(--enable-prompt-tokens-details)
+[ "$LMCACHE" = "1" ] && ARGS+=(--enable-prefix-caching)
+[ -n "$KV_TRANSFER_JSON" ] && ARGS+=(--kv-transfer-config "$KV_TRANSFER_JSON")   # DSH 的"缓存命中%"需要 usage.prompt_tokens_details.cached_tokens
 [ -n "$SPEC" ] && ARGS+=(--speculative-config "$SPEC")
 [ -n "$TOOL_PARSER" ] && ARGS+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
 [ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
