@@ -5510,6 +5510,39 @@ class KpoolTailSpec(SlidingWindowSpec):
 1610 个文件 ✓,基线提交 `1a997f6` ✓)—— 因为 GitHub 只有 ~6 KB/s ✗、PyPI 也超时 ✗,
 **"联网克隆"这条路不可行** ✓ ⇒ 用已装源码作 fork 起点(纯 Python ✓ 完整 ✓)
 
+
+### B188 LMCache 修法**已在 fork 实现并提交**;验收被 MiMo 加载占住 GPU 所阻
+
+**fork**:`/home/user/lvllm/lmcache-fork`(从已装 0.5.5 源码建仓 ✓)
+**提交**:`bd5d334` — `fix(mp): do not let one-block circular scratch groups bound the storable prefix`
+
+**改动(4 处,最小且向后兼容 ✓)**:
+1. `lmcache_mp_connector.py` 新增 `is_circular_scratch_spec(spec, vllm_config)` ✓
+   —— 判定用 vLLM 自己的 `spec.max_num_blocks_per_req(vllm_config, max_model_len) == 1` ✓
+   (**通用**:任何"1 块环形暂存"组 ✓;无该方法/上限更大的组**不受影响** ✓)
+2. 新增 `get_group_is_scratch(vllm_config, kv_cache_config) -> list[bool]` ✓
+3. 几何计算处一并算出 `self._group_is_scratch` ✓
+4. 两处 `GetStoreMetadata(...)` 调用点传入 `group_is_scratch=` ✓;
+   `GetStoreMetadata` 新增**可选**参数 ✓(缺省 `None` ⇒ 行为与以前一致 ✓),
+   并在 `min()` 里**跳过 scratch 组** ✓(若全是 scratch ⇒ 仍为 0 ✓,**与旧行为等价** ✓)
+
+**静态验证** ✓:两文件 `py_compile` 通过 ✓;
+**单元式验证** ✓:scratch spec→`True`、普通 spec(上限 4096)→`False`、无该方法→`False` ✓
+
+**已装入环境** ✓:把这两个文件覆盖进 `site-packages`(各留 `.prefix-bak` 备份 ✓);
+校验:2 处判定函数 + 3 处跳过逻辑 ✓
+
+**验收受阻(环境原因,非代码 ✗)**:为跑验收需起 V4.1,但其显存预检失败 ✗ ——
+```
+Free memory on device cuda:0 (32.4/39.49 GiB) is less than desired GPU memory utilization (0.85, 33.57 GiB)
+```
+⇒ 元凶是 **MiMo 的 worker**(各 **5.87 GB** ✓ —— MiMo 仍在加载 ✓,进度 **58% (38/65)** ✓,约 41 s/分片 ⇒ 还需 ~19 分钟 ✓)
+⇒ 另:LMCache 服务端自身占 **416 MiB**(CUDA 上下文 ✓,与 B186 的说明一致 ✓)
+⇒ **等 MiMo 加载完 ⇒ 先做第三个模型的冒烟 ✓ ⇒ 再停 MiMo 腾 GPU ⇒ 跑 LMCache 验收** ✓
+
+**注**:`GPU_UTIL` 对我们**只影响预检** ✓(我们显式给 `KV_CACHE_BYTES` ✓)⇒ 0.90→0.85 无效是**预期** ✓
+(真正需要的是释放 MiMo 的 11.7 GB ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
