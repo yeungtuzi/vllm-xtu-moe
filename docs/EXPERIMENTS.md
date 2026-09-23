@@ -5291,6 +5291,28 @@ dispatcher 又只在 `transfer_intermediate_tensors`(实验的 `TRANSFER_QUERY`)
 * 本轮把它推进到**最新 main** ✓(再新 185 个提交 ✓);**待编译完成后**在新树上跑 V4.1/GLM/MiMo 功能回归 ✓
 * 另:`serve_v41.sh`/`serve_glm53_mainline.sh`/`tune_serve.sh` 已加 `PYTHONPATH=$XTU_TREE`(默认生产树 ✓,B178 ✓)
 
+
+### B180 LMCache 的 V4.1 钩子**移植到最新 rebase 树**;编译仍在进行
+
+**移植结果** ✓:
+* 目标树 `/home/user/lvllm/vllm-rebase-latest`(= `origin/main` + 13 个 SM80 提交 ✓)
+* 新分支 **`xtu/rebase-latest-lmcache`** @ **`8be310c22d`** ✓;`py_compile` 通过 ✓
+* 该树现在的形态 = **最新上游 + 全部 SM80 能力 + LMCache 接线** ✓ ⇒ **上游就绪的完整状态** ✓
+* 移植细节(适配新版文件 ✓):`forward`(650 行 ✓,30 行)改名 `_forward_impl` ✓,新增包装 `forward` ✓;
+  按上游风格写(**88 列 + Google docstring** ✓);保持"无 connector 时零开销" ✓;
+  按 **组键**取 metadata 并同样以组键调用 connector ✓(V4.1 每层多组 ✓)
+* ⚠️ 注意:上游该文件**没有**任何 connector 钩子(0 处 ✓)⇒ 这个补丁**上游确实缺** ✓ ⇒ 有上游价值 ✓
+
+**编译(job `bash-11`)**:仍在 **CMake 配置/依赖阶段**(日志停在给 torch 打补丁 ✓,`.o` 仅 2 个 ✗)
+⇒ 会持续较久 ✓;GPU 空闲 ✓(服务均已停 ✓),完成后即做 **V4.1/GLM/MiMo 功能回归** ✓
+* 编译命令:**不带管道**、重定向到 `/tmp/build_rebased.log` ✓(退出码真实 ✓,遵守新纪律 ✓)
+* 日志已确认 **`CUDA target architectures: 8.0`** ✓(A100/SM80 ✓)
+
+**待办**:
+1. 编译完成 ⇒ 新树上起 V4.1(临时端口 ✓)+ 冒烟 + 投机/GPU 预填/解析器回归 ✓
+2. LMCache PR 价值评估(后台任务 ✓)⇒ 与我的初步判断交叉验证 ✓
+3. 若评估支持 ⇒ 准备 **LMCache issue/PR 材料**(按上游纪律:人类主导 ✓、重复性检查 ✓、测试与评测 ✓、AI 声明 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
