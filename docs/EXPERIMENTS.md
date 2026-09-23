@@ -5676,6 +5676,32 @@ L2 文件数 = 62                                                               
 * 三模型回归:V4.1 ✅ / GLM ✅ / **MiMo 待重做** ⏳
 * 6 棵旧树打包备份 + 删除 ⏳(用户指示 ✓)
 
+
+### B194 ✅ **树收敛完成:7 个 worktree → 1 个**(按用户指示:合并测试无误后备份并删除其余)
+
+**备份(在删除前完成 ✓)**:
+| 备份物 | 大小 | 说明 |
+|---|---|---|
+| `_backup/vllm-mainline-allbranches.bundle` | **260 MB** | `git bundle --all` ✓;**校验通过:"records a complete history"** ✓(含全部分支 + 各 worktree 的 HEAD ✓)|
+| `_backup/lmcache-fork-*.tgz` | 45 MB | LMCache fork(修法 ✓)|
+| `_backup/plugin-tree-*.tgz` | 1.66 GB | 插件仓 + `dev-docs`(台账/方案/交接 ✓)|
+
+**收敛动作** ✓:
+* **editable 安装**改指唯一树 ✓(`__editable__*vllm*finder.py` 的 MAPPING ✓)
+  ⇒ **无 `PYTHONPATH` 的 `import vllm` 也指向唯一树** ✓(实测 ✓),且 `vllm_flash_attn.layers` 可导入 ✓(GLM 需要 ✓)
+* **4 个启动脚本**的 `XTU_TREE` 默认 → 唯一树 ✓(已提交 ✓)
+* **删除 6 个冗余 worktree** ✓(`vllm-up-133b71e0b`/`ced`/`mtp2`/`pr4`/`lmcache`/`rebase-latest` ✓)
+  —— **分支全部保留在共享 `.git`** ✓(并已进 bundle ✓),删除不影响可恢复性 ✓
+
+**收敛后的形态** ✓:
+* **`/home/user/lvllm/vllm-consolidated`** = **唯一在用树** ✓
+  (分支 `xtu/consolidated-latest` ✓ = 最新 `origin/main` + 16 提交 ✓:13 SM80 + V4.1 注意力钩子 + CED ✓)
+* `/home/user/lvllm/process_data/ref/repos/vllm-mainline` = **git 仓库的宿主目录**(持有 `.git` ✓)
+  —— 其 checkout 停在旧分支 ✗,但**已无任何服务/安装依赖它** ✓(editable 已改指 ✓)
+* 磁盘:释放约 6 GB(可用 270 → **276 GB** ✓)
+
+**注**:今后新增补丁一律**加在唯一树上** ✓;需要预演时按 `AGENTS.md` 的工作树纪律**先问用户** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
