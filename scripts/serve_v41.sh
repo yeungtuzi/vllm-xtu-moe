@@ -86,20 +86,20 @@ ENV="${ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}"
 PY="$ENV/bin/python"
 CKPT="${CKPT:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master}"
 TAG="${TAG:-v41}"
-PORT="${PORT:-8077}"
-GPUS="${GPUS:-0}"
+PORT="${PORT:-8700}"           # 【本机+V4.1 默认】生产端口
+GPUS="${GPUS:-0,1}"            # 【本机+V4.1 默认】TP=2 需要两张卡
 # 【R-VRAM/§507】**TP 默认 2**(用户 2026-09-16 指示:TP=1 不满足就明确说、并以 TP=2 为默认)。
 # 按显存优先级算同一张 40 GB 卡:TP=2 每层常驻 3.36 GiB ⇒ 1M KV 之后还能放 3 层(20-22)+投机;
 # TP=1 每层 6.72 GiB ⇒ 只能放 1 层。TP=1 只在"单卡/没有第二张卡"时才用。
 TP="${TP:-2}"
-MAXLEN="${MAXLEN:-2048}"
+MAXLEN="${MAXLEN:-1048576}"    # 【本机+V4.1 默认】1M 上下文(实测:KV 6 GiB ⇒ 池 3,174,221 token)
 # 【2026-09-21 用户定的生产口径】**MBT=4096**(本脚本原默认 0 = 不传,由 vLLM 自选)。
 # 生产要保证 **1M 上下文**(MAXLEN=1048576):激活工作区 ∝ MBT,MBT=4096 才给 1M 的 KV 留得下。
 # 生产调用示例:`GPUS=0,1 TP=2 MAXLEN=1048576 MBT=4096 SEQS=64 LOAD=auto bash scripts/serve_v41.sh`
 # (本脚本默认 MAXLEN=2048 是**冒烟**口径,别拿默认值当生产。)
 MBT="${MBT:-4096}"
-LOAD="${LOAD:-dummy}"          # dummy = no disk read, exercises the kernels
-GPU_UTIL="${GPU_UTIL:-0.85}"
+LOAD="${LOAD:-auto}"           # 【本机+V4.1 默认】真实权重(dummy 只用于开发自测)
+GPU_UTIL="${GPU_UTIL:-0.90}"   # 【本机+V4.1 默认】生产值
 EXTRA_ENV="${EXTRA_ENV:-}"
 HF_OVERRIDES="${HF_OVERRIDES:-}"
 
@@ -287,7 +287,8 @@ nohup env \
   VLLM_HANDSHAKE_TIMEOUT_MINS=120 \
   VLLM_USE_FLASHINFER_SAMPLER=0 \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
-  VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-${POLICY_GP_MIN:-0}}" \
+  VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-0}"  \
+  # 【本机+V4.1 默认】1M 放不下 GPU 预填 ⇒ 显式关;256K 档请传 384
   XIAOTU_RELEASE_SOURCE="${XIAOTU_RELEASE_SOURCE:-1}" \
   XIAOTU_ENGRAM_LAST="${XIAOTU_ENGRAM_LAST:-1}" \
   XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-$THREADS_DEFAULT}" \
@@ -301,14 +302,16 @@ nohup env \
   numactl --interleave=all "$PY" -m vllm.entrypoints.openai.api_server \
     --model "$CKPT" --served-model-name dsv41 \
     --load-format "$LOAD" \
-    --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-4}" \
+    --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-2}" \
     $( [ "${MBT}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
     --gpu-memory-utilization "$GPU_UTIL" \
-    $( [ -n "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ] && printf -- '--kv-cache-memory %s' "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ) \
+    $( [ -n "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-6442450944}}" ] && printf -- '--kv-cache-memory %s' "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ) \
     $( [ -n "$HF_OVERRIDES" ] && printf -- '--hf-overrides %s' "$HF_OVERRIDES" ) \
-    $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager ) \
+    $( [ "${EAGER:-1}" = "1" ] && echo --enforce-eager )  \
+    # 【本机+V4.1 默认】EAGER=1;若确认不需要 GPU 预填,可试 EAGER=0(图)对比
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
-    $( [ "${SPEC:-0}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" ) \
+    $( [ "${SPEC:-1}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" )  \
+    # 【本机+V4.1 默认】dspark k=5
     $( [ -n "$CC_JSON" ] && printf -- '--compilation-config %s' "$CC_JSON" ) \
     $( [ "${PREFIX_CACHE:-1}" = "1" ] || echo --no-enable-prefix-caching ) --trust-remote-code \
     $( [ "${MM:-0}" = "1" ] && printf -- '--limit-mm-per-prompt {"image":%s,"video":0}' "${PROMPTS:-1}" || printf -- '--limit-mm-per-prompt {"image":0,"video":0}' ) \

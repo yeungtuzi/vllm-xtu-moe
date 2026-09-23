@@ -36,6 +36,32 @@ Using CPU Fp8 MoE backend out of potential backends: ['CPU', 'AITER', ...]   # �
 VLLM_EXPERTS_LOAD_DEVICE=cpu python scripts/probe_oracle.py
 ```
 
+### 0.1b-2 **本机 + DeepSeek-V4.1-Flash 的默认(推荐)配置**
+
+> **固化于 `scripts/serve_v41.sh` 的默认值** —— **裸跑脚本就等于这套配置**(2026-09-23 定)。
+
+| 项 | 默认值 | 依据 |
+|---|---|---|
+| PORT | **8700** | 生产端口 |
+| GPUS / TP | **0,1** / 2 | TP=2 |
+| **MAXLEN** | **1048576**(1M) | 用户要求 1M |
+| MAXSEQS | **2** | 用户口径 |
+| MBT | **4096** | 生产口径(激活 ∝ MBT,1M 下只能取 4096) |
+| KV (`--kv-cache-memory`) | **6442450944**(6 GiB) | 实测池 **3,174,221 token** ✓ |
+| **GPU 预填** | **0(显式关)** | 1M 下预检需要 14.80 GiB 空闲、实际 10.06 ⇒ **slack −4.74** ⇒ 放不下(EXPERIMENTS **B154**) |
+| 投机解码 | **dspark k=5** | 实测 `Mean acceptance length` **3.50/3.67** ✓ |
+| EAGER | **1** | 与生产一致;⚠️ **CPU 预填时 EAGER=0(图)可能更快,尚未测** |
+| MoE 常驻层 | **不设(关)** | 每层 **3.36 GiB/rank**,而稳态空闲仅 **4.32 GiB** ⇒ 20% 余量下最多 1 层,**无价值**(用户已决定不放) |
+| LOAD | **auto** | 真实权重 |
+
+**换成"要 GPU 预填"的档(≤256K)时**:`MAXLEN=262144 KV_CACHE_BYTES=2147483648 VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384` ✓
+(256K 实测预检 slack **+3.83** ✓,判据成立:L=512 时 +7.27 s 固定开销、L=8192/16384 时 GPU 反超 −2.4/−4.0 s ✓)
+
+**三个易错点**:
+1. **`GPU prefill ACTIVE` 不能单独当"已启用"**:它在**显存预检之前**打印,且每 (层,rank) 只打一次 ⇒ **必须看它尾巴的 slack 正负**,负值表示随后 `DISABLED ... staying on CPU`;
+2. **算驻留必须用稳态空闲**(本配置 **4.32 GiB**),预检时刻报的 10.66 GiB 是**瞬时值**;
+3. **`--gpu-memory-utilization` 在显式传 `--kv-cache-memory` 时不起作用**(vLLM 跳过显存剖析)⇒ 想腾显存只能真减 KV/staging。
+
 ### 0.1c 多模态:开法与**启动前**必须装好的依赖(实测)
 
 **开法**:`MM=1` ⇒ 写 `--limit-mm-per-prompt`;各模态的上限用 **`MM_LIMITS`** 覆盖(默认只开图片):
