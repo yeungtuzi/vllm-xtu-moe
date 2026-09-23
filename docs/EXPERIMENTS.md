@@ -5626,6 +5626,30 @@ LMCache WARNING: STORE block ID underflow for request_id=cmpl-…: each group ne
 
 **当前状态**:`v41_dbg4`(8078)+ LMCache 服务端存活 ✓;fork 里已有修法 `bd5d334` + 三条受保护的出口埋点 ✓
 
+
+### B192 🎉🎉🎉 **STORE 成功并落盘 SSD** —— 目标核心达成(vLLM 侧无需改动 ✓)
+
+**最终修法(fork `b310664`)** ✓:**把"1 块环形暂存组"从 LMCache 分组中排除**(通用 ✓,非 V4.1 特判 ✓)
+* `kv_layer_groups.is_circular_scratch_spec(spec)` ✓:判定 `spec.max_num_blocks_per_req(...) == 1` ✓
+* **注册期**排除(`create_engine_group_infos_from_vllm` ✓):这些层落为 `EXCLUDED_ENGINE_GROUP` ✓(系统既有机制 ✓)
+* **几何**同步排除(`get_group_tokens_per_block` ✓)⇒ 两侧组数一致(6 → **5** ✓)
+* 先前的"可存前缀跳过 scratch"补丁保留 ✓(独立有效 ✓)
+
+**实测证据** ✓:
+```
+Resolved LMCache MP geometry: group_tokens_per_block=[32, 32, 32, 32, 128]     ← 5 组 ✓
+LMCache INFO: Stored 4096 tokens in 0.009 seconds                            ← ★ 存成功 ✓
+LMCache INFO: Stored 3840 tokens in 0.003 seconds                            ← ★ 再次存 ✓
+★★★total_object_count = 62 | bytes = 106,913,792                            ← 62 对象 ✓
+L2 文件数 = 62                                                                ← ★★★ 已落盘 SSD ✓✓✓
+```
+⇒ **持久化前缀缓存已工作** ✓:写入 L1(内存 ✓)**并已淘汰/写入 L2(SSD ✓)**
+
+**关键教训** ✓:症状("永不 STORE")由**两层**造成,且**都在 LMCache 侧** ✓:
+① "可存前缀"的 `min()` 被 scratch 组拖垮 ⇒ **我们修好**(chunks 0→97 ✓)
+② store 的**每组块数校验**因 scratch 组不可能齐备而**整单拒收** ⇒ **正解是注册期排除**(✓ 本步 ✓)
+*vLLM 侧无需任何改动* ✓ —— 这也回答了"改谁":**LMCache 侧两处,且均通用** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
