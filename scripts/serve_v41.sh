@@ -22,6 +22,8 @@
 #   LOAD=auto bash scripts/serve_v41.sh       # real weights (~long load)
 #
 # Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS
+#      HF_OVERRIDES (JSON,默认空):透传 --hf-overrides(例:改 YaRN factor)。
+#      ⚠️ dict 形式的 hf_overrides **不会传播到投机草稿**(vLLM 已知问题 #37435/#58080)⇒ 改 RoPE 前必须验证接受率
 #
 # MBT(默认 **0 = 不传**,用 vLLM 默认 chunk 大小;如 8192):
 #   **这是 GPU prefill 的真正前提**。vLLM 按 max_num_batched_tokens 把 prompt 切成
@@ -99,6 +101,7 @@ MBT="${MBT:-4096}"
 LOAD="${LOAD:-dummy}"          # dummy = no disk read, exercises the kernels
 GPU_UTIL="${GPU_UTIL:-0.85}"
 EXTRA_ENV="${EXTRA_ENV:-}"
+HF_OVERRIDES="${HF_OVERRIDES:-}"
 
 # CED(默认 **1** = 用树默认:`CacheConfig.swa_bounded_replay=True`,decoder 侧 SWA
 #   有界回放开启)。=0 时加 `--no-swa-bounded-replay`,即 A/B 的**基线臂**。
@@ -302,6 +305,7 @@ nohup env \
     $( [ "${MBT}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
     --gpu-memory-utilization "$GPU_UTIL" \
     $( [ -n "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ] && printf -- '--kv-cache-memory %s' "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ) \
+    $( [ -n "$HF_OVERRIDES" ] && printf -- '--hf-overrides %s' "$HF_OVERRIDES" ) \
     $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager ) \
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
     $( [ "${SPEC:-0}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" ) \
