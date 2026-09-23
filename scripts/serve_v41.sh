@@ -22,6 +22,7 @@
 #   LOAD=auto bash scripts/serve_v41.sh       # real weights (~long load)
 #
 # Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS
+#      TOOL_PARSER / REASONING_PARSER(默认 deepseek_v41;置空关闭):DSH 工具调用与思考强度所需
 #      HF_OVERRIDES (JSON,默认空):透传 --hf-overrides(例:改 YaRN factor)。
 #      ⚠️ dict 形式的 hf_overrides **不会传播到投机草稿**(vLLM 已知问题 #37435/#58080)⇒ 改 RoPE 前必须验证接受率
 #
@@ -102,6 +103,14 @@ LOAD="${LOAD:-auto}"           # 【本机+V4.1 默认】真实权重(dummy 只�
 GPU_UTIL="${GPU_UTIL:-0.90}"   # 【本机+V4.1 默认】生产值
 EXTRA_ENV="${EXTRA_ENV:-}"
 HF_OVERRIDES="${HF_OVERRIDES:-}"
+# 【DSH 兼容】工具调用与推理(思考强度)解析器:vLLM 必须显式开,否则 DSH 报
+#   `"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set`,
+# 且拿不到 reasoning_content ⇒ DSH 的"思考强度"选项会消失。置空可关。
+TOOL_PARSER="${TOOL_PARSER:-deepseek_v41}"
+REASONING_PARSER="${REASONING_PARSER:-deepseek_v3}"
+# 【DSH 思考强度】解析器在**服务启动时**初始化,必须显式告诉它"思考是开的",否则不会切分 reasoning_content。
+# 请求侧仍可用顶层 `reasoning_effort`(low/high/xhigh/max/1-100)覆盖;`none` 表示关思考。
+DEFAULT_CHAT_KWARGS="${DEFAULT_CHAT_KWARGS-{\"thinking\":true}}"   # 解析器启动时初始化 ⇒ 必须显式告诉它思考开着;请求侧可用顶层 reasoning_effort 覆盖(low/high/xhigh/max/1-100;none=关)
 
 # CED(默认 **1** = 用树默认:`CacheConfig.swa_bounded_replay=True`,decoder 侧 SWA
 #   有界回放开启)。=0 时加 `--no-swa-bounded-replay`,即 A/B 的**基线臂**。
@@ -310,7 +319,10 @@ nohup env \
     $( [ "${MBT}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
     --gpu-memory-utilization "$GPU_UTIL" \
     $( [ -n "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-6442450944}}" ] && printf -- '--kv-cache-memory %s' "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ) \
-    $( [ -n "$HF_OVERRIDES" ] && printf -- '--hf-overrides %s' "$HF_OVERRIDES" ) \
+    $( [ -n "$HF_OVERRIDES" ] && printf -- '--hf-overrides %s' "${HF_OVERRIDES// /}" ) \
+    $( [ -n "$TOOL_PARSER" ] && printf -- '--enable-auto-tool-choice --tool-call-parser %s' "$TOOL_PARSER" ) \
+    $( [ -n "$REASONING_PARSER" ] && printf -- '--reasoning-parser %s' "$REASONING_PARSER" ) \
+    $( [ -n "$DEFAULT_CHAT_KWARGS" ] && printf -- '--default-chat-template-kwargs %s' "${DEFAULT_CHAT_KWARGS// /}" ) \
     $( [ "${EAGER:-1}" = "1" ] && echo --enforce-eager )  \
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
     $( [ "${SPEC:-1}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" )  \

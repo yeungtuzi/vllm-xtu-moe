@@ -113,8 +113,16 @@ if [ -n "$OFFLOAD_PARAMS" ]; then
   _opts=($OFFLOAD_PARAMS)
   ARGS+=(--cpu-offload-params "${_opts[@]}")
 fi
+# 【DSH 兼容】工具调用 + 推理(思考强度)。V4-Flash 模板标记同为 <think>/</think> ⇒ 推理解析器用 deepseek_v3,
+# 工具调用用 deepseek_v4;解析器启动时初始化,故用 default-chat-template-kwargs 声明"思考开着"。
+TOOL_PARSER="${TOOL_PARSER:-deepseek_v4}"
+REASONING_PARSER="${REASONING_PARSER:-deepseek_v3}"
+CHAT_TEMPLATE_KWARGS="${CHAT_TEMPLATE_KWARGS-{\"thinking\":true}}"
 [ "$EAGER" = "1" ] && ARGS+=(--enforce-eager)
 [ -n "$SPEC" ] && ARGS+=(--speculative-config "$SPEC")
+[ -n "$TOOL_PARSER" ] && ARGS+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
+[ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
+[ -n "$CHAT_TEMPLATE_KWARGS" ] && ARGS+=(--default-chat-template-kwargs "$CHAT_TEMPLATE_KWARGS")
 [ -n "$EXTRA" ] && ARGS+=($EXTRA)
 
 # 记录本次实验的"环境快照"(机器负载会显著影响数字)

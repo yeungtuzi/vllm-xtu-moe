@@ -59,6 +59,9 @@ mkdir -p "$(dirname "$ENVF")"
   [ -n "${RESIDENT_LAYERS:-}" ] && echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=${RESIDENT_LAYERS}"
   [ -n "${GPU_PREFILL_MIN:-}" ] && echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=${GPU_PREFILL_MIN}"; } > "$ENVF"
 
+# 【DSH 兼容】工具调用 + 推理(思考强度):vLLM 注册了 mimo 工具/推理解析器;置空可关。
+TOOL_PARSER="${TOOL_PARSER:-mimo}"
+REASONING_PARSER="${REASONING_PARSER:-mimo}"
 ARGS=(--model "$CKPT" --served-model-name mimo26
       --host 127.0.0.1 --port "$PORT"
       --tensor-parallel-size "$TP" --dtype bfloat16 --kv-cache-dtype bfloat16
@@ -66,6 +69,8 @@ ARGS=(--model "$CKPT" --served-model-name mimo26
       --gpu-memory-utilization "$UTIL" --trust-remote-code
       --kernel-config '{"enable_jit_warmup": false}'
       --load-format "$LOAD")
+[ -n "$TOOL_PARSER" ] && ARGS+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
+[ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
 [ "$MM" = "1" ] || ARGS+=(--language-model-only)
 if [ "$MM" = "1" ]; then
   # 注意:不要把 JSON 默认值直接写进 ${VAR:-...},花括号会和展开的 } 冲突(会多出一个 })。
