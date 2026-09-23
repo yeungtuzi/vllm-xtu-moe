@@ -4195,6 +4195,23 @@ bench `p99 ITL = 13,680.2 ms`(median ITL 66.2 ms),**而这次 `GPF_STAGE` 与 `L
    **加大 MBT**(16K prompt:MBT 2048 → 8 个 pass,MBT 32768 → 1 个 ⇒ **机会少 8×**)、
    或对尾延迟敏感场景**关掉 GPU 预填**(`GPU_PREFILL_MIN=0`,把 staging 从 `pre` 里整段去掉,已实测消除尖峰)。
 
+
+### B145 ⭐ KV 保底修复**端到端验证通过**(goal 第(4)步):不传 `KV_CACHE_BYTES` 也能起
+
+**改动已进 main**(`88def8e`,由过时分支 `fix/vram-kv-floor` 里**只取 `vram_policy.py` 那一处**重新应用 ——
+该分支早于后续文档更正与 `_stage_mark` 改写,直接合并会回退它们):
+① 下发 `_kv_bytes`(让 `XIAOTU_KV_CACHE_SLACK=1.15` **真正生效**);② 下限 **0.5 → 1 GiB**(`XIAOTU_KV_CACHE_FLOOR` 可覆盖)。
+
+**验证**:V4.1,`MAXLEN=131072 MBT=8192 MAXSEQS=4`,**刻意不传 `KV_CACHE_BYTES`**:
+* ✅ **490 s 到达 READY**,`GPU KV cache size: **250,108** tokens`;
+* 修复前该配置**必然失败**(`ValueError: To serve at least one request (131072 tokens), 0.66 GiB KV cache is needed`)
+  —— 因为旧下限 0.5 GiB < 引擎最低需求 0.66 GiB。
+
+**⇒ 状态**:**保底已交付并验证**;**根治未做** —— 每-token KV 的 `KV_GIB_PER_MTOKEN` 仍按 V4.1 标定,
+对 GQA 系模型(GLM/MiMo)会低估(B134/B135),长上下文**仍建议显式传 `KV_CACHE_BYTES`**。
+治本方案候选:用 vLLM 自身 spec(需 worker)或**逐模型实测标定**(已备 `/tmp/kv_calib.sh`:故意给极小 KV,
+让引擎报出真实需求,从而得到 GiB/Mtoken)。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
