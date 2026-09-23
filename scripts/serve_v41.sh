@@ -112,7 +112,11 @@ HF_OVERRIDES="${HF_OVERRIDES:-}"
 # L1=CPU 内存、L2=SSD ⇒ **服务重启后 prefix cache 仍在**(见 EXPERIMENTS B164)。
 LMCACHE="${LMCACHE:-0}"
 if [ "$LMCACHE" = "1" ]; then
-  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555,\"lmcache.mp.transfer_intermediate_tensors\":${LMCACHE_XFER:-false}}}"
+if [ "${LMCACHE_XFER:-false}" = "true" ]; then
+  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555},\"lmcache.mp.transfer_intermediate_tensors\":true}"
+else
+  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555}}"
+fi
 else
   KV_TRANSFER_JSON=""
 fi

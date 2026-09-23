@@ -35,7 +35,11 @@ KV_DTYPE="${KV_DTYPE:-auto}"
 # LMCACHE_XFER=true 会打开逐层传输实验特性(需服务端同开 transfer_query,见 EXPERIMENTS B169-B171)
 LMCACHE="${LMCACHE:-0}"
 if [ "$LMCACHE" = "1" ]; then
-  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555,\"lmcache.mp.transfer_intermediate_tensors\":${LMCACHE_XFER:-false}}}"
+if [ "${LMCACHE_XFER:-false}" = "true" ]; then
+  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555},\"lmcache.mp.transfer_intermediate_tensors\":true}"
+else
+  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555}}"
+fi
 else
   KV_TRANSFER_JSON=""
 fi
