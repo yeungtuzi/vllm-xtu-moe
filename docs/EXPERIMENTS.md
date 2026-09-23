@@ -4637,6 +4637,50 @@ L=16384 → 49.85 vs 53.85 = **−4.00**(GPU 反超)✓
 **⚠️ 生效时机**:正在跑的 8700 实例**仍以 `dsv41` 提供服务**(用户正在观察其稳定性,**未重启**)⇒
 **新名字下次启动才生效**;期间调它仍用 `dsv41` ✓。若需新旧并存,vLLM 的 `--served-model-name` **支持传多个名字** ✓
 
+
+### B160 ⭐ 让 DSH 能用本地端点:**工具调用 + 思考强度**在 vLLM 侧的完整配方(全模型)
+
+**起因(用户)**:新会话把 DSH 切到本地生产(`epyc-a100-server/DeepSeek-V4.1-Flash`)后
+①报 `400 "auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set`;
+②**"思考强度"选择消失**。两者**同一个根因**:`serve_v41.sh` 从来没传工具/推理解析器(GLM 脚本一直有)✗
+
+**排查过程中的三个坑(都记下来,别再试)**:
+
+| 试过 | 结果 |
+|---|---|
+| `--reasoning-parser **deepseek_v41**` | ✗ 它只是个 **engine 适配器**,会把输出搞坏:思考被整段吞掉、`content` 变成字符串 `'None'` |
+| `--reasoning-parser **deepseek_r1**` | ✗ 它要求输出里**成对的** `<think>…</think>`;而 V4.1 模板把 **起始标记放进了 PROMPT**(`tokenizers/deepseek_v41_encoding.py:209` `if index==0 and thinking_mode=="thinking"`),输出里**只有 `</think>`** |
+| `--reasoning-parser **deepseek_v3**` | ✅ **对**:它是**模板感知**解析器(`__init__` 里读 chat kwargs 的 `thinking`)⇒ 但**解析器在服务启动时初始化** ⇒ **必须**配 `--default-chat-template-kwargs '{"thinking":true}'` 告诉它"思考是开的" |
+
+**✅ V4.1 实测通过(8070 生产在跑)**:
+```
+--enable-auto-tool-choice --tool-call-parser deepseek_v41
+--reasoning-parser deepseek_v3
+--default-chat-template-kwargs {"thinking":true}
+```
+* **工具调用** ✓ `tool_choice:"auto"` 正常返回 `tool_calls`(不再 400);
+* **思考内容** ✓ 分离到 **`message.reasoning`** 字段 —— ⚠️ **不是 `reasoning_content`**(本版本 vLLM 的字段名,DSH 若只认 `reasoning_content` 会显示不出来);
+* **思考强度** ✓ 顶层 `reasoning_effort` 生效(vLLM `chat_completion/protocol.py:589/597` 把它传进模板,并 `effort != "none" ⇒ enable_thinking=True`):
+  实测 low 10.4 s / high 13.2 s / **xhigh 26.1 s** / none 6.9 s ✓
+* ⚠️ **V4.1 的合法值是 `low / high / xhigh / max` 或整数 1–100** —— **没有 `medium`** ✗(发 `medium` 直接 400,报错原文即此)⇒ **DSH 的强度档位别配 `medium`**
+
+**全模型配方(脚本默认已加,可用 `TOOL_PARSER=` / `REASONING_PARSER=` 置空关闭)**:
+
+| 模型 | 脚本 | 工具解析器 | 推理解析器 | 模板声明 |
+|---|---|---|---|---|
+| **V4.1-Flash** | `serve_v41.sh` | `deepseek_v41` | `deepseek_v3` | `{"thinking":true}` |
+| **V4-Flash** | `tune_serve.sh`(8070 的 MODE=dsv4 走它)| `deepseek_v4` | `deepseek_v3` | `{"thinking":true}` |
+| **MiMo-V2.6** | `serve_mimo26.sh` | `mimo` | `mimo` | — |
+| **GLM-5.3** | `serve_glm53_mainline.sh` | `glm47` | `glm47` | —(原本就有 ✓)|
+
+⚠️ **只有 V4.1 做了运行期验证** ✓;V4-Flash / MiMo / GLM 的参数取自 **vLLM 注册表 + 各自模板标记**,**尚未起服务实测** ✗
+
+**⚠️ 两个 shell 陷阱(本轮又踩到,已修)**:
+1. `$( printf -- '--flag %s' "$JSON" )` 的展开结果**会被按空格拆词** ⇒ 带空格的 JSON 被拆成两个参数
+   (报 `invalid loads value: '{"thinking":'`)⇒ **传参前去掉空格**(`${VAR// /}`);**`HF_OVERRIDES` 也有同样隐患,已一并修** ✓
+2. `${VAR-default}` 的默认值里若含 `}`(JSON 必含 ✗)**会提前终止参数展开**(`bash -n` 查不出 ✗)⇒
+   **用 if 分支赋值,别把 JSON 直接写进 `${VAR-...}`**(`serve_mimo26.sh` 里早就有这条注释 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
