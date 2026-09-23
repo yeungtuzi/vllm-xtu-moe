@@ -4806,6 +4806,40 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate **382.00 MiB**
 
 **0.2.5 发布要点(用户已定)**:⭐ **支持 LMCache 持久化输入缓存**(服务重启后前缀仍命中)✓
 
+
+### B165 LMCache 验证:**管道已通,但 store/retrieve 未观察到**(重启后未命中 ✗)
+
+**已完成(证据充分 ✓)**:
+* `lmcache 0.5.5` 安装 + `mla_enabled` 接口在 ✓;vLLM 侧 `LMCACHE=1` 旋钮 ✓;`scripts/serve_lmcache.sh`(L1=100 GB + **L2=`fs_native`** ✓)
+* **连接器握手**:需要显式 `kv_connector_extra_config:{lmcache.mp.host,lmcache.mp.port}` ✓
+  (否则报 `Cannot reach the LMCache MP server at tcp://localhost:5555 within 300s` ✗)
+* **V4.1 的 KV 几何被完整注册**(LMCache 服务端日志 ✓):
+  `Registered KV cache for GPU ID ... with 51 layers` ✓;
+  `KernelGroupInfo` 组:滑动窗组 `tokens_per_block=32, sw=128`、压缩组 `tokens_per_block=128, slots=64`、
+  索引器组 `tokens_per_block=8, dtype=float32` ✓;
+  KV 记录 **584 B/token**(`hs=584`)⇒ 恰是文档里"**非 SM100 架构**的 V4 记录" ✓
+  ⇒ **此前担心的 SM80 记录格式风险不存在** ✓
+* L2 适配器创建成功 ✓:`Created FS native L2 adapter: /home/user/.cache/lmcache_l2 (workers=4)` ✓
+
+**未通过 ✗**:
+1. vLLM 内**同前缀第二次**:冷 **26.26 s** → 热 **0.35 s** ✓ —— 但这是 **vLLM 自身的 GPU 前缀缓存** ✓,
+   **不是 LMCache** ✗(L2 目录始终 0 文件 ✓,L1 也没有留住跨重启 ✓)
+2. **重启 vLLM(保留 LMCache 服务)后同前缀:26.73 s** ✗ = 与冷启动同值 ⇒ **未命中** ✗
+3. vLLM 日志里**没有 store/retrieve 痕迹** ✗(只有 `lookup_status = True` 之类配置行 ✓)
+
+**⇒ 结论**:**wiring 全通,但 KV 没被真正存入 LMCache**(存储路径未触发)✗ —— **用户目标尚未达成** ✗
+
+**下一步(按优先级)**:
+1. 开 LMCache 调试日志(`LMCACHE_LOG_LEVEL=DEBUG`)+ 看 vLLM connector 的 **store 回调**是否被调用 ✓
+2. 检查 **L2 存储策略**(`--l2-store-policy {default,skip_l1}` ✓)—— 试 `skip_l1` 强制落盘 ✓,
+   绕开"L1 太大 ⇒ 永不淘汰 ⇒ 不落盘"的观察盲区 ✓
+3. 用**更小的 L1**(如 `--l1-size-gb 4`)迫使淘汰 ⇒ 观察 L2 是否有文件 ✓
+4. 逐项排除:**是否要求 `kv_role` 之外的角色** ✓ / **chunk-size 与 block 对齐** ✓ / **`--enable-prefix-caching` 是否与 connector 冲突** ✓
+5. 若确认是 LMCache/vLLM 的缺陷 ⇒ 按 Q3 的结论**提上游 PR** ✓
+
+**生产状态提示**:当前 8070 跑的是**调试用 LMCache 实例**(`SPEC=0` + CPU 预填 ✗),**不是**用户的生产口径;
+恢复生产需用固化默认(或 `LMCACHE=1` 复现当前调试态)✓ —— 待用户指示 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

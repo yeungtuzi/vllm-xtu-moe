@@ -329,7 +329,7 @@ nohup env \
     $( [ -n "$REASONING_PARSER" ] && printf -- '--reasoning-parser %s' "$REASONING_PARSER" ) \
     $( [ -n "$DEFAULT_CHAT_KWARGS" ] && printf -- '--default-chat-template-kwargs %s' "${DEFAULT_CHAT_KWARGS// /}" ) \
     $( [ "$KV_DTYPE" != "auto" ] && printf -- '--kv-cache-dtype %s' "$KV_DTYPE" ) \
-    $( [ "$LMCACHE" = "1" ] && printf -- '--enable-prefix-caching --kv-transfer-config %s' '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}' ) \
+    $( [ "$LMCACHE" = "1" ] && printf -- '--enable-prefix-caching --kv-transfer-config %s' '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5555}}' ) \
     $( [ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && echo --enable-prompt-tokens-details ) \
     $( [ "${EAGER:-1}" = "1" ] && echo --enforce-eager )  \
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
