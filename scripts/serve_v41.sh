@@ -42,7 +42,14 @@
 #   且 V4.1 的 config 里 `dspark_block_size=5`、`dspark_target_layer_ids=[37,38,39]`
 #   ⇒ **num_speculative_tokens 必须等于 5**。无需单独 draft model(旗标里没有 model 字段)。
 #   可用 SPEC_CONFIG 覆盖;注意 draft 层要显存,配合 GPU_UTIL 一起调。见 NOTES §478。
-SPEC_CONFIG="${SPEC_CONFIG:-{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"probabilistic\"}}"
+# 【B149 修 bug】不能把 JSON 默认值写进 ${VAR:-{...}} —— 末尾的 } 会与展开的 } 连在一起,
+# bash 多吐一个 },vLLM 直接拒绝启动:
+#   api_server.py: error: argument --speculative-config: Value {...}} cannot be converted
+# ⇒ **dspark 这条路一直是坏的**(MTP 走 SPEC_K,JSON 构造方式不同,所以没暴露)。
+# 正确写法:先取环境变量,为空再赋默认(与 serve_mimo26.sh 的 MM_LIMITS 同一处理)。
+if [ -z "${SPEC_CONFIG:-}" ]; then
+  SPEC_CONFIG='{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
+fi
 
 # PREFIX_CACHE(默认 1 = 保持 vLLM 默认开启):设为 0 会加 --no-enable-prefix-caching。
 #   **测量长上下文 prefill 时必须设 0** —— 否则不同 prompt 共享前缀会被整段命中,
