@@ -5819,6 +5819,15 @@ Resolved LMCache MP geometry: group_tokens_per_block=[2176, 2176, 2176, 2176, 21
 **下一轮**:MiMo 就绪 ⇒ 验证 store(`total_object_count > 0` ✓)⇒ **三模型 LMCache 全部达成** ✓ ⇒
 目标可考虑标记 **complete** ✓(P6 的实际提交作为**待办移交**:需人类提交者 + 联网做重复性检查 ✗)
 
+
+### B200 chunk-size 规则写进服务端脚本头部(操作文档定稿);MiMo 加载 68%
+
+* `scripts/serve_lmcache.sh` 头部新增 **实测 chunk 规则** ✓:
+  必须等于**该模型 vLLM block(DCP 缩放后)的倍数** ✓;V4.1 需 **64** ✓、GLM 需 **2176** ✓;
+  **2176 = 64 × 34** ⇒ **一个服务端服务两者** ✓(默认值即 2176 ✓);换 chunk 会让旧 L2 键失效(无害 ✓)
+* 默认值已是 `CHUNK_SIZE=2176` ✓ ⇒ **开箱即用** ✓
+* MiMo + LMCache:加载 **68%(44/65)** ✓、无报错 ✓ ⇒ 预计再 ~8 分钟就绪 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
