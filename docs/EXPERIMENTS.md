@@ -4609,6 +4609,34 @@ L=16384 → 49.85 vs 53.85 = **−4.00**(GPU 反超)✓
 * **在跑的 V4.1 实例(8700)暂不动**(用户正在观察其稳定性)⇒ 它属于一次性实例,不是生产默认 ✓;
 * 实验/临时验证仍可用 8700、87xx,但**不得称为生产** ✓。
 
+
+### B159 生产模型名改用**正式全称**:`dsv41` → `DeepSeek-V4.1-Flash`(用户规则)
+
+**用户要求**:"生产环境的模型名称现在是 `dsv41`,要用模型的正式全称,对应脚本都要改"。
+
+**背景**:`docs/HANDOFF_SERVER_RESTART.md:199` 原本写着 "served-model-name 是 `dsv41`(**不是** DeepSeek-V4.1-Flash)"
+—— 那是早期为避免"猜名 ⇒ NotFound"留下的**别名约定**,现按要求**反转** ✓
+
+**官方全称依据**:checkpoint 目录 `deepseek-ai--DeepSeek-V4.1-Flash`、`architectures=DeepseekV41ForCausalLM`、
+`model_type=deepseek_v41` ⇒ 服务名取 **`DeepSeek-V4.1-Flash`**(与既有生产命名一致:`GLM-5.3-Flash`、`DeepSeek-V4-Flash-xiaotu`)✓
+
+**改动清单**:
+| 文件 | 改动 |
+|---|---|
+| `scripts/serve_v41.sh` | `--served-model-name dsv41` → `DeepSeek-V4.1-Flash`;warmup 的 `MODEL=dsv41` 同步 |
+| `scripts/warmup_shapes.sh` | `MODEL` 默认 → 正式全称 |
+| `scripts/bench_sharegpt.sh` | `MODEL` 默认 → 正式全称(原 `dsv41-xtu`)|
+| `scripts/bench_serve_sweep.sh` | `SERVED` 默认 → 正式全称 |
+| `scripts/bench_random_12cells.sh` | 12 格驱动的 served 名 → 正式全称 |
+| `scripts/ab_lvllm_matrix.sh` | `MODEL_NAME` 默认 → 正式全称(**对端 lvllm 必须同名**,否则两侧不可比)|
+| `docs/HANDOFF_SERVER_RESTART.md` | 旧约定注释反转 + 陷阱说明更新 |
+| `docs/RUNBOOK.md` | 3 处 API 示例的 `"model"` 字段 |
+
+**校验**:所有改动过的 shell 脚本 `bash -n` 通过 ✓;`serve_v41.sh` 续行链结构校验通过 ✓
+
+**⚠️ 生效时机**:正在跑的 8700 实例**仍以 `dsv41` 提供服务**(用户正在观察其稳定性,**未重启**)⇒
+**新名字下次启动才生效**;期间调它仍用 `dsv41` ✓。若需新旧并存,vLLM 的 `--served-model-name` **支持传多个名字** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

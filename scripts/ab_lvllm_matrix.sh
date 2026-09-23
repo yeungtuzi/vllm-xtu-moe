@@ -41,7 +41,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV="${ENV:-/home/user/anaconda3/envs/lvllm}"
 PY="$ENV/bin/python"
 CKPT="${CKPT:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master}"
-MODEL_NAME="${MODEL_NAME:-dsv41-xtu}"     # 两边同一个 served-model-name
+MODEL_NAME="${MODEL_NAME:-DeepSeek-V4.1-Flash}"     # 两边同一个 served-model-name(对端 lvllm 也要用正式全称)
 TP="${TP:-2}"
 GPUS="${GPUS:-0,1}"
 GPU_UTIL="${GPU_UTIL:-0.95}"              # = lvllm 的 dsv41 脚本

@@ -196,7 +196,7 @@ setsid env PYTHONPATH=/home/user/lvllm/vllm-up-133b71e0b TAG=<tag> PORT=<port> \
   MAXLEN=262144 MBT=8192 KV_CACHE_BYTES=8031830016 \
   bash scripts/serve_v41.sh > /tmp/<tag>_w.log 2>&1 &
 # ⚠️ 必须显式传 GPUS=0,1（脚本默认 GPUS=0）
-# served-model-name 是 dsv41（不是 DeepSeek-V4.1-Flash）
+# served-model-name 是 DeepSeek-V4.1-Flash（2026-09-23 起改用正式全称；旧别名 dsv41 已废弃）
 # 日志在 dev-docs/report/tuning/logs/<tag>.log，不是 logs/
 ```
 
@@ -204,7 +204,7 @@ setsid env PYTHONPATH=/home/user/lvllm/vllm-up-133b71e0b TAG=<tag> PORT=<port> \
 
 1. **`GPUS` 默认是 `0`** ⇒ `TP=2` 不传 `GPUS=0,1` 会 pydantic 报
    「World size (2) larger than available GPUs (1)」；
-2. **`--served-model-name` 猜错** ⇒ `NotFound`，**请求根本没送达**（V4.1 真名是 `dsv41`）；
+2. **`--served-model-name` 猜错** ⇒ `NotFound`，**请求根本没送达**（V4.1 的服务名是 `DeepSeek-V4.1-Flash`）；
 3. **V4.1 日志路径**是 `dev-docs/report/tuning/logs/`，GLM 是 `logs/`；
 4. **`KV_CACHE_BYTES` 必须按引擎反算的真实需求、不加乘性余量**
    （GLM 19,505 B/token；V4.1 30,639 B/token）—— 256K 下 10% 余量就 OOM；

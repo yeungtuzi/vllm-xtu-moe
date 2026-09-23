@@ -1001,7 +1001,7 @@ SPEC=1 COMPILE=0 THREADS=60 SPIN=300 KV_CACHE_BYTES=12884901888 \
 # 健康检查
 curl -s localhost:8700/v1/models | head -c 120
 curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"dsv41","messages":[{"role":"user","content":"1+1=?"}],"max_tokens":8,"temperature":0}'
+  -d '{"model":"DeepSeek-V4.1-Flash","messages":[{"role":"user","content":"1+1=?"}],"max_tokens":8,"temperature":0}'
 ```
 
 **每个旋钮的依据(都是实测,不是猜)**
@@ -1131,14 +1131,14 @@ llm-pi-ai:
 ```bash
 # ① 缓存命中率字段
 curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"dsv41-xtu","messages":[{"role":"user","content":"hi"}],"max_tokens":8}' \
+  -d '{"model":"DeepSeek-V4.1-Flash","messages":[{"role":"user","content":"hi"}],"max_tokens":8}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"])'
 # 期望能看到 "prompt_tokens_details": {"cached_tokens": 0} 这样的键
 
 # ② 思考强度(同一句话,low vs none)
 for e in low none; do
   curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
-    -d "{\"model\":\"dsv41-xtu\",\"messages\":[{\"role\":\"user\",\"content\":\"9.11和9.9哪个大?\"}],\"max_tokens\":64,\"reasoning_effort\":\"$e\"}" \
+    -d "{\"model\":\"DeepSeek-V4.1-Flash\",\"messages\":[{\"role\":\"user\",\"content\":\"9.11和9.9哪个大?\"}],\"max_tokens\":64,\"reasoning_effort\":\"$e\"}" \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d["choices"][0]["message"]; print("reasoning_effort='$e'", "reasoning_content_len=", len(m.get("reasoning_content") or ""), "content=", (m.get("content") or "")[:60])'
 done
 # 期望:low 有 reasoning_content;none 的 reasoning_content 为空/缺失

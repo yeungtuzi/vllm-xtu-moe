@@ -12,7 +12,7 @@
 set -uo pipefail
 PORT="${PORT:-8077}"
 LENS="${LENS:-8192 32768}"
-MODEL="${MODEL:-dsv41}"
+MODEL="${MODEL:-DeepSeek-V4.1-Flash}"
 CKPT="${CKPT:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master}"
 export PATH="${BENCH_ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}/bin:$PATH"
 export HF_HUB_OFFLINE=1

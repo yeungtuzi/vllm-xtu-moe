@@ -243,7 +243,7 @@ run_v41() {
     bash scripts/serve_v41.sh > "$(srv_log $tag).wrapper" 2>&1 &
   wait_ready "$port" "$LOGD/$tag.pid" "$(srv_log $tag)" 5400 || return 1
   # DSV4.1 快照没有 chat_template ⇒ 必须走 /v1/completions 并跳过模板
-  cells_for "$port" "$CKPT_V" dsv41 v41 openai --skip-chat-template
+  cells_for "$port" "$CKPT_V" DeepSeek-V4.1-Flash v41 openai --skip-chat-template
 }
 
 echo "══ random 12 格基准 ══ ($(date -Is))"

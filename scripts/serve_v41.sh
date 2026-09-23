@@ -304,7 +304,7 @@ nohup env \
   $JIT_ENV \
   $EXTRA_ENV \
   numactl --interleave=all "$PY" -m vllm.entrypoints.openai.api_server \
-    --model "$CKPT" --served-model-name dsv41 \
+    --model "$CKPT" --served-model-name DeepSeek-V4.1-Flash \
     --load-format "$LOAD" \
     --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-2}" \
     $( [ "${MBT}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
@@ -329,7 +329,7 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
     echo "[v41] READY tag=$TAG"
   # 【§555】形状预热:把"首个长上下文请求付 ~237 s JIT"的成本挪到启动阶段
   if [ "${WARMUP:-1}" = "1" ]; then
-    PORT="$PORT" LENS="${WARMUP_LENS:-8192 32768}" CKPT="$CKPT" MODEL=dsv41 \
+    PORT="$PORT" LENS="${WARMUP_LENS:-8192 32768}" CKPT="$CKPT" MODEL=DeepSeek-V4.1-Flash \
       bash "$ROOT/scripts/warmup_shapes.sh" || echo "[v41] ⚠️ 预热失败(不致命,继续启动)"
   fi
   exit 0
