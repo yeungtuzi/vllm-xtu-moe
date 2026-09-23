@@ -4742,6 +4742,38 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate **382.00 MiB**
 **教训**:判断"能不能开 GPU 预填"不能只看**预检是否过线** ✗,还要看**余量是否大于一次常规分配**
 (prefill 的 MLA logits ≈ **382 MiB**,且**余量会随 staging 驻留/碎片而漂移** ✗)⇒ 经验阈值:**至少留 1 GiB 以上** ✓
 
+
+### B163 ⚠️ 极限配置**第二次崩溃**:失败分配涨到 **512 MiB**,且崩溃时 **2 路并发** ⇒ 单路(seqs=1)重试
+
+**现象**:调稳版(fp8 KV + 预留 3.0,预检 slack +1.39 GiB)仍在 **08:58 崩于 OOM** ✗
+(只读看护任务自 #07 起连续 CRIT ✓ —— 它按预期抓到了 ✓)
+
+**诊断**:
+* 失败分配 **512.00 MiB × 5**,同一处 `_fp8_mqa_logits_torch → logits = torch.zeros(...)`
+  (`vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py`)= **MLA 稀疏索引器的 prefill logits** ✓
+* 相比第一次的 **382 MiB 变大了** ⇒ 该缓冲**随上下文长度增长** ✗(用户的 768K 工作正好踩到 ✓)
+* 崩溃前:`Running: 2 reqs, Waiting: 1 reqs, KV 14.3%` ⇒ **2 路并发**把激活峰值翻倍 ✓✓
+
+**⇒ 结论(两次实测一致)**:在 **2×40 GB** 上,**1M + GPU 预填在"长上下文 + 并发"下没有可靠余量** ✗
+(staging 10.7 + 非专家权重 19.6 + KV + 每 chunk 的 MLA logits 0.5 GiB ⇒ 余量被吃光 ✓)
+
+**⇒ 处置**:去掉"并发"这个放大器 ⇒ **`MAXSEQS=1`** 单路重试 ✓
+其余不变:`GPU 预填 384 · FULL_DECODE_ONLY · fp8 KV 3 GiB · 预留 3.0 · dspark k=5 · 正式全称 · 解析器` ✓
+预检 slack **+1.43 GiB** ✓
+**若仍崩** ⇒ 说明 1M 与 GPU 预填在本机**互斥**,只能二选一:
+①**1M + CPU 预填**(稳)②**GPU 预填 + ≤256K**(已验证可行)✓
+
+**本轮顺带交付(两个 DSH 阻塞项)**:
+1. **`~/.dsh/settings.yaml`**(已改,备份在 `settings.yaml.bak.*` ✓):模型条目加
+   `reasoning: true` + `thinkingLevelMap`(**屏蔽 `medium`**、`minimal→low`、`off→none`、显式给 `xhigh/max`)+
+   `compat.thinkingFormat: deepseek` ✓ ⇒ **重载 DSH 后即可选思考强度** ✓
+   (依据:DSH 源码 `models.js` 的 `if (!model.reasoning) return ["off"]` ✓;实测 vLLM 对三种格式全部 200 ✓,
+   只有 `reasoning_effort="medium"` 400 ✓)
+2. **四个 serve 脚本加 `--enable-prompt-tokens-details`** ✓ ⇒ DSH 的"缓存命中%"才有数
+   (实测我们的 `usage` 原本是 `prompt_tokens_details: null` ✗,vLLM 源码 `_make_prompt_tokens_details` 里
+   `if not enable_prompt_tokens_details: return` ✓)
+   —— **旁证**:`serve_glm53_mainline.sh` 一直带这个参数 ⇒ 这正是**当年 GLM 能显示缓存命中**的原因 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
