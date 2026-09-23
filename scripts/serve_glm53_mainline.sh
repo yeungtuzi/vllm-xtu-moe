@@ -69,6 +69,13 @@ MBT="${MBT:-4096}"
 SEQS="${SEQS:-4}"   # 用户 2026-09-22 定:所有模型默认 seqs=4(原为 2)
 THREADS="${THREADS:-60}"
 KV_DTYPE="${KV_DTYPE:-bfloat16}"
+# 【LMCache】LMCACHE=1 启用外部 KV 缓存(需 scripts/serve_lmcache.sh);LMCACHE_XFER=true 开逐层传输
+LMCACHE="${LMCACHE:-0}"
+if [ "$LMCACHE" = "1" ]; then
+  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555,\"lmcache.mp.transfer_intermediate_tensors\":${LMCACHE_XFER:-false}}}"
+else
+  KV_TRANSFER_JSON=""
+fi
 # 投机解码(MTP,2026-09-20)。GLM-5.3-Flash 的检查点自带 **1 层 MTP**
 # (`model.language_model.layers.45`,见 docs/MODEL_GUIDES.md §2.6)。
 #   **SPEC_K=0(默认,关闭)**;要尝鲜再 `SPEC_K=1..4`。
@@ -151,6 +158,8 @@ ARGS=(
 [ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
 # 让客户端能读到前缀缓存命中数(usage.prompt_tokens_details.cached_tokens)
 [ "$PROMPT_TOKENS_DETAILS" = "1" ] && ARGS+=(--enable-prompt-tokens-details)
+[ "$LMCACHE" = "1" ] && ARGS+=(--enable-prefix-caching)
+[ -n "$KV_TRANSFER_JSON" ] && ARGS+=(--kv-transfer-config "$KV_TRANSFER_JSON")
 # 【RUNBOOK §5.8 铁律】开 GPU 预填充时**必须**显式封顶 KV 池,否则 vLLM 会把 util 填满、
 # 让 staging/投机/长 prefill 激活没地方放 ⇒ 长 prompt 直接 CUDA OOM。
 # 用法:KV_CACHE_BYTES=6442450944(6 GiB) bash scripts/serve_glm53_mainline.sh
@@ -231,7 +240,7 @@ echo "[glm53] prompt-tokens-details=${PROMPT_TOKENS_DETAILS} (cached_tokens repo
 echo "[glm53] speculative=${SPEC_K} (0=off; MTP method=mtp, draft=layers.45) eager=${EAGER}"
 echo "[glm53] log=$LOG"
 
-# 【§601】PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True —— 事故现场是"PyTorch 已分配
+# 【§601】PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" —— 事故现场是"PyTorch 已分配
 # 37.90 GiB、另有 **695 MiB reserved-but-unallocated**",PyTorch 自己的 OOM 提示就是这一项。
 # 本服务没有 KV connector,所以 vLLM 那条 "kv connector 与 expandable_segments 不兼容" 的
 # 检查不适用。想要旧行为就显式 `PYTORCH_CUDA_ALLOC_CONF=` 传空。

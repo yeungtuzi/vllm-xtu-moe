@@ -5053,6 +5053,37 @@ vLLM `scheduler.py` 对 `SupportsHMA` 的 connector 调 **`request_finished_all_
 
 **现场**:8070 已恢复到**可用的外部 connector 配置**(`LMCACHE=1`、无 `LMCACHE_XFER` ✓,调试态 ✓)
 
+
+### B172 ⭐⭐ 两个**硬性前置条件**(LMCache 与 vLLM 的兼容性约束)—— 以及 chunk-size 的"跨模型公共值"
+
+**① allocator 硬约束(vLLM 直接拒绝启动)** ✓:
+```
+ValidationError: KV connector LMCacheMPConnector is incompatible with
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True unless enable_cumem_allocator is also enabled.
+```
+⇒ **用 LMCache connector 时不能开 `expandable_segments`** ✗(除非同时启用 cumem allocator ✓)
+⇒ 这解释了"为什么 V4.1 能起、GLM 起不来" ✓:`serve_glm53_mainline.sh` 默认设了它 ✗,`serve_v41.sh` 没有 ✓
+⚠️ 另一坑:该行写法是 `${VAR:-default}` ⇒ **显式传空值会退回默认值** ✗(脚本注释里"传空即可"是**错的** ✗)
+⇒ 想关必须传**非空**值(如 `expandable_segments:False`)✓;已把 GLM 脚本改为 `${VAR-default}`(显式传空即生效 ✓)
+
+**② chunk-size 必须与模型的 vLLM block 对齐(每模型不同)** ✓:
+```
+ValueError: LMCache chunk size 256 must be a multiple of 2176 (the vLLM block size scaled by decode_context_parallel_size…)
+```
+⇒ V4.1 需要 **64 的倍数**(我们此前用 256 ✓);**GLM 需要 2176 的倍数** ✗
+⇒ **关键:2176 = 64 × 34** ⇒ **`--chunk-size 2176` 同时满足 V4.1 与 GLM** ✓✓
+⇒ ⇒ **这是"支持所有模型"的运营参数**:服务端 `--chunk-size` 取**各模型 block 的最小公倍数** ✓
+   (V4.1 的组几何 `[32,32,32,32,128,8]` ⇒ 需 64 的倍数 ✓;GLM 需 2176 ✓;`lcm(64,2176)=2176` ✓)
+   ⇒ 若未来有模型需要更大的块 ⇒ 服务端需按其调整(或开多个 LMCache 服务端 ✓)
+
+**③ 本机模型清单(修正计划)**:
+* 本机**只有** V4.1 / MiMo-V2.6 / **GLM-5.3** 三份 checkpoint ✓;**没有 V4-Flash** ✗
+  ⇒ 计划里"用 V4-Flash 做基线对照"**不可行** ✗ ⇒ **改用 GLM-5.3**(它同样是 LMCache 官方 validated ✓ 且本机可用 ✓)
+
+**④ 已落地的脚本改动**:`tune_serve.sh`(V4-Flash 启动器,顺带修了**缺可执行位** ✗)、
+`serve_glm53_mainline.sh`、`serve_v41.sh` 均支持 `LMCACHE=1` / `LMCACHE_XFER=true` ✓;
+`serve_lmcache.sh` 加 `TRANSFER_MODE`(支持 `auto` ✓,以配对 `transfer_query` ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
