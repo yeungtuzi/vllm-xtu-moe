@@ -5155,6 +5155,40 @@ lmcache server --enable [MODULE ...]
 
 **现场**:8070 = V4.1 + LMCache(逐层传输已配对 ✓,不写盘 ✗);LMCache 服务端存活(`transfer_query` + chunk 2176 + auto ✓)
 
+
+### B176 ⭐⭐ **两个决定性观察**:connector 分派已发生(dispatcher=SET)✓,但服务端**从未分配过 L1** ✗
+
+**① connector 侧(带 `XIAOTU_KVHOOK_DEBUG=1`)** ✓:
+```
+[lmc-save] called layer='…layers.0.attn.swa_cache'  dispatcher=SET  conn_meta=True  attn_meta=True
+```
+⇒ `--enable transfer_query` 配对后,connector 的 **dispatcher 终于被创建** ✓、`save_kv_layer` **确实分派** ✓
+(此前是 `NONE` ⇒ 静默 no-op ✓)—— **这是一次真实的推进** ✓
+
+**② 服务端侧(受管任务日志)** ✓:
+```
+Registered KV cache for GPU ID … with 51 layers        ← 注册完整 ✓(9 个组,含压缩组与 fp32 索引器 ✓)
+Checking memory allocator consistency
+ - Total active allocations: 0
+ - Total allocated size: 0.000000 MB
+ - Total free size: 40960.000000 MB                     ← ★ L1 从未分配过 ✗
+```
+⇒ **没有任何对象进入 L1** ✓ ⇒ 与 `/status.total_object_count = 0` 完全一致 ✓
+
+**③ 由此得到的关键设计判断**(修正我们此前的方向)✓:
+* 我们开的 `lmcache.mp.transfer_intermediate_tensors` 让 connector 建 dispatcher 时**请求的是
+  `TRANSFER_QUERY`**(源码:`requested = {TRANSFER_QUERY} if self.transfer_intermediate_tensors else set()` ✓)
+  —— 那是**实验性"中间张量传输"**特性 ✓,**官方 V4.1 配方并不开它** ✗
+* 而本次日志显示真正在**注册 KV 并准备搬运**的是 **`lmcache_driven_transfer`** 模块 ✓
+  ⇒ **KV 持久化的正道是"服务端驱动"** ✓ ⇒ 其 store 触发点 = vLLM 在请求结束时调用的
+  **`connector.request_finished_all_groups(request, block_ids)`** ✓(B171 已确认 vLLM 会调用 ✓)
+* ⇒ **我们先前补的逐层钩子对"存储"并非必需**(它服务的是 wait/load 侧与实验特性 ✓);
+  **真正要查的是 `request_finished_all_groups` 里发生了什么** ✓
+
+**④ 下一步(已注入诊断 ✓)**:在外部 connector 的 `request_finished_all_groups` 入口加了一次性日志 ✓
+⇒ 重启后看:①它**是否被调用** ②`block_ids` 有几组 ③是否 early-return ⇒ 直接定位"服务端驱动"为何不拉取 ✓
+   (这条路**理论上无性能损失** ✓:服务端经 CUDA IPC 直读 GPU 块 ✓,见 B173 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
