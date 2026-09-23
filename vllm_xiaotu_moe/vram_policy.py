@@ -47,7 +47,10 @@ WEIGHTS_GIB = 9.78              # 【§592 实测修正】V4.1/TP=2 每 rank 的
 #   ⇒ 2.20 KiB/token ⇒ **1M 上下文 ≈ 2.2 GiB/卡**(不是 16.4!)
 # 注:早先记的 17.45 GiB/1.116M tok 来自别的配置(TP=1 的 v41el 口径)⇒ 用量级差 7×。
 # 这个数直接决定"优先级 2/3/4 还剩多少显存",所以必须用**本配置**实测值。
-KV_GIB_PER_MTOKEN = 2.71 / 1.290154      # ≈2.1 GiB / 1M tokens
+KV_GIB_PER_MTOKEN = 5.04                # 【B134/B148 实测】V4.1:引擎在 maxlen=131072 报 **0.66 GiB**
+                                        #   ⇒ 5.04 GiB/Mtoken。原值 2.71/1.290154≈2.10 **低估 2.4×**,
+                                        #   这正是 1M 上下文"不显式传 KV_CACHE_BYTES 就起不来"的根因。
+                                        #   实测方法:给一个极小的 KV 让引擎报出需求(见 scripts 里的标定流程)。
 # ⚠️【§592 实测异常,未解释】KV 的"每 token 成本"**随 maxlen 变化**,不是常数:
 #   maxlen=1M  : 2.53 GiB → 1,206,255 tok(2.25 KiB/tok);12.01 GiB → 6,724,586 tok(1.79 KiB/tok);
 #                 2.71 GiB → 1,290,154 tok(2.20 KiB/tok)   ← 三次互洽
@@ -393,8 +396,13 @@ def emit_env(p: dict) -> str:
     # ⚠️ 这仍是**保底**;每-token KV 的模型常量(KV_GIB_PER_MTOKEN)按 V4.1 标定,对 GQA 系模型
     #   会低估(见 EXPERIMENTS B134/B135),把长上下文容量算准是独立工作项。
     _kv_floor = max(1 << 30, int(_env_gib("XIAOTU_KV_CACHE_FLOOR", 1.0) * (1 << 30)))
-    if _kv_bytes < _kv_floor:
-        _kv_bytes = _kv_floor
+    # `p["kv_bytes"]` 是旧逻辑给的上限 = max(0.5, min(需求, 可用显存))。
+    # 下发值取"需求×slack 与下限的较大者",但**不得超过可用显存**(否则 1M 时会下发一个
+    # 显存装不下的值,服务照样起不来,只是换个错法);可用不足时按可用给,并已有容量自检告警。
+    _kv_avail = max(int(p.get("kv_bytes", 0)), _kv_floor)
+    _kv_bytes = max(int(p.get("kv_gib", 0.0) * _slack * (1 << 30)), _kv_floor)
+    if _kv_bytes > _kv_avail:
+        _kv_bytes = _kv_avail
     lines.append(f"XIAOTU_KV_CACHE_BYTES={_kv_bytes}")
     return "\n".join(lines)
 
