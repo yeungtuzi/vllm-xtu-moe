@@ -100,7 +100,7 @@ GLM-5.3(FP8,每 rank 每层 **3.38 GiB**)实测 —— ⚠️ **必须用无 syn
 |---|---|
 | 吞吐优先 / 低并发长 prefill | **开** GPU 预填(收益大) |
 | **尾延迟敏感**的并发长上下文 | **`GPU_PREFILL_MIN=0` 关掉**(已验证可消除 10–14 s 尖峰;代价:prefill 变慢,GLM 8K 预热 TTFT 37→57 s) |
-| 想两者兼得 | 增大 **MBT**(**减少 chunk 数 ⇒ 减少总上传次数**,总 H2D ∝ chunk 数)(总 DMA ∝ chunk 数;**但单步尖峰不变**)、或**常驻层** `RESIDENT_LAYERS`(收益 = N/层数;实测 2 层 ⇒ prefill **+4.4%**,但 decode −2~6%) |
+| **想提速/降尾延迟** | ⭐ **加大 MBT(减少 chunk 数)**:实测 8000-token prompt 从 2 chunk 降到 1 chunk,**prefill 51.7s → 34.7s(−33%)**;同时 prefill-carrying pass 变少 ⇒ 停顿机会变少(EXPERIMENTS **B144/B147**)。⚠️ **受显存硬上限**:GLM(maxlen 131072,util 0.85,KV 1 GiB)下 **MBT 16384/32768 直接 OOM** ⇒ 要更大 MBT 需同时压 KV 或降 util |(总 DMA ∝ chunk 数;**但单步尖峰不变**)、或**常驻层** `RESIDENT_LAYERS`(收益 = N/层数;实测 2 层 ⇒ prefill **+4.4%**,但 decode −2~6%) |
 
 **诊断命令(定位这类问题只用这两条)**:
 ```bash
