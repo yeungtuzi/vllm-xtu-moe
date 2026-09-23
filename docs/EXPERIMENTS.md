@@ -5084,6 +5084,29 @@ ValueError: LMCache chunk size 256 must be a multiple of 2176 (the vLLM block si
 `serve_glm53_mainline.sh`、`serve_v41.sh` 均支持 `LMCACHE=1` / `LMCACHE_XFER=true` ✓;
 `serve_lmcache.sh` 加 `TRANSFER_MODE`(支持 `auto` ✓,以配对 `transfer_query` ✓)
 
+
+### B173 用户决策:**DeepSeek-V4-Flash 永久退役**;支持面收敛为 V4.1 / GLM-5.3 / MiMo
+
+**用户指示**:"deepseek-v4-flash 已经永久退役,不要再尝试支持它了。" ⇒
+* 计划里"用 V4-Flash 做 LMCache 基线对照"**取消** ✓(本机也确实没有其 checkpoint ✓,见 B172)
+* **支持面 = V4.1-Flash / GLM-5.3-Flash / MiMo-V2.6-Flash-RL** ✓ ⇒ LMCache 的"所有模型"按**这三者**验收 ✓
+* `serve_prod_8070.sh` 的 `MODE=fast`(V4-Flash 档)与 `tune_serve.sh` 的 V4-Flash 默认 CKPT
+  ⇒ **标记为退役、不再维护/不再测试** ✓(脚本保留,便于历史归档 ✓)
+
+**本轮进展(配置全部对齐后)**:GLM + LMCache **能正常加载** ✓
+(日志逐层建 MoE 引擎 ✓;GPU0/1 各 ~16–17 GiB ✓;**无报错** ✓)——GLM 冷加载本就慢(历史 ~38 s/shard ✓)
+⇒ 等加载完成后执行 store 验收 ✓
+
+**GLM 的完整对齐配置(下一步复用)**:
+```
+服务端:CHUNK_SIZE=2176 TRANSFER_MODE=auto L1_GB=40      (scripts/serve_lmcache.sh)
+vLLM  :PORT=8071 TAG=glm_lmcache LMCACHE=1 LMCACHE_XFER=true SPEC_K=0 MAXLEN=524288 \
+       PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (scripts/serve_glm53_mainline.sh)
+验收  :①/status.total_object_count > 0 ②重启 vLLM 后同前缀 TTFT < 5 s ③L2 目录出现文件
+```
+**已知的两条硬前置**(B172):①**不能开** `expandable_segments:True`(除非 cumem ✓)
+②**chunk-size 必须是各模型 block 的公倍数**(V4.1 需 64 的倍数 ✓、GLM 需 2176 ✓ ⇒ **取 2176** ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

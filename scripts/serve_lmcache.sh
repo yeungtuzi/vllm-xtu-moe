@@ -10,7 +10,7 @@ L2_GB="${L2_GB:-100}"
 TRANSFER_MODE="${TRANSFER_MODE:-lmcache_driven}"   # lmcache_driven|engine_driven|auto
 # chunk 必须 ≥ 各模型 vLLM block 的最小公倍数:V4.1 需 64 的倍数 ✓;GLM 需 2176 的倍数 ✓
 # ⇒ 2176 = 64 × 34 同时满足两者(见 EXPERIMENTS B172)✓
-CHUNK_SIZE="${CHUNK_SIZE:-2176}"                       # 磁盘容量上限
+CHUNK_SIZE="${CHUNK_SIZE:-2176}"                       # 跨模型公共值(见 B172)
 PORT="${PORT:-5555}"                        # connector 默认 tcp://localhost:5555
 mkdir -p "$L2_DIR"
 echo "[lmcache] L1=${L1_GB}GB L2=${L2_DIR}(${L2_GB}GB) port=${PORT} transfer=${TRANSFER_MODE} chunk=${CHUNK_SIZE}"
