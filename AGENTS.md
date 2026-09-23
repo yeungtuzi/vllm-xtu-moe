@@ -28,3 +28,8 @@
 - 启动服务后**必须同步读启动日志**确认,不许"发脚本→等结果"。
 - 改投机 / 图模式 / RoPE 前先看 `Mean acceptance ratio`;`GPU prefill ACTIVE` 不等于已启用,要看 slack 正负。
 - 结论写入台账(`docs/EXPERIMENTS.md`),不要只留在会话里。
+
+9. **"清理残留"也必须用显式 PID 允许列表**:从**日志/PID 文件**里把要停的 PID **逐个抄出来**,
+   确认归属后**逐个 kill** ✓;**禁止**任何形式的模式匹配(包括 `case "$cmdline" in *xxx*`,
+   `grep`+xargs 等 ✗)。**教训**:本会话曾用 `case` 匹配 `*lmcache*` "清理残留",
+   结果**把本该保留的 LMCache 服务端杀了** ✗ —— 模式匹配在清理场景同样会命中错误目标 ✓。

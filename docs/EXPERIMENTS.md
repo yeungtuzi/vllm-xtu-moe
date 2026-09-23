@@ -5107,6 +5107,22 @@ vLLM  :PORT=8071 TAG=glm_lmcache LMCACHE=1 LMCACHE_XFER=true SPEC_K=0 MAXLEN=524
 **已知的两条硬前置**(B172):①**不能开** `expandable_segments:True`(除非 cumem ✓)
 ②**chunk-size 必须是各模型 block 的公倍数**(V4.1 需 64 的倍数 ✓、GLM 需 2176 ✓ ⇒ **取 2176** ✓)
 
+
+### B174 ⚠️ 事故:用 `case` 模式"清理残留"时**误杀 LMCache 服务端**;纪律加第 9 条
+
+**经过**:GLM 卡在加载(`layers.22` 后日志不再更新 ✗),我改用 V4.1 验收;
+清理"残留 GPU 进程"时我用 `case "$cmdline" in *api_server*|*EngineCore*|*lmcache*)` ✗
+⇒ **LMCache 服务端的 cmdline 正是 `python .../lmcache/...`** ⇒ **被一起杀掉** ✗✗
+
+**实际状态**:当时 GPU 上**只剩 LMCache 服务端**一个进程(377259 ✓),GLM/V4.1 的 worker 早已退出 ✓
+⇒ 我的"清理"**只杀掉了唯一该保留的东西** ✗
+
+**⇒ 纪律(已写入 AGENTS.md 第 9 条)**:清理残留**也必须**用**显式 PID 允许列表**(从日志/PID 文件逐个抄 ✓),
+**禁止任何模式匹配**(含 `case`/`grep`+xargs ✗)——模式匹配在清理场景**同样会命中错误目标** ✓
+
+**处置**:按正确配置重启 LMCache 服务端(`CHUNK_SIZE=2176 TRANSFER_MODE=auto L1_GB=40` ✓),
+继续 V4.1 的 store 验收 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
