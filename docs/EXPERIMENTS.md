@@ -4990,6 +4990,36 @@ def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
 (`XIAOTU_KVHOOK_DEBUG=1` 时才打印 ✓,默认不影响 ✓);该改动**不在版本控制内** ✓,在此明确记录 ✓,
 回滚方式 = 重装同版本 lmcache 或删除那 8 行 ✓
 
+
+### B170 ⭐⭐ 两套 connector 的**对照结论**:内置的**不支持 V4.1 多组 KV**;外部的不 store(被门控)
+
+**A/B 实测(同一套 LMCache 服务、同一模型、只换 connector 实现)**:
+
+| connector | 启动 | 几何 | store |
+|---|---|---|---|
+| **外部**(`lmcache 0.5.5` 包内,默认 ✓) | ✅ 起来 ✓ | ✅ `Resolved LMCache MP geometry: [32,32,32,32,128,8]` ✓ | ✗ **`dispatcher=NONE` ⇒ 静默 no-op**(B169 ✓) |
+| **内置**(`LMCACHE_USE_UPSTREAM_MP=1` ✓) | ✗ **起不来** | — | — |
+| 内置的失败原文 | `ValueError: Failed to promote local KV cache specs to one unified type.` + `Engine core initialization failed` | | |
+
+⇒ **内置版只支持"单一 KV 类型"** ✗ ⇒ **不支持 V4.1 的异构多组 KV**(uint8 fp8/压缩组 + float32 索引器组 ✓)
+⇒ **外部版支持多组几何** ✓,但它的**逐层 `save_kv_layer` 只在 `self.transfer_intermediate_tensors` 为真时**
+才创建 dispatcher(`lmcache_mp_connector.py:623-638` ✓)⇒ 默认 False ⇒ **逐层存储路径是 no-op** ✗
+⇒ 而现代 LMCache MP 的**正常存储是"服务端驱动"**(`Supported transfer mode: lmcache_driven` ✓ +
+`Bind GPU block pool` ✓ + `Registered KV cache … with 51 layers` ✓)⇒ 走 `request_finished` ⇒ 服务端**拉取** ✓
+
+**⇒ 因此当前阻塞点的准确表述**:
+> **`lmcache 0.5.5` 的外部 MP connector 在"服务端驱动 + HMA 多组"组合下,没有把 V4.1 的 KV 写入缓存。**
+
+**下一轮的可选路径(按性价比)**:
+1. **查 LMCache 的版本兼容页**([vLLM and LMCache compatibility](https://docs.lmcache.ai/getting_started/compatibility.html) ✓)
+   ⇒ 对**我们这棵 dev revision** 应配**哪个 lmcache 版本**(最可能就是这个不匹配 ✓)
+2. 试 `transfer_intermediate_tensors` 对应的**配置开关**(若它就是"逐层传输"的合法入口 ✓)
+3. 读外部 connector 的 `request_finished` / 服务端 pull 路径,确认**服务端要什么才肯拉**(块 id ✓? `l2-store-policy` ✓?)
+4. 必要时按上游纪律(**人类主导** ✓ + 重复性检查 ✓ + 测试与评测 ✓ + AI 声明 ✓)向 LMCache 提 issue/PR ✓
+
+**现场状态**:8070 已恢复到**可用的外部 connector 配置**(调试态:`SPEC=0` + CPU 预填 ✓,不写 LMCache ✗)
+⇒ 用户如需恢复生产口径(dspark + GPU 预填)随时可用固化默认 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
