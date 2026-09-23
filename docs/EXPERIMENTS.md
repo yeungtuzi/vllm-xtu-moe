@@ -4840,6 +4840,43 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate **382.00 MiB**
 **生产状态提示**:当前 8070 跑的是**调试用 LMCache 实例**(`SPEC=0` + CPU 预填 ✗),**不是**用户的生产口径;
 恢复生产需用固化默认(或 `LMCACHE=1` 复现当前调试态)✓ —— 待用户指示 ✓
 
+
+### B166 ⭐⭐ **根因定位**:V4.1 注意力层**漏了 `@maybe_transfer_kv_layer` 装饰器** ⇒ LMCache 只查不存
+
+**证据链(全部实测)**:
+1. LMCache `/status` ⇒ **`total_object_count: 0`**、`memory_used_bytes: 0` ✗(什么都没存)
+2. `/metrics` ⇒ **lookup 在跑**(`lmcache_mp_l2_prefetch_lookup_requests_total=3`、
+   `..._objects_chunks_total=186` ✓)但 **`hit_chunks=0`** ✗;`lmcache_mp_lookup_requested_tokens_total{model_name=…V4.1-Flash}`
+   说明 connector **确实在与服务端对话** ✓
+3. **重启 vLLM 后同前缀 26.73 s**(= 冷启动)✗;而**不重启**时的 0.35 s 是 **vLLM 自己的 GPU 前缀缓存** ✗
+
+**代码追因(逐层排除)**:
+* 全树里 **`save_kv_layer` 的唯一通用调用点** =
+  `vllm/model_executor/layers/attention/kv_transfer_utils.py` 的装饰器 **`@maybe_transfer_kv_layer`**
+  (入口 `wait_for_layer_load` ✓ / 出口 `save_kv_layer` ✓;无 KV-transfer group 时 **no-op** ✓)
+* **标准层在用它**:`layers/attention/attention.py:15` ✓、`layers/attention/mla_attention.py:1458`
+  (`@eager_break_during_capture` + `@maybe_transfer_kv_layer` + 函数带 **`layer_name: LayerNameType`** ✓)
+* **V4.1 全后端 0 处** ✗:`nvidia/{flashmla,flashinfer_sparse,engram,dspark,model,vl_model,…}.py` 全部未装饰
+  ⇒ **lookup(scheduler 驱动 ✓)会跑,store(注意力层驱动 ✗)永远不跑** ✓✓ **与观测完全自洽**
+
+**修法(照标准层样板,两行)**:
+```python
+from vllm.model_executor.layers.attention.kv_transfer_utils import maybe_transfer_kv_layer
+
+@eager_break_during_capture
+@maybe_transfer_kv_layer                      # ← 唯一缺的东西
+def <V4.1 的 KV 写入函数>(..., layer_name: LayerNameType, ...):
+    ...
+```
+* 装饰器**没有 connector 时是 no-op** ⇒ **对现有生产零风险** ✓
+* 前提:被装饰函数需有 **`layer_name`** 参数(标准层有 ✓;V4.1 侧需补上并让调用方传入 ✓)
+* V4.1 的候选位置:`models/deepseek_v41/attention.py` 的 `_fused_qnorm_rope_kv_insert`(:831)/ `forward`(:545)
+  / `forward_mqa`(nvidia 侧 :101)
+
+**⇒ 上游化价值(直接回答 Q3)**:这是**教科书式的 vLLM PR** —— "V4.1 注意力缺失 KV-connector 钩子,
+导致 LMCache 等外部 KV 缓存无法存储" ✓;而且它**天然与 rebase 计划合流**:
+补丁应打在 **rebase 后的上游树**上 ✓(而不是我们的旧分支 ✓),这样既能上游、又能长期维护 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
