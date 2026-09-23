@@ -4505,6 +4505,36 @@ L=16384 → 49.85 vs 53.85 = **−4.00**(GPU 反超)✓
 
 **配套文档**:`docs/MODEL_GUIDES.md` **§0.1b-2** 新增"本机 + V4.1-Flash 默认配置"表 + 三个易错点 + 256K(GPU 预填)档的切换命令 ✓
 
+
+### B156 ⭐ A/B:**EAGER=1(现状) vs FULL_DECODE_ONLY+compile** —— **现状胜**(新配置慢 30%,但省 9.6 GiB 显存)
+
+**动机(用户)**:lk_moe 作者推荐 `cudagraph_mode=FULL_DECODE_ONLY`;我们脚本里也有这个模式
+(`COMPILE=1` ⇒ `{"cudagraph_mode":"FULL_DECODE_ONLY","mode":"VLLM_COMPILE"}`,注释写"probe 里一直是这个")。
+历史上强制 eager 的原因是 **①dspark 草稿在图捕获下崩**,**②引擎的 use-after-free**(`NOTES §1.2`,**已修**)⇒ 值得复测。
+
+**测试**:sharegpt 数据集,**N=100,C=2,OUT=128**,同一台机同一 1M 配置,只改图模式(客户端 `vllm bench serve` + 服务端 `/metrics` + 日志周期统计)。
+
+| 指标 | **A:EAGER=1** | **B:COMPILE=1 EAGER=0** |
+|---|---|---|
+| agg 吞吐 | **29.50 tok/s** | 20.50 tok/s(**−30%**)|
+| TPOT(客户端,每 token)| **53.84 ms** | 66.79 ms(+24%)|
+| TTFT | **1140 ms** | 2112 ms(+85%)|
+| completed | 100/100 | 100/100 |
+| **崩溃(XTSIG/SIGSEGV)** | 0 | **0** ✓(use-after-free 确实已修)|
+| spec 接受长度 | 2.43 | 2.30–2.49(≈同)|
+| **显存占用** | 36,533 MiB/卡 | **26,931 MiB/卡(省 9.6 GiB)** ✓ |
+
+**⇒ 结论**:
+1. **A(EAGER=1)全面更优** ⇒ **维持 A 为固化默认** ✓(用户规则:"新的更好才换")⇒ 固化默认现在**有实测支撑** ✓;
+2. **B 没崩**(历史 use-after-free 已修 ✓),但**更慢**:推测原因是 `mode: VLLM_COMPILE` 面对 sharegpt
+   **长度各异**的 prompt 会**反复按形状编译**,而我们的路径 Python/CPU 编排很重 ⇒ 编译收益抵不过开销;
+3. **B 唯一优势:省 9.6 GiB/卡** ⇒ 若将来要"常驻层 + 更多 KV",B 是一条可换的路径(但要以 −30% 吞吐为代价)。
+
+**⇒ 过程教训(两条,已让我踩坑)**:
+* **启动必须同步读日志确认**:我先前"发脚本→等结果"导致 B 臂根本没起来而我以为在跑 ✗;
+* **裸跑脚本时 TAG 默认是 `v41`** ⇒ 日志落在 `logs/v41.log`,不是你以为的 TAG 名;且**旧 EngineCore 残留进程会占着显存**
+  (B 臂的 worker 在我停掉 API server 后仍活了 11 分钟并占 ~32 GiB ✗)⇒ **清理必须按 PID、并核对 GPU 进程列表**。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
