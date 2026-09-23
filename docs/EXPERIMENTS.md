@@ -5123,6 +5123,38 @@ vLLM  :PORT=8071 TAG=glm_lmcache LMCACHE=1 LMCACHE_XFER=true SPEC_K=0 MAXLEN=524
 **处置**:按正确配置重启 LMCache 服务端(`CHUNK_SIZE=2176 TRANSFER_MODE=auto L1_GB=40` ✓),
 继续 V4.1 的 store 验收 ✓
 
+
+### B175 ⭐ 找到 `transfer_query` 的**真正配对开关**(服务端 `--enable`),但 store 仍未落地
+
+**关键发现** ✓:`transfer_query` **不是** `--supported-transfer-mode` 的事 ✗,而是服务端**独立的实验模块列表**:
+```
+lmcache server --enable [MODULE ...]
+  List of experimental transfer modules to enable. Options: transfer_query
+```
+(源码:`lmcache/v1/multiprocess/config.py:119-121` ✓;CLI:同文件 `:438-446` ✓)
+
+**配对后的效果(实测)**:
+| 配置 | 服务能否启动 |
+|---|---|
+| connector `LMCACHE_XFER=true` + 服务端**未** `--enable transfer_query` | ✗ `Connector enables transfer_query but server does not.` |
+| **两者都开**(`ENABLE_MODULES=transfer_query` ✓) | ✅ **启动成功**(READY 370 s ✓,**报错消失** ✓) |
+
+**但仍未存储** ✗:请求正常(26.9 s ✓)、`/status.total_object_count = 0` ✗、L2 文件数 0 ✗
+
+**⇒ 缺口从"连不上/被拒"推进到"连上了但不落盘"** ✓ ⇒ 下一步诊断**非常明确**:
+1. **带 `XIAOTU_KVHOOK_DEBUG=1` 重启** ⇒ 看 connector 的 `[lmc-save]` 行里
+   **`dispatcher` 是否终于变成 `SET`** ✓✓:
+   * 若 **SET** ⇒ 分派发生了 ⇒ 缺口在**服务端的接收/提交**(查服务端日志与 L2 store 策略 ✓)
+   * 若仍 **NONE** ⇒ connector 的 dispatcher 初始化路径**没被走到**(继续查它的初始化条件 ✓)
+2. 并行验证**服务端驱动**那条路(`transfer_intermediate_tensors=false` ✓):给 connector 的
+   `request_finished_all_groups` 注入一次性日志 ✓,确认它是否真把块交给服务端 ✓
+   —— 这条路**理论上无性能损失**(CUDA IPC 直读 ✓,见 B173 的性能结论 ✓)⇒ 若它能通,**应优先采用** ✓
+
+**已固化的脚本能力**:`serve_lmcache.sh` 支持 `CHUNK_SIZE`(默认 2176 ✓)/ `TRANSFER_MODE` / `ENABLE_MODULES` ✓;
+`serve_v41.sh` / `serve_glm53_mainline.sh` / `tune_serve.sh` 支持 `LMCACHE` + `LMCACHE_XFER` ✓
+
+**现场**:8070 = V4.1 + LMCache(逐层传输已配对 ✓,不写盘 ✗);LMCache 服务端存活(`transfer_query` + chunk 2176 + auto ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
