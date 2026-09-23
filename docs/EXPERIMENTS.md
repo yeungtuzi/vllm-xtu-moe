@@ -5313,6 +5313,44 @@ dispatcher 又只在 `transfer_intermediate_tensors`(实验的 `TRANSFER_QUERY`)
 2. LMCache PR 价值评估(后台任务 ✓)⇒ 与我的初步判断交叉验证 ✓
 3. 若评估支持 ⇒ 准备 **LMCache issue/PR 材料**(按上游纪律:人类主导 ✓、重复性检查 ✓、测试与评测 ✓、AI 声明 ✓)
 
+
+### B181 ⭐⭐⭐ **重大纠正**:B166/B169/B177 的因果链**被推翻**;store 的真路径是 `wait_for_save`
+
+> 由独立评估(子代理,逐行读源码 ✓)提出,并**经我亲自复核代码确认** ✓。
+
+**三条被推翻/修正的结论**:
+| 旧结论 | 复核结果 |
+|---|---|
+| B177:"HMA 入口只传 `block_ids[0]`,**其余组被丢弃**" | ✗ **错**:`request_finished` **从不使用** `block_ids` 参数(只在签名里出现 ✓)⇒ 传什么**都不影响** ✓,改它**是无意义改动** ✗ |
+| B166/B169:"V4.1 缺注意力钩子 ⇒ 从不 store"、"dispatcher=None ⇒ 静默 no-op" | ✗ **对 MP connector 不成立**:store 由 **`wait_for_save()`** 提交(vLLM 在每次 forward 后调用 ✓,见 `kv_connector_model_runner_mixin.py` ✓),其数据来自 **scheduler 产出的 `GetStoreMetadata`** ✓ ⇒ **注意力层钩子对 MP connector 不是必需** ✓ |
+| "内置 connector 起不来是它的缺陷" | ⚠️ 部分修正:内置版**未声明 `SupportsHMA`** ⇒ vLLM 自动关闭 HMA ⇒ 触发 `unify_hybrid_kv_cache_specs` 失败 ✓;而**外部版声明了 `SupportsHMA`**(第 448 行 ✓)⇒ **文档的正解是显式加载外部 connector** ✓ |
+
+**新发现的最强假设(代码支持 ✓)**:
+`GetStoreMetadata` 里 `allocated_tokens = min(各 engine 组已分配块 × 每组 tokens_per_block)`
+(遍历**所有**组 ✓)⇒ **只要有任一组的已分配块为 0 ⇒ `num_chunks = 0` ⇒ 永不产生 STORE** ✗✓
+⇒ 这**完全能解释**"lookup 有、store 无、服务端 L1 零分配" ✓✓
+
+**上游文档(评估方查证 ✓,权威)**:V4.1 与 GLM-5.3 **均被列为 validated** ✓,且**配方极简**:
+```
+服务端:--chunk-size 256 --separate-object-groups --l1-size-gb 100 --eviction-policy LRU
+vLLM  :--kv-cache-dtype fp8_ds_mla --enable-prefix-caching \
+       --kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}'
+```
+⇒ **没有** `transfer_intermediate_tensors` ✗、**没有** `--enable transfer_query` ✗、**不需要**注意力钩子 ✗
+⇒ 而我们此前的实验**全部偏离配方** ✗(chunk 2176 ✗、XFER ✓、transfer_query ✓、未设 `kv_connector_module_path` ✗),
+且**服务端 site-packages 里还留着我的调试注入** ✗、**跑的还是 499 提交落后的旧树** ✗
+⇒ **⇒ 所以"LMCache 有缺陷"的结论证据不足** ✗;**必须先按配方在干净环境重做** ✓
+
+**修正后的行动**:
+1. **停止 LMCache PR 轨道** ✗(不提交)
+2. **恢复干净**:移除 site-packages 里的调试注入 ✓;按**配方**重配(chunk **256** ✓、无 XFER ✓、无 transfer_query ✓、设 `kv_connector_module_path` ✓)
+3. **instrument 真路径**:`build_connector_meta`/`GetStoreMetadata`(**重点看各组的 `num_allocated_blocks`** ✓)
+   → `wait_for_save` → `submit_store_request` → 服务端接收 ✓
+4. 验收:`total_object_count > 0` ✓ ⇒ 重启后同前缀 **TTFT < 5 s** ✓
+5. 只有在**干净环境**下仍复现缺陷 ⇒ 先给 LMCache **提 issue**(附完整运行时元组 ✓),再谈 PR ✓
+6. **vLLM 的 V4.1 注意力钩子另案处理** ✓(它只对"逐层连接器"有用 ✓;若上游化需清理:
+   用 `maybe_transfer_kv_layer` 装饰器 ✓、传**层名**而非组键 ✓、去掉调试代码 ✓、覆盖各后端 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
