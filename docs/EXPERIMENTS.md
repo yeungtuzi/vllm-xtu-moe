@@ -5543,6 +5543,25 @@ Free memory on device cuda:0 (32.4/39.49 GiB) is less than desired GPU memory ut
 **注**:`GPU_UTIL` 对我们**只影响预检** ✓(我们显式给 `KV_CACHE_BYTES` ✓)⇒ 0.90→0.85 无效是**预期** ✓
 (真正需要的是释放 MiMo 的 11.7 GB ✓)
 
+
+### B189 验收与第三模型**并行推进中**(两个都在跑,均无报错)
+
+**并行方案**(用户等待时间优化 ✓):`GPU_UTIL` 对我们**只影响预检** ✓(KV 显式 ✓)⇒
+用 `GPU_UTIL=0.78`(29.6 GiB < 空闲 32.4 GiB ✓)让 V4.1 的预检通过 ✓,
+与 MiMo 的加载**并行**跑 ✓(实测显存:两卡各 ~14 GB ✓ ⇒ 放得下 ✓)
+
+| 任务 | 状态 |
+|---|---|
+| **V4.1 + LMCache(修法验收)** | ⏳ 加载中(8077 ✓,已建到 layer 4 ✓,**0 报错** ✓)|
+| **MiMo(第三模型)** | ⏳ **98% (64/65)** ✓(即将就绪 ✓)|
+
+**下一轮**:①MiMo 冒烟 ⇒ **三模型回归完成** ✓ ②V4.1 就绪后发请求 ⇒
+**`/status.total_object_count > 0`?**(修法是否生效 ✓)⇒ 若 >0 ⇒ 再做**重启后仍命中** ✓(= P3 达成 ✓✓)
+③之后:打包备份 + 删除 6 棵旧树 ✓;整理 LMCache PR 材料 ✓
+
+**当前唯一树**:`/home/user/lvllm/vllm-consolidated`(最新 `origin/main` + 16 提交 ✓,behind=0 ✓)
+**fork**:`/home/user/lvllm/lmcache-fork`(`bd5d334` = 修法 ✓;已装入 site-packages ✓,留 `.prefix-bak` 备份 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
