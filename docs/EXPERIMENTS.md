@@ -4952,6 +4952,44 @@ if _md is not None and conn.has_connector_metadata():
   commit 需 `Co-authored-by:`/`Signed-off-by:` ✓
 ⇒ 结论:我们的 V4.1 钩子补丁**具备上游价值** ✓,但提交时必须 **由人主导** 并补齐上述材料 ✓
 
+
+### B169 ⭐⭐⭐ **LMCache 不存储的最终根因:`dispatcher is None`** ⇒ `save_kv_layer` 静默 no-op
+
+**决定性证据**(在 connector 的 `save_kv_layer` 里注入一次性日志 ✓,开关 `XIAOTU_KVHOOK_DEBUG=1` ✓):
+```
+[lmc-save] called layer='language_model.model.layers.0.attn.swa_cache'
+           dispatcher=NONE   conn_meta=True   attn_meta=True
+```
+而 connector 的实现(`site-packages/lmcache/integration/vllm/lmcache_mp_connector.py:818`):
+```python
+def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
+    if self.dispatcher is not None:          # ← None ⇒ 什么都不做,直接 return
+        dispatch(self.dispatcher, "save_kv_layer", layer_name=..., metadata=..., attn_metadata=..., **kwargs)
+    return
+```
+⇒ **KV 从未离开 vLLM 进程** ✓ ⇒ L1 对象数 0 ✓、L2 空 ✓ —— 与全部观测一致 ✓✓
+
+**副产物(此前白试的原因)**:`save_kv_layer` **根本不把 `kv_layer` 张量传给 dispatch** ✓
+⇒ 所以"传层名 vs 传组键"、以及传哪个组的缓冲,**都不影响** ✓(两条路都不落对象的原因 ✓)
+
+**完整因果链(四层,全部实测)**:
+| # | 层 | 结论 | 出处 |
+|---|---|---|---|
+| 1 | 模型注意力 | V4.1 八个后端**无** `save_kv_layer` 钩子 ⇒ 从不"存" | **B166** |
+| 2 | metadata 键 | 是**组级**键 `<layer>.attn.<group>`(每层多组) | **B167** |
+| 3 | connector 参数 | `kv_layer` **不被使用**;层名/组键均可到达 `save_kv_layer` | **B168** |
+| 4 | **connector 状态** | **`dispatcher` 未创建** ⇒ 调用被静默跳过 ⇒ **不存** | **B169(本条)** |
+
+**下一轮/上游化的精确落点**:
+1. 查 `self.dispatcher` 的**创建点与触发条件**(在哪个 hook 里初始化 ✓),弄清为什么 worker 侧是 None
+   (最可能:**懒初始化未被 vLLM 的 dev 修订触发** ✗,或**初始化只发生在 scheduler 侧** ✗)
+2. 若属 LMCache 侧缺陷 ⇒ 按上游纪律提 **LMCache issue/PR** ✓;若属 vLLM 侧 hook 缺失 ⇒ 提 **vLLM PR** ✓
+3. 我们的 V4.1 钩子补丁(B166/B167 两项)**仍需保留并上游化** ✓(它是必要条件 ✓)
+
+**⚠️ 现场状态说明**:为定位问题,我在 **site-packages** 的 connector 里加了**受环境变量保护**的一次性日志 ✓
+(`XIAOTU_KVHOOK_DEBUG=1` 时才打印 ✓,默认不影响 ✓);该改动**不在版本控制内** ✓,在此明确记录 ✓,
+回滚方式 = 重装同版本 lmcache 或删除那 8 行 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
