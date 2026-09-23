@@ -119,6 +119,7 @@ TOOL_PARSER="${TOOL_PARSER:-deepseek_v4}"
 REASONING_PARSER="${REASONING_PARSER:-deepseek_v3}"
 CHAT_TEMPLATE_KWARGS="${CHAT_TEMPLATE_KWARGS-{\"thinking\":true}}"
 [ "$EAGER" = "1" ] && ARGS+=(--enforce-eager)
+[ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && ARGS+=(--enable-prompt-tokens-details)   # DSH 的"缓存命中%"需要 usage.prompt_tokens_details.cached_tokens
 [ -n "$SPEC" ] && ARGS+=(--speculative-config "$SPEC")
 [ -n "$TOOL_PARSER" ] && ARGS+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
 [ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")

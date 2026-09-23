@@ -71,6 +71,7 @@ ARGS=(--model "$CKPT" --served-model-name mimo26
       --load-format "$LOAD")
 [ -n "$TOOL_PARSER" ] && ARGS+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
 [ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
+[ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && ARGS+=(--enable-prompt-tokens-details)
 [ "$MM" = "1" ] || ARGS+=(--language-model-only)
 if [ "$MM" = "1" ]; then
   # 注意:不要把 JSON 默认值直接写进 ${VAR:-...},花括号会和展开的 } 冲突(会多出一个 })。
