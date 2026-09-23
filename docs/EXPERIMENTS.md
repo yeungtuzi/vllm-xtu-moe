@@ -5761,6 +5761,30 @@ L2 文件数 = 62                                                               
 **fork 现状** ✓:`/home/user/lvllm/lmcache-fork`(基线 `1a997f6` ⇒ 修法 `b310664` ✓ + 忽略字节码 `f5f4fb1` ✓);
 **已装入 site-packages** ✓(本轮全部实测均基于它 ✓)
 
+
+### B197 ✅ **P5 文档定稿** + ✅ **P4 投机复测通过**
+
+**P5(文档)** ✓:
+* `docs/MODEL_GUIDES.md` **§5 改写为「已打通」** ✓ —— 含实测数字(冷 26.7 s ⇒ 重启后 **1.27 s** ✓;
+  连服务端重启仍 1.27 s ⇒ **纯 L2 磁盘命中** ✓)、**三条前置条件** ✓(allocator / chunk / V4.1 补丁 ✓)、
+  实测可用的启动配方 ✓、巡检与验收方法(`Stored`/`Retrieved`/`total_object_count`/L2 文件数 ✓)、
+  V4.1 专属修法与**为什么通用** ✓、我们的上游化候选 ✓
+* `README.md` 新增「持久化输入缓存(LMCache,SSD)」段 ✓(配方 + 头条数字 ✓)
+
+**P4(投机复测)** ✓ —— 目标要求"开 dspark 复测(文档标注未验证)" ✓:
+```
+SPEC=1 ⇒ SpeculativeConfig(method='dspark', num_speculative_tokens=5)      ← 投机已启用 ✓
+★total_object_count = 62                                                  ← store 正常 ✓
+服务端:Stored 3840 tokens / Stored 4096 tokens                             ✓
+```
+⇒ **投机解码与 LMCache 共存无冲突** ✓;此前文档标注的"V4.1 MTP 未验证" ✗ 在
+**dspark** 这条路线上**已实测可用** ✓(`serve_v41.sh` 的 `SPEC=1` ✓)
+
+**剩余** ✓:
+* **GLM / MiMo 的 LMCache 路径**(目标的"支持已经支持的所有模型" ✗)——
+  GLM 官方为**单组** ✓(无 scratch 组 ⇒ 理论上无需本修法 ✓),MiMo 待验 ⏳
+* **P6 提交**(需人类 + 联网做重复性检查 ✗)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
