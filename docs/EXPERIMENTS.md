@@ -4918,6 +4918,40 @@ if _md is not None and conn.has_connector_metadata():
    [Hybrid Attention 模型](https://docs.lmcache.ai/zh_CN/mp/hybrid_models.html) 的 HMA 契约 ✓
 3. 成功后:重启验证"**重启后仍命中**" ✓ ⇒ P3 完成 ⇒ 再做 P4(开 dspark)与 P5(落地文档/README)✓
 
+
+### B168 LMCache 进行时:钩子已生效(fire ✓),但对象仍不落地 ✗ —— 缺口收窄到 connector 内部
+
+**本轮已排除/已确认**:
+
+| 步骤 | 结果 |
+|---|---|
+| 补装饰器等价物(V4.1 注意力 forward 包装)✓ | **`[kvhook] ENGAGED layer=…layers.0.attn key=…attn.swa_cache`** ⇒ 钩子**确实触发** ✓ |
+| 传参约定 1:connector 标识用**裸层名** | fire ✓,`total_object_count` **仍 0** ✗ |
+| 传参约定 2:HMA 按组 ⇒ 用**组键** | fire ✓,`total_object_count` **仍 0** ✗;L2 文件数 0 ✗ |
+| vLLM 侧是否暴露 HMA/组 | ✅ 暴露:`kv cache group sizes [32,32,32,32,128,8]` ✓ + LMCache `Resolved LMCache MP geometry` ✓ |
+| 提交路径是否存在 | ✅ 两侧都有:`scheduler.request_finished` / `request_finished_all_groups` ✓;worker `wait_for_save()` ✓;外部 connector 均实现 ✓ |
+| 服务端 L2 适配器 | ✅ `Created FS native L2 adapter` ✓、`store_adapters{state=active}=1` ✓ |
+
+**⇒ 剩余唯一未知**:**外部 connector 的 `save_kv_layer` 为什么没有产出对象**
+(不是"没调用" ✓、不是"没提交路径" ✓、不是"组几何不对" ✓)
+
+**下一轮的具体办法(择一/组合)**:
+1. **在外部 connector 的 `save_kv_layer` 内部加一次性日志**,打印它走的分支/是否 skip(最直接 ✓)
+   —— 文件:`site-packages/lmcache/integration/vllm/lmcache_mp_connector.py:799`
+2. **基线对照**:用官方 validated 的**同族模型**(V4-Flash ✓,同为多组几何)在**同一套 LMCache** 上跑一次
+   ⇒ 若它也不存 ⇒ **是环境/版本问题** ✓;若它存 ⇒ **是 V4.1 特有路径问题** ✓(缩小范围 ✓)
+3. 查 LMCache [Hybrid Attention 模型](https://docs.lmcache.ai/zh_CN/mp/hybrid_models.html) 的 HMA 契约
+   ✓ 以及 lmcache 的 issue 区(可能已有同类报告 ✓)
+4. 需要时按上游纪律提 issue/PR ✓
+
+**P6 上游化的硬约束(刚加载的上游 `AGENTS.md` ✓,必须遵守)**:
+* **禁止纯 AI-agent 的 PR** ✗ —— 必须由**人类提交者**完整理解并能为每一行辩护 ✓
+* 提 PR 前必须做**重复性检查**(`gh issue view` / `gh pr list --search` ✓)
+* AI 协助的 PR 描述**必须**包含:为什么不重复 ✓、**跑过的测试与结果** ✓、**模型评测结果** ✓、**AI 协助声明** ✓
+* 开发规范:`uv` + `.venv`(**禁止** 系统 python/pip ✗)、行宽 88 ✓、Google 风格 docstring ✓、尽量少注释 ✓、
+  commit 需 `Co-authored-by:`/`Signed-off-by:` ✓
+⇒ 结论:我们的 V4.1 钩子补丁**具备上游价值** ✓,但提交时必须 **由人主导** 并补齐上述材料 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
