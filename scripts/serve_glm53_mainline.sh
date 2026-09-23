@@ -245,6 +245,7 @@ echo "[glm53] log=$LOG"
 # 本服务没有 KV connector,所以 vLLM 那条 "kv connector 与 expandable_segments 不兼容" 的
 # 检查不适用。想要旧行为就显式 `PYTORCH_CUDA_ALLOC_CONF=` 传空。
 ENVPREFIX=(
+  PYTHONPATH="${XTU_TREE:-/home/user/lvllm/vllm-up-133b71e0b}"
   HF_HUB_OFFLINE=1
   PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
   VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
