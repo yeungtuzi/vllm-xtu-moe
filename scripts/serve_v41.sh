@@ -106,6 +106,9 @@ HF_OVERRIDES="${HF_OVERRIDES:-}"
 # 【DSH 兼容】工具调用与推理(思考强度)解析器:vLLM 必须显式开,否则 DSH 报
 #   `"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set`,
 # 且拿不到 reasoning_content ⇒ DSH 的"思考强度"选项会消失。置空可关。
+# KV 显存类型:`fp8_ds_mla` 可让同容量显存减半(V4-Flash 生产口径)⇒ 给 GPU 预填腾出余量;
+# 缺省 auto = 不传该参数(保持模型默认)。⚠️ 1M + GPU 预填必须留够余量,否则 prefill 的 MLA logits 缓冲会 OOM。
+KV_DTYPE="${KV_DTYPE:-auto}"
 TOOL_PARSER="${TOOL_PARSER:-deepseek_v41}"
 REASONING_PARSER="${REASONING_PARSER:-deepseek_v3}"
 # 【DSH 思考强度】解析器在**服务启动时**初始化,必须显式告诉它"思考是开的",否则不会切分 reasoning_content。
@@ -323,6 +326,7 @@ nohup env \
     $( [ -n "$TOOL_PARSER" ] && printf -- '--enable-auto-tool-choice --tool-call-parser %s' "$TOOL_PARSER" ) \
     $( [ -n "$REASONING_PARSER" ] && printf -- '--reasoning-parser %s' "$REASONING_PARSER" ) \
     $( [ -n "$DEFAULT_CHAT_KWARGS" ] && printf -- '--default-chat-template-kwargs %s' "${DEFAULT_CHAT_KWARGS// /}" ) \
+    $( [ "$KV_DTYPE" != "auto" ] && printf -- '--kv-cache-dtype %s' "$KV_DTYPE" ) \
     $( [ "${EAGER:-1}" = "1" ] && echo --enforce-eager )  \
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
     $( [ "${SPEC:-1}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" )  \

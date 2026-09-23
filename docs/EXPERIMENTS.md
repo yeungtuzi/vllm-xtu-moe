@@ -4705,6 +4705,43 @@ VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384 · SPEC=1(dspark k=5)
 **⇒ "固化默认 A"的角色**:不是生产,而是**低风险回退档** ✓(不稳时用它)✓
 **⇒ handoff §6 第 1 条恢复为"进行中"**:观察**极限配置**的长期稳定性(此前 31 分钟窗口:0 OOM / 0 崩溃 ✓)
 
+
+### B162 ⭐ 极限配置**在生产中崩了(OOM)**,并用 **fp8 KV + 恢复预留** 调稳:余量 297 MiB → **1,423 MiB**
+
+**现象**(2026-09-23,用户在 8070 上工作时):`EngineCore encountered an issue` + 端到端失败;看护任务第一条就抓到
+`Connection refused` ✗。日志:**8 次 OutOfMemoryError / 9 次 CUDA OOM** ⇒ 服务死亡 ✗
+
+**根因(精确定位)**:
+```
+vllm/models/deepseek_v4/nvidia/ops...  _fp8_mqa_logits_torch → logits = torch.zeros(...)
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate **382.00 MiB**
+```
+* 失败点是 **MLA 索引器的 prefill logits 缓冲** ✓(大小 ∝ prefill chunk ⇒ 每次 prefill 都会要 ✓);
+* **而极限配置的预检余量只有 +0.29 GiB = 297 MiB** ✗ ⇒ **余量比一次常规分配还小** ⇒ **迟早必崩**(此前 31 分钟未崩只是没赶上 ✓)
+⇒ **结论:bf16 KV 的 "1M + GPU 预填" 在 2×40 GB 上不可用于生产** ✗
+
+**调稳方案(完全不动性能路径)**:
+1. **KV 改 fp8**(`--kv-cache-dtype fp8_ds_mla`;V4 模型代码里有 `fp8_ds_mla UE8M0 paged layout`,V4-Flash 生产一直这么用 ✓)
+   ⇒ 同容量显存约为一半 ⇒ 把 **KV 预算 5.6 → 3 GiB** 仍够 1M ⇒ **腾出 ~2.6 GiB** ✓
+2. **把激活预留恢复到 3.0**(它本来就是防这个 OOM 的;崩溃版为了挤进预检把它降到 1.5 ✗)
+3. 保持:`GPU 预填 384` + `FULL_DECODE_ONLY` + `1M` + `dspark k=5` + 解析器 ✓
+
+**调稳后实测**:
+| 项 | 崩溃版 | **调稳版** |
+|---|---|---|
+| 预检 slack | +0.29 GiB(297 MiB)| **+1.39 GiB(1,423 MiB)= 3.7×** ✓ |
+| OOM / EngineDead | 8 / 2 ✗ | **0 / 0** ✓ |
+| GPU 预填 | ACTIVE 80 / DISABLED 0 | ACTIVE 80 / DISABLED 0 ✓ |
+| 显存 | 39,173 MiB | **38,311 MiB** ✓ |
+| KV 池 | 2,962,508 token(bf16)| **1,587,110 token(fp8)**⇒ 1 路 1M 够,两路并发排队 ✓ |
+
+**⇒ 新生产口径(8070)**:`MAXLEN=1048576 · MBT=4096 · SEQS=2 · KV_DTYPE=fp8_ds_mla · KV 3 GiB ·
+预留 3.0 · GPU 预填 384 · COMPILE=1 EAGER=0 · SPEC=1 · 正式全称 + 解析器` ✓
+**⇒ `serve_v41.sh` 新增 `KV_DTYPE` 旋钮**(缺省 auto=不传)✓
+
+**教训**:判断"能不能开 GPU 预填"不能只看**预检是否过线** ✗,还要看**余量是否大于一次常规分配**
+(prefill 的 MLA logits ≈ **382 MiB**,且**余量会随 staging 驻留/碎片而漂移** ✗)⇒ 经验阈值:**至少留 1 GiB 以上** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
