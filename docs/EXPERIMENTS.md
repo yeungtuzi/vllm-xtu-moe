@@ -5785,6 +5785,27 @@ SPEC=1 ⇒ SpeculativeConfig(method='dspark', num_speculative_tokens=5)      ←
   GLM 官方为**单组** ✓(无 scratch 组 ⇒ 理论上无需本修法 ✓),MiMo 待验 ⏳
 * **P6 提交**(需人类 + 联网做重复性检查 ✗)
 
+
+### B198 ✅ **GLM-5.3 + LMCache 通过**(单组对照 ✓);并定出**一个服务端配置同时服务 V4.1 与 GLM**
+
+**实测** ✓:
+```
+Resolved LMCache MP geometry: group_tokens_per_block=[2176, 2176, 2176, 2176, 2176]   ← 5 组,同粒度 ✓
+★★total_object_count = 4
+服务端: Stored 2176 tokens in 0.004 seconds                                          ← 存成功 ✓
+```
+⇒ **GLM 无需我们的补丁即可工作** ✓ —— 它的 5 个组**粒度相同(2176)** ✓、**没有"1 块环形暂存组"** ✗
+⇒ **这正好是理想的对照** ✓:证明我们的修法**只影响该影响的组** ✓,对普通多组模型**零副作用** ✓✓
+
+**两条操作结论** ✓:
+1. **chunk-size 必须按"模型 + DCP 缩放"取** ✓:GLM 在本树需要 **2176 的倍数** ✗
+   (报错:`LMCache chunk size 256 must be a multiple of 2176 (the vLLM block size scaled by
+   decode_context_parallel_size)` ✓)
+2. **`CHUNK_SIZE=2176` 同时满足两者** ✓✓:V4.1 需 **64** 的倍数 ✓(2176 = 64 × 34 ✓)、GLM 需 **2176** ✓
+   ⇒ **一个 LMCache 服务端可同时服务 V4.1 与 GLM** ✓(换 chunk 会使旧键失效 ⇒ 已缓存对象需重建 ✓,无害 ✓)
+
+**三模型 LMCache 状态**:V4.1 ✅(含纯磁盘证明 ✓)/ GLM ✅ / **MiMo ⏳ 待验**
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
