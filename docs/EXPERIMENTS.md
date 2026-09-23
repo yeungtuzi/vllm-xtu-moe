@@ -5427,6 +5427,34 @@ V4.1 注意力钩子对 MP connector 非必需 ✓(仅对逐层连接器有用 �
 * **重指向(`XTU_TREE` → 合并树)推迟到编译成功之后** ✓ —— 否则下次重启会失败 ✗(违反"不破坏现有功能" ✓)
 * 另:生产树 `.so` **不能直接复用** ✗(csrc 有差异:上游新增 `all_reduce_mhc.cu` ✓ + `csrc/cpu/*` 变更 ✓)
 
+
+### B185 ⭐⭐⭐ **单一树落成并验证通过**(含 CED);工作树/发布模型一并定清
+
+**唯一的树 = `/home/user/lvllm/vllm-consolidated`**(分支 `xtu/consolidated-latest` ✓)
+= **最新 `origin/main`(behind=0 ✓)+ 16 个提交**:
+* 13 个 SM80 补丁 ✓(快照/mHC/V4.1 Triton prefill+decode/Engram/GLM kpool/topk 流/GLM SM8x 绑定/
+  稀疏 MLA 2-D tile/MiMo MTP + 1 Revert ✓)
+* **V4.1 的 KV-connector 钩子** ✓(上游缺失 ✓,上游化候选 ✓)
+* **CED:decoder-side SWA bounded replay** ✓(手工按权威 diff 移植 ✓
+  4 个辅助方法 `_run_layers`/`_collapse`/`_run_decoder_replay_layers`/`_decoder_replay_supported`
+  + `decoder_replay_layers` property ✓;并把我们 SM80 的 `fuse_mhc_all_reduce` 保留进 `_collapse` ✓)
+* **不含** MiMo MTP 深度改动 ✓(用户指示:上游故意写死 mtp=1,其他值 dirty 且效果差 ⇒ **不该改** ✓)
+
+**验证方式(比 py_compile 强 ✓)**:①运行时 `import` + `getattr` 反射确认四个方法都在类内 ✓
+②起服务:`XTU_TREE=/home/user/lvllm/vllm-consolidated` ✓(从 `/proc/<pid>/environ` 证实 ✓)、
+`READY(300s)` ✓、冒烟生成 7.3 s ✓、**CED 无降级 warning ⇒ replay 已启用** ✓
+
+**教训(已入 `AGENTS.md`)**:①**工作树纪律**:再需要临时 worktree 必须先警告用户、由用户取舍 ✓
+②`textwrap.dedent` 会吃掉 4 空格前缀 ⇒ 方法落到模块级 ✗(`py_compile` 仍通过 ✗)⇒
+**类内方法必须用运行时反射验证** ✓;③**方向遍历缩进修复会连带吞掉文件尾部** ✗ ⇒ 宁可 `git reset` 重做 ✓
+
+**发布模型(回答用户提问)**:
+* **发布单元 = 插件仓 `vllm-xtu-moe`** ✓(`pyproject.toml` version ✓、tags `v0.2.0…v0.2.4` ✓、不发布 PyPI ✓)
+* **vLLM 树 = 被钉住的依赖** ✓,由 `XTU_TREE` 指定 ✓ ⇒ **0.2.4 = 插件 v0.2.4 + 当时那一棵指定树** ✓
+* **树为何曾分叉**(三条,均有出处 ✓):①主树是 editable 安装且生产在用 ⇒ 不能就地 rebase ②生产靠
+  `PYTHONPATH` 指向具体 worktree ⇒ 路径变承重结构 ③**预编译扩展每树一套** ⇒ 删树代价高
+* ⇒ **今后纪律**:始终保持**一棵指定树** ✓;临时预演放 `/tmp`、用完即删 ✓;要另开树**先问用户** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
