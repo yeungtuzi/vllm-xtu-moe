@@ -281,6 +281,11 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
 } > "$XTU_ENV_FILE"
 export XIAOTU_ENV_FILE
 
+# 【本机+V4.1 默认,见 MODEL_GUIDES §0.1b-2 / EXPERIMENTS B155】
+#   GPU 预填门槛:1M 放不下 ⇒ 显式 0;要 256K + GPU 预填请传 384
+#   EAGER:默认 1(全 eager);可试 COMPILE=1 EAGER=0(FULL_DECODE_ONLY)对比
+#   SPEC=1 ⇒ dspark k=5
+#   ⚠️ 这些注释必须在 nohup env 语句**之外** —— 续行链里出现 # 会打断链,后续参数会变成新命令(2026-09-23 踩过)
 nohup env \
   HF_HUB_OFFLINE=1 \
   VLLM_ENGINE_READY_TIMEOUT_S=7200 \
@@ -288,7 +293,6 @@ nohup env \
   VLLM_USE_FLASHINFER_SAMPLER=0 \
   VLLM_EXPERTS_LOAD_DEVICE=cpu \
   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-0}"  \
-  # 【本机+V4.1 默认】1M 放不下 GPU 预填 ⇒ 显式关;256K 档请传 384
   XIAOTU_RELEASE_SOURCE="${XIAOTU_RELEASE_SOURCE:-1}" \
   XIAOTU_ENGRAM_LAST="${XIAOTU_ENGRAM_LAST:-1}" \
   XIAOTU_MOE_THREADS="${XIAOTU_MOE_THREADS:-$THREADS_DEFAULT}" \
@@ -308,10 +312,8 @@ nohup env \
     $( [ -n "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-6442450944}}" ] && printf -- '--kv-cache-memory %s' "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ) \
     $( [ -n "$HF_OVERRIDES" ] && printf -- '--hf-overrides %s' "$HF_OVERRIDES" ) \
     $( [ "${EAGER:-1}" = "1" ] && echo --enforce-eager )  \
-    # 【本机+V4.1 默认】EAGER=1;若确认不需要 GPU 预填,可试 EAGER=0(图)对比
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
     $( [ "${SPEC:-1}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" )  \
-    # 【本机+V4.1 默认】dspark k=5
     $( [ -n "$CC_JSON" ] && printf -- '--compilation-config %s' "$CC_JSON" ) \
     $( [ "${PREFIX_CACHE:-1}" = "1" ] || echo --no-enable-prefix-caching ) --trust-remote-code \
     $( [ "${MM:-0}" = "1" ] && printf -- '--limit-mm-per-prompt {"image":%s,"video":0}' "${PROMPTS:-1}" || printf -- '--limit-mm-per-prompt {"image":0,"video":0}' ) \
