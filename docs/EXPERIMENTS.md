@@ -4681,6 +4681,30 @@ L=16384 → 49.85 vs 53.85 = **−4.00**(GPU 反超)✓
 2. `${VAR-default}` 的默认值里若含 `}`(JSON 必含 ✗)**会提前终止参数展开**(`bash -n` 查不出 ✗)⇒
    **用 if 分支赋值,别把 JSON 直接写进 `${VAR-...}`**(`serve_mimo26.sh` 里早就有这条注释 ✓)
 
+
+### B161 ⚠️ 更正:**生产要的就是"极限配置"**(我一度换成了"固化默认 A",并据此错写"观察稳定性已失效")
+
+**用户指正**:"我记得我要的是 `cuda_graph=FULL_DECODE_ONLY` + 1M 上下文 + 挤显存开 GPU 预填" ✓ —— **确实如此** ✗
+
+**我犯的错**:
+1. 端口/命名整改时,我用**裸跑脚本的"固化默认 A"**(CPU 预填 + 全 eager + KV 6 GiB)把 8070 的生产起了起来 ✗,
+   **替换掉了用户正在观察的"极限配置"** ✗;
+2. 并据此在 handoff §6 写下"观察极限配置稳定性 —— 现生产是固化默认 A,此条基本已失效" ✗ ——
+   **这条不但没失效,反而正是用户的目标** ✓
+
+**纠正后的生产口径(2026-09-23 恢复)**:
+```
+PORT 8070 · served name DeepSeek-V4.1-Flash · MAXLEN 1048576 · seqs 2 · TP 2 (GPU 0,1)
+COMPILE=1 EAGER=0(FULL_DECODE_ONLY) · KV 5.6 GiB · XIAOTU_GP_ACT_RESERVE_GIB=1.5
+VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384 · SPEC=1(dspark k=5)
++ 解析器默认(--tool-call-parser deepseek_v41 / --reasoning-parser deepseek_v3 / --default-chat-template-kwargs {"thinking":true})
+```
+**恢复后实测**:预检 `slack **+0.29 GiB**` ✓、`GPU prefill ACTIVE`、**无 DISABLED** ✓;
+工具调用 ✓;思考分离到 `reasoning`(567 字)✓;显存启动后 26.5 GiB/卡,预填 staging 会随后驻留(峰值 ≈40.1/41.0 GiB ⚠️)✓
+
+**⇒ "固化默认 A"的角色**:不是生产,而是**低风险回退档** ✓(不稳时用它)✓
+**⇒ handoff §6 第 1 条恢复为"进行中"**:观察**极限配置**的长期稳定性(此前 31 分钟窗口:0 OOM / 0 崩溃 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
