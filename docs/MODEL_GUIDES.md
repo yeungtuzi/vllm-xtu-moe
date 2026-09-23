@@ -794,3 +794,60 @@ k=1 下两者逐字等价,那 17 行零收益。
 
 > 免责声明:以上均为**单机初步实测**,共享机器上存在其他负载(会话记录里标注了当时的
 > `load average` 与并发任务);不同批次之间的绝对值可能相差 10–30%,请以趋势与量级为准。
+
+---
+
+## 5. LMCache 持久化输入缓存(SSD 前缀缓存)
+
+> 目标:服务重启后,DSH 的巨大重复前缀仍能从**磁盘**命中,不再重新 prefill。
+> 状态(2026-09-23):**接线已通、存储尚未落地** ✗ —— 阻塞在 LMCache 侧(见 §5.4)⇒ **暂不可用于生产**。
+
+### 5.1 两条硬性前置条件(踩过才知道)
+
+1. **不能用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** ✗ —— vLLM 直接拒绝启动:
+   `ValidationError: KV connector LMCacheMPConnector is incompatible with
+   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True unless enable_cumem_allocator is also enabled`
+   ⇒ 跑 LMCache 时传**非空**值 `expandable_segments:False` ✓
+   ⚠️ `${VAR:-default}` 的语义:显式传**空**会退回默认值 ⇒ 想关必须传非空 ✓
+2. **`--chunk-size` 必须是各模型 vLLM block 的公倍数** ✓ —— V4.1 需 **64** 的倍数 ✓、
+   GLM-5.3 需 **2176** ✓ ⇒ **取 2176**(= 64 × 34 ✓,两者通吃 ✓);
+   否则报 `LMCache chunk size 256 must be a multiple of 2176 ✗`
+
+### 5.2 启动
+
+```bash
+# ① LMCache 服务端(L1=内存,L2=磁盘)：
+CHUNK_SIZE=2176 TRANSFER_MODE=auto ENABLE_MODULES="transfer_query" L1_GB=40 \
+  bash scripts/serve_lmcache.sh            # ZMQ 127.0.0.1:5555；HTTP 巡检 :8080
+# ② vLLM(任一模型)只需加 LMCACHE=1：
+LMCACHE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False PORT=8070 bash scripts/serve_v41.sh
+#    逐层传输实验特性(必须与服务端 ENABLE_MODULES 配对,否则报
+#    "Connector enables transfer_query but server does not")：
+LMCACHE=1 LMCACHE_XFER=true ...
+```
+
+### 5.3 巡检
+
+```bash
+curl -s localhost:8080/status | python -c 'import json,sys;d=json.load(sys.stdin);print(d["storage_manager"]["l1_manager"]["total_object_count"])'
+curl -s localhost:8080/metrics | grep -E "lookup|prefetch"   # lookup 涨而 hit=0 ⇒ 只查不存 ✗
+lmcache kvcache clear                                        # 清 L1
+```
+**"是否真的存了"看 `total_object_count`**(>0 ✓);**L2 落盘**看 `/home/user/.cache/lmcache_l2` 文件数 ✓
+
+### 5.4 当前限制(2026-09-23 定案)
+
+| 现象 | 原因 |
+|---|---|
+| **lookup 正常、store 从不发生** ✗ | LMCache 外部 MP connector 的 HMA 入口只把 `block_ids[0]` 传给 `request_finished` ✗;逐层路径需实验 dispatcher,而该路径下服务端 L1 **零分配** ✗ |
+| **内置 connector 起不来** ✗ | `Failed to promote local KV cache specs to one unified type`(不支持异构多组 KV)|
+
+⇒ **需要 LMCache(或匹配的 vLLM 版本)侧修复** ✓;我们的 V4.1 注意力钩子**必要但不充分** ✓
+详见 `docs/EXPERIMENTS.md` **B164–B180** ✓;方案见 `dev-docs/LMCACHE_PLAN.md` ✓
+
+### 5.5 我们这边已做的改动(上游化候选)
+
+* `vllm/models/deepseek_v41/attention.py`:**补齐 KV-connector 钩子**(上游该文件 **0 处** ✗)
+  —— 没有它任何外部 KV 缓存都无法在 V4.1 上工作 ✓;已移植到最新 rebase 树
+  (分支 `xtu/rebase-latest-lmcache` ✓)
+* 启动脚本支持:`serve_v41.sh` / `serve_glm53_mainline.sh` / `tune_serve.sh` 的 `LMCACHE` / `LMCACHE_XFER` ✓

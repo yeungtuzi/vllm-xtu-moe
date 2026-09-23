@@ -1231,3 +1231,28 @@ cd /tmp/vllm-up && git cherry-pick <我们的 10 个提交>   # 解那 4-5 个�
 ⚠️ 两个坑:① `vllm.__version__` 报的是**构建时**的 base(`0.29.1rc1.dev95+gdabc4362b`),
 不是当前 HEAD(`git describe` = `v0.29.1rc0-105-gaf3e7c14d7`)——判断代码版本看 `git describe`;
 ② 直接在当前目录 rebase 会改到正在被 8070 加载的代码(editable install),**必须用 worktree/分支隔离**。
+
+---
+
+### 6.9 ⭐ 2026-09-23 rebase 实测:13 个提交**零冲突**落进最新 `origin/main`
+
+* **预演**:`git worktree add --detach <dir> origin/main` ⇒ `git cherry-pick` 我们的 **13 个**提交
+  ⇒ **全部干净落地,零冲突** ✓✓(本文档 6 节曾预判"约 4–5 个文件需手工解冲突/重指" ✗ ⇒ 实际**一个都没有** ✓;
+  它提的 GLM 注意力"重指"发生在生产树基点 `133b71e0be` **之前** ✓,快照补丁已含 ✓)
+* **静态门禁**:插件挂点全在 ✓(`FusedMoEFactory` 是**函数** ✓)、新增 **126** 个文件 ✓、
+  **572** 个 Python 文件编译通过 ✓(4 个失败在上游自带 `allspark*` ✓,与我们无关)
+* ⚠️ **运行时验证的硬门槛**:`PYTHONPATH=<另一棵树>` **只换 Python 代码,换不了已编译扩展** ✗
+  ⇒ 目标树必须**树内有 `.so`**,否则报
+  `ImportError: vllm.vllm_flash_attn requires the CUDA flash attention extensions (_vllm_fa2_C …)` ✗
+  ⇒ 在新树内**就地编译**(不动 editable 安装 = 不动生产 ✓):
+  ```bash
+  export PATH=<env>/bin:$PATH                 # 需要 cmake(4.x)与 ninja
+  cd <new-tree> && MAX_JOBS=32 python setup.py build_ext --inplace > /tmp/build.log 2>&1
+  ```
+  这 185 个提交改了 **30 个 C++/CUDA 文件**(含新增 `all_reduce_mhc.cu` +212 行)⇒ **必须重编** ✓;
+  日志会打印 `CUDA target architectures: 8.0` ✓
+* ⚠️ **`cmd | tail` 会掩盖退出码** ✗(曾把一次失败的编译误报为成功 ✗)⇒ 构建务必**重定向到日志**
+  或 `set -o pipefail` 后再判退出码 ✓
+* ⚠️ **生产树 vs editable 安装的漂移**:生产树 `vllm-up-133b71e0b` ✓,但 editable 安装指向**旧树** ✗
+  ⇒ 2026-09-23 起 `serve_v41.sh` / `serve_glm53_mainline.sh` / `tune_serve.sh` 已加
+  `PYTHONPATH=$XTU_TREE`(默认生产树 ✓,可用环境变量覆盖 ✓)
