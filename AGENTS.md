@@ -33,3 +33,12 @@
    确认归属后**逐个 kill** ✓;**禁止**任何形式的模式匹配(包括 `case "$cmdline" in *xxx*`,
    `grep`+xargs 等 ✗)。**教训**:本会话曾用 `case` 匹配 `*lmcache*` "清理残留",
    结果**把本该保留的 LMCache 服务端杀了** ✗ —— 模式匹配在清理场景同样会命中错误目标 ✓。
+
+## 其它纪律补充
+
+- **`cmd | tail` 会掩盖退出码** ✗(本会话已踩:编译其实失败 `Cannot find CMake executable`,
+  却因管道返回 `tail` 的 0 而被误判为成功 ✗)。**构建/关键命令必须**:
+  重定向到日志文件(或 `set -o pipefail`)后再判断退出码 ✓。
+- **跨树运行 vLLM 的硬约束**:`PYTHONPATH=<另一棵树>` **只能换 Python 代码,换不了已编译扩展** ✗
+  ⇒ 目标树必须**树内有 `.so`**(即就地 `setup.py build_ext --inplace` 过 ✓);
+  否则报 `vllm_flash_attn requires the CUDA flash attention extensions` ✗(见 EXPERIMENTS B179 ✓)。
