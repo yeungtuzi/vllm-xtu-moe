@@ -5806,6 +5806,19 @@ Resolved LMCache MP geometry: group_tokens_per_block=[2176, 2176, 2176, 2176, 21
 
 **三模型 LMCache 状态**:V4.1 ✅(含纯磁盘证明 ✓)/ GLM ✅ / **MiMo ⏳ 待验**
 
+
+### B199 MiMo 的 LMCache 旋钮补齐(统一四个启动器);MiMo 加载中
+
+* `serve_mimo26.sh` 此前**没有** `LMCACHE` 旋钮 ✗ ⇒ 已补(与 `serve_v41.sh`/`serve_glm53_mainline.sh`/
+  `tune_serve.sh` **同一形态** ✓:注入 `--enable-prefix-caching` + `kv-transfer-config`,含
+  `kv_connector_module_path` 与显式 host/port ✓;`bash -n` 通过 ✓)
+* MiMo + LMCache(8076,纯文本 `MM=0`/`SPEC_K=0`)已启动 ✓ —— **加载很慢**
+  (65 个分片 × ~42 s ⇒ **约 40 分钟** ✗;日志可能因块缓冲看似冻结 ⇒ 判活看 worker 的 CPU ticks ✓,B103)
+* LMCache 服务端:`chunk=2176` ✓(**同时兼容 V4.1 与 GLM ✓**)
+
+**下一轮**:MiMo 就绪 ⇒ 验证 store(`total_object_count > 0` ✓)⇒ **三模型 LMCache 全部达成** ✓ ⇒
+目标可考虑标记 **complete** ✓(P6 的实际提交作为**待办移交**:需人类提交者 + 联网做重复性检查 ✗)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
