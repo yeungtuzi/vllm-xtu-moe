@@ -354,10 +354,13 @@ def emit_env(p: dict) -> str:
     """把判定转成可 export 的 env(服务脚本直接 eval 即可)。"""
     lines = []
     # 总约束:GPU 预填充要么用"零主机代价"的实现,要么不开
-    # 【§603】**阈值 1024 偏低**:实测 GPU 预填充是"每 chunk ≈8.9 s 固定 + 0.79 ms/token",
-    # 而 CPU 是 ≈3.9 ms/token ⇒ 盈亏平衡在 **~2860 token**。用 1024 会让 1-3K 的 prompt
-    # 白付 ~9 s(实测 L=1024 的 TTFT 从 CPU 的 ~4 s 变成 10.03 s)。这里取 **4096**。
-    _gpm = _env_gib("XIAOTU_GPU_PREFILL_SWITCH_TOKENS", 4096)
+    # 【B149 更正】**上面 §603 的 ~2860 是"非重叠"条件下的成本模型上界,已被实测推翻**：
+    # V4.1(TP=2、MBT=8192)实测 TTFT @2048 = **824 ms**、@8192 = 1003 ms，
+    # 而 CPU 预填充 @512 就要 **4661 ms**；实现里 ping/pong 预取把 staging 与计算重叠，
+    # 有效固定开销远低于 §603 假设的 8.9 s/chunk ⇒ 真实甜点在**几百 token**(见
+    # dev-docs/GPU_PREFILL.md §5.4 与 EXPERIMENTS B149)。故默认取 **384**，
+    # 需回到保守值可用 `XIAOTU_GPU_PREFILL_SWITCH_TOKENS=4096` 覆盖。
+    _gpm = _env_gib("XIAOTU_GPU_PREFILL_SWITCH_TOKENS", 384)
     lines.append(f"VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS={int(_gpm) if p['gpu_prefill'] else 0}")
     lines.append(f"XIAOTU_GPU_RESIDENT_LAYERS={p.get('resident_spec','')}")
     # 【§508 更正】draft 上不上 GPU **不需要新旋钮**:hybrid_model.py:669-686 里
