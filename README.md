@@ -162,3 +162,15 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 ## 许可
 
 Apache-2.0。第三方组件与致谢清单见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 与 [`NOTICE`](NOTICE)。
+
+## 持久化输入缓存(LMCache,SSD)
+
+服务重启后仍能复用巨大重复前缀(不再重新 prefill):
+
+```bash
+CHUNK_SIZE=256 bash scripts/serve_lmcache.sh &        # L1=内存 + L2=SSD
+LMCACHE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False bash scripts/serve_v41.sh
+```
+
+实测(V4.1-Flash,10K 前缀):冷 26.7 s ⇒ **重启后 1.27 s**;连 LMCache 服务端也重启仍 **1.27 s**
+(⇒ 从 **L2 磁盘**命中 ✓)。三条前置条件与 V4.1 的必要补丁见 `docs/MODEL_GUIDES.md` §5 ✓。

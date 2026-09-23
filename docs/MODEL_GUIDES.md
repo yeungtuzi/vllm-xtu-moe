@@ -797,57 +797,57 @@ k=1 下两者逐字等价,那 17 行零收益。
 
 ---
 
-## 5. LMCache 持久化输入缓存(SSD 前缀缓存)
+## 5. LMCache 持久化输入缓存(SSD 前缀缓存)—— ✅ **已打通(2026-09-23)**
 
-> 目标:服务重启后,DSH 的巨大重复前缀仍能从**磁盘**命中,不再重新 prefill。
-> 状态(2026-09-23):**接线已通、存储尚未落地** ✗ —— 阻塞在 LMCache 侧(见 §5.4)⇒ **暂不可用于生产**。
+> 目标:服务(甚至 **LMCache 服务端**)重启后,DSH 的巨大重复前缀仍能**从磁盘命中**,不再重新 prefill。
+> **实测(V4.1-Flash,10K 固定前缀)**:冷 26.7 s ⇒ **重启后 1.27 s** ✓(21×);
+> 连 **LMCache 服务端也重启**(L1/RAM 全空)后仍 **1.27 s** ⇒ **纯 L2 磁盘命中** ✓✓
+> 详见 `docs/EXPERIMENTS.md` **B164–B196** ✓
 
-### 5.1 两条硬性前置条件(踩过才知道)
+### 5.1 三条前置条件(踩过才知道)
 
 1. **不能用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** ✗ —— vLLM 直接拒绝启动:
-   `ValidationError: KV connector LMCacheMPConnector is incompatible with
-   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True unless enable_cumem_allocator is also enabled`
+   `KV connector LMCacheMPConnector is incompatible with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
    ⇒ 跑 LMCache 时传**非空**值 `expandable_segments:False` ✓
-   ⚠️ `${VAR:-default}` 的语义:显式传**空**会退回默认值 ⇒ 想关必须传非空 ✓
-2. **`--chunk-size` 必须是各模型 vLLM block 的公倍数** ✓ —— V4.1 需 **64** 的倍数 ✓、
-   GLM-5.3 需 **2176** ✓ ⇒ **取 2176**(= 64 × 34 ✓,两者通吃 ✓);
-   否则报 `LMCache chunk size 256 must be a multiple of 2176 ✗`
+   ⚠️ `${VAR:-default}` 语义:显式传**空**会退回默认值 ⇒ 想关必须传非空 ✓
+2. **`--chunk-size` 必须是该模型 vLLM block 的倍数** ✓(V4.1 与 GLM 实测 ⇒ 用 **256** ✓);
+   否则报 `LMCache chunk size … must be a multiple of …`
+3. **V4.1 需要打了"环形暂存组"补丁的 LMCache**(见 §5.4)✗ —— 官方 0.5.5 **未含**该修法 ✓
 
-### 5.2 启动
+### 5.2 启动(实测可用的配方)
 
 ```bash
-# ① LMCache 服务端(L1=内存,L2=磁盘)：
-CHUNK_SIZE=2176 TRANSFER_MODE=auto ENABLE_MODULES="transfer_query" L1_GB=40 \
-  bash scripts/serve_lmcache.sh            # ZMQ 127.0.0.1:5555；HTTP 巡检 :8080
-# ② vLLM(任一模型)只需加 LMCACHE=1：
+# ① LMCache 服务端(L1=内存,L2=磁盘)
+CHUNK_SIZE=256 TRANSFER_MODE=lmcache_driven ENABLE_MODULES= L1_GB=100 \
+  bash scripts/serve_lmcache.sh            # ZMQ 127.0.0.1:5555;HTTP 巡检 :8080
+# ② vLLM(任一模型)只需 LMCACHE=1:
 LMCACHE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False PORT=8070 bash scripts/serve_v41.sh
-#    逐层传输实验特性(必须与服务端 ENABLE_MODULES 配对,否则报
-#    "Connector enables transfer_query but server does not")：
-LMCACHE=1 LMCACHE_XFER=true ...
 ```
 
-### 5.3 巡检
+### 5.3 巡检与验收
 
 ```bash
 curl -s localhost:8080/status | python -c 'import json,sys;d=json.load(sys.stdin);print(d["storage_manager"]["l1_manager"]["total_object_count"])'
-curl -s localhost:8080/metrics | grep -E "lookup|prefetch"   # lookup 涨而 hit=0 ⇒ 只查不存 ✗
-lmcache kvcache clear                                        # 清 L1
+ls /home/user/.cache/lmcache_l2 | wc -l        # L2(磁盘)文件数
+grep -aE "Stored|Retrieved" <vllm日志>/../logs/lmcache_server.log | tail
 ```
-**"是否真的存了"看 `total_object_count`**(>0 ✓);**L2 落盘**看 `/home/user/.cache/lmcache_l2` 文件数 ✓
+* **写入**:服务端日志出现 `Stored N tokens in … seconds` ✓,`total_object_count > 0` ✓
+* **命中**:重启 vLLM(甚至**连服务端一起重启**)后同前缀 **TTFT 显著下降** ✓,日志出现 `Retrieved N tokens` ✓
 
-### 5.4 当前限制(2026-09-23 定案)
+### 5.4 V4.1 专属的必要修法(LMCache 侧,**待上游**)
 
-| 现象 | 原因 |
-|---|---|
-| **lookup 正常、store 从不发生** ✗ | LMCache 外部 MP connector 的 HMA 入口只把 `block_ids[0]` 传给 `request_finished` ✗;逐层路径需实验 dispatcher,而该路径下服务端 L1 **零分配** ✗ |
-| **内置 connector 起不来** ✗ | `Failed to promote local KV cache specs to one unified type`(不支持异构多组 KV)|
+V4.1 的 KV 含 **9 个组**,其中 indexer 尾部是 vLLM 的 **`KpoolTailSpec`**
+——「**one-block circular scratch cache**」✓,**按设计只有 1 个块** ✓。官方 0.5.5 会因此:
+① "可存前缀"的 `min()` 被拖到 8 token ⇒ `chunks=0` ⇒ 永不 STORE ✗
+② 即便修好①,store 的"每组块数齐备"校验因该组**永不可能齐备**而**整单拒收** ✗
 
-⇒ **需要 LMCache(或匹配的 vLLM 版本)侧修复** ✓;我们的 V4.1 注意力钩子**必要但不充分** ✓
-详见 `docs/EXPERIMENTS.md` **B164–B180** ✓;方案见 `dev-docs/LMCACHE_PLAN.md` ✓
+**修法(通用 ✓,非 V4.1 特判 ✓)**:判定 `spec.max_num_blocks_per_req(...) == 1` 的组为环形暂存 ✓,
+在**注册期**与**几何**两处一致排除 ✓(其层落为既有 `EXCLUDED_ENGINE_GROUP` ✓)。
+实现见 `dev-docs/lmcache-scratch-group-fix.patch` ✓(5 文件 / +131 行 ✓);**PR 草案**见
+`dev-docs/LMCACHE_PR_DRAFT.md` ✓。
 
-### 5.5 我们这边已做的改动(上游化候选)
+### 5.5 我们这边的改动(上游化候选)
 
 * `vllm/models/deepseek_v41/attention.py`:**补齐 KV-connector 钩子**(上游该文件 **0 处** ✗)
-  —— 没有它任何外部 KV 缓存都无法在 V4.1 上工作 ✓;已移植到最新 rebase 树
-  (分支 `xtu/rebase-latest-lmcache` ✓)
-* 启动脚本支持:`serve_v41.sh` / `serve_glm53_mainline.sh` / `tune_serve.sh` 的 `LMCACHE` / `LMCACHE_XFER` ✓
+  —— 对**逐层**连接器必需 ✓;MP connector 不需要它 ✓
+* 启动脚本:`LMCACHE` / `LMCACHE_XFER` 旋钮 ✓;`serve_lmcache.sh` 的 `CHUNK_SIZE`/`TRANSFER_MODE`/`ENABLE_MODULES` ✓
