@@ -5732,6 +5732,35 @@ L2 文件数 = 62                                                               
 
 **剩余**:P4(投机复测)✗ / P5(文档定稿)✗ / P6(**PR 材料**)✗ / 三模型回归(MiMo)⏳
 
+
+### B196 P6 交付物就绪:**LMCache PR 草案 + 干净 patch**(重复性检查受网络所阻 ✗)
+
+**产物** ✓:
+| 文件 | 内容 |
+|---|---|
+| `dev-docs/LMCACHE_PR_DRAFT.md` | 完整 PR 描述:标题建议、**两层的根因**(附代码出处 ✓)、复现步骤与运行时元组、3 文件修法、**为什么通用**、修前/修后对照表、已跑/待跑测试、**AI 协助声明** ✓ |
+| `dev-docs/lmcache-scratch-group-fix.patch` | **干净 diff**:266 行;**5 个文件** = `.gitignore` + `kv_layer_groups.py`(判定 ✓)+ `kv_cache_groups.py`(注册期排除 ✓)+ `lmcache_mp_connector.py`(几何同步 ✓)+ `lmcache_mp_metadata.py`(min 跳过 ✓);**131 行新增** ✓ |
+
+**修前 → 修后(同一环境实测)** ✓:
+| 指标 | 修前 | 修后 |
+|---|---|---|
+| `chunks` | **0** | **15/16/97** ✓ |
+| 注册组数 | 6(含 scratch)| **5** ✓ |
+| 服务端 | `Total allocated size: 0 MB` + `underflow` 警告 ✗ | **`Stored 4096 tokens in 0.009s`** ✓ |
+| `total_object_count` | 0 | **62**(102 MB;**L2 磁盘 62 文件** ✓)|
+| 重启 vLLM 后同前缀 | **26.7 s**(=冷)| **1.27 s** ✓ |
+| **LMCache 服务端也重启后**(L1 全空)| — | **1.27 s** ⇒ **从 L2 磁盘命中** ✓✓ |
+
+**⚠️ 提交前必须补做(我做不到的)** ✗:
+1. **重复性检查** —— 上游纪律要求 `gh issue view` / `gh pr list --search`;
+   本机 **`gh search` 被网络/代理挡住**(返回空 ✗)⇒ **未完成** ✗
+2. **跑 LMCache 自带测试** —— 分组相关单测 + CI 的 `hma_lm_eval`(官方文档的"冷跑 / `reset_prefix_cache`
+   再跑,分数一致"验收法 ✓)
+3. **人类提交者逐行复核**(纯 AI PR 上游**不接收** ✗)
+
+**fork 现状** ✓:`/home/user/lvllm/lmcache-fork`(基线 `1a997f6` ⇒ 修法 `b310664` ✓ + 忽略字节码 `f5f4fb1` ✓);
+**已装入 site-packages** ✓(本轮全部实测均基于它 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
