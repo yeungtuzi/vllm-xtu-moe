@@ -10,6 +10,13 @@ L2_GB="${L2_GB:-100}"
 TRANSFER_MODE="${TRANSFER_MODE:-lmcache_driven}"   # lmcache_driven|engine_driven|auto
 # chunk 必须 ≥ 各模型 vLLM block 的最小公倍数:V4.1 需 64 的倍数 ✓;GLM 需 2176 的倍数 ✓
 # ⇒ 2176 = 64 × 34 同时满足两者(见 EXPERIMENTS B172)✓
+# ⭐ CHUNK 规则(实测 2026-09-23,见 EXPERIMENTS B198):
+#   * chunk 必须是**该模型 vLLM block(按 DCP 缩放后)**的倍数,否则 connector 在启动时直接报错:
+#       "LMCache chunk size 256 must be a multiple of 2176 (the vLLM block size scaled by
+#        decode_context_parallel_size)"
+#   * 实测:V4.1-Flash 需 **64** 的倍数 ✓;GLM-5.3 需 **2176** ✓
+#   * **2176 = 64 × 34** ⇒ 同时满足两者 ⇒ **一个服务端即可服务 V4.1 与 GLM** ✓(默认值即此 ✓)
+#   * 换 chunk 会让既有 L2 对象的键失效(需重建,无害 ✓)
 CHUNK_SIZE="${CHUNK_SIZE:-2176}"                       # 跨模型公共值(见 B172)
 # 实验传输模块:connector 侧开 transfer_intermediate_tensors 时,服务端必须 `--enable transfer_query`
 # 与之配对(否则报 "Connector enables transfer_query but server does not",见 EXPERIMENTS B175)
