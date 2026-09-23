@@ -5409,6 +5409,24 @@ V4.1 注意力钩子对 MP connector 非必需 ✓(仅对逐层连接器有用 �
 **待办**:①编译完成后把 `.so` 复制/就地编译 ✓ ②把 `XTU_TREE` 默认指向合并树 ✓
 ③验证 V4.1/GLM/MiMo 功能不回归 ✓ ④再退休其余 worktree(保留分支作档案 ✓)
 
+
+### B184 P6 交付物:**LMCache issue 草案**(基于已确认根因)+ 合并树的验证待编译
+
+**issue 草案** ✓:`dev-docs/LMCACHE_ISSUE_DRAFT.md`(内部 ✓)
+* 标题:`[MP] No STORE is produced for multi-group (HMA) models when the smallest-granularity group
+  has fewer blocks than one chunk`
+* 含:**完整运行时元组**(vLLM dev `c961121519` + 本地 SM80 补丁 ✓、lmcache 0.5.5 ✓、V4.1-Flash TP=2 ✓、
+  官方配方 ✓)、**复现步骤** ✓、**关键证据**(`allocated_blocks={5:1}` ⇒ `allocated_tokens=8` ⇒ `chunks=0` ✓)、
+  **已排除的 5 条原因**(钩子/`block_ids`/dispatcher/chunk/transfer_query ✓,附代码依据 ✓)、
+  **建议修复方向** ✓、**影响范围**(所有 HMA 模型 ✓、无性能损失 ✓)、**AI 协助声明** ✓
+
+**合并树的验证仍待编译** ✗:
+* 源码构建(job `bash-11`)卡在**可选 kernel 的联网拉取**(cutlass/deepgemm/deepselect/flashkda/flashmla/**tml-fa4** ✓
+  —— 都是 **SM90+ 才用** ✗,对 A100 无用 ✓)⇒ 耗时以小时计 ✓
+* 已并行尝试 **`VLLM_USE_PRECOMPILED=1`**(job `bash-12` ✓;pip 仅在成功时替换 ⇒ **失败也不破坏现有环境** ✓)
+* **重指向(`XTU_TREE` → 合并树)推迟到编译成功之后** ✓ —— 否则下次重启会失败 ✗(违反"不破坏现有功能" ✓)
+* 另:生产树 `.so` **不能直接复用** ✗(csrc 有差异:上游新增 `all_reduce_mhc.cu` ✓ + `csrc/cpu/*` 变更 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
