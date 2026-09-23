@@ -4877,6 +4877,47 @@ def <V4.1 的 KV 写入函数>(..., layer_name: LayerNameType, ...):
 导致 LMCache 等外部 KV 缓存无法存储" ✓;而且它**天然与 rebase 计划合流**:
 补丁应打在 **rebase 后的上游树**上 ✓(而不是我们的旧分支 ✓),这样既能上游、又能长期维护 ✓
 
+
+### B167 ⭐⭐ 补丁的第二层:**metadata 表是"KV 组级"键**;connector 契约是"传层名、内部按组路由"
+
+**实测诊断**(在 V4.1 注意力 forward 里加一次性打印 ✓,`XIAOTU_KVHOOK_DEBUG=1` ✓):
+```
+[kvhook-dbg] prefix='language_model.model.layers.0.attn'
+             type(attn)=dict
+             keys=['language_model.model.layers.0.attn.swa_cache', ...]      ← 组级 ✗ 不是 ...attn
+```
+⇒ **根因第二层**:V4.1 每层有**多个 KV 缓存组**(`swa_cache` / 压缩组 / 索引器组 ✓),
+而 `forward_context.attn_metadata` 的键是 **`<layer>.attn.<group>`** ✓ ⇒ 我按"层名"查表必然 KeyError/落空 ✓
+(第一版 KeyError ✓,修正版因候选名不匹配而 **静默跳过** ⇒ 服务正常但**不存** ✓ = 观测到的现象 ✓)
+
+**connector 侧契约(读外部实现 ✓)**:
+`lmcache/integration/vllm/lmcache_mp_connector.py:799 save_kv_layer(layer_name, kv_layer, attn_metadata)`
+—— 文档串写的是 **"the name of the layer"** ✓;实现里有
+`create_engine_group_infos_from_vllm` / `kv_cache_groups` ✓,并注明
+*"Older vLLM builds do not expose HMA. They cannot route per-group … legacy single-group behavior"* ✓
+⇒ **connector 支持按组路由,前提是 vLLM 暴露组信息(HMA)** ✓
+
+**⇒ 正确的钩子写法(下一轮实现)**:
+```python
+_ln    = _resolve_layer_name(self.prefix)                  # 传"层名"给 connector ✓
+_pref  = self.prefix + "."
+_key   = next(k for k in attn_metadata if k.startswith(_pref))   # 任意一个本层"组键",只为取 metadata ✓
+_md, _attn, _kv, _slot = get_attention_context(_key)
+if _md is not None and conn.has_connector_metadata():
+    conn.wait_for_layer_load(_ln)
+    out = self._forward_impl(...)
+    conn.save_kv_layer(_ln, _kv, _md)                      # 层名 ⇒ connector 内部按组存 ✓
+```
+
+**当前状态(安全 ✓)**:钩子在匹配不到时**跳过** ⇒ **服务正常但不写 LMCache** ✓
+(= 本轮前的行为 ✓);生产/调试实例可用 ✓;目标**未达成**,goal 保持 active ✓
+
+**下一轮要点**:
+1. 按上面的写法改钩子(取组键 ⇒ 传层名)✓,重启验证 `/status.total_object_count > 0` ✓
+2. 若 `save_kv_layer` 的 `kv_layer` 参数在多组下需要**全部组的缓冲**(而非单组)⇒ 参考 LMCache
+   [Hybrid Attention 模型](https://docs.lmcache.ai/zh_CN/mp/hybrid_models.html) 的 HMA 契约 ✓
+3. 成功后:重启验证"**重启后仍命中**" ✓ ⇒ P3 完成 ⇒ 再做 P4(开 dspark)与 P5(落地文档/README)✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
