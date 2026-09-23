@@ -5595,6 +5595,37 @@ Free memory on device cuda:0 (32.4/39.49 GiB) is less than desired GPU memory ut
 (`[lmc-store-meta]` 在 `GetStoreMetadata` ✓;`[lmc-store-wait]`/`[lmc-submit]` 在 connector ✓)
 —— 默认关闭 ✓,不影响功能 ✓
 
+
+### B191 ⭐⭐⭐ **链条逐段点亮**:元数据传递**是通的**;最后一道闸在**服务端拒收**(scratch 组仍需块)
+
+**全量分布证据(同一份日志 ✓)**:
+```
+[lmc-build-meta] len(metadata)=0   ×7     ← 这些是"没有新请求"的 step ✓
+[lmc-build-meta] len(metadata)=1   ×2     ← ★ store 元数据**确实生成了** ✓
+[lmc-store-wait] store_ops=1 total_meta=1 ×4  ← ★★ worker 侧**确实收到了** ✓
+[lmc-store-meta] chunks=97 / 16 / 15      ← 修法让可存前缀变得很大 ✓
+```
+⇒ **更正我先前的判断** ✗:`total_meta=0` 只是"空 step" ✓ —— **scheduler→worker 的传递是通的** ✓✓
+
+**但对象数仍 0** ✗ ⇒ **服务端日志给出了确切原因** ✓:
+```
+LMCache WARNING: STORE block ID underflow for request_id=cmpl-…: each group needs num_chunks * blocks
+```
+⇒ **服务端按"每个组都要 `num_chunks × blocks`"校验** ✓,而 **scratch 组按设计只有 1 块** ✗
+⇒ 所以它**拒收**整个 store ✓✓ —— **最后一道闸** ✓
+
+**⇒ 我的修法只做了一半(诚实结论 ✓)**:
+* 已做 ✓:把 scratch 组从**"可存前缀长度"**计算里排除(`chunks` 0→97 ✓,**实测有效** ✓)
+* **还缺** ✗:store **操作**里仍带着该组的 block ids(`slice_block_ids_per_group` ✓)⇒ 服务端校验失败 ✓
+
+**⇒ 正解(更彻底、也更通用 ✓)**:让 scratch 组**不参与 LMCache 对象** ✓ ——
+在**注册阶段**就排除它 ✓(LMCache 已有 `EXCLUDED_ENGINE_GROUP = -1` ✓ 与
+`GroupKind = Literal["attention","recurrent","aux"]` ✓ 的机制 ✓)⇒
+这样 store 元数据与服务端的"每组齐备"校验都**不再要求它的块** ✓✓
+(备选:在服务端校验里容忍被排除的组 ✓ —— 但注册期排除更干净 ✓)
+
+**当前状态**:`v41_dbg4`(8078)+ LMCache 服务端存活 ✓;fork 里已有修法 `bd5d334` + 三条受保护的出口埋点 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
