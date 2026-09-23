@@ -86,7 +86,7 @@ ENV="${ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}"
 PY="$ENV/bin/python"
 CKPT="${CKPT:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master}"
 TAG="${TAG:-v41}"
-PORT="${PORT:-8700}"           # 【本机+V4.1 默认】生产端口
+PORT="${PORT:-8070}"           # 【生产约定】生产端口固定 8070,不随模型漂移(2026-09-23 用户规则)
 GPUS="${GPUS:-0,1}"            # 【本机+V4.1 默认】TP=2 需要两张卡
 # 【R-VRAM/§507】**TP 默认 2**(用户 2026-09-16 指示:TP=1 不满足就明确说、并以 TP=2 为默认)。
 # 按显存优先级算同一张 40 GB 卡:TP=2 每层常驻 3.36 GiB ⇒ 1M KV 之后还能放 3 层(20-22)+投机;
