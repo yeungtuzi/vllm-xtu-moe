@@ -5562,6 +5562,39 @@ Free memory on device cuda:0 (32.4/39.49 GiB) is less than desired GPU memory ut
 **当前唯一树**:`/home/user/lvllm/vllm-consolidated`(最新 `origin/main` + 16 提交 ✓,behind=0 ✓)
 **fork**:`/home/user/lvllm/lmcache-fork`(`bd5d334` = 修法 ✓;已装入 site-packages ✓,留 `.prefix-bak` 备份 ✓)
 
+
+### B190 ⭐⭐⭐ **我们的修法被实测证明有效**(chunks 0→15);第二道闸定位在 scheduler→worker 元数据传递
+
+**实测(唯一树 + 官方配方 + 我们的 fork 修法 + 深埋点)**:
+```
+[lmc-store-meta] scratch_mask=[False,False,False,False,False,True] counted=[0,1,2,3,4]
+                 allocated_blocks={0:128,...,5:1} tpb=[32,32,32,32,128,8]
+                 allocated_tokens=4096  min_available=4096  staged=4096  chunk=256  **chunks=16**
+                 (后续调用:chunks=15)
+```
+⇒ **修法生效** ✓✓:`allocated_tokens` 从被 scratch 组拖到的 **8** → **4096** ✓ ⇒ **可存前缀 0 → 15/16 个 chunk** ✓✓
+(= 我们的 `is_circular_scratch_spec` / `get_group_is_scratch` / `min()` 跳过逻辑**确实解决了它要解决的问题** ✓)
+
+**但对象数仍为 0** ✗ ⇒ **第二道闸**:
+```
+[lmc-store-wait] store_ops=0  total_meta=0  dispatcher=NONE       ← worker 侧 metadata **空** ✗
+[lmc-submit] (无输出)
+```
+⇒ **scheduler 侧已生成 store 元数据** ✓(`GetStoreMetadata` ⇒ `chunks=15` ✓),但 **worker 侧的
+`wait_for_save()` 读到的 connector metadata 里 0 个请求** ✗ ⇒ **scheduler → worker 的元数据没有传过来** ✓✓
+
+**⇒ 结论(两层,分别清楚)**:
+1. **LMCache 侧"可存前缀"缺陷 = 我们已修好并实测有效** ✓(`bd5d334` ✓)—— 这是**通用**修复 ✓,值得上游 ✓
+2. **第二层**是 **LMCache ↔ 这棵 dev 版 vLLM 的握手**问题 ✗(scheduler 算出的 store 元数据没进 worker ✓)
+   —— 与官方"dev 构建不受支持 / 请用匹配版本"的警告同类 ✓;下一步应查
+   **`build_connector_meta` / `update_connector_output` / `_get_connector_metadata` 的传递链** ✓
+   (即:vLLM 在 scheduler 侧调 connector 生成元数据后,是否把它放进发给 worker 的
+   `KVConnectorMetadata` ✓;若 dev 树改了这条链的接口 ⇒ LMCache 侧需适配 ✓)
+
+**诊断方法留档** ✓:fork 里已加两条**受 `XIAOTU_KVHOOK_DEBUG=1` 保护**的一次性埋点
+(`[lmc-store-meta]` 在 `GetStoreMetadata` ✓;`[lmc-store-wait]`/`[lmc-submit]` 在 connector ✓)
+—— 默认关闭 ✓,不影响功能 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
