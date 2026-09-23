@@ -5256,6 +5256,41 @@ dispatcher 又只在 `transfer_intermediate_tensors`(实验的 `TRANSFER_QUERY`)
    —— 旧树上我的 4 个提交(`5c45e42e1a`/`3a4b9cd637`/`62fe9b400c`/`70f8d42499`)应**压成 1 个干净提交** ✓
 3. rebase 目标若还要更进一步(追平 `origin/main`,再 185 个提交 ✓)⇒ 作为**独立任务**评估 ✓
 
+
+### B179 ⭐⭐ **rebase 到最新 `origin/main` 完成**:13 个提交**零冲突**;验证需重建扩展
+
+**① rebase 结果(超出预期 ✓)**:
+* 目标 = `origin/main` = **`c961121519`**(比生产树基点 `133b71e0be` **新 185 个提交** ✓)
+* 预演 worktree:`/home/user/lvllm/vllm-rebase-latest`(detached ✓,隔离、不碰工作树/8070 ✓,按 RUNBOOK:1171 规程 ✓)
+* **13 个提交逐个 cherry-pick ⇒ 全部 ✅,零冲突** ✓✓
+  (RUNBOOK:1184 预判"约 4–5 个文件需手工解冲突/重指" ✗ ⇒ 实际**一个都没有** ✓;
+   包括 RUNBOOK 说需"重指"的 GLM 注意力文件 ✓ —— 因为该搬迁发生在生产树基点**之前** ✓,快照补丁已含 ✓)
+* 树上现有:快照 ✓ + mHC ✓ + V4.1 Triton prefill/decode ✓ + Engram ✓ + GLM forward-with-sink ✓ +
+  GLM SM8x 绑定 ✓ + kpool FP8 ✓ + topk 流 ✓ + MiMo MTP ✓ + 稀疏 MLA 2-D tile ✓ + 1 个 Revert ✓
+
+**② 静态验证全绿 ✓**:
+| 检查 | 结果 |
+|---|---|
+| 插件挂点(RUNBOOK 核对表)| ✅ `FusedMoEFactory`(是**函数** ✓,`class` 形式查不到是**预期** ✓)、`oracle/{fp8,int_wna16,unquantized}.py`、`fused_moe/experts/cpu_moe.py`、`profile_run`、`compile_or_warm_up_model`、`init_attn_backend`、`_initialize_kv_caches` **全部在** ✓ |
+| 插件 import 路径 | ✅ 与挂点一致(`...layers.fused_moe.experts import cpu_moe` ✓)|
+| 我们新增文件 | ✅ `flashmla_sparse_sm8x.py` / `sparse_mla_kernels.py` 在 ✓(新增文件共 126 个 ✓)|
+| Python 编译 | ✅ **572 个通过**;4 个失败**全在上游自带的 `allspark*`**(与我们无关 ✓)|
+
+**③ 运行时验证的**真实门槛**(重要教训 ✓):
+* `PYTHONPATH=<另一棵树>` **只能换 Python 代码,换不了已编译扩展** ✗
+* 实测:`PYTHONPATH=vllm-rebase-latest` 启动 ⇒ `ImportError: vllm.vllm_flash_attn requires the CUDA flash
+  attention extensions (_vllm_fa2_C or _vllm_fa3_C)` ✗
+* 原因对照:生产树 `vllm-up-133b71e0b` 树内有 **11 个 `.so`**(上一轮**已就地编译** ✓)⇒ 所以 `PYTHONPATH` 指**它**可行 ✓;
+  而新树 **0 个 `.so`** ✗;且这 185 个提交**改了 30 个 C++/CUDA 文件**(含新增 `all_reduce_mhc.cu` +212 行 ✓)
+  ⇒ **必须重建扩展** ✓
+* ⇒ 已在**新树内**跑 `setup.py build_ext --inplace`(**不动 editable 安装 = 不动生产** ✓)作为后台任务 ✓
+
+**④ 关于"rebase + 验证"目标的现状**:
+* **生产树 `vllm-up-133b71e0b` 本身就是一次已验证的 rebase** ✓(2026-09-21 起进生产 ✓,带全部 SM80 能力 ✓)
+  ⇒ 目标这一半**在该层级已达成** ✓
+* 本轮把它推进到**最新 main** ✓(再新 185 个提交 ✓);**待编译完成后**在新树上跑 V4.1/GLM/MiMo 功能回归 ✓
+* 另:`serve_v41.sh`/`serve_glm53_mainline.sh`/`tune_serve.sh` 已加 `PYTHONPATH=$XTU_TREE`(默认生产树 ✓,B178 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
