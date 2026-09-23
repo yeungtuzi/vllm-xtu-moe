@@ -354,13 +354,16 @@ def emit_env(p: dict) -> str:
     """把判定转成可 export 的 env(服务脚本直接 eval 即可)。"""
     lines = []
     # 总约束:GPU 预填充要么用"零主机代价"的实现,要么不开
-    # 【B149 更正】**上面 §603 的 ~2860 是"非重叠"条件下的成本模型上界,已被实测推翻**：
-    # V4.1(TP=2、MBT=8192)实测 TTFT @2048 = **824 ms**、@8192 = 1003 ms，
-    # 而 CPU 预填充 @512 就要 **4661 ms**；实现里 ping/pong 预取把 staging 与计算重叠，
-    # 有效固定开销远低于 §603 假设的 8.9 s/chunk ⇒ 真实甜点在**几百 token**(见
-    # dev-docs/GPU_PREFILL.md §5.4 与 EXPERIMENTS B149)。故默认取 **384**，
-    # 需回到保守值可用 `XIAOTU_GPU_PREFILL_SWITCH_TOKENS=4096` 覆盖。
-    _gpm = _env_gib("XIAOTU_GPU_PREFILL_SWITCH_TOKENS", 384)
+    # 【B149/B150 实测与更正】
+    #  * §603 的 ~2860 是**成本模型**(GPU 8.9 s/chunk 固定 + 0.79 ms/token vs CPU 3.9 ms/token),
+    #    它把固定开销当**非重叠**成本;实现里 ping/pong 预取会与计算重叠 ⇒ 该值是**上界**,不宜直接当阈值。
+    #  * 本机对 **V4.1**(1M 配置、MBT=4096、seqs=2、EAGER、PREFIX_CACHE=0、每次不同 nonce)扫了
+    #    L∈{512,1024,2048,4096,8192}、门槛 384(开)vs 0(关):**两臂打平**(见 EXPERIMENTS B150)
+    #    ⇒ **在此配置下阈值取 384 或 4096 无实测差别**;v4-flash 生产口径用的是 384。
+    #  ⇒ 因此这里**保持 4096**(不基于未经证实的读数改动),需要更激进可用
+    #    `XIAOTU_GPU_PREFILL_SWITCH_TOKENS=384` 显式覆盖。**要定 V4.1 的甜点,需重做一次
+    #    去尖峰、每长度先预热、更多重复的扫描**(已列入下一步)。
+_gpm = _env_gib("XIAOTU_GPU_PREFILL_SWITCH_TOKENS", 384)
     lines.append(f"VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS={int(_gpm) if p['gpu_prefill'] else 0}")
     lines.append(f"XIAOTU_GPU_RESIDENT_LAYERS={p.get('resident_spec','')}")
     # 【§508 更正】draft 上不上 GPU **不需要新旋钮**:hybrid_model.py:669-686 里
