@@ -46,6 +46,13 @@ VERIFY="${VERIFY:-0}"
 PORT="${PORT:-8130}"
 PROMPTS="${PROMPTS:-1}"
 VLLM_TREE="${VLLM_TREE:-/home/user/lvllm/vllm-consolidated}"
+# 【LMCache】LMCACHE=1 启用外部 KV 缓存(需先跑 scripts/serve_lmcache.sh;chunk 2176 ✓)
+LMCACHE="${LMCACHE:-0}"
+if [ "$LMCACHE" = "1" ]; then
+  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555}}"
+else
+  KV_TRANSFER_JSON=""
+fi
 PY="${PY:-/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python}"
 ENVF="${ENVF:-/tmp/mimo26.env}"
 
@@ -72,6 +79,8 @@ ARGS=(--model "$CKPT" --served-model-name mimo26
 [ -n "$TOOL_PARSER" ] && ARGS+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
 [ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
 [ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && ARGS+=(--enable-prompt-tokens-details)
+[ "$LMCACHE" = "1" ] && ARGS+=(--enable-prefix-caching)
+[ -n "$KV_TRANSFER_JSON" ] && ARGS+=(--kv-transfer-config "$KV_TRANSFER_JSON")
 [ "$MM" = "1" ] || ARGS+=(--language-model-only)
 if [ "$MM" = "1" ]; then
   # 注意:不要把 JSON 默认值直接写进 ${VAR:-...},花括号会和展开的 } 冲突(会多出一个 })。
