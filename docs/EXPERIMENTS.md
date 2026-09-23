@@ -5479,6 +5479,37 @@ V4.1 注意力钩子对 MP connector 非必需 ✓(仅对逐层连接器有用 �
   (源码构建卡在可选 kernel 的联网拉取 ✓ —— SM90+ 专属、A100 用不到 ✓,
    `VLLM_USE_PRECOMPILED` 也已试过失败 ✓)⇒ **待办:让唯一树完成一次自己的就地编译** ✓
 
+
+### B187 ⭐⭐⭐ **根因定性完成 + 通用修法确定**(LMCache fork 已就绪)
+
+**官方文档确认(V4.1 的一行)** ✓:
+> DeepSeek-V4.1-Flash | Sparse-MLA + per-layer sliding window(**9 KV groups**, **scratch ring**)
+⇒ V4.1 被官方列为 **validated** ✓,其组里含 **scratch ring** ✓ —— 我们的第 5 组正是它 ✓
+
+**vLLM 自己的定义(决定性证据)** ✓ `vllm/v1/kv_cache_interface.py:986-996`:
+```python
+@dataclass(frozen=True, kw_only=True)
+class KpoolTailSpec(SlidingWindowSpec):
+    """One-block circular scratch cache for a kpool indexer's raw tail."""
+    def max_admission_blocks_per_request(self, ...) -> int: return 1
+    def max_num_blocks_per_req(self, ...) -> int: return 1     # ← 按设计恒为 1 块
+```
+⇒ 这一组**按设计永远只有 1 个块** ✓ ⇒ 实测 `allocated_blocks={..., 5:1}` + `tokens_per_block[5]=8`
+⇒ `GetStoreMetadata` 对**所有组**取 `min(已分配块 × 每组 tokens_per_block)` ✗ ⇒ 被拖到 **8 token**
+⇒ 不足一个 chunk ⇒ **`num_chunks = 0` ⇒ 永不产生 STORE** ✓✓ **根因闭合** ✓
+
+**通用修法(不写 V4.1 特判 ✓)**:
+在 `lmcache/integration/vllm/lmcache_mp_metadata.py` 的 `GetStoreMetadata`(约 234-242 行 ✓)里,
+`min()` **跳过"环形暂存/scratch"组** ✓ —— 判定用 vLLM 自己暴露的
+`spec.max_num_blocks_per_req(...) == 1`(等价于"该组按设计只有 1 块、环形复用 ✓")✓
+* **通用**:任何"1 块环形暂存"组都适用(不限 V4.1 ✓)
+* **无性能损失**:只影响"可存前缀"的长度计算 ✓,不进解码热路径 ✓
+* **可审阅**:改动集中在 LMCache 侧一个函数 ✓
+
+**fork 已就绪** ✓:`/home/user/lvllm/lmcache-fork`(从**已装的 0.5.5 完整源码**建仓 ✓,
+1610 个文件 ✓,基线提交 `1a997f6` ✓)—— 因为 GitHub 只有 ~6 KB/s ✗、PyPI 也超时 ✗,
+**"联网克隆"这条路不可行** ✓ ⇒ 用已装源码作 fork 起点(纯 Python ✓ 完整 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
