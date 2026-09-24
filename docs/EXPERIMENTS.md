@@ -6176,6 +6176,28 @@ YAML 1.1 会把它解析成**布尔 `False`** ✗(与 `on`/`yes`/`no` 同类)⇒
 ⇒ 已改为 **`"off": null`** ✓,复核键类型**全为字符串** ✓。
 **教训** ✓:DSH 的 `settings.yaml` 里凡是以 `off/on/yes/no` 作**键名或枚举值**的地方,**必须加引号** ✓。
 
+
+### B215 "能力声明走哪个协议才能被 DSH 接受" —— 查清整条链路(结论:**没有运行时协议,靠内置目录 + 显式配置**)
+
+**链路** ✓:`DSH → dsh-llm-pi-ai(包装)→ @earendil-works/pi-ai v0.85.1` ✓
+
+| 环节 | 事实(实测)|
+|---|---|
+| vLLM 侧 | `GET /v1/models` 只有 `id/object/created/owned_by/root/parent/max_model_len/permission` ✗;全仓 `input_modalities`/`capabilities` **0 命中** ✗ |
+| pi-ai 是否抓 `/v1/models` | **否** ✗(`api/v1/models`、`/v1/models` 在 pi-ai 里 **0 命中** ✓)|
+| 能力从哪来 | **打包进包里的静态目录** ✓:`dist/providers/data/*.json` **39 个 provider**(含 `deepseek.json`/`openrouter.json`/`openai.json` …)✓;README 有专节 **「Static Catalog Reads」** ✓ |
+| 唯一的动态机制 | ✓ README **「Dynamic Providers」**:"*Providers may have dynamic model lists (**a llama.cpp server, a live OpenRouter listing**); fetching is an explicit async verb*" ⇒ **`models.refresh({providers:[…]})`** ✓ ⇒ **只有 `llamacpp` / `openrouter` 这类"内置动态 provider"** ✓(且 `data/` 里**没有 llamacpp.json** ✓ 正说明它是动态那类 ✓)|
+| DSH 是否暴露刷新 | **有** ✓:客户端 `refreshModels()` ✓(`dsh-client-ui-settings-models` ✓)+ 中文"刷新"命中的 UI 文件 ✓ ⇒ 模型设置里有**刷新**入口 ✓ |
+| 我们这条的协议 | `api: openai-completions` ✓ —— **通用协议,无动态清单** ✗ ⇒ 能力只能由 **配置** 给 ✓ |
+
+**⇒ 结论** ✓:**没有"哪种协议能让自建 vLLM 自动声明能力"** ✗ —— 因为 pi-ai 对通用 OpenAI 兼容端点**不抓任何清单** ✓,
+能力**只**来自:①**打包目录**(仅覆盖它已知的 39 家 ✓)②**内置动态 provider**(llamacpp / openrouter ✓)③**显式配置** ✓。
+> 想走"自动"只有两条现实路径:把模型**经由 OpenRouter** 提供并用 `openrouter` provider ✓(其清单带架构/模态字段 ✓,
+> 且 DSH 有刷新 ✓);或**让它进入 pi-ai 的内置目录**(要上游发版 ✓)。
+> `DeepSeek-V4.1-Flash` 是**新模型**,任何目录里都还没有 ⇒ **显式 `models:` 配置是当前唯一可行且正确的方式** ✓(我们已配 ✓)
+
+**顺带核对** ✓:官方 `deepseek.json` 里条目的字段名与我们写的一致(`inputModalities` 等 ✓)⇒ 我们的写法**符合目录 schema** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
