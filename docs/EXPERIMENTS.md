@@ -6689,6 +6689,28 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
    按机器人建议去 Slack `#pr-reviews` ✓;候选评审人(近期改这些文件者):`WoosukKwon`/`Lorenzo…`/
    `yewentao256`/`LucasWilkinson`/`zyongye` 等 ✓(**单点、礼貌、不群发** ✓)
 
+
+### B228 PR#56118 **已完成 rebase**(手工解冲突)+ 记录一个**必须记住的 git 语义坑**
+
+**成果** ✓(在隔离区 `/tmp/vllm-pr-rebase/fork` ✓,分支 `pr1` ✓,**未推送** ✓):
+* `pr1` 从原基点 `1454b7172`(09-09)**rebase 到上游 `5747d4500`(09-24)** ✅
+* 唯一冲突 `fused_moe/oracle/mxfp4.py`:上游把这段**重构走了**(CPU 判定移到 `_get_experts_cls`/`map_mxfp4_backend` ✓)
+  ⇒ **正解 = 保留上游重构 + 手工插回我方"提前返回"那段 + 丢弃冗余的 `is_cpu() or …`** ✓
+* **净改动 3 文件 / +43 −1**(原为 +59 −2 ✓,差值正是被丢弃的冗余 hunk ✓):
+  `envs.py` +9(VLLM_EXPERTS_LOAD_DEVICE ✓)、`mxfp4.py` +14(提前返回 ✓)、`routed_experts.py` +21(权重落在 host ✓)
+* 插入位置:**`raise last_error` 之后、`_requires_qwen38_tep8_emulation` 之前** ✓(与原提交一致 ✓)
+* `py_compile` 三文件全过 ✓;默认行为不变(env 默认 `gpu` ✓)
+
+**⚠️ git 语义坑(本会话踩了两次,务必记住)** ✓:
+* **在 `git rebase` 冲突中:`--ours` = 上游基(被 rebase 到的分支),`--theirs` = 你正在应用的提交** ✗
+  —— 与 **merge 完全相反** ✓。我第一次用 `--theirs`(以为取上游)⇒ 把**旧版整个文件**带进来、**回退了上游重构** ✗
+  (diff 从 31 行变成 180 行 ✗);第二次用 `--ours` ⇒ 又把**我方改动全丢了** ✗(文件从 diff 里消失 ✗)
+* ⇒ **正确做法**:`git checkout --ours <file>` 拿上游基,然后**手工插入**自己的改动 ✓;
+  或用 `git checkout --theirs` 后**手工删掉**上游已重构掉的部分 ✓ —— **都要人工确认** ✓
+* 另两条同批教训 ✓:①`git diff A..B`(两点)会显示"**反向**"的差异(把上游自己的改动算成我的 ✗);
+  比较"我的分支相对上游"必须用 **三点 `A...B`** ✓ ②**先 `git rev-parse --abbrev-ref HEAD` 确认分支**再动手 ✓
+  (我曾误以为在 pr1、实际在 pr3 ✗,导致"解冲突"根本没生效却报了成功 ✗)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
