@@ -337,7 +337,7 @@ tok.apply_chat_template([{"role":"system","content":"SYS-PROMPT-MARKER"},{"role"
   | 不传 | **字段不出现**(模板按 `Max` 渲染) | `system` |
 
   同一个探测在 `supportsDeveloperRole: true` 下打出的是 `developer,user` —— 也就是上面那个坑。
-  脚本存在。
+  脚本存在 `dev-docs/dsh_wire_probe.mjs`(不进仓库,随 dev-docs 一起被 gitignore)。
 * **生效方式**:DSH 用 chokidar 监听 `settings.yaml`,改完**热重载**;前端刷新一次页面(拉模型目录)
   就会出现档位。若仍没有,说明运行中的 DSH 用它启动时的旧内存文档把文件**回写覆盖**了
   (踩过一次,11:10 的文件改动被抹掉)—— 先确认文件里 `reasoningEfforts` 还在,不在就重写,
@@ -424,7 +424,7 @@ settings,只能走 `~/.dsh/profiles/web/cordis.patch.yml`)。
 = ~25.2 GiB   ⇒ 留给「激活工作区」的只剩 ~7 GiB
 ```
 而**长 prefill 的激活正比于 chunk 大小**(MBT),4,148-token 级的请求会超过这 7 GiB
-⇒ **实测 `torch.OutOfMemoryError` → EngineCore 死**。诊断见。
+⇒ **实测 `torch.OutOfMemoryError` → EngineCore 死**。诊断见 `dev-docs/HANDOFF_PERF_TOPN.md` §10。
 
 ⇒ **GLM 上"GPU 预填充 + 投机 + 长上下文"三者不可兼得**,而投机只值 +3%,**最不值得保**。
 
@@ -946,7 +946,7 @@ TAG=gpf KV_CACHE_BYTES=4729960528 GP_MIN=1024 MAXLEN=1048576 SEQS=2   bash <内�
 > **26.86 GB/s** ⇒ **只跑到 24%,有 ~4.2× 空间**(地板 144 ms/层 ⇒ 6.0 s/chunk)。
 > 待查:插桩自身的 `cuda.synchronize()` 会放大串行(需用 CUDA event 复核)、host 回调是否
 > 真与 attention 重叠、环形槽只有 2 个是否退化成串行。诊断细节见
->。
+> `dev-docs/HANDOFF_PERF_TOPN.md` §12。
 | chunk | 当前 11.6 s | 修掉转置 7.4 s | 线速+重叠 5.74 s |
 |---|---|---|---|
 | 2048 | 174 | 277 | 357 |

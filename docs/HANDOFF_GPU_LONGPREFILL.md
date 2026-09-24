@@ -154,7 +154,7 @@ GPU_UTIL=<尽量高>              # 把省下的显存全部让给 staging + 激
   `XIAOTU_GP_ASM_SIDE_STREAM=0` 即干净,且 `GPU prefill ACTIVE=84` 证明装配确实跑了。
 * **代价**:长 prompt TTFT **+17%**。**这正是本阶段要抢回来的东西之一** ——
   正确的做法是实现**真正的流间依赖/重叠**,而不是把重叠关掉。
-* 完整复盘见 `CHANGELOG.md`;诊断过程见。
+* 完整复盘见 `CHANGELOG.md`;诊断过程见 `dev-docs/RND_CAMPAIGN_DIAGNOSIS.md`。
 
 ---
 
@@ -202,7 +202,7 @@ GPU_UTIL=<尽量高>              # 把省下的显存全部让给 staging + 激
 | `scripts/bench_random_12cells.sh` | 12 格基准(KV cap 自动算 + 前置断言 + 早退检测) |
 | `scripts/bench_resident_sweep.sh` | 常驻层扫描(**本阶段停用**) |
 | `scripts/summarize_random12.py` | 从 JSON 出表 |
-|
+| `dev-docs/RND_CAMPAIGN_DIAGNOSIS.md` | 非法访存事故的完整诊断(含所有弯路) |
 | `docs/TUNING_GUIDE.md` | 三方显存预算框架与实测单位代价 |
 | `CHANGELOG.md` | 旁路流修复的复盘 |
 

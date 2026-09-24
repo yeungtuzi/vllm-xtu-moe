@@ -587,7 +587,7 @@ CPU 引擎里是多一次逐层调用,若放 GPU 则需要 ~1.7 GiB/rank 的 FP8
 
 > 背景:MiMo-2.5 的调研发现,**检查点里带了 3 层 MTP 权重**,而 vLLM 用两处硬编码常量
 > (`_MIMO_V2_*_NUM_MTP_LAYERS = 1`)只跑第 1 层 ⇒ "改常量即可解锁 3 层链"(详见
->。**GLM-5.3-Flash 不是这个情况**:
+> `dev-docs/MIMO25_ANALYSIS.md` §9)。**GLM-5.3-Flash 不是这个情况**:
 
 | | MiMo-2.5 | **GLM-5.3-Flash** |
 |---|---|---|
@@ -653,7 +653,7 @@ MiMo 那边对应的多层 MTP PR([#31180](https://github.com/vllm-project/vllm/
 
 > 命名:`MiMo-2.5` 是 **`XiaomiMiMo/MiMo-V2.5`**(310B / 15B active,48 层,256 专家 top-8,
 > Hybrid SWA-128 + DiffKV,官方只有 FP8 block-128)。完整调研见内部
->。检查点 ~295 GB(17 分片 + `model_mtp.safetensors`)。
+> `dev-docs/MIMO25_ANALYSIS.md`。检查点 ~295 GB(17 分片 + `model_mtp.safetensors`)。
 
 **启动(TP=1 单卡 A100-40GB,专家在 CPU)**:
 
@@ -718,7 +718,7 @@ k=3 走多模块链。实测**结论明确:k=1 可用,k=3 不可用**:
 
 ## 3b. MiMo-V2.6-Flash-RL(A100 / SM80:**骨架、1M、MTP k=1 已在 P1 通过**;完整端到端待 P4)
 
-> 2026-09-22 新增。事实来源 `docs/EXPERIMENTS.md` **B92–B95**;计划。
+> 2026-09-22 新增。事实来源 `docs/EXPERIMENTS.md` **B92–B95**;计划 `dev-docs/MIMO26_PLAN.md`。
 > 检查点:`/home/user/.cache/modelscope/models/MiMo-V2.6-Flash-RL`(166 GB;index `total_size` = **161 GiB**)。
 
 **与 V2.5 的关键差异(实测张量头,不是抄 config)**
@@ -843,7 +843,8 @@ V4.1 的 KV 含 **9 个组**,其中 indexer 尾部是 vLLM 的 **`KpoolTailSpec`
 
 **修法(通用 ✓,非 V4.1 特判 ✓)**:判定 `spec.max_num_blocks_per_req(...) == 1` 的组为环形暂存 ✓,
 在**注册期**与**几何**两处一致排除 ✓(其层落为既有 `EXCLUDED_ENGINE_GROUP` ✓)。
-实现见。
+实现见 `dev-docs/lmcache-scratch-group-fix.patch` ✓(5 文件 / +131 行 ✓);**PR 草案**见
+`dev-docs/LMCACHE_PR_DRAFT.md` ✓。
 
 ### 5.5 我们这边的改动(上游化候选)
 

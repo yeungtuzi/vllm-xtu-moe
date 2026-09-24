@@ -43,7 +43,7 @@
    ⇒ **§3.4 第 3 条「nsys 一次运行给出完整时间线」作废**。
 2. ③ 的下一步改为**插件自带的逐层计时**：`[layer-timing]` 已加**墙钟时间戳**（只改打印），
    配 `XIAOTU_LAYER_TIMING=1 XIAOTU_LAYER_TIMING_EVERY=1` 可逐层反解 `pre/eng/post` + 层间墙钟，
-   解析器。**这是 ③ 现在最便宜的一步。**
+   解析器 `dev-docs/report/tuning/probes/attrib_layer_timing.py`。**这是 ③ 现在最便宜的一步。**
 
 **③ 已按此做完(见 §3 顶部、EXPERIMENTS B87/B88):缺口 = 稀疏 MLA 注意力被记进 MoE 的 `pre`;闭合账无残差。**
 
@@ -164,7 +164,7 @@ profile 的调用次数 vs 应有层数：
 2. **已做**：`[layer-timing]` 加了**墙钟时间戳**（只改打印，默认不变）。
    现在可直接从日志得到**逐层时间线**：相邻行 Δt = 层间墙钟，逐层 `pre/eng/post` 由累计平均反解
    ⇒ 一跑就能把每层拆成「apply 内 MoE」vs「apply 之外（注意力/indexer/层间）」。
-   解析器：。
+   解析器：`dev-docs/report/tuning/probes/attrib_layer_timing.py`。
 3. **❌ 已作废**：`nsys` **在本机采不到 GPU 核事件**（只有 2023.1.2 套件 vs driver 580；
    `nsys stats` → `does not contain CUDA kernel data`，sqlite 无 KERNEL 表）。见 B86。
 4. **结构性怀疑对象**（未验证）：KDA 侧的**非核**工作、CUDA graph 的 replay 开销、
@@ -197,7 +197,7 @@ setsid env PYTHONPATH=/home/user/lvllm/vllm-up-133b71e0b TAG=<tag> PORT=<port> \
   bash scripts/serve_v41.sh > /tmp/<tag>_w.log 2>&1 &
 # ⚠️ 必须显式传 GPUS=0,1（脚本默认 GPUS=0）
 # served-model-name 是 DeepSeek-V4.1-Flash（2026-09-23 起改用正式全称；旧别名 dsv41 已废弃）
-# 日志在
+# 日志在 dev-docs/report/tuning/logs/<tag>.log，不是 logs/
 ```
 
 ### 4.2 五个必踩的坑（每个都让我失败过）
@@ -205,7 +205,7 @@ setsid env PYTHONPATH=/home/user/lvllm/vllm-up-133b71e0b TAG=<tag> PORT=<port> \
 1. **`GPUS` 默认是 `0`** ⇒ `TP=2` 不传 `GPUS=0,1` 会 pydantic 报
    「World size (2) larger than available GPUs (1)」；
 2. **`--served-model-name` 猜错** ⇒ `NotFound`，**请求根本没送达**（V4.1 的服务名是 `DeepSeek-V4.1-Flash`）；
-3. **V4.1 日志路径**是
+3. **V4.1 日志路径**是 `dev-docs/report/tuning/logs/`，GLM 是 `logs/`；
 4. **`KV_CACHE_BYTES` 必须按引擎反算的真实需求、不加乘性余量**
    （GLM 19,505 B/token；V4.1 30,639 B/token）—— 256K 下 10% 余量就 OOM；
 5. **V4.1 的 `MBT=16384` 会撞装配期 `aten::new_empty` 失败** ⇒ 用 8192（或更小）。

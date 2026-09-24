@@ -517,7 +517,7 @@ launch: gate_up_kernel_fp8[(E, triton.cdiv(2*I, bn))]   # grid 第一维 = E = 2
 
 ### B25 ⭐⭐ V4.1 长 prompt 崩溃**根因定位**(精确到行/大小/原因)—— 满足目标对诊断的要求
 
-**崩溃栈(实测,来自
+**崩溃栈(实测,来自 `dev-docs/report/tuning/logs/big10.memfoot.log:668-674`):**
 ```
 deepseek_v41/attention.py:871  _fused_qnorm_rope_kv_insert
   → torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(...)
@@ -596,7 +596,7 @@ value_error: 0     ← 不再报错
 1. 漏传 `GPUS=0,1`(serve_v41.sh 默认 `GPUS=0`)⇒ 单卡+TP=2 ⇒ pydantic 校验失败(B26);
 2. `--served-model-name` **猜错**:真名是 **`dsv41`**(`serve_v41.sh:277`),我传 `DeepSeek-V4.1-Flash`
    ⇒ `NotFound`,请求从未送达 ⇒ **那次"失败"完全不能说明 MBT 修法无效**;
-3. 查日志查错了路径(`logs/` 而非。
+3. 查日志查错了路径(`logs/` 而非 `dev-docs/report/tuning/logs/`)⇒ 一度看不到错误。
 
 **⇒ 规则(与 B26 同类,再记一次):传参前读服务脚本的接口与 `--served-model-name`;
 查日志前确认脚本的 `$OUTDIR`。**
@@ -2296,7 +2296,7 @@ KV_CACHE_BYTES=8031830016 SPEC=0 PREFIX_CACHE=1 MAXSEQS=2 LOAD=auto`;
 **⇒ 不崩:4 格全部 8/8 成功、0 失败**(含两路并发与 CUDA graph 路径)。
 **⇒ ⚠️ 判据教训:CED 开臂的 `mean` TPOT 被少数 185 ms 离群步拉高(69.76 vs median 51.84)**
 ⇒ 报 decode 用 **median**;若照抄 `mean` 会得出"CED 让 decode 慢 26%"的**假结论**。
-原始 JSON/日志已留在。
+原始 JSON/日志已留在 `dev-docs/report/tuning/raw/ced_ab/`。
 
 ### B85 ⚠️ 生成等价性:首 token **全一致**;但「逐字节全文」在 ≥5K 上**不能用作判据**(同臂就自相矛盾)
 
@@ -2553,7 +2553,7 @@ GPU 预填充 ACTIVE:`first 15232 tokens >= threshold 1500`)。TTFT **47.44 s**;
 
 模型:`/home/user/.cache/modelscope/models/MiMo-V2.6-Flash-RL`(166 GB;index `total_size` 172,923,364,096 B = **161 GiB**)。
 口径(用户 2026-09-22 定):**TP=2 / 1M 上下文 / 多模态 / 投机先用 MTP(k=1–3)**,dflash 只做调研。
-纪律:**多搜索、多核上游与 SGLang**。详细计划见。
+纪律:**多搜索、多核上游与 SGLang**。详细计划见 `dev-docs/MIMO26_PLAN.md`。
 
 **1. 与 V2.5 的关键差异:专家从 FP8 变成 MXFP4(对我们更有利)**
 实测张量头(非抄 config):`down_proj.weight` **U8 [4096,1024]**、`weight_scale` **U8 [4096,64]**
@@ -2717,7 +2717,7 @@ SGLang "MTP uses SWA ⇒ 不给全长 KV" 那条实现细节的依据。
 
 ### B96 上游核对(路线比较):#56752 只能贡献验收;**我们自己的 MTP 补丁有两个缺陷(已本机核实)**
 
-材料:。
+材料:`dev-docs/CED_56752_UPSTREAM_PACKAGE.md`(506 行,subagent 用**只读** gh 产出)。
 
 **(a) #56752 现状 —— 仍是"自动关闭",而且维护者自己挂着跟踪项**
 * `mergedAt: null`,closedAt `2026-09-18T22:01:27Z`;base **#56227 由 WoosukKwon 在 `22:01:24Z` 合并**
@@ -2820,14 +2820,14 @@ SGLang "MTP uses SWA ⇒ 不给全长 KV" 那条实现细节的依据。
 * 上游行为 = 建 1 层;我们的补丁 = `min(3, 1) = 1` 层 ⇒ **两者在 k=1 下逐字等价**;
 * ⇒ **我们这 17 行在推荐配置下什么也没买到**。
 **⇒ 建议:把 `eddc6d0eb7` 回退掉**(继续用 k=1),这样**零损失地消掉一处与上游的分叉**
-(正是。
+(正是 `dev-docs/UPSTREAM_DRIFT.md` 关心的那类分叉)。
 唯一需要保留的是**测试**:它对"层数不足即失败"的守卫仍然有价值(但那也是给上游的,不是给我们自己的)。
 
 **⇒ 路线 2 关闭(2026-09-22,用户决定:既然不成立就停)。** 保留的产物(**作为本次判断的证据归档,不再推进**):
 * `patches/upstream/mimo-mtp-depth-layers.patch`(11 KB)—— subagent 产出的**修正版补丁**:
   层数从真实 config 推导 + `num_nextn_predict_layers < 1` 时 fail-closed + 两个测试文件;
   **状态:不提上游**(它是给"多深度"这个已被否掉的特性服务的)。
-*。
+* `dev-docs/MIMO_MTP_UPSTREAM_PACKAGE.md`(8.6 KB)—— 两条路线的比较与 PR 材料草案;**状态:归档**。
 * GPU2 上的验证运行**已停止**(只按 GPU2 的 PID 清,未触碰 GPU0/1 的运行);工作树
   `/home/user/lvllm/vllm-mtp2` 保留未删(不再使用)。
 
@@ -2866,7 +2866,7 @@ SGLang "MTP uses SWA ⇒ 不给全长 KV" 那条实现细节的依据。
 
 ### B101 SGLang #37983 评估:**问题是真的,但 PR 已经存在 ⇒ 不提竞争 PR,改为支持 #38142**
 
-材料:本仓内部文档 + `sglang_37983_option_b_backend_guard.patch` +
+材料:`dev-docs/SGLANG_37983_ASSESSMENT.md` + `sglang_37983_option_b_backend_guard.patch` +
 `sglang_37983_kernel_demo.py`(subagent 产出;**GitHub 全程只读**;GPU 只用 GPU2)。
 
 **① bug 是真的,而且是"静默默认路径"**:上游 main `877a293`(2026-09-22)里
@@ -2998,7 +2998,7 @@ prefill_agg = C × 每流,其中 每流 = (total_input_tokens / completed) / (me
 decode_agg  = C × 每流,其中 每流 = 1000 / median_tpot_ms
 ```
 
-**验证方式(判据:能否复现已发布的数)**:用
+**验证方式(判据:能否复现已发布的数)**:用 `dev-docs/report/tuning/raw/ced_ab/` 的原始 JSON 复算,
 与 `README.md` 表格逐格对照:
 
 | 用例 | 复算 prefill_agg | 复算 decode_agg | README 记录 | 一致? |
@@ -3013,7 +3013,7 @@ decode_agg  = C × 每流,其中 每流 = 1000 / median_tpot_ms
 3. **decode_agg 在 C=2 反而变小是真实的并发回退**(V4.1 长上下文 19.3 → 15.4),
    **不是口径错误** —— 这种格子必须**单独说明**,不能按"聚合应更大"去改数。
 
-**配套交付**:
+**配套交付**:`dev-docs/report/tuning/probes/p5_unified.sh` —— P5 一条命令跑三模型
 (GLM-512K / V4.1-1M / MiMo-1M → 逐格 bench → 直接打印**这个口径**的对照表),
 协议与 `ced_v41_ab.sh` 完全一致(`random` / `random-output-len 128` / `num-prompts 8` /
 `seed = L*7+C*131+17`)。按仓库约定它留在 gitignored 的 `dev-docs/`,属本地工具。
@@ -3167,7 +3167,7 @@ P5 驱动 `probes/p5_unified.sh` 是我本轮新写的。**在真正跑出第一
 
 | # | bug | 症状 | 修法 |
 |---|---|---|---|
-| 1 | `REPO` 上溯写成 3 层(应 4 层:`probes→tuning→report→dev-docs→根`) | 会去 本仓内部文档 找 serve 脚本 ⇒ 启动即失败 | 改 `/../../../..`,并**实测验证路径解析** |
+| 1 | `REPO` 上溯写成 3 层(应 4 层:`probes→tuning→report→dev-docs→根`) | 会去 `dev-docs/scripts/` 找 serve 脚本 ⇒ 启动即失败 | 改 `/../../../..`,并**实测验证路径解析** |
 | 2 | `set -u` 下引用未赋值的 `PORT_mimo` / `MAXLEN_mimo`(主循环设的是 `PORT`/`MAXLEN`) | **第一条命令就崩**(实测到) | 改用已算好的变量;`glm`/`v41` 分支同样问题**一并修** |
 | 3 | `READY_TRIES=120`(×10 s = **20 分钟**),而加载**要 40–60 分钟**;且超时分支会 `stop_port` | **白等 20 分钟 + 把正在加载的服务杀掉**(进度停在 48%) | 提到 **600(=100 分钟)**;且**超时不再杀服务**(改为保留 + 下次 `SKIP_START=1` attach) |
 
@@ -3320,7 +3320,7 @@ KV 池 **1,165,160 token**(`1.11×` 一次完整 1M 请求);加载 ~9 min(页缓
   且 MBT 由 8192 降到 4096;decode **19.2 vs 19.3** ✓ 一致(CED 不影响 decode)。
 
 **⇒ P5 完成度**:✅ pr4 生产树确认(B109)　✅ MiMo(B112)　✅ GLM(B115)　✅ **V4.1(本条)**
-⇒ 三模型在同一协议、同一聚合口径下的**统一表**已齐(原始 JSON 在。
+⇒ 三模型在同一协议、同一聚合口径下的**统一表**已齐(原始 JSON 在 `dev-docs/report/tuning/raw/p5_unified/`)。
 
 
 ### B117 ⭐⭐ DS-V4.1-Flash **多模态正确性通过**(用户新加项)
@@ -4295,9 +4295,9 @@ bench `p99 ITL = 13,680.2 ms`(median ITL 66.2 ms),**而这次 `GPF_STAGE` 与 `L
 **① 2860 的出处(三处正式文档,性质是"成本模型"而非端到端扫描)**:
 * `docs/RUNBOOK.md:1051`:`GPU ≈ 8.9 s/chunk 固定 + 0.79 ms/token` vs `CPU ≈ 3.9 ms/token` ⇒ 平衡 ~2860 token;
 * `vllm_xiaotu_moe/vram_policy.py:358`(§603):同模型,据此把默认阈值定 **4096**;
-*。
+* `dev-docs/PLUGIN_INTERFACE.md:29`:同结论。
 
-**② 用户记忆的 256–512 有 V4.1 的直接实测**(
+**② 用户记忆的 256–512 有 V4.1 的直接实测**(`dev-docs/GPU_PREFILL.md` §5.4「最新(V4.1,TP=2,MBT=8192,本机)」):
 
 | 项 | 数值 |
 |---|---|
@@ -4321,7 +4321,7 @@ bench `p99 ITL = 13,680.2 ms`(median ITL 66.2 ms),**而这次 `GPF_STAGE` 与 `L
 
 ### B150 V4.1 的 GPU 预填阈值:**实测两臂打平**,甜点未被证实(并更正我引用 §5.4 的方式)
 
-**动机**:B149 里我用 本仓内部文档 §5.4` 的 "TTFT @2048 = 824 ms / @8192 = 1003 ms" 论证
+**动机**:B149 里我用 `dev-docs/GPU_PREFILL.md §5.4` 的 "TTFT @2048 = 824 ms / @8192 = 1003 ms" 论证
 "V4.1 甜点在几百 token"。**复核上下文后发现那两句是「同形状第二次请求」的 TTFT**(文档原文:
 "同形状第二次请求的 TTFT 明显低于 CPU 预填充(本机 824 ms vs 4.6 s@512)")
 ⇒ **极可能是前缀缓存命中,不是真实 prefill** ⇒ **不能用作甜点依据** ✗。
@@ -5042,7 +5042,7 @@ vLLM `scheduler.py` 对 `SupportsHMA` 的 connector 调 **`request_finished_all_
 * **LMCache 侧**:当前阻塞点(dispatcher 门控 / `transfer_query` 配对)可能**纯配置** ✓ ⇒ 走通则**无需改上游** ✓
 * **vLLM 内置 connector** 无法处理 V4.1 异构多组 KV ✗(B170 ✓)⇒ 但**可绕开**(用外部 connector ✓)
 
-**③ 完整方案已落地**:
+**③ 完整方案已落地**:`dev-docs/LMCACHE_PLAN.md` ✓(内部文档 ✓)包含:
 * **§1 "改谁"矩阵**(7 项,逐项标注归属/是否必需/现状)✓
 * §2 已完成清单(含证据编号)✓;§3 阶段计划与**验收判据**(P2 判据 = `/status.total_object_count > 0` ✓,
   P3 判据 = **重启后首次 TTFT < 5 s** ✓)✓
@@ -5412,7 +5412,7 @@ V4.1 注意力钩子对 MP connector 非必需 ✓(仅对逐层连接器有用 �
 
 ### B184 P6 交付物:**LMCache issue 草案**(基于已确认根因)+ 合并树的验证待编译
 
-**issue 草案** ✓:
+**issue 草案** ✓:`dev-docs/LMCACHE_ISSUE_DRAFT.md`(内部 ✓)
 * 标题:`[MP] No STORE is produced for multi-group (HMA) models when the smallest-granularity group
   has fewer blocks than one chunk`
 * 含:**完整运行时元组**(vLLM dev `c961121519` + 本地 SM80 补丁 ✓、lmcache 0.5.5 ✓、V4.1-Flash TP=2 ✓、
@@ -5738,8 +5738,8 @@ L2 文件数 = 62                                                               
 **产物** ✓:
 | 文件 | 内容 |
 |---|---|
-| 本仓内部文档 | 完整 PR 描述:标题建议、**两层的根因**(附代码出处 ✓)、复现步骤与运行时元组、3 文件修法、**为什么通用**、修前/修后对照表、已跑/待跑测试、**AI 协助声明** ✓ |
-|;**5 个文件** = `.gitignore` + `kv_layer_groups.py`(判定 ✓)+ `kv_cache_groups.py`(注册期排除 ✓)+ `lmcache_mp_connector.py`(几何同步 ✓)+ `lmcache_mp_metadata.py`(min 跳过 ✓);**131 行新增** ✓ |
+| `dev-docs/LMCACHE_PR_DRAFT.md` | 完整 PR 描述:标题建议、**两层的根因**(附代码出处 ✓)、复现步骤与运行时元组、3 文件修法、**为什么通用**、修前/修后对照表、已跑/待跑测试、**AI 协助声明** ✓ |
+| `dev-docs/lmcache-scratch-group-fix.patch` | **干净 diff**:266 行;**5 个文件** = `.gitignore` + `kv_layer_groups.py`(判定 ✓)+ `kv_cache_groups.py`(注册期排除 ✓)+ `lmcache_mp_connector.py`(几何同步 ✓)+ `lmcache_mp_metadata.py`(min 跳过 ✓);**131 行新增** ✓ |
 
 **修前 → 修后(同一环境实测)** ✓:
 | 指标 | 修前 | 修后 |
@@ -5829,7 +5829,7 @@ Resolved LMCache MP geometry: group_tokens_per_block=[2176, 2176, 2176, 2176, 21
 * MiMo + LMCache:加载 **68%(44/65)** ✓、无报错 ✓ ⇒ 预计再 ~8 分钟就绪 ✓
 
 
-### B201 交接文档就绪(
+### B201 交接文档就绪(`dev-docs/HANDOFF_LMCACHE.md`)—— P6 提交需人类
 
 **内容** ✓:一句话状态 ✓、**实测结论表**(冷/热/重启/双冷 ✓)、**复现验收步骤**(可直接执行 ✓)、
 改动清单(fork 修法 / PR 草案 / patch / 唯一树 / 四个启动器 / 文档 / 备份 ✓)、

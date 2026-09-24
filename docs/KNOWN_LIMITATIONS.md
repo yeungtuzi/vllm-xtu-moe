@@ -183,7 +183,7 @@ python scripts/tiny_moe_equiv.py         # CPU/GPU 专家端到端等价性
 > **2026-09-21 重要更新**:本条原先把这个报错点归给「上游新 indexer ↔ 我们 SM80
 > `kpool_compress.py` 的交互面」。**单变量实验否定了该归属**:
 > 根因是 **FP8 装配的那条 pitched 2-D DMA 跑在未同步的旁路流上**,见
-> `CHANGELOG.md` 的事故复盘。
+> `CHANGELOG.md` 的事故复盘与 `dev-docs/RND_CAMPAIGN_DIAGNOSIS.md`。
 > `byte_transpose.py:71` 只是**粘性错误的浮出点**(`load_binary` 不碰显存)。
 >
 > * 单变量证据:仅置 `XIAOTU_GP_ASM_SIDE_STREAM=0`,必崩序列即干净,
