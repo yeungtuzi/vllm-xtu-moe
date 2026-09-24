@@ -6246,6 +6246,35 @@ YAML 1.1 会把它解析成**布尔 `False`** ✗(与 `on`/`yes`/`no` 同类)⇒
 
 **⚠️ 纪律补充** ✓:`/tmp` 下用 `git archive` 导出快照做预演 ⇒ **不注册 worktree、不污染仓库** ✓(已按用户要求事先声明 ✓)
 
+
+### B217 ✅ rebase 落地 + 分支清理完成:**vLLM 仓只剩 `main`,且 == `origin/main`**
+
+用户 2026-09-24 授权"8070 可安全关闭、几天内不启动" ⇒ 借此窗口完成 B216 里待决的两步 ✓
+
+**前置判断** ✓:上游比我们基线前进 **33 提交 / 170 文件**,其中 **仅 2 个非 Python**
+(`csrc/cpu/cpu_attn.cpp`、`csrc/cpu/cpu_attn_impl.hpp` = CPU 注意力)⇒ 与 CUDA 扩展无关
+⇒ **`.so` 无需重建** ✓(实测 rebase 前后树内 `.so` 均为 **11 个** ✓)
+
+**执行** ✓:
+1. `proc.sh stop v41_8070` ✓(GPU0/1 释放到 ~657 MiB,只剩 LMCache 服务端 ✓)
+2. 服务树 `git reset --hard origin/main` ✓ ⇒ HEAD = **`70fc359d25`** ✓;**未跟踪的 `.so`/构建产物保留** ✓
+3. `scripts/apply_xtu_patches.sh <服务树>` ✓ ⇒ **16/16 干净应用、0 `.rej`** ✓、**35 文件 +2383/−209** ✓
+4. 与 `/tmp` 基线(上游+patch)比对:仅 **9 处差异,全为 `vllm/third_party/*` 构建产物**(我方独有 ✓)
+   —— 其中 9 个 `??` 含我们 patch **新建**的源码文件(`deepseek_v41/decoder_replay_layers.py` 等 ✓)
+   ⇒ `git apply` 不带 `--index` 时新文件为未跟踪 ✓,属**预期** ✓
+5. **删除 9 个本地分支** ✓(逐个按名 ✓,无任何模式匹配 ✓):`ced/pr56752`、`xtu/consolidated-latest`、
+   `xtu/glm53-sm80`(先 `checkout --detach` 释放 ✓)、`xtu/glm53-sm80-pr4`、`xtu/lmcache-hook`、
+   `xtu/mimo-mtp-depth`、`xtu/rebase-latest-lmcache`、`xtu/snapshot-6c73b08dec`、`xtu/upgrade-dabc4362b` ✓
+   ⇒ **备份**:260 MB `git bundle`(含全部分支 ✓)+ `patches/xtu-series/`(全部改动 ✓)⇒ 可完全恢复 ✓
+
+**最终形态** ✓:vLLM 仓**本地分支 0 个** ✓(`main` == `origin/main` ✓,落后 0 ✓);
+仓库宿主目录停在游离 HEAD(纯上游 ✓);服务树 = **最新上游 + 我们的 16 个 patch**(未提交工作区 ✓)
+**回归验证** ✓:`import vllm` 指向唯一树 ✓;`flash_attn.layers`/`mla`/`deepseek_v41.attention` 均可导入 ✓
+(`_indexer_k_cache_head_dim` 在 ✓)⇒ 几天后启动不会踩坑 ✓
+
+**⚠️ 今后注意** ✓:服务树的改动是**未提交**状态(真源在插件仓 ✓)⇒ 对该树做任何 `git` 操作
+(`checkout`/`stash`/`reset`)前,先按 `AGENTS.md`「vLLM 树治理」重新应用系列 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
