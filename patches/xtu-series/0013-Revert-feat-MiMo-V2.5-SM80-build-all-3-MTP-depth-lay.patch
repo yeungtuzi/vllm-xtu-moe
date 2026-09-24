@@ -1,0 +1,53 @@
+From 1f3077ef366e5a5e7902928a606ee512abc14452 Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Tue, 22 Sep 2026 04:33:48 +0000
+Subject: [PATCH 13/16] Revert "feat(MiMo-V2.5/SM80): build all 3 MTP depth
+ layers (was hardcoded to 1)"
+
+This reverts commit eddc6d0eb7be7068083995f29ca05f5dbcd9934a.
+
+(cherry picked from commit c7d9f7b9c50ff4dc218927c1f644d943b261bcc8)
+---
+ vllm/model_executor/models/mimo_v2_mtp.py | 22 +++++-----------------
+ 1 file changed, 5 insertions(+), 17 deletions(-)
+
+diff --git a/vllm/model_executor/models/mimo_v2_mtp.py b/vllm/model_executor/models/mimo_v2_mtp.py
+index ba47820f81..6fd8309350 100644
+--- a/vllm/model_executor/models/mimo_v2_mtp.py
++++ b/vllm/model_executor/models/mimo_v2_mtp.py
+@@ -48,13 +48,10 @@ from .interfaces import (
+ from .mimo_v2 import MiMoV2Attention, MiMoV2MLP, _shard_fp8_qkv_proj
+ from .utils import _merge_multimodal_embeddings, maybe_prefix
+ 
+-# MiMo-V2.5 ships 3 MTP depth layers (`model.mtp.layers.{0,1,2}`, 48 tensors in
+-# `model_mtp.safetensors`; verified against the published weight index). vLLM
+-# used to build only the first one, which makes k>1 pure overhead. The predictor
+-# now builds min(checkpoint_layers, num_speculative_tokens) layers, so k=1 keeps
+-# the old single-layer cost while k=3 unlocks the full chain.
+-_MIMO_V2_PRO_NUM_MTP_LAYERS = 3
+-_MIMO_V2_FLASH_NUM_MTP_LAYERS = 3
++# MiMo-V2 checkpoints contain multiple MTP layers, but vLLM currently supports
++# only the first layer
++_MIMO_V2_PRO_NUM_MTP_LAYERS = 1
++_MIMO_V2_FLASH_NUM_MTP_LAYERS = 1
+ 
+ 
+ class MiMoV2MTPLayer(nn.Module):
+@@ -173,16 +170,7 @@ class MiMoV2MultiTokenPredictor(nn.Module):
+         config = vllm_config.model_config.hf_config
+         spec_cfg = vllm_config.speculative_config
+         assert spec_cfg is not None
+-        # Build only min(checkpoint layers, k): a k=1 run must not pay for (or
+-        # try to load) layers 1..N-1, while k=3 uses the full chain.
+-        n_checkpoint = int(getattr(config, "num_nextn_predict_layers", 1) or 1)
+-        n_spec = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
+-        num_mtp_layers = min(n_checkpoint, n_spec) if n_spec else n_checkpoint
+-        if num_mtp_layers <= 0:
+-            raise ValueError(
+-                "MiMo MTP requires num_nextn_predict_layers and "
+-                "num_speculative_tokens to select at least one depth layer."
+-            )
++        num_mtp_layers = 1
+ 
+         self.num_mtp_layers = num_mtp_layers
+ 

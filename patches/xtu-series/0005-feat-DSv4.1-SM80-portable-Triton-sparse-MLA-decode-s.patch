@@ -1,0 +1,309 @@
+From 5ed8417d8e1a75f423e13feff43eb714c10ebbfe Mon Sep 17 00:00:00 2001
+From: xtu-v41 <xtu@local>
+Date: Mon, 14 Sep 2026 23:29:15 +0000
+Subject: [PATCH 05/16] feat(DSv4.1/SM80): portable Triton sparse-MLA decode so
+ V4.1 attention runs on A100
+
+Completes the SM80 attention path: `_forward_decode` called `flash_mla_with_kvcache`,
+which is a raise-stub on non-SM90 exactly like the prefill op.
+
+- `_forward_sparse_mla_swa_decode_triton` (compress_ratio == 0 / SWA-only):
+  non-MTP -> `fp8ds_paged_sparse_mla_attention_with_sink_multihead`;
+  MTP -> online-softmax accumulate over `decode_swa_indices` + sink finish.
+- `_forward_sparse_mla_compressed_decode_triton` (compress_ratio in {1,2}):
+  non-MTP -> `fp8ds_global_paged_sparse_mla_attention_with_sink_multihead`
+  (compressed physical slots + SWA window; the kernel is ratio-agnostic, so c1a
+  and c2a share it); MTP -> chunked compressed accumulate + SWA accumulate merged
+  into ONE online-softmax state (mathematically identical to V4's two-state
+  merge, and halves the reserved workspace).
+- Warmup spec reserves 3 float32 decode state buffers, gated on
+  `is_triton_sparse_mla_enabled(q.device)`.
+
+Gate: only `is_triton_sparse_mla_enabled(q.device)` (Ampere/Ada) takes the new
+path; the SM90+ `tile_metadata` + `flash_mla_with_kvcache` statements are
+unchanged in content and order.
+
+NO COMPATIBILITY IMPACT ON OTHER MODELS (project principle): every file this
+V4.1 work touches lives under `vllm/models/deepseek_v41/` -- a package no other
+model imports. `git diff 34e36f8075 HEAD --name-only` + `git diff --name-only`
+contain no file outside that directory, so V4/Qwen/GLM/Mixtral paths are
+untouched and their measured performance is unaffected by construction.
+
+Verified on GPU 2 (A100, SM80) vs a float32 torch reference over synthetic
+fp8_ds_mla paged caches, 3 identical runs, 7 cases (SWA-only / compressed x
+non-MTP / MTP): worst max_abs=3.69e-3, max_rel=2.73e-2 (bf16 output rounding);
+padded heads verified zeroed. Prefill test re-run: still passes.
+
+(cherry picked from commit 4306f50156d027a1cdc4914a57c81c4fb2321890)
+---
+ vllm/models/deepseek_v41/nvidia/flashmla.py | 226 ++++++++++++++++++++
+ 1 file changed, 226 insertions(+)
+
+diff --git a/vllm/models/deepseek_v41/nvidia/flashmla.py b/vllm/models/deepseek_v41/nvidia/flashmla.py
+index 1cac6e6cfc..22dbf01c89 100644
+--- a/vllm/models/deepseek_v41/nvidia/flashmla.py
++++ b/vllm/models/deepseek_v41/nvidia/flashmla.py
+@@ -27,10 +27,15 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
+     is_triton_sparse_mla_enabled,
+     triton_sparse_mla_prefill_topk_chunk_size,
+     triton_sparse_mla_query_chunk_size,
++    triton_sparse_mla_topk_chunk_size,
+ )
+ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
++    accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
+     accumulate_indexed_sparse_mla_attention_chunk,
+     finish_sparse_mla_attention_with_sink,
++    fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
++    fp8ds_paged_sparse_mla_attention_with_sink_multihead,
++    sparse_mla_decode_head_block_size,
+ )
+ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+ from vllm.v1.attention.ops.flashmla import (
+@@ -152,6 +157,21 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
+                         ),
+                     ]
+                 )
++                # MTP decode (more than one query token per sequence) needs the
++                # same online-softmax state; the single-token paged kernels do
++                # not allocate any. num_decode_tokens is bounded by
++                # max_num_batched_tokens.
++                decode_rows = self.max_num_batched_tokens
++                specs.extend(
++                    [
++                        ((decode_rows, self.n_local_heads), torch.float32),
++                        ((decode_rows, self.n_local_heads), torch.float32),
++                        (
++                            (decode_rows, self.n_local_heads, q.shape[-1]),
++                            torch.float32,
++                        ),
++                    ]
++                )
+             current_workspace_manager().get_simultaneous(*specs)
+             output.zero_()
+             return
+@@ -235,12 +255,41 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
+ 
+         swa_indices = swa_metadata.decode_swa_indices
+         swa_lens = swa_metadata.decode_swa_lens
++        assert swa_indices is not None
++        assert swa_lens is not None
+ 
+         # We treat queries in the same seq as different queries
+         # and later we only attend by generated indices.
+         # q arrives pre-padded to self.padded_heads by the outer wrapper.
+         q = q.unsqueeze(1)
+ 
++        # Portable Triton fallback for Ampere/Ada (and SM12x), where
++        # flash_mla_with_kvcache is unavailable.
++        if is_triton_sparse_mla_enabled(q.device):
++            if swa_only:
++                self._forward_sparse_mla_swa_decode_triton(
++                    q=q,
++                    swa_k_cache=self.swa_cache_layer.kv_cache,
++                    swa_metadata=swa_metadata,
++                    output=output,
++                )
++            else:
++                assert kv_cache is not None
++                assert attn_metadata is not None
++                assert topk_indices is not None
++                assert topk_lens is not None
++                self._forward_sparse_mla_compressed_decode_triton(
++                    q=q,
++                    compressed_k_cache=kv_cache,
++                    swa_k_cache=self.swa_cache_layer.kv_cache,
++                    topk_indices=topk_indices,
++                    topk_lens=topk_lens,
++                    swa_metadata=swa_metadata,
++                    attn_metadata=attn_metadata,
++                    output=output,
++                )
++            return
++
+         # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)
+         # Use unsqueeze to preserve strides (handles padded blocks correctly)
+         swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
+@@ -284,6 +333,183 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
+             out=output.unsqueeze(1),
+         )
+ 
++    def _forward_sparse_mla_swa_decode_triton(
++        self,
++        q: torch.Tensor,
++        swa_k_cache: torch.Tensor,
++        swa_metadata: "DeepseekSparseSWAMetadata",
++        output: torch.Tensor,
++    ) -> None:
++        """Portable Triton SM80/Ada fallback for SWA-only decode."""
++        num_decodes = swa_metadata.num_decodes
++        num_decode_tokens = swa_metadata.num_decode_tokens
++        mtp_decode = num_decode_tokens != num_decodes
++
++        assert swa_metadata.decode_swa_lens is not None
++        assert swa_metadata.decode_swa_indices is not None
++        assert swa_metadata.seq_lens is not None
++        swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
++        swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
++        max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
++        head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
++
++        if not mtp_decode:
++            # One query row per sequence: the paged kernel derives the
++            # contiguous SWA window from seq_lens / gather_lens.
++            fp8ds_paged_sparse_mla_attention_with_sink_multihead(
++                q=q,
++                k_cache=swa_k_cache,
++                seq_lens=swa_metadata.seq_lens[:num_decodes],
++                gather_lens=swa_lens,
++                block_table=swa_metadata.block_table[:num_decodes],
++                block_size=swa_metadata.block_size,
++                candidate_offset=0,
++                num_candidates=max_swa_len,
++                scale=self.scale,
++                attn_sink=self.attn_sink,
++                output=output,
++                head_block_size=head_block_size,
++                num_heads=self.n_local_heads,
++            )
++            if output.shape[1] > self.n_local_heads:
++                output[:, self.n_local_heads :].zero_()
++            return
++
++        # MTP: several query tokens per sequence attend to the same cache, so
++        # accumulate the per-token SWA slots with an online softmax and add the
++        # sink once at the end.
++        max_score, denom, acc = current_workspace_manager().get_simultaneous(
++            ((num_decode_tokens, self.n_local_heads), torch.float32),
++            ((num_decode_tokens, self.n_local_heads), torch.float32),
++            ((num_decode_tokens, self.n_local_heads, q.shape[-1]), torch.float32),
++        )
++        max_score.fill_(float("-inf"))
++        denom.zero_()
++        acc.zero_()
++        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
++            q=q,
++            k_cache=swa_k_cache,
++            slot_ids=swa_indices,
++            lens=swa_lens,
++            block_size=swa_metadata.block_size,
++            scale=self.scale,
++            max_score=max_score,
++            denom=denom,
++            acc=acc,
++            head_block_size=head_block_size,
++        )
++        finish_sparse_mla_attention_with_sink(
++            max_score,
++            denom,
++            acc,
++            self.attn_sink,
++            output=output,
++        )
++        if output.shape[1] > self.n_local_heads:
++            output[:, self.n_local_heads :].zero_()
++
++    def _forward_sparse_mla_compressed_decode_triton(
++        self,
++        q: torch.Tensor,
++        compressed_k_cache: torch.Tensor,
++        swa_k_cache: torch.Tensor,
++        topk_indices: torch.Tensor,
++        topk_lens: torch.Tensor,
++        swa_metadata: "DeepseekSparseSWAMetadata",
++        attn_metadata: DeepseekV4FlashMLAMetadata,
++        output: torch.Tensor,
++    ) -> None:
++        """Portable Triton SM80/Ada fallback for compressed + SWA decode."""
++        num_decodes = swa_metadata.num_decodes
++        num_decode_tokens = swa_metadata.num_decode_tokens
++        mtp_decode = num_decode_tokens != num_decodes
++
++        assert swa_metadata.decode_swa_lens is not None
++        assert swa_metadata.decode_swa_indices is not None
++        assert swa_metadata.seq_lens is not None
++        max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
++        compressed_topk = topk_indices.shape[-1]
++        compressed_block_size = attn_metadata.block_size // self.compress_ratio
++        compressed_slot_ids = (
++            topk_indices[:, 0, :] if topk_indices.dim() == 3 else topk_indices
++        )
++        swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
++        swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
++        head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
++
++        if not mtp_decode:
++            fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
++                q=q,
++                compressed_k_cache=compressed_k_cache,
++                slot_ids=compressed_slot_ids,
++                topk_lens=topk_lens,
++                compressed_block_size=compressed_block_size,
++                swa_k_cache=swa_k_cache,
++                seq_lens=swa_metadata.seq_lens[:num_decodes],
++                gather_lens=swa_lens,
++                block_table=swa_metadata.block_table[:num_decodes],
++                swa_block_size=swa_metadata.block_size,
++                num_compressed_candidates=compressed_topk,
++                num_swa_candidates=max_swa_len,
++                scale=self.scale,
++                attn_sink=self.attn_sink,
++                output=output,
++                head_block_size=head_block_size,
++                num_heads=self.n_local_heads,
++            )
++            if output.shape[1] > self.n_local_heads:
++                output[:, self.n_local_heads :].zero_()
++            return
++
++        # MTP: the paged kernel assumes one query row per sequence, so gather
++        # the compressed and SWA candidate sets into a single online-softmax
++        # state (the two subsets merge associatively) and finish once.
++        topk_chunk_size = min(compressed_topk, triton_sparse_mla_topk_chunk_size())
++        max_score, denom, acc = current_workspace_manager().get_simultaneous(
++            ((num_decode_tokens, self.n_local_heads), torch.float32),
++            ((num_decode_tokens, self.n_local_heads), torch.float32),
++            ((num_decode_tokens, self.n_local_heads, q.shape[-1]), torch.float32),
++        )
++        max_score.fill_(float("-inf"))
++        denom.zero_()
++        acc.zero_()
++        for chunk_start in range(0, compressed_topk, topk_chunk_size):
++            chunk_end = min(chunk_start + topk_chunk_size, compressed_topk)
++            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
++                q=q,
++                k_cache=compressed_k_cache,
++                slot_ids=compressed_slot_ids[:, chunk_start:chunk_end],
++                lens=topk_lens,
++                block_size=compressed_block_size,
++                scale=self.scale,
++                max_score=max_score,
++                denom=denom,
++                acc=acc,
++                candidate_offset=chunk_start,
++                head_block_size=head_block_size,
++            )
++        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
++            q=q,
++            k_cache=swa_k_cache,
++            slot_ids=swa_indices,
++            lens=swa_lens,
++            block_size=swa_metadata.block_size,
++            scale=self.scale,
++            max_score=max_score,
++            denom=denom,
++            acc=acc,
++            head_block_size=head_block_size,
++        )
++        finish_sparse_mla_attention_with_sink(
++            max_score,
++            denom,
++            acc,
++            self.attn_sink,
++            output=output,
++        )
++        if output.shape[1] > self.n_local_heads:
++            output[:, self.n_local_heads :].zero_()
++
+     def _forward_sparse_mla_prefill_triton(
+         self,
+         q: torch.Tensor,

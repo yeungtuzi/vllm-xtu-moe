@@ -1,0 +1,77 @@
+From 8be310c22d443446bd21fc3593f6c1deb610fb1a Mon Sep 17 00:00:00 2001
+From: xtu <xtu@local>
+Date: Wed, 23 Sep 2026 14:23:21 +0000
+Subject: [PATCH 14/16] feat(DSv4.1): transfer KV through the connector from
+ the V4.1 attention layer
+
+The V4.1 attention layer never calls save_kv_layer or wait_for_layer_load, and the only generic caller of
+those is the maybe_transfer_kv_layer decorator that the standard attention layers apply, so an external KV
+cache such as LMCache can look up prefixes but never stores them, and nothing survives a restart.
+
+This wraps the layer's forward, renamed to _forward_impl, with the equivalent of that decorator. The forward
+context keys attention metadata per KV cache group, as in <layer>.attn.swa_cache, because each V4.1 layer
+owns several groups, so one of the layer's group keys is used to fetch the context and the connector is
+called with that key. The wrapper is a no-op without a transfer group or connector metadata, so ordinary
+serving pays nothing.
+---
+ vllm/models/deepseek_v41/attention.py | 47 +++++++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+diff --git a/vllm/models/deepseek_v41/attention.py b/vllm/models/deepseek_v41/attention.py
+index d0e69fb358..d9e2a916e7 100644
+--- a/vllm/models/deepseek_v41/attention.py
++++ b/vllm/models/deepseek_v41/attention.py
+@@ -652,6 +652,53 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+         llama_4_scaling: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Run the layer, transferring KV to and from an external connector.
++
++        Equivalent to the ``maybe_transfer_kv_layer`` decorator that the
++        standard attention layers use; the unwrapped body is ``_forward_impl``.
++        Attention metadata is keyed per KV cache group (for example
++        ``<layer>.attn.swa_cache``) rather than per layer, so any one of this
++        layer's group keys is used to reach the context while the connector is
++        called with that same key. Without a transfer group or connector
++        metadata this is a no-op and costs nothing.
++        """
++        from vllm.distributed.kv_transfer import (
++            get_kv_transfer_group,
++            has_kv_transfer_group,
++            is_v1_kv_transfer_group,
++        )
++        from vllm.forward_context import get_forward_context
++        from vllm.model_executor.layers.attention.attention import (
++            get_attention_context,
++        )
++
++        args = (positions, hidden_states, llama_4_scaling)
++        if not (has_kv_transfer_group() and is_v1_kv_transfer_group()):
++            return self._forward_impl(*args)
++        raw = getattr(self, "prefix", None) or getattr(self, "layer_name", None)
++        if not raw:
++            return self._forward_impl(*args)
++        attn_metadata = get_forward_context().attn_metadata
++        key = None
++        if isinstance(attn_metadata, dict):
++            prefix = raw if raw.endswith(".") else raw + "."
++            key = next((k for k in attn_metadata if k.startswith(prefix)), None)
++        if key is None:
++            return self._forward_impl(*args)
++        metadata, _, kv_cache, _ = get_attention_context(key)
++        connector = get_kv_transfer_group()
++        if metadata is None or not connector.has_connector_metadata():
++            return self._forward_impl(*args)
++        connector.wait_for_layer_load(key)
++        out = self._forward_impl(*args)
++        connector.save_kv_layer(key, kv_cache, metadata)
++        return out
++    def _forward_impl(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        llama_4_scaling: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         # The eager attention region writes into a caller-owned buffer
+         # (breakable_cudagraph needs in-place outputs); its shape and how it is

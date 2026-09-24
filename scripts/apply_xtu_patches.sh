@@ -1,49 +1,51 @@
 #!/usr/bin/env bash
-# 把 vllm-xtu-moe 的补丁打到一棵 vLLM 主线上(源码树或已安装的 site-packages 树)。
+# 把 vLLM-XTU 的补丁打到一棵 vLLM 上(源码树或已安装的 site-packages 树)。
 #
-# 补丁是**纯 Python**(不碰 csrc/rust),所以既能打在源码树上,也能直接打在
-# `pip install vllm` 之后的 site-packages 里 —— 后者不需要编译任何东西。
+# ★ 开发模型(用户 2026-09-24 明确):
+#   * vLLM 仓库**与上游保持一致** —— 定期 rebase,**不在 vLLM 侧留自有长命分支**;
+#   * 我们的功能**全部以 patch 形式**保存在本仓(patches/xtu-series/),这是**唯一真源**。
 #
-# 基线:以下补丁针对 vLLM 主线 **dabc4362b**(2026-09-14)重新生成并实测全部干净应用。
-# 规模:pr0=1 文件 / pr1=6 文件 / pr2=2 文件 / pr3=21 文件。
+# 补丁是**纯 Python**(不碰 csrc/rust)⇒ 既能打源码树,也能直接打 site-packages(无需编译)。
 #
 # 用法:
-#   scripts/apply_xtu_patches.sh <vllm_tree>            # 只打 PR1(最小使能补丁)
-#   LEVEL=1 scripts/apply_xtu_patches.sh <vllm_tree>    # 同上(默认)
-#   LEVEL=2 scripts/apply_xtu_patches.sh <vllm_tree>    # + PR2(A100/SM80 的 FP8 o_proj)
-#   LEVEL=3 scripts/apply_xtu_patches.sh <vllm_tree>    # + PR3(SM80 DS-V4 移植,含新内核文件)
-#   DRY=1 ...                                           # 只 --dry-run
-#
-# <vllm_tree> 是**包含 `vllm/` 目录**的那一层,例如:
-#   /path/to/vllm                       (源码树)
-#   /path/to/venv/lib/python3.12/site-packages   (已安装)
-#
-# License: Apache-2.0
+#   scripts/apply_xtu_patches.sh <含 vllm/ 的目录> [series_dir]    # 默认用 patches/xtu-series
+#   DRY=1 ...                                                      # 只试不落盘
+#   LEVEL=1|2|3 ...                                                # legacy:旧 topic patch(基线已过期,仅供追溯)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TREE="${1:-}"
-LEVEL="${LEVEL:-1}"
 DRY="${DRY:-0}"
+SERIES_DIR="${2:-$ROOT/patches/xtu-series}"
 
 if [ -z "$TREE" ] || [ ! -d "$TREE/vllm" ]; then
-  echo "用法: $0 <包含 vllm/ 的目录>(当前:'$TREE')" >&2
+  echo "用法: $0 <包含 vllm/ 的目录> [series_dir](当前:'$TREE')" >&2
   exit 2
 fi
 
-# pr0 必须最先打:它把"引擎握手超时"变成可配置的,否则 CPU 引擎逐层构造
-# (>5 min)会在健康加载过程中被主线硬编码的 5 分钟握手超时掐掉。
-PATCHES=("$ROOT/patches/upstream/pr0-handshake-timeout.patch"
-         "$ROOT/patches/upstream/pr1-experts-load-device.patch")
-[ "$LEVEL" -ge 2 ] && PATCHES+=("$ROOT/patches/upstream/pr2-fp8-sm80-o-proj.patch")
-[ "$LEVEL" -ge 3 ] && PATCHES+=("$ROOT/patches/upstream/pr3-sm80-port.patch")
-
-echo "[xtu-patch] tree=$TREE level=$LEVEL dry=$DRY"
-for p in "${PATCHES[@]}"; do
+apply_one() {
+  local p="$1"
   echo "[xtu-patch] $(basename "$p")"
   if [ "$DRY" = "1" ]; then
-    ( cd "$TREE" && patch -p1 --dry-run < "$p" )
+    ( cd "$TREE" && git apply --check --whitespace=nowarn "$p" 2>/dev/null || patch -p1 --dry-run -f < "$p" )
   else
-    ( cd "$TREE" && patch -p1 < "$p" )
+    ( cd "$TREE" && git apply --whitespace=nowarn "$p" 2>/dev/null || patch -p1 -f < "$p" )
   fi
-done
-echo "[xtu-patch] done"
+}
+
+if [ "${LEVEL:-}" != "" ]; then
+  echo "[xtu-patch] legacy LEVEL 模式(基线 dabc4362b,可能已过期)"
+  PATCHES=("$ROOT/patches/upstream/pr0-handshake-timeout.patch"
+           "$ROOT/patches/upstream/pr1-experts-load-device.patch")
+  [ "$LEVEL" -ge 2 ] && PATCHES+=("$ROOT/patches/upstream/pr2-fp8-sm80-o-proj.patch")
+  [ "$LEVEL" -ge 3 ] && PATCHES+=("$ROOT/patches/upstream/pr3-sm80-port.patch")
+  echo "[xtu-patch] tree=$TREE level=$LEVEL dry=$DRY"
+  for p in "${PATCHES[@]}"; do apply_one "$p"; done
+else
+  echo "[xtu-patch] series 模式:dir=$SERIES_DIR tree=$TREE dry=$DRY"
+  [ -f "$SERIES_DIR/series" ] || { echo "缺少 $SERIES_DIR/series" >&2; exit 2; }
+  while read -r line; do
+    case "$line" in ''|'#'*) continue;; esac
+    apply_one "$SERIES_DIR/$line"
+  done < "$SERIES_DIR/series"
+fi
+echo "[xtu-patch] 完成 ✓"

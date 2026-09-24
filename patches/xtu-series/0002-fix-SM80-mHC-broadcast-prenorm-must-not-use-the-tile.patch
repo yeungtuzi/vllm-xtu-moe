@@ -1,0 +1,70 @@
+From caead0dbec10c2b37cef598fe759c741e8a9b3fe Mon Sep 17 00:00:00 2001
+From: xtu-upgrade <xtu@local>
+Date: Mon, 14 Sep 2026 22:06:27 +0000
+Subject: [PATCH 02/16] fix(SM80): mHC broadcast prenorm must not use the
+ tilelang fallback
+
+The tilelang fallback in _hc_prenorm_gemm_outputs asserts
+x.shape[1] == hc_mult * hidden_size, but the first-layer broadcast variant
+passes x = residual of shape (T, H). Gate on is_deep_gemm_supported() and use
+the torch reference otherwise, matching the layout (1, T, hc_mult3) the fused
+kernel consumes.
+
+(cherry picked from commit 885acf0de6c3c62459324ddd5b3bdf787cc77e19)
+---
+ vllm/model_executor/kernels/mhc/tilelang.py | 42 ++++++++++++++-------
+ 1 file changed, 29 insertions(+), 13 deletions(-)
+
+diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
+index c119b9a8fc..a3419420a9 100644
+--- a/vllm/model_executor/kernels/mhc/tilelang.py
++++ b/vllm/model_executor/kernels/mhc/tilelang.py
+@@ -755,19 +755,35 @@ def mhc_pre_broadcast_tilelang(
+         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
+     )
+ 
+-    gemm_out_mul, gemm_out_sqrsum = _hc_prenorm_gemm_outputs(
+-        residual_flat,
+-        fn_broadcast,
+-        hidden_size=hidden_size,
+-        hc_mult=hc_mult,
+-        # Let the helper decide: `use_deep_gemm = is_deep_gemm_supported() or not
+-        # use_tilelang_fallback`. Hard-coding False forced `tf32_hc_prenorm_gemm`
+-        # even on architectures DeepGEMM does not support (A100/SM80), where it
+-        # aborts with "Unsupported architecture" in hyperconnection.hpp. Every
+-        # other mHC pre path already gates on DeepGEMM support; this was the one
+-        # parity gap.
+-        use_tilelang_fallback=True,
+-    )
++    # `_hc_prenorm_gemm_outputs` picks `use_deep_gemm = is_deep_gemm_supported()
++    # or not use_tilelang_fallback`. Upstream passes use_tilelang_fallback=False
++    # because this *broadcast* variant passes x = residual of shape (T, H),
++    # while the helper's tilelang fallback asserts x.shape[1] == hc_mult * H.
++    # DeepGEMM's tf32_hc_prenorm_gemm handles the (T, H) x (hc_mult3, H) shape,
++    # but DeepGEMM has no hyperconnection kernels on A100 (SM80) and aborts with
++    # "Unsupported architecture" (hyperconnection.hpp). So on such devices use
++    # the torch reference, which produces the same (1, T, hc_mult3) / (1, T)
++    # layout that the fused tilelang kernel below consumes.
++    from vllm.utils.deep_gemm import is_deep_gemm_supported
++
++    if is_deep_gemm_supported():
++        gemm_out_mul, gemm_out_sqrsum = _hc_prenorm_gemm_outputs(
++            residual_flat,
++            fn_broadcast,
++            hidden_size=hidden_size,
++            hc_mult=hc_mult,
++            use_tilelang_fallback=False,
++        )
++    else:
++        gemm_out_mul = torch.empty(
++            1, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
++        )
++        gemm_out_sqrsum = torch.empty(
++            1, num_tokens, dtype=torch.float32, device=residual.device
++        )
++        _torch_hc_prenorm_gemm(
++            residual_flat, fn_broadcast, gemm_out_mul, gemm_out_sqrsum
++        )
+     _MHC_PRE_BIG_FUSE_TILELANG_KERNEL(
+         gemm_out_mul,
+         gemm_out_sqrsum,

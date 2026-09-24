@@ -1,0 +1,16 @@
+0001-snapshot-local-SM80-mixed-mode-patch-set-on-6c73b08d.patch
+0002-fix-SM80-mHC-broadcast-prenorm-must-not-use-the-tile.patch
+0003-fix-DSv4.1-SM80-remove-Triton-fp8e4nv-dependency-fro.patch
+0004-feat-DSv4.1-SM80-portable-Triton-sparse-MLA-prefill-.patch
+0005-feat-DSv4.1-SM80-portable-Triton-sparse-MLA-decode-s.patch
+0006-fix-DSv4.1-SM80-Engram-lookup-kernel-must-not-use-Tr.patch
+0007-feat-GLM5.3-SM80-portable-Triton-sparse-MLA-forward-.patch
+0008-feat-GLM5.3-SM80-bind-SM8x-sparse-MLA-backend-for-gl.patch
+0009-fix-GLM5.3-SM80-remove-Triton-fp8e4nv-dependency-fro.patch
+0010-fix-GLM5.3-SM80-convert-decode-topk-on-the-current-s.patch
+0011-feat-MiMo-V2.5-SM80-build-all-3-MTP-depth-layers-was.patch
+0012-SM80-sparse-MLA-prefill-2-D-BLOCK_H-tile-2.89x-on-th.patch
+0013-Revert-feat-MiMo-V2.5-SM80-build-all-3-MTP-depth-lay.patch
+0014-feat-DSv4.1-transfer-KV-through-the-connector-from-t.patch
+0015-feat-DSv4.1-decoder-side-SWA-bounded-replay-for-Deep.patch
+0016-feat-DSv4.1-integrate-decoder-side-SWA-bounded-repla.patch

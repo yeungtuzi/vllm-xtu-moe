@@ -1,0 +1,145 @@
+From 46c6ba0c9c39f49e60f746af8053a5bf5c3467b0 Mon Sep 17 00:00:00 2001
+From: xtu-v41 <xtu@local>
+Date: Mon, 14 Sep 2026 23:18:33 +0000
+Subject: [PATCH 03/16] fix(DSv4.1/SM80): remove Triton fp8e4nv dependency from
+ V4.1 cache/indexer ops
+
+Same class of bug already fixed for DeepSeek-V4: Triton has no fp8e4nv on Ampere
+(SM80), so '.to(tl.float8e4nv)' cannot compile on A100.
+
+- cache_utils.py: e4m3 encode/decode via _f32_to_e4m3_uint8 / _e4m3_uint8_to_f32
+  (the store/load target is already a uint8 pointer -> byte layout unchanged)
+- cache_utils.py: gate the cuTeDSL dequant-gather fast path off on Ampere/Ada
+- fused_compress_quant_cache.py: the fp8_ds_mla uint8 paged path (ratio 1/2).
+  The FlashInfer-only fp8_e4m3 row path (STORE_FP8) is deliberately NOT changed:
+  it is not on the fp8_ds_mla path and its target really is an fp8 pointer.
+- indexer_k_store.py: per-token FP8 indexer K store.
+
+Verified bit-exact: a Triton kernel using the helpers reproduces torch's
+float8_e4m3fn bytes exactly (0 mismatches in 1M values, decode error 0.0).
+
+(cherry picked from commit cb35809cb61bf1674d32da267a6ab113603bc909)
+---
+ .../deepseek_v41/common/ops/cache_utils.py    | 25 ++++++++++++-------
+ .../common/ops/fused_compress_quant_cache.py  | 10 ++++++--
+ .../common/ops/indexer_k_store.py             |  6 ++++-
+ 3 files changed, 29 insertions(+), 12 deletions(-)
+
+diff --git a/vllm/models/deepseek_v41/common/ops/cache_utils.py b/vllm/models/deepseek_v41/common/ops/cache_utils.py
+index 02fb0d5539..e0dfc56f50 100644
+--- a/vllm/models/deepseek_v41/common/ops/cache_utils.py
++++ b/vllm/models/deepseek_v41/common/ops/cache_utils.py
+@@ -18,6 +18,10 @@ from typing import Any
+ 
+ import torch
+ 
++from vllm.model_executor.layers.quantization.utils.fp8_utils import (
++    _e4m3_uint8_to_f32,
++    _f32_to_e4m3_uint8,
++)
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     get_fp8_min_max,
+ )
+@@ -34,6 +38,7 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.import_utils import has_cutedsl
+ from vllm.utils.math_utils import next_power_of_2
++from vllm.v1.attention.backends.mla.sparse_mla_env import is_ampere_or_ada
+ 
+ # Per-token byte width of the two paged fp8 records. Both put a page's whole
+ # data region ahead of its whole scale region, so ``k_cache.shape[-1]`` -- the
+@@ -151,10 +156,10 @@ def quantize_and_insert_k_kernel(
+ 
+             # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
+             if use_fnuz:
+-                x_fp8 = x_clamped.to(tl.float8e4b8)
++                x_uint8 = x_clamped.to(tl.float8e4b8).to(tl.uint8, bitcast=True)
+             else:
+-                x_fp8 = x_clamped.to(tl.float8e4nv)
+-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
++                # Ampere (SM80) has no fp8e4nv type; encode e4m3 bytes directly.
++                x_uint8 = _f32_to_e4m3_uint8(x_clamped)
+ 
+             # Store as uint8 (1 byte each)
+             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
+@@ -404,12 +409,10 @@ def _dequantize_and_gather_k_kernel(
+ 
+                 # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
+                 if use_fnuz:
+-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
++                    x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
+                 else:
+-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+-
+-                # Convert fp8 to float32 for computation
+-                x_float = x_fp8.to(tl.float32)
++                    # Ampere (SM80) has no fp8e4nv type; decode e4m3 bytes.
++                    x_float = _e4m3_uint8_to_f32(x_uint8)
+ 
+                 # Load and decode UE8M0 scale
+                 # UE8M0: scale = 2^(stored_value - 127)
+@@ -683,7 +686,11 @@ def dequantize_and_gather_k_cache(
+     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
+     writes FNUZ on gfx942 and OCP on gfx950).
+     """
+-    if has_cutedsl() and k_cache.shape[-1] != V41_NVFP4_BYTES_PER_TOKEN:
++    if (
++        has_cutedsl()
++        and not is_ampere_or_ada()
++        and k_cache.shape[-1] != V41_NVFP4_BYTES_PER_TOKEN
++    ):
+         # lazily import, otherwise some tests fail due to CUDA driver init failure.
+         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
+             _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,
+diff --git a/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py b/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
+index 2ba9dbea3d..4f420878e6 100644
+--- a/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
++++ b/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
+@@ -4,6 +4,9 @@
+ 
+ import torch
+ 
++from vllm.model_executor.layers.quantization.utils.fp8_utils import (
++    _f32_to_e4m3_uint8,
++)
+ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+@@ -330,8 +333,11 @@ def _rope_quant_insert_kernel(
+     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
+     exponent = tl.ceil(tl.log2(amax * (1.0 / 448.0)))
+     scaled = quant * tl.reshape(tl.exp2(-exponent), (8, 1))
+-    fp8 = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
+-    packed = tl.reshape(fp8.to(tl.uint8, bitcast=True), (512,))
++    # Ampere (SM80) has no fp8e4nv; encode e4m3 bytes directly (identical
++    # 1-byte layout -- this is the fp8_ds_mla uint8 paged path).
++    packed = tl.reshape(
++        _f32_to_e4m3_uint8(tl.clamp(scaled, -448.0, 448.0)), (512,)
++    )
+     tl.store(values + d, packed, d < 448)
+     s = tl.arange(0, 8)
+     max_encoded: tl.constexpr = 254.0 if SANITIZE_CACHE_NANS else 255.0
+diff --git a/vllm/models/deepseek_v41/common/ops/indexer_k_store.py b/vllm/models/deepseek_v41/common/ops/indexer_k_store.py
+index ba8ddbd95a..a887de03c9 100644
+--- a/vllm/models/deepseek_v41/common/ops/indexer_k_store.py
++++ b/vllm/models/deepseek_v41/common/ops/indexer_k_store.py
+@@ -15,6 +15,9 @@ group-boundary tokens ``(position + 1) % compress_ratio == 0`` produce a key.
+ 
+ import torch
+ 
++from vllm.model_executor.layers.quantization.utils.fp8_utils import (
++    _f32_to_e4m3_uint8,
++)
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ 
+@@ -243,7 +246,8 @@ def _indexer_k_norm_rope_quant_store_kernel(
+         exponent = tl.ceil(tl.log2(absmax * INV_FP8_MAX))
+         inv_scale = tl.exp2(-exponent)
+         x_clamped = tl.clamp(result_bf16 * inv_scale, -FP8_MAX, FP8_MAX)
+-        x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
++        # Ampere (SM80) has no fp8e4nv; encode e4m3 bytes directly.
++        x_uint8 = _f32_to_e4m3_uint8(x_clamped)
+         if SHUFFLE:
+             tiled = (
+                 block // HEAD_TILE_SIZE * BLOCK_TILE_SIZE * HEAD_TILE_SIZE

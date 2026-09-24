@@ -1,0 +1,86 @@
+From 4ca0a6a8f8975a7176a33725c44365afb986c63f Mon Sep 17 00:00:00 2001
+From: xtu-glm53 <xtu@local>
+Date: Fri, 18 Sep 2026 20:00:54 +0000
+Subject: [PATCH 10/16] fix(GLM5.3/SM80): convert decode topk on the current
+ stream, not the index-group side stream
+
+Second A100 bring-up failure, at CUDA graph capture in determine_available_memory:
+
+  File index_group.py:133 in _convert_once
+    self.side_stream.wait_event(self.logical_topk_ready)
+  torch.AcceleratorError: CUDA error: invalid argument
+
+The MLA wrapper records logical_topk_ready on the capturing stream (mla.py
+record_logical_topk_ready), but the attention body runs eagerly inside a
+breakable CUDA graph (breakable_cudagraph.add_eager ends the segment and calls
+the wrapped op directly). Waiting on a capture-recorded event from a
+non-capturing side stream is invalid, so the wait itself returns
+cudaErrorInvalidValue. Confirmed with CUDA_LAUNCH_BLOCKING=1: the error still
+surfaces exactly at that wait.
+
+The index group exists to convert one layer's logical top-k to physical slots
+and share the result across the layer group. On SM8x that sharing is not worth
+the cross-stream protocol: the conversion is a tiny index kernel and decode
+batches are a handful of rows. Override _convert_logical_to_physical_topk in
+FlashMLASparseSM8XImpl to call the same triton_convert_req_index_to_global_index
+the prefill branch already uses, on the current stream.
+
+With this, GLM-5.3-Flash serves on 2x A100 (TP=2, bf16 KV): greedy prompts are
+coherent and C=1 gives ~20.5 output tok/s at ~44.6 ms TPOT (33-token prompts).
+
+No impact on other models: the override lives on the SM8x backend only.
+
+(cherry picked from commit 63f9f312540488b65e71cacf0667c9eb47438bc2)
+---
+ .../backends/mla/flashmla_sparse_sm8x.py      | 31 +++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py b/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
+index 6fae274271..f8549e6dfc 100644
+--- a/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
+@@ -38,6 +38,9 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
+ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+     sparse_mla_fwd_with_sink,
+ )
++from vllm.v1.attention.backends.mla.sparse_utils import (
++    triton_convert_req_index_to_global_index,
++)
+ 
+ if TYPE_CHECKING:
+     pass
+@@ -96,6 +99,34 @@ class FlashMLASparseSM8XImpl(FlashMLASparseImpl):
+         )
+         return attn_out, None
+ 
++    def _convert_logical_to_physical_topk(
++        self,
++        logical_topk_indices: torch.Tensor,
++        attn_metadata: Any,
++        *,
++        block_stride_rows: int | None,
++        return_valid_counts: bool,
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        # The inherited implementation routes the decode case through
++        # SparseMLAIndexGroup, whose side stream waits on ``logical_topk_ready``.
++        # That event is recorded on the *capturing* stream by the MLA wrapper's
++        # forward (mla.py record_logical_topk_ready), while this attention body
++        # runs eagerly inside a breakable CUDA graph -- so the cross-stream wait
++        # is invalid and CUDA raises cudaErrorInvalidValue on A100 during the
++        # profile/capture run. On SM8x the conversion is a tiny index kernel and
++        # decode batches are a handful of rows, so convert on the current stream
++        # instead of sharing one result across the layer group. This is the same
++        # kernel the prefill branch of _forward_bf16_kv already uses.
++        return triton_convert_req_index_to_global_index(
++            attn_metadata.req_id_per_token[: logical_topk_indices.shape[0]],
++            attn_metadata.block_table,
++            logical_topk_indices,
++            BLOCK_SIZE=attn_metadata.block_size,
++            BLOCK_STRIDE_ROWS=block_stride_rows,
++            NUM_TOPK_TOKENS=logical_topk_indices.shape[1],
++            return_valid_counts=return_valid_counts,
++        )
++
+     def _bf16_flash_mla_kernel(
+         self,
+         q: torch.Tensor,
