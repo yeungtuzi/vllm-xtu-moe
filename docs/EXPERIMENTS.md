@@ -6809,6 +6809,30 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
   **DeepGEMM** 路径(为分组 BMM 改形状 ✓),**不是** Marlin 的旁路 ✓ ⇒ 不能说明上游已修 ✓
 * ⇒ ⇒ **结论:值得做,且无人竞争 ⇒ 可以开始实施** ✓(最小修复:~23 行守卫 + 一个测试 ✓,详见 B231 ✓)
 
+
+### B233 #56119 最小修复**已实现并自测通过**(候选补丁,未提交 ✓;按最高纪律须用户逐条批准)
+
+**分支** ✓:`/tmp/vllm-pr-rebase/fork` 的 `xtu/pr2-minimal-fix`,基于上游 `5747d4500` ✓(**干净新分支**,不复用上次失败合并 ✓)
+**补丁** ✓:**3 文件 +121 行**
+* `quantization/fp8.py` **+23** ✓:在 `Fp8LinearMethod.process_weights_after_loading` 的
+  `if self.use_marlin:` **之前**插守卫 —— 当 `use_marlin and block_quant and getattr(layer,"is_bmm",False)` 时,
+  用**原始 block scale** 把权重量化成 bf16 并**提前 return**(跳过全部内核收尾 ✓,因为该层本就不走 `apply_weights` ✓)
+* `quantization/utils/fp8_utils.py` **+35** ✓:新增可测试助手 `dequantize_fp8_block_weight_to_bf16(weight, weight_scale, block_size)` ✓
+* `tests/model_executor/layers/quantization/test_fp8_block_dequant.py` **+63** ✓:**4 个 CPU 用例全过** ✓
+  (形状/dtype ✓、与手工展开逐位一致 ✓、非 fp8 拒绝 ✓、**scale 是 scale 不是倒数** ✓)
+* 复用了上游既有的 `get_fp8_block_weight_scale(layer)` ✓;导入按 **isort 字母序** 修正 ✓(避免 CI lint 失败 ✗)
+
+**⭐ 测试当场抓出一个真 bug** ✓:助手原先写成
+`...repeat_interleave(block_n,dim=0)[:N].repeat_interleave(block_k,dim=1)[:K]` ✗ ——
+最后那个切片**默认切 dim 0** ✗ ⇒ 非方形 block(如 `(128,64)`)时展开成 `(192,192)` 与权重 `(256,192)` 不匹配 ✗;
+`(128,128)` 之所以过**纯属 N==K 的侥幸** ✗ ⇒ 已改为"**去掉切片 + 断言整除与网格形状**" ✓
+⇒ ⇒ 这正是评审员坚持"正确性修复必须带测试"的价值 ✓✓
+
+**刻意缩小的范围(待评审挑战 ✓)** ✓:**丢弃** 320 行 Triton kernel 与 56 行手写 e4m3 编解码 ✗
+(上游已有 bf16 `torch.bmm` 回退 ⇒ 正确性不需要新内核 ✓);守卫放在共享 `Fp8LinearMethod` 而非 DS-V4 模型内
+(因为 Marlin 重打包就发生在这里 ✓),并以 `is_bmm` 门控 ⇒ 其它层行为不变 ✓
+**待议** ✓:是否改为按 `is_deep_gemm_supported()` 门控;以及 SM8 上非 Marlin 的其它路径是否也需要同样处理 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
