@@ -370,7 +370,9 @@ nohup env \
     $( [ "${SPEC:-1}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" )  \
     $( [ -n "$CC_JSON" ] && printf -- '--compilation-config %s' "$CC_JSON" ) \
     $( [ "${PREFIX_CACHE:-1}" = "1" ] || echo --no-enable-prefix-caching ) --trust-remote-code \
-    $( [ "${MM:-0}" = "1" ] && printf -- '--limit-mm-per-prompt {"image":%s,"video":0}' "${PROMPTS:-1}" || printf -- '--limit-mm-per-prompt {"image":0,"video":0}' ) \
+    $( [ "${MM:-1}" = "1" ] && printf -- '--limit-mm-per-prompt {"image":%s,"video":0}' "${MM_IMAGES:-1}" \
+        || printf -- '--limit-mm-per-prompt {"image":0,"video":0}' ) \
+    $( [ "${MM:-1}" = "1" ] && echo --mm-processor-device cpu --mm-processor-cache-gb 0 ) \
     --kernel-config '{"enable_jit_warmup": false}' \
     --port "$PORT" > "$LOG" 2>&1 &
 echo $! > "$OUTDIR/$TAG.pid"
@@ -393,4 +395,19 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
   fi
   sleep 10
 done
-echo "[v41] TIMEOUT waiting for readiness; tail:"; tail -25 "$LOG"; exit 1
+echo "[v41] TIMEOUT waiting for readiness; tail:"; tail -25 "$LOG"; exit 1# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║ 多模态(MM)默认开启,并**按省显存的安全组合**配置(2026-09-24)                  ║
+# ╠══════════════════════════════════════════════════════════════════════════════╣
+# ║ 事实(实测/源码):                                                            ║
+# ║  * 我们**没有**传 --language-model-only ⇒ V4.1 的**视觉塔一直加载着**         ║
+# ║    (config: 32 层 × hidden 1024 ≈ 0.59B ⇒ fp16 ≈ 1.17 GB,TP 后 ~0.6 GB/卡)  ║
+# ║    ⇒ **开图不会额外吃权重显存** ✓                                            ║
+# ║  * 真正的显存风险来自**每次请求**:patch 过视觉编码器的激活 + 图片 token 占 KV ║
+# ║  * vLLM 默认 `mm_processor_cache_gb=4`,且**每个 API/engine 进程各一份** ✗     ║
+# ║    ⇒ 这里显式关掉(0)✓;并把预处理放到 **CPU** ✓(`--mm-processor-device cpu`)║
+# ║  * `video` 恒为 0 ⇒ 贴视频爆显存的情况**天然不会发生** ✓                       ║
+# ║                                                                            ║
+# ║ 旋钮:MM=0 关闭;MM_IMAGES=N 限制每条 prompt 的图片数(默认 **1**,先少后多)   ║
+# ║ 注意:本机 GPU0/1 已用 ~92%(37.6/40.9 GiB)⇒ **先贴 1 张图并在看板上盯显存** ✓ ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
