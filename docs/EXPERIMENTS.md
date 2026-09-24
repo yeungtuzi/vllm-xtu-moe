@@ -6424,6 +6424,15 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
 ④暂不升级就**每机自带一个 LMCache 服务端**、跨机只做弱共享(共享 FS 的 L2 ✓,接受慢 ✓)
 * 已写入 `docs/DEPLOYMENT_FLEET.md` **§7.5** ✓(提交 `docs/` 前跑了 `check_no_secrets.sh` ⇒ 干净 ✓)
 
+
+**B223 追加(组件关系确认)** ✓:用户确认"**Mooncake 是 LMCache 集群服务的重要支撑选项之一**" ✓ ⇒
+我补了文档 §7.7,把层次写清:**vLLM(引擎)→ LMCache(KV 层:分块/查找/分层/淘汰)→ { Mooncake | NIXL | 共享 FS | S3/Valkey … }(共享存储与传输)** ✓
+* 二者是**组合**不是替代 ✓:LMCache 通过 **`type:"mooncake_store"` L2 适配器**把 Mooncake 接在下面 ✓;同一位置还有 **NVIDIA NIXL**(`nixl_store` ✓)
+* ⭐ **唯一"必须靠 Mooncake"的能力 = RDMA 池化 L1**(LMCache 把 `l1_memory_desc` 交给 Mooncake 客户端**预注册** ⇒ 别节点 RDMA 直读本节点 L1 ✓)
+* **对本项目**:单机(现在)与单机多副本(M>1)阶段**完全无关** ✓;只有**多机**才进入选项(T3 或快共享 L2 ✓);
+  仅需"跨机共享冷层"时用**共享 FS 的 `fs_native`** 即可,成本最低 ✓
+* **正交性** ✓:我们的 V4.1 补丁在 **connector 层**,Mooncake 在 **L2 适配器层** ⇒ **互不冲突**,补丁继续有效 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
