@@ -5896,6 +5896,32 @@ Resolved LMCache MP geometry: group_tokens_per_block=[2176, 2176, 2176, 2176, 21
 **剩余(P6 修订版)** ✓:①(需人类)在 #5268 下贴证据评论 ✓ ②(需人类)**跟踪 #5268 合并**,
 合并后即可**弃用本地 fork** ✓ ③可选:在 #5217 下补 chunk 实测数据 ✓
 
+
+### B204 监控栈落地:Grafana + Prometheus(仪表盘 27 面板:顶层简约 + 4 个可折叠下钻行)
+
+**访问** ✓:`http://127.0.0.1:3000/d/vllm-lmcache/vllm-2b-lmcache`(匿名 Admin ⇒ 免登录 ✓)
+
+| 组件 | 位置 / 端口 | 状态 |
+|---|---|---|
+| **Grafana 11.4** | `/home/user/lvllm/monitoring/grafana-v11.4.0`,**:3000** | ✅ `{"database":"ok"}`;仪表盘+数据源**自动 provision** ✓ |
+| **Prometheus 2.45.6 LTS** | `/home/user/lvllm/monitoring/prometheus-2.45.6.linux-amd64`,**:9090** | ✅ 两目标 **health=up** ✓ |
+| 配置 | `monitoring/prometheus/prometheus.yml` / `grafana/grafana.ini` / `dashboards/vllm-lmcache.json` | 5s 间隔 ✓ |
+| 启动 | `proc.sh spawn prometheus` / `spawn grafana`(**受管 + PID 文件** ✓) | ✅ |
+
+**仪表盘设计** ✓:顶层 **6 卡**(并发/排队、KV 使用率、vLLM 前缀命中率、**LMCache 命中率**、**投机接受率**)
++ **4 个可折叠行**:① 延迟与吞吐(TTFT p50/p95/p99、TPOT、tokens/s)② **LMCache 内部**(命中 **L1/L2 拆分**、
+L2 store 提交 vs 完成(=失败差值)、L2 磁盘占用、L1 读写)③ 投机(draft vs accepted、各位置接受)
+④ 显存/算力(显存读写带宽、FLOPs、引擎睡眠)
+
+**⚠️ 三个坑(已记)** ✓:
+* **Prometheus 3.1(Go 1.23)在本机连 `--version` 都段错误** ✗ ⇒ **必须用 2.45.6 LTS(Go 1.21)** ✓
+* 下载**必须带代理** ✓(见 `AGENTS.md`)+ **校验大小 == Content-Length** ✓(本次两包大小完全一致 ⇒ 段错误**不是**截断 ✓)
+* Grafana 11 旗标是 `--config <file>` ✗ 不是 `-cfg :default.…`
+
+**DSH 侧同时修**(用户问题 2)✓:新任务首次读大 handoff ⇒ 长时间无流式输出 ⇒ 撞 **默认 5 分钟**流空闲超时 ✗
+⇒ 已在 `~/.dsh/settings.yaml` 的 `llm-pi-ai.providers.epyc-a100-server` 加 **`streamIdleTimeoutMs: 1500000`(25 min)** ✓
+(YAML 校验通过 ✓;`watch:true` ⇒ **改完即生效,无需重启** ✓);**未加** `timeoutMs` 总时限(以免反而掐断长请求 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
