@@ -5863,6 +5863,39 @@ Resolved LMCache MP geometry: group_tokens_per_block=[2176, 2176, 2176, 2176, 21
 **收尾状态** ✓:唯一树 `vllm-consolidated`(16/0 ✓);fork `b310664` + 诊断 ✓;备份(bundle 260 MB + 2 tar ✓);
 四个启动器支持 `LMCACHE` ✓;文档(`MODEL_GUIDES §5` / `README` / `serve_lmcache.sh` 头 ✓)+ 交接文档 ✓
 
+
+### B203 ⭐⭐⭐ **重复性检查(补做)⇒ 我们的 LMCache 修法与上游 **#5268** 重复 ⇒ **不提 PR**,改为贡献证据**
+
+> 感谢用户提醒:**代理是 `http://192.168.195.21:8080`**(在 `~/.bashrc` 里,非交互 shell 读不到 ✗)——
+> 加上代理后 `gh api` 可用 ✓,`gh search` 仍空 ✗,改用 **REST 搜索 API**(`gh api search/issues`)成功 ✓✓
+
+**检查结果(LMCache 仓库)** ✓:
+| 命中 | 内容 |
+|---|---|
+| ⭐ **#5268 [open] PR** | **"Fix scratch group blocking store metadata in hybrid models"** —— **与我们的缺陷完全相同** ✓:其描述逐字复现了我们的分析(scratch 组 1 block×8 token ⇒ `min()` 被截到 8 ⇒ `num_chunks=0` ⇒ 不 STORE ✓)。其修法用 **`prefix_cacheable=False`** 作判据(**比我们的 `max_num_blocks_per_req==1` 更语义化 ✓**),覆盖 **同样 4 个文件** ✓(+`group_view.py` ✓),规模 **+131/−320** ✓;且有配套测试 PR **#5279** ✓ |
+| **#5059 [open] PR** | "Reject unsupported **CircularBufferSpec** cache groups" —— 同族的另一种处理(拒绝而非支持 ✓) |
+| **#5217 [open] issue** | "**Negotiate chunk_size from vLLM KV geometry** at first registration" —— **正是我们实测的 chunk 规则** ✓ |
+| #5004 [closed] | "Don't store MTP's speculative scratch block as a Mamba state" —— 同族**早期已修** ✓ |
+
+**⇒ 纠正 P6 方案** ✓(按上游纪律:「若已有 open PR 处理同一修复,**不要**再开」✓):
+* ✗ **不提 PR**(我们的 patch 是重复 ✓)
+* ✅ **改为在 #5268 下补充证据** —— 我们的**独有增量**:
+  1. **独立复现**(DeepSeek-V4.1-Flash):`allocated_blocks={0:128,…,5:1}`、`chunks=0`、
+     服务端 `STORE block ID underflow … skipping the store` ✓(**完整日志链** ✓)
+  2. **端到端验收数字**(该 PR 必然没有 ✓):冷 **26.7 s** ⇒ 重启后 **1.27 s**;
+     **连 LMCache 服务端也重启(L1/RAM 全空)仍 1.27 s ⇒ 纯 L2 磁盘命中** ✓✓
+  3. **实测 chunk 规则**(同时可评 #5217 ✓):V4.1 需 **64** 的倍数 ✓、GLM-5.3 需 **2176** ✓、
+     **2176 = 64×34 ⇒ 一个服务端通吃** ✓
+  4. **一处事实差异** ✓:我们观测到 V4.1-Flash 的 scratch 组是 **engine_group_idx=5**(共 6 组 ✓),
+     而该 PR 描述里写 "group 9" ✓ ⇒ 值得指出(可能因版本/几何不同 ✓)
+* **vLLM 侧** ✓:`deepseek+v4.1+save_kv_layer` **0 命中** ⇒ 我们的 V4.1 注意力钩子**无重复** ✓
+  (但它对 MP connector **并非必需** ✓,优先级低 ✓)
+* **重要实践结论** ✓:#5268 仍是 **OPEN**(未合并 ✓)⇒ **0.5.5 及任何 release 都不含该修复** ✗
+  ⇒ **在那之前,我们的本地 fork 是可用该修复的唯一途径** ✓✓
+
+**剩余(P6 修订版)** ✓:①(需人类)在 #5268 下贴证据评论 ✓ ②(需人类)**跟踪 #5268 合并**,
+合并后即可**弃用本地 fork** ✓ ③可选:在 #5217 下补 chunk 实测数据 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
