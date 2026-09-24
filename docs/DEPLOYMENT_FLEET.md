@@ -195,3 +195,49 @@ vLLM 收到请求
 
 **对 M 副本的意义** ✓:**任一副本 prefill 过的前缀,都会进共享 L1/L2 ⇒ 其它 M-1 个副本直接受益** ✓
 即 **M 越大,整体命中率越高、平均 prefill 越少** ✓ —— 这正是"共享缓存"的核心收益 ✓
+
+## 7.5 集群化:LMCache 支持什么,以及**本机的硬件现实**
+
+### 能力(上游文档 + 我们这版源码均已确认)
+
+**① L1 通过 RDMA 共享 —— 支持** ✓
+通过 **Mooncake Store L2 适配器**的 `protocol: "rdma"` 模式实现:该模式下 LMCache 会把**本节点的 L1 内存区域
+预注册**(`l1_memory_desc`)给 Mooncake 客户端,使**其它节点可经 RDMA 直读本节点 L1**。
+我们这版代码里该逻辑已存在(`mooncake_store_l2_adapter.py`:*"a valid `l1_memory_desc` must be provided so the
+native Mooncake client can preregister the L1 memory region for RDMA access"*)。
+上游文档另建议 RDMA 模式下用 `--no-l1-use-lazy`(禁用 L1 延迟分配,保证注册前完整分配——**新版特性,需按部署版本核对**)。
+
+**② L2 通过分布式文件系统共享 —— 支持** ✓
+`fs` / `fs_native` 可直接跑在**已挂载的共享文件系统**上(源码明确注明其设计对
+*"multi-node shared-FS setup" 至关重要*);此外还有更可扩展的远端后端:
+`S3`、`Valkey`/`RESP`、`Mooncake Store`、`NIXL Store`、`Bigtable`、`Aerospike`、`HF Bucket`、`SageMaker HyperPod` 等。
+
+**③ 更强的分布式能力(同样已在我们版本里)** ✓
+`P2P`(点对点 KV 共享:`p2p_controller` + NIXL/socket 传输通道)、
+`mp_coordinator`(多服务端协调:api/app/discovery/controllers)、K8s 部署与 Operator。
+
+**④ 前提条件(都要额外投入)** ✗
+Mooncake 扩展**默认不构建**,需 `BUILD_MOONCAKE=1` 重新编译,并部署其 **metadata server / master server**;
+NIXL 需要 NVIDIA 相应库。⇒ **当前这套普通安装(v0.5.5)开箱做不到**。
+
+### 本机硬件现实(2026-09-24 实测)
+
+| 项 | 实测 | 对集群化的含义 |
+|---|---|---|
+| **RDMA 网卡** | **无**(无任何 IB 设备) | ⇒ **RDMA 方案在本机不可行**;要走这条路必须**新增硬件** |
+| **网络** | 一张**千兆以太网** | ⇒ 约 125 MB/s ⇒ 搬运一个 1.5 GB 的前缀需 **~12 s**,几乎抵消"省 prefill"的收益 ⇒ **跨机共享不划算** |
+| **GPU 互联** | 三卡两两 **SYS(PCIe,无 NVLink)**,且跨 NUMA socket | ⇒ **同机**跨副本搬运走 PCIe,**可接受** |
+| **共享文件系统** | 未挂载任何 NFS/Lustre/Ceph | ⇒ 共享 FS 的 L2 也需先建 |
+
+### ⇒ 结论与建议(分阶段,**先别碰集群**)
+
+1. **阶段 1(现在,单机)**:一台 LMCache 服务端共享 L1(主机内存)+ L2(本地盘)——
+   这正是**已验证**的形态(prefill 26.7 s → 1.27 s)。
+2. **阶段 2(单机多副本,M>1)**:仍用**同一台**服务端 ⇒ 共享走**本机内存/PCIe,零网络开销** ✓
+   ⇒ **这是性价比最高的"共享"**,也正是 §8 里唯一待验证的那条。
+3. **阶段 3(多机,跨机)**:当前网络下**不建议**做跨机 KV 共享 ✗。
+   若确实需要:先把网络升到 **≥25 GbE 或 RDMA**,再选
+   ①共享 FS 的 `fs_native` L2(最省事)②`NIXL`/`Mooncake` 的 RDMA L2(延迟最低)
+   ③要跨机共享 **L1** ⇒ **仅** Mooncake `protocol:"rdma"`(需 RDMA 网卡 + 预注册 L1)。
+4. 若暂时不升级网络:让**每台机器自带一个 LMCache 服务端**(本地 L1/L2 充分共享),
+   跨机只做**弱共享**(例如共享 FS 上的 L2,接受较慢的冷层)。
