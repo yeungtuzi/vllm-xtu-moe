@@ -6528,6 +6528,25 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
 `ISSUE_vllm_sm8x_sparse_mla_prefill.md`、`HANDOFF_GPU_LONGPREFILL.md`、`HANDOFF_SERVER_RESTART.md`、
 `MIMO26_VS_DSV41_FLASH_BRIEF.md`、`TUNING_GUIDE.md` —— 我**没有擅自移动** ✓,等你指示 ✓
 
+
+### B226 文档归属落实:再移 6 份内部文档出公开区(用户指示"最后两个留下,其他移走")
+
+**用户指示** ✓:在我列出的 8 份"偏计划/内部"文档中,**保留最后两个**(`MIMO26_VS_DSV41_FLASH_BRIEF.md`、
+`TUNING_GUIDE.md` ✓),**其余 6 份移走** ✓
+
+**已做** ✓(提交 `410413f` ✓,提交前自检干净 ✓):
+* 移入 `dev-docs/`(内部区 ✓):`SM70_VOLTA_FORK_PLAN` · `SM70_VOLTA_VERDICT` · `PREFILL_KNOWN_ISSUES` ·
+  `ISSUE_vllm_sm8x_sparse_mla_prefill` · `HANDOFF_GPU_LONGPREFILL` · `HANDOFF_SERVER_RESTART` ✓
+* **保留文档里对被移走文档的引用已复查** ✓:除**台账**外**零残留** ✓(无需修改 ✓)
+  —— 台账里的旧路径按纪律**不改写** ✓(历史事实 ✓)
+
+**公开 `docs/` 最终 8 份** ✓:`BENCHMARKS` · `EXPERIMENTS`(台账)· `INSTALL_MAINLINE` ·
+`KNOWN_LIMITATIONS` · **`MIMO26_VS_DSV41_FLASH_BRIEF`** · `MODEL_GUIDES` · `RUNBOOK` · **`TUNING_GUIDE`**
+(其中 README 文档索引只列 **5** 份面向发布者的 ✓:`RUNBOOK`/`MODEL_GUIDES`/`BENCHMARKS`/`KNOWN_LIMITATIONS`/`INSTALL_MAINLINE` ✓)
+
+**⚠️ 顺带发现(未擅自处理)** ✓:`MIMO26_VS_DSV41_FLASH_BRIEF` 与 `TUNING_GUIDE` **保留在 `docs/` 但未出现在 README 索引里** ✗ ⇒
+外部读者只能靠浏览发现 ✓;是否加进 README 索引(或它们本就无需索引)由用户决定 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
