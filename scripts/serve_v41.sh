@@ -93,7 +93,30 @@ GPUS="${GPUS:-0,1}"            # 【本机+V4.1 默认】TP=2 需要两张卡
 # 按显存优先级算同一张 40 GB 卡:TP=2 每层常驻 3.36 GiB ⇒ 1M KV 之后还能放 3 层(20-22)+投机;
 # TP=1 每层 6.72 GiB ⇒ 只能放 1 层。TP=1 只在"单卡/没有第二张卡"时才用。
 TP="${TP:-2}"
-MAXLEN="${MAXLEN:-1048576}"    # 【本机+V4.1 默认】1M 上下文(实测:KV 6 GiB ⇒ 池 3,174,221 token)
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║ ★ 最佳性能配置(实测锁定 2026-09-23;用户要求写死,勿凭记忆 ✗)              ║
+# ╠══════════════════════════════════════════════════════════════════════════════╣
+# ║ 口径:768K 上下文 + GPU 预填 + dspark(k=5)+ FULL_DECODE_ONLY + LMCache      ║
+# ║   MAXLEN=786432  MBT=4096  MAXSEQS=1  GPUS=0,1  TP=2  GPU_UTIL=0.90        ║
+# ║   EAGER=0 COMPILE=1  SPEC=1  KV_DTYPE=fp8_ds_mla                          ║
+# ║   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384  XIAOTU_GP_ACT_RESERVE_GIB=1.5    ║
+# ║   KV_CACHE_BYTES=3221225472(3 GiB;768K 只需 ~1.4 GiB)                    ║
+# ║   LMCACHE=1  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False              ║
+# ║                                                                            ║
+# ║ 实测显存(2026-09-23):首填后峰值 35,403/40,960 MiB = 86.4%(余量 ~5.5 GiB)║
+# ║ ⚠️ **1M(1048576)+ GPU 预填 = 必定 OOM** ✗(历史两次 OOM:MLA 索引器缓冲      ║
+# ║    382→512 MiB,slack 仅 +0.29/+1.39;峰值 ≈40.1/41.0 GiB = 98% ✗)          ║
+# ║ ⚠️ 1M 那套的 KV 池是 5.6 GiB ⇒ 768K + LMCache 必须把 KV 池降到 ~3 GiB       ║
+# ║ ⚠️ fp8/fp4 indexer 与显存**无关**(那是每层仅 1 块的环形暂存,可忽略)✗        ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+MAXLEN="${MAXLEN:-786432}"
+# ── 护栏:1M + GPU 预填会 OOM(见上),显式拦住而不是让它崩 ──────────────────────
+if [ "${MAXLEN}" -gt 786432 ] && [ "${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-0}" != "0" ]; then
+  echo "[serve_v41] ⛔ 拒绝启动:MAXLEN=${MAXLEN} > 786432 且开启了 GPU 预填 —— 实测必定 OOM ✗" >&2
+  echo "[serve_v41]    实测最佳为 768K(MAXLEN=786432),峰值 86.4%;1M 峰值 98% 且历史上两次 OOM。" >&2
+  echo "[serve_v41]    确有需要请显式设 VLLM_SERVE_ALLOW_RISKY_1M=1(自负风险)。" >&2
+  [ "${VLLM_SERVE_ALLOW_RISKY_1M:-0}" != "1" ] && exit 2
+fi    # 【本机+V4.1 默认】1M 上下文(实测:KV 6 GiB ⇒ 池 3,174,221 token)
 # 【2026-09-21 用户定的生产口径】**MBT=4096**(本脚本原默认 0 = 不传,由 vLLM 自选)。
 # 生产要保证 **1M 上下文**(MAXLEN=1048576):激活工作区 ∝ MBT,MBT=4096 才给 1M 的 KV 留得下。
 # 生产调用示例:`GPUS=0,1 TP=2 MAXLEN=1048576 MBT=4096 SEQS=64 LOAD=auto bash scripts/serve_v41.sh`
