@@ -6833,6 +6833,22 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
 (因为 Marlin 重打包就发生在这里 ✓),并以 `is_bmm` 门控 ⇒ 其它层行为不变 ✓
 **待议** ✓:是否改为按 `is_deep_gemm_supported()` 门控;以及 SM8 上非 Marlin 的其它路径是否也需要同样处理 ✓
 
+
+**B233 追加(补丁级 pro 评审 + 按评审整改)** ✓:
+* **评审结论** ✓:**NO-GO as-is,3 处小改后 GO** ✓;机制被判定**正确** ✓(位置 ✓、scale 布局 ✓、乘数语义 ✓、
+  **以 `use_marlin` 而非 `is_deep_gemm_supported` 门控是对的** ✓ —— 后者会误伤 SM90 已能正确处理 `is_bmm` 的 DeepGEMM 路径 ✓)
+* **被推翻的指控** ✓(我方更正 ✓):"`is_bmm` 是未文档化的魔法属性" ✗ **不成立** —— `is_bmm` 是既有契约
+  (`deepgemm_post_process_fp8_weight_block`/`scaled_mm/deep_gemm.py`/mxfp8/modelopt 均在用 ✓)⇒ **无需重构** ✓✓
+* **裁决员独家发现** ✓:**DeepSeek-V4.1 也设 `is_bmm=True`**(`attention.py:381` ✓)且 block 为 **`[1,32]`** ✗
+  ⇒ 守卫同样影响它(应良性 ✓ 但**新增了 `(1,32)` 用例** ✓)
+* **按评审整改** ✓:①`assert` → **`ValueError`**(避免 `python -O` 下静默失效 ✓)②scale 支持 **e8m0**
+  (经 `_upcast_e8m0_to_fp32` ✓ —— **默认检查点就是 e8m0** ✓)并**明确拒绝**其它 dtype(如 uint8 ✗)
+  ③**新增集成测试**:驱动真实 `Fp8LinearMethod.process_weights_after_loading` ✓,断言权重变 bf16 ✓、
+  `input_scale=None` ✓、**Marlin 内核未被调用** ✓,并含"非 is_bmm 仍走 Marlin"的回归用例 ✓
+* ⚠️ **本机限制** ✓:`import vllm...quantization.fp8` 需要**已编译扩展** ✗,`/tmp` 克隆没有(我们 AGENTS.md 记过 ✓)
+  ⇒ 集成测试在本机 **skip**(`pytest.importorskip` ✓),**由上游 CI 执行** ✓;助手层用例本机全过 ✓
+* **补丁最终规模** ✓:3 文件 / ~264 行(含 190 行测试 ✓);**仍未提交** ✓(按最高纪律,提交前须用户逐条批准 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
