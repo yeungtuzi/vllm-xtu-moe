@@ -6198,6 +6198,23 @@ YAML 1.1 会把它解析成**布尔 `False`** ✗(与 `on`/`yes`/`no` 同类)⇒
 
 **顺带核对** ✓:官方 `deepseek.json` 里条目的字段名与我们写的一致(`inputModalities` 等 ✓)⇒ 我们的写法**符合目录 schema** ✓
 
+
+**⭐ B215 追加:抓到并修正我自己的字段错误** ✓ —— 先前写进 settings 的 **`inputModalities` 根本不是 settings 的字段名** ✗
+* 插件 schema(`dsh-llm-pi-ai/lib/index.js:973-995` `modelProfile`)的**真名是 `input`** ✓:
+  `input: z.array(z.union(MODALITIES))` ✓;`inputModalities` 只是**插件内部**的表示 ✓(`inputModalities: [...model.input]` @1792/1811 ✓)
+  ⇒ 我写的 `inputModalities` 会被 **schema 忽略** ✗ ⇒ **图片照样会被拦** ✗(幸好核对官方目录时发现 ✓)
+* `reasoning: z.union(THINKING_LEVELS)` ✗ 不吃布尔 ⇒ 去掉 `reasoning: true` ✓;
+  等级由 **`reasoningEfforts`** 表达 ✓,其"关闭"档的**合法值是 `false`** ✓(schema 里就是 `z.const(false)` ✓)
+* **最终(已生效 ✓)**:
+  ```yaml
+  compat: { thinkingFormat: deepseek }            # 提供方级
+  models: [ { id: DeepSeek-V4.1-Flash, contextWindow: 512000,
+              input: [text, image],
+              reasoningEfforts: { "off": false, low: low, medium: medium, high: high } } ]
+  ```
+* **教训** ✓:配置项的真名**必须以包内 schema 为准** ✓,不能凭 README 叙述或内部变量名推断 ✓
+  (`input` vs `inputModalities`、`reasoning` 的取值范围 ✓ 都是这么踩出来的 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
