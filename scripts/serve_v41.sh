@@ -405,7 +405,14 @@ echo "[v41] TIMEOUT waiting for readiness; tail:"; tail -25 "$LOG"; exit 1# ╔�
 # ║  * 真正的显存风险来自**每次请求**:patch 过视觉编码器的激活 + 图片 token 占 KV ║
 # ║  * vLLM 默认 `mm_processor_cache_gb=4`,且**每个 API/engine 进程各一份** ✗     ║
 # ║    ⇒ 这里显式关掉(0)✓;并把预处理放到 **CPU** ✓(`--mm-processor-device cpu`)║
-# ║  * `video` 恒为 0 ⇒ 贴视频爆显存的情况**天然不会发生** ✓                       ║
+# ║  * **V4.1 不支持视频** ✗(证据:config 无 video_token_id ✓;模型自带               ║
+# ║    inference/image_processor.py 只收 images ✓、无 video/num_frames ✓;README 不提)║
+# ║    ⇒ `video` **必须**保持 0 ✓(开大只是声明模型没有的能力 ⇒ 请求会失败 ✗)        ║
+# ║  * **要"视频"请抽帧成多张图** ✓:模型对**多图原生支持** ✓                          ║
+# ║    (`prepare_vl_inputs`: num_placeholders == len(images) ✓);N 帧 = N 张图        ║
+# ║    ⇒ 上限就由 **MM_IMAGES** 控制 ✓(先 1,稳妥后逐步加)                          ║
+# ║  * 每图 token 量级(320×320/patch14 ⇒ ≈500 tok);KV 池 3 GiB ≈1.5M token ⇒        ║
+# ║    **KV 不是瓶颈** ✓;真正的瓶颈是**预填激活**(多图/多帧一起过编码器)✓           ║
 # ║                                                                            ║
 # ║ 旋钮:MM=0 关闭;MM_IMAGES=N 限制每条 prompt 的图片数(默认 **1**,先少后多)   ║
 # ║ 注意:本机 GPU0/1 已用 ~92%(37.6/40.9 GiB)⇒ **先贴 1 张图并在看板上盯显存** ✓ ║
