@@ -6937,6 +6937,31 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
 * **PR 现状** ✓:`open / draft:false / mergeable:true(无冲突 ✓)`;3 文件 +283/−0 ✓;
   已指派 6 位评审人 ✓ ⇒ **球在维护者一侧** ✓;**不再主动 ping** ✓(任何评论都是写操作,须用户批准 ✓)
 
+
+### B235 #56120 价值/竞争研究(用户指示:研究是否有价值、是否有人在做)⇒ **目标有价值,但已有多个上游在办 ⇒ 不建议推进**
+
+**技术缺口确认为真** ✓:上游 main 里 `is_ampere_or_ada`/`sm12x_mqa`/`sm12x_deep_gemm_fallbacks`/
+`sparse_mla_kernels` **全部 0 命中** ✓ ⇒ 这些确实还没有 ✓
+
+**⚠️ 但竞争/重复严重** ✓(上游检索 ✓):
+* **#38476**(PR)`[Feature] TRITON_MLA_SPARSE backend for SM8x/11x/12x DSA Sparse MLA Support` ⭐⭐ —— **同一件事**,且范围更聚焦 ✓
+* **#55184**(PR)`Fix/dsv4 pre-sm90 (software fp8) sparse mla omnibus` ⭐ —— 一个"总纲式"修复 ✓
+* **#55177**(PR)`Fix/dsv4 sparse mla portability` ✓
+* **#55173**(PR)`[Kernel] Add portable Triton FP8 E4M3 conversions` ⭐ —— **正是评审要求我们从 #56119 删掉的那 56 行编解码**,
+  别人已作为**独立 kernel 贡献**在做 ✓
+* **#40929**(PR,WIP)`Support DeepSeek V4 flash on SM120 with Triton fallback` ✓
+* **#57144 / #50576**(**Issue**)`[Feature]: SM8x (A100/A800) support for DeepSeek-V4.1-Flash / V4-Flash` ⭐⭐ —— **正是我们的目标** ✓
+* **#48285**(Issue)`TRITON_MLA_SPARSE fallback crashes on SM80 during CUDA graph capture` ⇒ 说明该 backend **已存在**,
+  现在处于**修 bug** 阶段 ✓
+* **来源 fork** ✓:`guqiong96/Lvllmds4-x` **活跃**(60 stars ✓,最后推送 2026-09-16 ✓)
+
+**⇒ 建议** ✓:①**不**把这 6350 行作为独立 PR 推 ✓(目标被 ≥4 个在办项目覆盖 ✓ + 我们的代码源自第三方 fork ✓
+⇒ 提交同源重复代码有"未协调重复"的风险 ✗)②改为**读透** #38476/#55184/#57144/#50576 ✓,
+**只提它们没有的增量**并引用之 ✓ ③或**协助** #48285 这类**具体 bug**(门槛低、价值明确、是协助而非竞争 ✓)
+
+**#56118 关闭说明草案** ✓ 已拟(4 条技术理由 + "愿以 RFC 重来" ✓,见 `dev-docs/PR_56118_CLOSE_DRAFT.md` ✓)
+⇒ **待用户批准后发出** ✓(按最高纪律 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
