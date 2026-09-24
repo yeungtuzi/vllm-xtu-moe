@@ -5957,6 +5957,34 @@ L2 store 提交 vs 完成(=失败差值)、L2 磁盘占用、L1 读写)③ 投�
 **CPU 拓扑事实** ✓(用户口径确认):`lscpu` = **2 socket × 96 核 = 192 物理核,SMT 关闭** ✓
 ⇒ 方块数 **192** ✓(不是 192 线程;主机另有 384 vCPU 视图 ⇒ 以 `(socket,core)` 组合为准 ✓)
 
+
+### B206 监控栈就绪后的**基线快照**(供后续"观察/对比"参照)
+
+**栈** ✓(全部受 `proc.sh` 管理 ✓):Prometheus:9090 / Grafana:3000 / node_exporter:9100 /
+xtu 导出器:9100(textfile) / vLLM:8070 / LMCache:8080 ⇒ **4 个抓取目标全部 health=up** ✓
+**仪表盘** ✓:`vLLM + LMCache`(业务,27 面板)与 `主机 · NUMA / GPU / CPU`(主机 + **192 核方块网格** + 顶行 **UP/DOWN 采集健康** ✓)
+
+**基线(2026-09-24 02:13)** ✓:
+
+| 指标 | 值 |
+|---|---|
+| vllm:num_requests_running | 0 |
+| vllm:kv_cache_usage_perc | 0 |
+| vllm:prompt_tokens_total | 45986 |
+| vllm:generation_tokens_total | 6 |
+| LM 命中率% | 15.384615384615385 |
+| LM L2 占用(bytes) | 491518720 |
+| LM 已提交 store chunk 累计 | 48 |
+| LM 已完成 store chunk 累计 | 48 |
+| GPU0 显存% | 89.39208984375 |
+| GPU1 显存% | 89.39208984375 |
+| 主机内存 used(GiB) | 480.47117614746094 |
+| CPU 忙碌核(>50%) | None |
+
+**待观察项** ✓:**第二次同前缀请求 76.6 s(首次 38 s)** ✗ —— 用户决定"先不管,继续观察" ✓
+观察入口:① `vLLM + LMCache` 盘的 **TTFT/TPOT 分位** 与 **LMCache 命中(L1/L2 拆分)** ✓
+② **L2 store 提交 vs 完成**(差值说明失败/积压 ✓)③ **各传输阶段字节/耗时**(`lmcache_mp_transfer_phase_*` ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
