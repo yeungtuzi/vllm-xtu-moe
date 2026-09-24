@@ -6905,6 +6905,19 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
 **待观察/待决定** ✓:①CI 结果(非 draft 后检查会跑得更全 ✓)②**残留的 `needs-rebase` 标签**是否要去掉(又是一次写操作 ⇒ 须用户批准 ✓)
 ③PR#56118(更小的那个)与 #56120(大的)仍是 draft ✓ ⇒ 按阶梯后续处理 ✓
 
+
+**B234 追加(提交后 CI 发现硬阻塞)** ✓:
+* ⚠️ **DCO 检查 `action_required`** ✗:"There is one commit incorrectly signed off… include
+  `Signed-off-by: Author Name <authoremail@example.com>` in every commit message… use `-s`" ✓
+  ⇒ 我们的提交 **`Signed-off-by` 出现 0 次** ✗ ⇒ **vLLM 强制 DCO ⇒ 不合签永远无法合并** ✗
+  (评审员 P4 当初就指出"缺 DCO 签核" ✗,我未落实 ⇒ **教训:评审的非阻断项若涉及合规,应无条件落实** ✓)
+* 另:`pre-run-check` **2 个 failure** ✓,但其 `output` 为空 ✓,只给 Actions 任务链接 ✓ ⇒ 疑为残留
+  `needs-rebase` 标签或 DCO 连带 ✓(推送后应重跑 ✓)
+* **待人决定** ✓:**签核身份用谁** ✗ —— DCO 要求 `Signed-off-by` 与**提交作者**一致 ✓;
+  当前提交作者为 `BigHippo <dahema@me.com>` ✓ ⇒ 要么以该身份签 ✓,要么把**作者与签核一并改成用户身份** ✓
+  (这属于**署名/法律性质**的声明 ⇒ **必须由用户本人决定** ✓,我不代为决定 ✓)
+* 拟修命令(待批准 ✓):`commit --amend --no-edit -s --author=…` ⇒ `push --force …:xtu/pr2-fp8-sm80-o-proj` ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
