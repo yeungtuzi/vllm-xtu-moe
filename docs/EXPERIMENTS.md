@@ -6790,6 +6790,25 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
   ⇒ **必须取原始 scale** ⇒ 守卫必须插在重打包**之前** ✓
 * ❓ **待查** ✓:DS-V4 模型里 `wo_a` **是否设置 `is_bmm`**(若不设,守卫不会生效 ✗)
 
+
+### B232 【最高纪律】面向他人项目的 GitHub 写操作,须用户**逐条**批准(用户 2026-09-24 明令)
+
+**用户原话** ✓:"所有在 github 上对别人项目的 PR,issue,comment 都必须经过我手工一个个批准审阅才能发出" ✓
+⇒ 已写入 `AGENTS.md` 的**最顶部(第 0 条之前)** ✓,覆盖:`gh pr create/edit/ready/comment/review`、
+`gh issue create/comment/close`、任何指向他人仓库的 `gh api -X POST/PATCH/PUT/DELETE`、
+**push / force-push 到承载 PR 的 fork 分支**(会公开更新他人 PR 页面 ✓)、贴标签与 @ 提及 ✓
+⇒ **一条一批**,不得类推;读取类(GET/search)与我们自己仓库的推送不受限 ✓
+
+**同轮的另一项检查结论(#56119 是否有价值 / 是否冲突)** ✓:
+* ✅ **有价值** —— **上游的 Marlin 重打包 bug 依然存在** ✓:`scaled_mm/marlin.py:65-80` 的
+  `process_weights_after_loading` **没有任何 `is_bmm` 判断** ✓ ⇒ 对 `is_bmm` 层照样
+  `process_fp8_weight_block_strategy` + `prepare_fp8_layer_for_marlin` ⇒ 权重被重打包、scales 被折入 bias ✗
+* ✅ **不冲突** —— 针对 SM80/Ampere + DeepSeek-V4 + `is_bmm` 的上游 PR/issue 检索**无结果** ✓
+  (检索较简单,属弱证据 ✓;另注该目录**上游近期活跃** ✓:`#57428` wo_b GEMM 融合、`#56228` DSV4.1 模型定义 ✓)
+* ⚠️ 上游 `fp8_utils.py:1111-1150` 的 `deepgemm_post_process_fp8_weight_block(...is_bmm...)` 只服务于
+  **DeepGEMM** 路径(为分组 BMM 改形状 ✓),**不是** Marlin 的旁路 ✓ ⇒ 不能说明上游已修 ✓
+* ⇒ ⇒ **结论:值得做,且无人竞争 ⇒ 可以开始实施** ✓(最小修复:~23 行守卫 + 一个测试 ✓,详见 B231 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
