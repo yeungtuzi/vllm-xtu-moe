@@ -6765,6 +6765,31 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
 (B229 的 `_needs_intermediate_size_param` ✗、本条的 Callable 丢失与上游逻辑被回退 ✗)⇒
 **任何上游提交前,必须先做"与上游逐行比对 + 多角色独立评审"** ✓✓
 
+
+### B231 PR#56119 **设计意图评审**(pro 模型 5 agent)⇒ GO 但**缩小到最小修复**;并纠正评审员一处错判
+
+**方式** ✓:4 名设计视角评审员 + 1 名裁决员,全部 `deepseek-v4-pro` ✓;评审包 `/tmp/pr2_review/` ✓
+(原始提交 diff ✓、新 kernel ✓、**上游今日版** `o_proj.py`/`deep_gemm.py` ✓、PR 正文 ✓)
+⇒ 结论写入 `dev-docs/PR_REVIEW_56119_DESIGN.md` ✓
+
+**一致结论:GO,但只做最小正确性修复** ✓:
+* ✅ **该做** ✓:`fp8.py` ~23 行守卫 —— 对 `is_bmm` 层,在 **Marlin 重打包之前** 把 block-fp8 权重复原为 bf16,
+  并 `use_marlin=False` ✓;可选 `o_proj.py` ~2 行 `use_fp8 = ... and is_deep_gemm_supported()` ✓
+* ❌ **丢掉 320 行 Triton kernel** ✓ + 56 行手写 e4m3 编解码 ✗ —— 上游重写后**已有 `torch.bmm` bf16 回退** ✓,
+  小修复即够 ✓;单模型 kernel 对**过时架构**维护负担高、无测试、还改道 SM12x(= 无关回归风险 ✓)
+* **评审员的关键理由** ✓:权重复原为 bf16 ⇒ `use_fp8` 自然为 False ⇒ 走上游回退 ⇒ **无需新 kernel** ✓
+
+**⚠️ 我方核实(不盲信评审 ✓)**:
+* ❌ **评审员说 `weight_scale_inv` 是"倒数"—— 这是错的** ✓:`fp8.py:352` 用 `create_fp8_scale_parameter(...)`
+  注册 ⇒ **就是 scale** ✓;`marlin_utils_fp8.py` 只做 pad/permute ✓,无倒数 ⇒ 反量化应用 **`weight * scale`** ✓
+  (裁决员要求"先核实再写码"✓ **恰好避免我们写反** ✗✓)
+* ✅ 确认:SM8 必选 Marlin ✓(`use_marlin = isinstance(fp8_linear, MarlinFP8ScaledMMLinearKernel)` ✓);
+  `layer.is_bmm` 上游在用 ✓;守卫须在 `if self.use_marlin:` **之前** ✓;`is_deep_gemm_supported()` 在 SM8 为假 ✓;
+  上游 `o_proj.py:77` **仍无条件调用 DeepGEMM** ✓
+* ⚠️ **真陷阱(与评审不同)** ✓:Marlin 会把 exponent bias **折进** scales(`fp8_fused_exponent_bias_into_scales` ✓)
+  ⇒ **必须取原始 scale** ⇒ 守卫必须插在重打包**之前** ✓
+* ❓ **待查** ✓:DS-V4 模型里 `wo_a` **是否设置 `is_bmm`**(若不设,守卫不会生效 ✗)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
