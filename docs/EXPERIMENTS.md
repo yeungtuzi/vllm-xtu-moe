@@ -6647,6 +6647,48 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
 * ⇒ ⇒ **结论** ✓:0.30 元/度 + 零折旧下,**理想态在 50% 利用率即可盈利,商业上可行** ✓;
   门槛从"必须 70%+"降到 **35~39%**(改存储型后 21~23%)✓ —— 这也说明**闲置硬件再利用**这条路是成立的 ✓
 
+
+### B227 上游 PR 现状核查 + "小步快跑"推进计划(用户指示:不能丢着不管)
+
+**用户问我方 PR** ✓:`https://github.com/vllm-project/vllm/pull/56120` ⇒ 核查结果:
+* **确认是我方**(作者 `yeungtuzi` ✓)。**账号下共 3 个 PR,全部 OPEN 且仍是 Draft** ✗ ⇒ **尚无被合并记录** ✗
+  (⇒ 用户所说"已有被接纳的贡献者"这一前提**目前还不成立** ⇒ 这正是要先落一个**最小 PR** 的原因 ✓)
+  | PR | 标题 | 规模 |
+  |---|---|---|
+  | #56118 | `[MoE] add VLLM_EXPERTS_LOAD_DEVICE=cpu …` | **+59/−2** |
+  | #56119 | `[DS-V4] fix o_proj fp8 einsum on SM8.x …` | **+422/−12** |
+  | #56120 | `[DS-V4][SM80] portable Triton fallbacks …` | **+6350/−119** |
+  fork 分支一一对应:`xtu/pr1-experts-load-device` / `xtu/pr2-fp8-sm80-o-proj` / `xtu/pr3-sm80-port` ✓
+* **#56120 状态** ✓:open+draft,创建 09-09,**最后活动 09-10** ⇒ 已 14 天;标签 **`needs-rebase`**、
+  `deepseek`/`nvidia`/`DSv4`;评审 **0**、**未指派评审人**;仅 2 条机器人评论(greeting + **mergify 提示有合并冲突** ✓);
+  CI 19 项:10 skipped / 4 success / **2 failure** / 2 cancelled / 1 action_required(多为"冲突"连带 ✓)
+* **上游仍需要这些工作** ✓:vLLM main 里 `is_ampere_or_ada`、`float8e4nv`、`sm80` **均 0 命中**;
+  本 PR 新增的 `sm12x_mqa.py`/`sparse_mla_kernels.py`/`sparse_mla_env.py` **上游都不存在** ✓
+  (仅 `deep_gemm.py` 有 1 处 SM80 相关 ✓ ⇒ 上游在朝这个方向缓慢移动 ✓)
+
+**rebased 实测**(在 `/tmp/vllm-pr-rebase/` 隔离进行 ✓,**未动生产树/`vllm-mainline` 仓** ✓):
+* 分支基点 `1454b7172`(09-09)⇒ 上游现 `5747d4500`(09-24)⇒ **落后 817 个提交** ✓
+* **#56120**:3 文件 / **5 处冲突** —— `mhc/tilelang.py`(2)†`fused_indexer_q.py`(1)†`fused_inv_rope_fp8_quant.py`(2);
+  其余 19 文件干净 ✓。其中 2 处只是 **import 合并**(上游新增 `kernel_launcher`,我方新增 `_f32_to_e4m3_uint8` ✓);
+  `tilelang.py` 处上游**已重构**该段,且**上游自身存在 parity gap**(第一层路径无条件调 `tf32_hc_prenorm_gemm`,
+  而其它路径均已用 `is_deep_gemm_supported()` 门控 ✓)
+* **#56118**:1 文件冲突(`fused_moe/oracle/mxfp4.py`)✓;**#56119**:1 文件冲突(`deepseek_v4/nvidia/ops/o_proj.py`)✓
+* ⚠️ **上游改动频率(越拖越难 ✓)**:`mxfp4.py` 近两周 **8 次**;`mla/indexer.py` **19 次**;`o_proj.py` 仅 2 次 ✓
+
+**推进计划("小步快跑",用户策略)** ✓:
+1. ⭐ **先落 #56118**(最小 ✓ 59 行 ✓ 仅加一个环境开关 `VLLM_EXPERTS_LOAD_DEVICE=cpu` ✓ 风险极低 ✓)
+   ⇒ 换来**第一个 merged 记录** ✓(这是后续一切的前提 ✓)
+2. 次推 **#56119**(措辞按 **bug fix** ✓:"SM8.x 上 o_proj 的 fp8 einsum 修复" ✓ 最易被接受 ✓)
+3. **#56120 拆小** ✓:先提 3~13 行的小文件(`compressor.py` 3、`flashinfer_sparse_mla_warmup.py` 5、
+   `ops/__init__.py` 6、`attention.py` 7、`nvidia/model.py` 7、`sparse_mla.py` 8、`sparse_swa.py` 11 ✓);
+  4 个大新文件(3517/880/756/711 行)**最后**单独提 ✓
+4. ⭐ **可选但最优的第一步**:从 `tilelang.py` 抽出**上游 parity gap 的 2 行修复**单独提 PR ✓ ——
+   显然正确、与上游方向一致、极易被合并 ⇒ **最佳"信誉建立"动作** ✓
+5. **沟通方式** ✓:rebase → **取消 Draft** → 简明描述(强调"**运行时按算力门控 ⇒ SM90+ 行为不变**" ✓ +
+   验证方式 + "**如需我可以拆成更小的 PR**" ✓ 主动给台阶 ✓);**不要**到处 @ 评审人 ✗;
+   按机器人建议去 Slack `#pr-reviews` ✓;候选评审人(近期改这些文件者):`WoosukKwon`/`Lorenzo…`/
+   `yewentao256`/`LucasWilkinson`/`zyongye` 等 ✓(**单点、礼貌、不群发** ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
