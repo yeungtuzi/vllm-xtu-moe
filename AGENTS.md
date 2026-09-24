@@ -62,3 +62,29 @@ export HTTPS_PROXY=http://192.168.195.21:8080 HTTP_PROXY=http://192.168.195.21:8
 * 代理值来自 `~/.bashrc`,但**非交互 shell 不读它** ⇒ **必须在命令里显式 export**
 * 典型症状:下载“看似成功”实则被截断/为空、`gh search` 返回空 ⇒ **下载后必须校验大小与 Content-Length 一致**
 * 判据:`curl -sI https://...` 应看到 `Proxy-agent: tinyproxy/...`
+
+## ⛔ vLLM 树治理(用户 2026-09-24 明确)
+
+**开发模型**:vLLM **只跟上游** ✓,我们的功能**一律以 patch 形式**留在本仓 ✓
+* ❌ **不得**在 vLLM 仓里留自有长命分支 ✗(历史违规:曾有 9 个本地分支 + `main` 自带 16 个提交 ✗)
+* ✅ **唯一真源** = 本仓 `patches/xtu-series/`(`series` + `NNNN-*.patch` ✓),由
+  `git -C <vllm> format-patch origin/main..<branch> -o patches/xtu-series --no-signature` **生成** ✓
+  ⇒ **每次 rebase 后重新生成** ✓(手工维护的 `patches/upstream/*` 已腐化过 3/12 ✗)
+
+**应用(严格,不许静默跳过)** ✓:
+```bash
+scripts/apply_xtu_patches.sh <含 vllm/ 的目录>     # 顺序应用系列,失败即报错 ✓
+DRY=1 scripts/apply_xtu_patches.sh <树>            # 只试第一条(系列必须逐条顺序,整体 dry-run 无意义 ✗)
+```
+⚠️ **禁止**用 `patch -f` 作回退 ✗ —— 它会**静默跳过**打不上的 hunk ✗(脚本已改为纯 `git apply` ✓)
+
+**rebase 流程(定期或上游重要更新时)** ✓:
+1. `git -C <vllm> fetch origin` ✓
+2. 在 `/tmp` 下用 **`git archive origin/main | tar -x -C /tmp/x`** 导出**纯上游快照** ✓
+   (⇒ **不注册 worktree、不污染仓库** ✓;或用完即删的临时 worktree ✓,**事先告知用户** ✓)
+3. 把系列打到该快照上 ✓ ⇒ **必须全部干净应用** ✓(失败 ⇒ 改 patch,不许 `-f` 蒙过去 ✗)
+4. 与"在服务的树"**逐文件比对** ✓(用 patch 的 `+++` 列表取文件集 ✓;允许差异**仅**来自上游改过的文件 ✓)
+5. 通过后**再**更新在服务的树 ✓ —— ⚠️ 该树在服务生产,**必须先问用户** ✓(要重启 8070 ✓)
+
+**本次验证记录** ✓(台账 B216):16/16 干净应用 ✓、0 `.rej` ✓、35 文件 +2383/−209 ✓、
+45 个触及文件里 41 个与在服务树**逐字节一致** ✓,余 4 个差异**全部**是上游自己改的 ✓
