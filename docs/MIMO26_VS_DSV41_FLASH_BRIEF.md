@@ -1,7 +1,7 @@
 # MiMo-V2.6-Flash-RL vs DeepSeek-V4.1-Flash(精简对比)
 
 > 本文只给结论与对比,不含引用标记。**所有数据的具体出处、本机实测记录与派生公式,详见完整版
-> `dev-docs/MIMO26_VS_DSV41_FLASH.md`。**
+>。**
 > 成本口径:decode、batch=1、无前缀复用、专家权重按 4-bit 计。
 
 ---

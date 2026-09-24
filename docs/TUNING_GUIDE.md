@@ -174,8 +174,8 @@ MiMo 的 1M 在这台机器上**不可达**(6.3 倍于单卡);GLM 与 V4.1 的 1
 
 * `docs/RUNBOOK.md` —— 具体服务脚本的参数与默认值;
 * `docs/KNOWN_LIMITATIONS.md` §4(MTP)、§8.2(MTP 与激活峰)、§8.3(GPU 预填充非法访存);
-* `dev-docs/report/tuning/NOTES.md` §309/§320(常驻层原始实测)、`:10423`(串行机制);
-* `dev-docs/report/tuning/TRIED_AND_REVERTED.md` R15/R16/R17(不要再试的方向);
+*
+*
 * `scripts/bench_random_12cells.sh`(12 格)、`scripts/bench_resident_sweep.sh`(常驻层扫描);
 * `CHANGELOG.md` —— 2026-09-21 的旁路流非法访存修复(**代价 +17% 长 prompt TTFT**)。
 

@@ -215,7 +215,7 @@ Two options:
 2. Lower `get_min_capability` and add an fp16 W8A16 dequant-in-kernel path. More work.
 
 ⚠️ A subtlety if you take option 1: the CPU expert engine's format registry is
-**BF16 / FP8 / MXFP4 / INT4(WNA16)** (`dev-docs/ARCHITECTURE.md` §4.1) — there is **no FP16
+**BF16 / FP8 / MXFP4 / INT4(WNA16)** (
 expert backend**. So you cannot simply convert the whole checkpoint to fp16: the experts would
 lose their format (and a BF16 expert copy would be ~567 GiB for GLM). The workable split is
 **FP8 experts for the CPU engine + FP16 (or W8A16) non-expert weights on GPU**, which means a
@@ -346,7 +346,7 @@ other blockers stand:
   DeepSeek-V4's, and its kernels need **AVX512-BF16 + AMX** (`csrc/cpu/sgl-kernels/*`, loaded
   only when `_is_avx512_bf16_supported()`, `cpu.py:603-611`) — a Xeon Gold 6254 has AVX-512 but
   no AVX512-BF16, so they would not even load.
-- **Cross-machine expert distribution is a draft.** `dev-docs/CLUSTER_SCALE_DESIGN.md:3` says
+- **Cross-machine expert distribution is a draft.**
   "初步设计(v0.1 草案)"; the functions to change are `run_moe_and_ep` +
   `EpShmState` (`xiaotu_moe/csrc/python_binding/binding.cpp:395-477,184-200`) and
   `_ep_shm_attach` / `ep_shm_enabled` (`vllm_xiaotu_moe/hybrid_model.py:274-295,247-253`).

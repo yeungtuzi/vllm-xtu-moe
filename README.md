@@ -91,6 +91,30 @@ GLM / DeepSeek-V4.1 未开投机解码（random 数据集对投机是最坏情�
 > ⚠️ **长上下文 C=2 的 decode(9.8)是实测到的并发争用**:median TPOT 从 36.6 跳到 **203.6 ms**(同族的 GLM 长 C=2 更严重,45.9 → 700.8 ms;见 `docs/EXPERIMENTS.md` B115/B125)。
 > ⚠️ **`--max-num-seqs` 必须 ≥2**:早期用 `seqs=1` 测过一批,`C=2` 会退化成**串行**、把短 C=2 的聚合 prefill 压到 54(那是**配置问题,不是模型问题**);判据见 **B124**。其余格子均为同一批实测。
 
+
+## 持久化输入缓存(LMCache,SSD)
+
+服务重启后仍能复用巨大重复前缀(不再重新 prefill):
+
+```bash
+CHUNK_SIZE=256 bash scripts/serve_lmcache.sh &        # L1=内存 + L2=SSD
+LMCACHE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False bash scripts/serve_v41.sh
+```
+
+实测(V4.1-Flash,10K 前缀):冷 26.7 s ⇒ **重启后 1.27 s**;连 LMCache 服务端也重启仍 **1.27 s**
+(⇒ 从 **L2 磁盘**命中 ✓)。三条前置条件与 V4.1 的必要补丁见 `docs/MODEL_GUIDES.md` §5 ✓。
+
+## 性能观测:通过 DeepSeek Harness 进行本项目开发的典型性能统计
+
+![通过 DeepSeek Harness 进行本项目开发的一个典型性能统计](docs/assets/dsh-dev-performance.webp)
+
+> 上图是本项目**自建监控栈**在一次典型开发会话中的读数(面板来自 vLLM + LMCache 业务指标与主机
+> NUMA/GPU/CPU 指标)。该次会话中:**前缀命中率(vLLM) 97.1%**、**LMCache 命中率 97.0%**、
+> **投机解码接受率 51.0%**、KV 使用率 15.1%、TTFT p50 ≈ 14 s(p99 ≈ 1.33 min,长预填阶段)。
+
+复现这张图:见 `docs/MODEL_GUIDES.md` §5(启动监控栈与看板的完整步骤)。
+图中涉及的 LMCache 修复对应上游 PR [LMCache#5268](https://github.com/LMCache/LMCache/pull/5268)(**尚未合并** ⇒ 当前需本地补丁 ✓)。
+
 ## 快速开始
 
 ```bash
@@ -162,25 +186,3 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 ## 许可
 
 Apache-2.0。第三方组件与致谢清单见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 与 [`NOTICE`](NOTICE)。
-
-## 持久化输入缓存(LMCache,SSD)
-
-服务重启后仍能复用巨大重复前缀(不再重新 prefill):
-
-```bash
-CHUNK_SIZE=256 bash scripts/serve_lmcache.sh &        # L1=内存 + L2=SSD
-LMCACHE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False bash scripts/serve_v41.sh
-```
-
-实测(V4.1-Flash,10K 前缀):冷 26.7 s ⇒ **重启后 1.27 s**;连 LMCache 服务端也重启仍 **1.27 s**
-(⇒ 从 **L2 磁盘**命中 ✓)。三条前置条件与 V4.1 的必要补丁见 `docs/MODEL_GUIDES.md` §5 ✓。
-
-## 性能观测:通过 DeepSeek Harness 进行本项目开发的典型性能统计
-
-![通过 DeepSeek Harness 进行本项目开发的一个典型性能统计](docs/assets/dsh-dev-performance.webp)
-
-> 上图是本项目**自建监控栈**在一次典型开发会话中的读数(面板来自 vLLM + LMCache 业务指标与主机
-> NUMA/GPU/CPU 指标)。该次会话中:**前缀命中率(vLLM) 97.1%**、**LMCache 命中率 97.0%**、
-> **投机解码接受率 51.0%**、KV 使用率 15.1%、TTFT p50 ≈ 14 s(p99 ≈ 1.33 min,长预填阶段)。
-
-复现这张图:见 `docs/MODEL_GUIDES.md` §5 与 `dev-docs/HANDOFF.md`(启动监控栈与看板的完整步骤)。
