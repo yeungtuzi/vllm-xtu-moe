@@ -295,3 +295,38 @@ L3  (可选)更冷的对象存储
    * `T3` 的 L1 预注册路径(`l1_memory_desc` 传入适配器工厂)与 `--no-l1-use-lazy` 行为
    * `T4` P2P 的节点发现与失效处理
    * `T5` 各 L2 适配器的吞吐/淘汰在长期运行下的表现
+
+## 7.7 组件关系:LMCache 与 Mooncake 是什么关系(**不是同类替代**)
+
+```
+vLLM(推理引擎,持有 GPU 上的 KV)
+  │  由 LMCache 的 vLLM connector 接入
+  ▼
+LMCache(KV 缓存层:分块 / 查找 / 分层 / 淘汰 / 可观测)
+  │  通过 **L2 适配器**接各种"共享存储 / 传输"后端
+  ▼
+{ Mooncake Store | NIXL | 共享文件系统 | S3 | Valkey/RESP | Bigtable | … }
+```
+
+* **LMCache** 回答"**哪些 KV、以什么粒度、何时存/取、放到哪一层**" —— 是**管理层**;
+* **Mooncake** 是一个**分布式 KV 存储引擎**(C++ 实现,面向 RDMA),回答"**字节放在哪、怎么快速搬**" —— 是**存储/传输层**;
+* 二者是**组合关系**:LMCache 通过 **`type: "mooncake_store"`** 这个 L2 适配器把 Mooncake 接在下面 ✓
+  ——(仓库:[kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake);LMCache 侧文档:[Mooncake Store](https://docs.lmcache.ai/zh_CN/mp/l2_storage/mooncake_store.html))
+* **同一个"位置"还有另一个候选**:**NVIDIA NIXL**(LMCache 侧为 `nixl_store`,另有 P2P 用的 NIXL 传输通道)
+  ——(文档:[NIXL](https://docs.lmcache.ai/zh_CN/mp/l2_storage/nixl.html))
+* ⭐ **只有 RDMA 池化 L1 这一条路,目前唯一支撑就是 Mooncake** ✓:
+  LMCache 会把**自己的 L1 内存区描述符**(`l1_memory_desc`)交给 Mooncake 客户端**预注册**,
+  从而让**别的节点经 RDMA 直读本节点的 L1** ✓ —— 这是"把 L1 变成共享池"的机制,而非某种通用能力 ✓
+
+**对本项目的含义** ✓:
+
+| 阶段 | 与 Mooncake 的关系 |
+|---|---|
+| **现在(单机)** | **完全无关** ✓ —— 我们用的是 LMCache **自带的服务端 L1(主机内存)+ 本地磁盘 L2**;没接任何 Mooncake ✓ |
+| **单机多副本(M>1)** | 仍**无关** ✓ —— 一台 LMCache 服务端,共享走本机内存/PCIe ✓ |
+| **多机(未来)** | Mooncake 才进入选项:**T3(RDMA 池化 L1)** 或**快共享 L2** ✓ |
+| **替代方案** | 只要"跨机共享冷层"的话,**共享 FS 的 `fs_native` L2** 就够了(成本最低 ✓),不必引入 Mooncake ✓ |
+
+⚠️ **引入成本** ✓:Mooncake 需要 `BUILD_MOONCAKE=1` 重编 LMCache,并自行部署其 **metadata server / master server**;
+**我们的改动与其正交** ✓ —— 我们那个 V4.1 的"环形暂存组"补丁在 **connector 层**,
+而 Mooncake 是 **L2 适配器层**(更靠下)⇒ **两者不冲突**,补丁仍然有效 ✓
