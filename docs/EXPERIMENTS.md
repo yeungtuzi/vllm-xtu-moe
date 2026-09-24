@@ -5922,6 +5922,41 @@ L2 store 提交 vs 完成(=失败差值)、L2 磁盘占用、L1 读写)③ 投�
 ⇒ 已在 `~/.dsh/settings.yaml` 的 `llm-pi-ai.providers.epyc-a100-server` 加 **`streamIdleTimeoutMs: 1500000`(25 min)** ✓
 (YAML 校验通过 ✓;`watch:true` ⇒ **改完即生效,无需重启** ✓);**未加** `timeoutMs` 总时限(以免反而掐断长请求 ✓)
 
+
+### B205 主机仪表盘(NUMA / GPU / CPU 方格)+ 一处**指标口径错误**的修正
+
+**新增仪表盘** ✓:`主机 · NUMA / GPU / CPU`
+→ `http://127.0.0.1:3000/d/host-numa-gpu-cpu`(自动 provision ✓)
+
+* **GPU**:逐卡显存占用% / 利用率% / 显存控制器% / 温度 / 功耗(**本机 3 张 A100-PCIE-40GB** ✓)
+* **NUMA**:**8 个节点**(`0-23,24-47,…,168-191` ✓)⇒ 各节点**内存已用%**(bar gauge ✓)+
+  **组成堆叠**(已用/共享/页缓存/空闲 ✓)+ 各节点 CPU 核数 ✓
+* **CPU**:★ 按用户要求 —— **一个大方块切成 192 个小方块,每块 = 1 个物理核** ✓
+  (Grafana `stat` + `repeat: core` ✓,`colorMode=background` ✓,**中心显示数字** ✓,
+  **绿<50 / 黄<80 / 红≥80** ✓;实现见 `monitoring/dashboards/host-numa-gpu-cpu.json` ✓)
+
+**新增数据源** ✓:
+* **node_exporter 1.8.2**(:9100 ✓,`--collector.textfile.directory` ✓)—— CPU 每核/内存/系统 ✓
+* **自写 textfile 导出器**(`monitoring/textfile_exporter.py` ✓,受管任务 `xtu_exporter` ✓):
+  * GPU 逐卡:`xtu_gpu_memory_{used,total}_bytes` / `_used_percent` / `utilization_percent` /
+    `memory_utilization_percent` / `temperature_celsius` / `power_watts` ✓
+  * NUMA 逐节点:total / free / **cache** / **shared** / **available** / **used** / used% ✓
+  * **每物理核心**:`xtu_core_utilization_percent{core,node,package}` ✓
+    (取 `/proc/stat` 增量 ✓,按 `topology/core_id` + `physical_package_id` 分组 ✓)
+* Prometheus 第三/四个抓取目标:**node** 与 xtu(textfile)⇒ 全部 **health=up** ✓
+* ⚠️ Prometheus 需 `--web.enable-lifecycle` 才能热重载 ✗(先前漏了,已补 ✓)
+
+**⭐ 修正:我的 NUMA "已用"口径曾经错了** ✗(用户用 `free -h` 当场指出 ✓):
+* 内核 `node*/meminfo` 的 `MemUsed` = `MemTotal − MemFree` ⇒ **把可回收 page cache 当成已用** ✗
+  ⇒ 我一度报出"节点 99.4% 满"的**假象** ✗,而实际主机 **1.5 TiB 中只用了 480 GiB** ✓
+* 正确口径(**与 `free -h` 逐项对账通过** ✓):`used = total − free − file(Active+Inactive) − SReclaimable − Shmem`
+  ⇒ 实测导出器合计 `used=480Gi / shared=274Gi / cache=738Gi / free=19Gi`,`free -h` 为
+  `480 / 273 / 1024(buff+cache 含 shared)/ 19` ✓ ⇒ **used 偏差 0 GiB、shared 偏差 1 GiB** ✓✓
+* 教训:**内存"已用"必须区分 anon / 可回收缓存 / tmpfs(shared)** ✓,否则会误报容量危机 ✗
+
+**CPU 拓扑事实** ✓(用户口径确认):`lscpu` = **2 socket × 96 核 = 192 物理核,SMT 关闭** ✓
+⇒ 方块数 **192** ✓(不是 192 线程;主机另有 384 vCPU 视图 ⇒ 以 `(socket,core)` 组合为准 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
