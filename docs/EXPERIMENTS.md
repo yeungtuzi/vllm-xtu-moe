@@ -6056,6 +6056,28 @@ xtu 导出器:9100(textfile) / vLLM:8070 / LMCache:8080 ⇒ **4 个抓取目标�
 **说明** ✓:我的无头 Chromium **没有中文字体** ✗ ⇒ 截图里面板标题显示为方块 ▮▮▮(这是**我截图环境**的问题 ✓,
 你本地浏览器显示正常 ✓)。若要让截图也可读,可给容器装 CJK 字体(未做 ✓)。
 
+
+### B211 README 加入监控截图并推送到 GitHub;查清"DSH 说图片不支持"的**两处开关**
+
+**README** ✓:新增「性能观测:通过 DeepSeek Harness 进行本项目开发的典型性能统计」章节
+(图 `docs/assets/dsh-dev-performance.webp` ✓,用户提供的描述原文 ✓,并标注该次读数:
+vLLM 前缀命中 **97.1%** / LMCache 命中 **97.0%** / 投机接受 **51.0%** / KV 15.1% / TTFT p50 ≈14s ✓)
+**推送** ✓:`git push origin main` ⇒ `1dfb563..664c63e` ✓(远程 `main` 已核实与本地一致 ✓;
+凭据用 `gh auth setup-git` ✓;推送**必须带代理** ✓)
+
+**⭐ "本地生产环境提示不支持图片"的根因(不是"没做多模态" ✗)**:
+* 模型**本身就是多模态** ✓:`config.json` 里 `vision_config={model_type:'deepseek_v41_vision',…}` ✓
+  且 `image_token_id=129264` ✓ ⇒ 视觉塔与图片占位符都在 ✓
+* **两处开关都关着** ✗:
+  1. **vLLM 侧**:`serve_v41.sh` 在 `MM=0`(默认)时显式传
+     `--limit-mm-per-prompt {"image":0,"video":0}` ✗ ⇒ 图片被**主动禁用** ✓;`MM=1` 才传 `{"image":N,"video":0}` ✓
+  2. **DSH 侧**:provider 的模型条目**必须声明** `inputModalities` 含 `image` ✓ ——
+     DSH 源码原话:`inputModalities?.includes("image") !== true` ⇒ **抛错** ✓(就是你看到的那句 ✗);
+     当前 `~/.dsh/settings.yaml` 里 V4.1 条目为 `{ id, name, contextWindow: 512000 }` ⇒ **未声明** ✗
+* **改法**(两处都要 ✓):启动加 **`MM=1`** ✓;**DSH 条目加 `inputModalities: [text, image]`** ✓
+  (参考同文件 `llm-deepseek` 下的写法 ✓);改 vLLM 需**重启 8070** ⇒ 按纪律**须先经用户同意** ✓
+* 附注 ✓:用户当前把 DSH 的 `contextWindow` 设成 **512000**(vLLM 侧跑的是 768K ✓)⇒ 偏保守、安全 ✓(其选择 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
