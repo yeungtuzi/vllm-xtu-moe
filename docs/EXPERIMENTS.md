@@ -6394,6 +6394,36 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
 ⇒ 并补充 ✓:**跨模型共享不指望也不应该** ✓(KV 形状语义不同 ⇒ 缓存**按模型分区** ✓),
 但 **L1/L2 是同一个池** ⇒ 会被其它模型挤占 ✗(非正确性问题 ✓)⇒ **容量需按三模型总工作集规划** ✓
 
+
+### B223 LMCache 集群化能力核查(回答"能否 RDMA 共享 L1、共享 FS 共享 L2")+ 本机硬件现实
+
+**能力:两个都是 YES ✓**(上游文档 + **我们 v0.5.5 源码**均已确认 ✓):
+* **L1 经 RDMA 共享** ✓:走 **Mooncake Store L2 适配器**的 `protocol:"rdma"` ✓ ——
+  该模式下 LMCache **预注册本节点 L1 内存区**(`l1_memory_desc` ✓)供其它节点 RDMA 直读 ✓;
+  我们代码里已有此逻辑(`mooncake_store_l2_adapter.py`:*"a valid `l1_memory_desc` must be provided so the
+  native Mooncake client can preregister the L1 memory region for RDMA access"* ✓);
+  上游另建议 RDMA 下用 `--no-l1-use-lazy`(新版特性,需按部署版本核对 ✓)
+* **L2 经分布式文件系统共享** ✓:`fs`/`fs_native` 可直接跑在已挂载的共享 FS 上 ✓
+  (源码注明对 *"multi-node shared-FS setup"* 至关重要 ✓);另有 `S3`/`Valkey`/`RESP`/`Mooncake`/`NIXL`/
+  `Bigtable`/`Aerospike`/`HF Bucket`/`SageMaker HyperPod` 等 ✓
+* 另有 **P2P**(`p2p_controller` + nixl/socket 通道 ✓)与 **`mp_coordinator`**(多服务端协调 ✓)✓
+* **前提** ✗:Mooncake 需 `BUILD_MOONCAKE=1` 重编译 + 其 metadata/master server ✓;NIXL 需 NVIDIA 库 ✓
+  ⇒ **当前普通 v0.5.5 安装开箱做不到** ✓
+
+**⚠️ 本机硬件现实(实测,决定"能不能真做")** ✗:
+| 项 | 实测 | 含义 |
+|---|---|---|
+| RDMA 网卡 | **无任何 IB 设备** ✗ | ⇒ **RDMA 方案在本机不可行**,需**新增硬件** |
+| 网络 | **一张千兆以太网** ✗ | ⇒ ~125 MB/s ⇒ 搬 1.5 GB 前缀 ~**12 s**,几乎抵消省 prefill ⇒ **跨机共享不划算** |
+| GPU 互联 | 三卡两两 **SYS(PCIe,无 NVLink)**,跨 NUMA socket | ⇒ **同机**搬运走 PCIe ✓ 可接受 |
+| 共享文件系统 | **未挂载任何 NFS/Lustre/Ceph** ✗ | ⇒ 共享 FS 的 L2 也需先建 |
+
+**⇒ 建议(分阶段,先别碰集群)** ✓:①**阶段1** 单机一台服务端(已验证 ✓)
+②**阶段2** 单机多副本仍用**同一台**服务端 ⇒ 共享走**本机内存/PCIe、零网络开销** ✓ = 性价比最高 ✓(即 §8 待验证那条 ✓)
+③**阶段3 多机**:当前网络下**不建议** ✗;要做得先升到 ≥25 GbE 或 RDMA ✓;跨机共享 **L1** 仅 Mooncake RDMA 一条路 ✓
+④暂不升级就**每机自带一个 LMCache 服务端**、跨机只做弱共享(共享 FS 的 L2 ✓,接受慢 ✓)
+* 已写入 `docs/DEPLOYMENT_FLEET.md` **§7.5** ✓(提交 `docs/` 前跑了 `check_no_secrets.sh` ⇒ 干净 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
