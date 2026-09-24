@@ -411,8 +411,12 @@ echo "[v41] TIMEOUT waiting for readiness; tail:"; tail -25 "$LOG"; exit 1# ╔�
 # ║  * **要"视频"请抽帧成多张图** ✓:模型对**多图原生支持** ✓                          ║
 # ║    (`prepare_vl_inputs`: num_placeholders == len(images) ✓);N 帧 = N 张图        ║
 # ║    ⇒ 上限就由 **MM_IMAGES** 控制 ✓(先 1,稳妥后逐步加)                          ║
-# ║  * 每图 token 量级(320×320/patch14 ⇒ ≈500 tok);KV 池 3 GiB ≈1.5M token ⇒        ║
-# ║    **KV 不是瓶颈** ✓;真正的瓶颈是**预填激活**(多图/多帧一起过编码器)✓           ║
+# ║  * ★模型**自带每图上限** ✓:`vision_config.max_image_tokens = 1024` ✓(配           ║
+# ║    `solve_resize_ratio` 自动把图缩到 ≤1024 token ✓)⇒ **分辨率再大也不会撑爆 KV**  ║
+# ║    ⇒ N 张图 ≤ 1024·N token(32 帧"视频" ≤32K token,对 768K 上下文毫无压力 ✓)      ║
+# ║  * ⇒ **唯一风险点 = 预填激活**(N 张图一次过视觉编码器 ✓);故:先 MM_IMAGES=1,      ║
+# ║    稳妥后逐步加到 2/4/8,并在看板顶行盯 GPU 显存 ✓                               ║
+# ║  * 用"视频"的推荐做法:客户端**抽帧**(如 4–8 帧)当**多张图**发 ✓                    ║
 # ║                                                                            ║
 # ║ 旋钮:MM=0 关闭;MM_IMAGES=N 限制每条 prompt 的图片数(默认 **1**,先少后多)   ║
 # ║ 注意:本机 GPU0/1 已用 ~92%(37.6/40.9 GiB)⇒ **先贴 1 张图并在看板上盯显存** ✓ ║

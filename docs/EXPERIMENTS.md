@@ -6106,6 +6106,39 @@ vLLM 前缀命中 **97.1%** / LMCache 命中 **97.0%** / 投机接受 **51.0%** 
 `inputModalities: [text, image]` ✓ —— 否则 DSH 仍会按其源码判据
 (`inputModalities?.includes("image") !== true`)直接抛"不支持图片" ✓
 
+
+### B213 视频支持:**V4.1 没有视频路径** ✗ ⇒ 用"抽帧成多图"替代;并找到模型自带的显存安全阀
+
+**用户诉求** ✓:"增加 video 支持,同样不希望爆显存" —— 查证后**不能按字面开** ✗,但**有等效且更安全的做法** ✓
+
+**证据(V4.1 不支持视频)** ✓:
+* `config.json`:**只有 `image_token_id=129264`,无 `video_token_id`** ✗
+* 模型自带 `inference/image_processor.py`:全部是 image 函数
+  (`plan_image_grid` / `load_image` / `image_token_types` / `prepare_vl_inputs(prompt, images, …)` ✓);
+  **无 video / num_frames / fps** ✗;`README` 不提视频 ✗
+* vLLM 的 `vllm/models/deepseek_v41/*.py` 里 **0 处** video 相关 ✗
+⇒ `--limit-mm-per-prompt` 的 **video 必须保持 0** ✓(开大 = 声明模型没有的能力 ⇒ 请求会失败 ✗)
+⇒ 注释里已写死这条理由 ✓(`scripts/serve_v41.sh` ✓)
+
+**替代方案(推荐 ✓)** ✓:**客户端抽帧 ⇒ 当多张图发** ✓
+* 模型**原生支持多图** ✓:`prepare_vl_inputs` 里 `if num_placeholders != len(images): raise` ✓
+* ⇒ 一串帧 = 一串图 ✓;**"帧数上限"就等于 `MM_IMAGES`** ✓(先 1,稳妥后加到 2/4/8 ✓)
+
+**★找到模型自带的显存安全阀(重要 ✓)**:
+```
+vision_config: max_image_tokens = 1024     ← 每图 token 上限 ✓
+               downsample_ratio = 3, patch_size = 14, min_pixels = 295936
+image_processor.solve_resize_ratio(...)    "Largest aspect-preserving pixel size
+                                            whose token grid still fits in max_n_token"
+```
+⇒ **每张图会被自动缩放到 ≤ 1024 token** ✓ ⇒ **分辨率再大也不会撑爆 KV** ✓
+⇒ `N 张 ≤ 1024·N token`(32 帧 ≤ 32K token,对 768K 上下文**毫无压力** ✓);
+   而我们 KV 池 3 GiB(fp8 ≈2KB/token)≈ **1.5M token** ⇒ **KV 根本不是瓶颈** ✓
+⇒ ⇒ **唯一真正的风险点 = 预填激活**(N 张图**一次**过视觉编码器 ✓)——
+   与用户看到的"不做 CPU 预处理、贴大量图/视频会爆"**完全吻合** ✓✓
+⇒ 对策(已在脚本里 ✓):`--mm-processor-device cpu` ✓ + `--mm-processor-cache-gb 0` ✓ +
+   每请求图数默认 **1**(`MM_IMAGES` ✓)+ 视频恒 0 ✓ + **盯看板 GPU 显存** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
