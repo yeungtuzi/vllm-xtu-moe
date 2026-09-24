@@ -6880,6 +6880,31 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
   ②**真实 DeepSeek-V4 在 SM8 上的端到端**(需大模型 ✓,未做 ✓)
 * **提交状态** ✓:**仍未提交** ✓(分支推送 / PR 编辑 / 评论**均须用户逐条批准** ✓)
 
+
+### B234 ✅ **已提交上游**:PR#56119 在原 PR 号上"换血"为**最小正确性修复**(用户逐条批准 ①②③)
+
+**用户按最高纪律逐条批准** ✓:①force-push ②改标题/正文 ③取消 Draft ⇒ **依次执行并核验** ✓
+* **①** `git push --force origin xtu/pr2-minimal-fix:xtu/pr2-fp8-sm80-o-proj` ✓
+  ⇒ `31b548721...2a9bc4cc0 (forced update)` ✓,远端 SHA 与本地一致 ✓
+* **②** `gh pr edit 56119 --title … --body-file …` ✓(新标题见下 ✓)
+* **③** `gh pr ready 56119` ✓(输出 "marked as ready for review" ✓)
+
+**PR 最终状态** ✓(只读核验 ✓):
+* 标题 `[Bugfix][Quantization] Dequantize directly-consumed block-FP8 weights before Marlin repacks them` ✓
+* **open / draft: false** ✓;**3 文件 +283 / −0** ✓(旧的 +422/−12 已被覆盖 ✓)
+* 分支 `xtu/pr2-fp8-sm80-o-proj @ 2a9bc4cc0` ✓;标签 `needs-rebase`(⚠️ 疑残留 ✓)、`deepseek`、`quantization`、`DSv4` ✓
+* `mergeable_state: blocked` ✓ —— 通常表示**缺必需检查或必需评审**(受保护分支 ✓),不是冲突 ✓
+* URL: https://github.com/vllm-project/vllm/pull/56119 ✓
+
+**内容提要** ✓(正文全文见 `/tmp/pr2fix_review/PR_BODY.md` ✓):症状(SM8 选 Marlin ⇒ 直接消费方把打包整数当 fp8 ✓)
+⇒ 根因(`is_bmm` 层绕开 `apply_weights` ✓,且 main 上 `fp8.py` 对 `is_bmm` **毫无处理** ✓)
+⇒ 修复(重打包**之前**量化为 bf16 并提前 return ✓)⇒ 范围(仅 `is_bmm` ✓;按 `use_marlin` 门控 ⇒
+**不动 SM90 的 DeepGEMM 路径** ✓)⇒ 测试(9 单元 + 2 集成,本地 11 passed ✓)⇒ **明说**放弃 320 行 portable kernel 及原因 ✓
++ "尚未在真实 DeepSeek-V4 硬件端到端跑过,欢迎指导 SM8 e2e 测试形态" ✓
+
+**待观察/待决定** ✓:①CI 结果(非 draft 后检查会跑得更全 ✓)②**残留的 `needs-rebase` 标签**是否要去掉(又是一次写操作 ⇒ 须用户批准 ✓)
+③PR#56118(更小的那个)与 #56120(大的)仍是 draft ✓ ⇒ 按阶梯后续处理 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
