@@ -6139,6 +6139,37 @@ image_processor.solve_resize_ratio(...)    "Largest aspect-preserving pixel size
 ⇒ 对策(已在脚本里 ✓):`--mm-processor-device cpu` ✓ + `--mm-processor-cache-gb 0` ✓ +
    每请求图数默认 **1**(`MM_IMAGES` ✓)+ 视频恒 0 ✓ + **盯看板 GPU 显存** ✓
 
+
+### B214 DSH 配置补齐(多模态 + 思考强度);并回答"为什么不能自动匹配能力"
+
+**问题现象** ✓:用户"选不了思考强度" + "传图被拒" —— 根因是**那条模型条目只剩 3 个字段** ✗:
+`{ id, name, contextWindow: 512000 }` ⇒ 既无 `inputModalities` ✗ 也无推理字段 ✗
+
+**为什么 DSH 不能"按 API 声明的能力自动匹配"** ✓(**实测证据**):vLLM 的 `GET /v1/models` 只返回
+`id / object / created / owned_by / root / parent / max_model_len / permission` ✓ ——
+**没有任何模态或推理能力字段** ✗(`grep -i modalit|capab|vision|image|reasoning` ⇒ **0 命中** ✓)。
+OpenAI 兼容协议**不是能力声明协议** ✓;DSH 只能靠**内置目录 + 显式配置** ✓(内置目录仅覆盖官方提供方 ✓,
+自建/本地路由必须自己写 ✓)⇒ **这不是 DSH 的缺陷,是协议层的空白** ✓
+
+**改法(权威字段名来自插件 README 示例与字段表 ✓)**:
+```yaml
+llm-pi-ai:
+  providers:
+    epyc-a100-server:
+      compat: { thinkingFormat: deepseek }        # 提供方级:让 DSH 知道怎么表达 DeepSeek 的思考
+      streamIdleTimeoutMs: 1500000
+      models:
+        - { id: DeepSeek-V4.1-Flash, name: DeepSeek-V4.1-Flash, contextWindow: 512000,
+            inputModalities: [text, image],        # ← 多模态放行(DSH 源码判据就是它 ✓)
+            reasoning: true,                       # ← 显示思考强度选择器
+            reasoningEfforts: { off: null, low: low, medium: medium, high: high } }
+```
+* ⚠️ **注意字段名** ✓:README 的字段表用的是 **`reasoningEfforts`**(不是 `thinkingLevelMap` ✗)
+* ⚠️ 另有一组**客户端侧图片预算**旋钮 ✓(与"别爆显存"直接相关 ✓):`requestImagePixelBudget`(默认 4,194,304 px ✓)、
+  `requestImageMaxBytes`(默认 1 MiB ✓)、`maxRequestImageBytes`(默认 20 MiB ✓,超出按最旧优先卸载 ✓)——
+  本次**未改**(先按默认跑 ✓),需要时再收紧 ✓
+* 备份 ✓:`~/.dsh/settings.yaml.bak.<ts>`;改后 **YAML 解析通过** ✓ 且**长注释完好** ✓;`watch:true` ⇒ **热生效** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
