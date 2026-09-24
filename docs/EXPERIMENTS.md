@@ -6740,6 +6740,31 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
 * **方法论收获** ✓:`py_compile` + "文本干净 rebase" **完全查不出** B1/B2/B3 ✗ ⇒
   **多角色独立评审 + 更强模型 = 提交前必要环节** ✓(用户此要求直接避免了一次会破坏上游的提交 ✓✓)
 
+
+### B230 PR#56119 的 rebase 实测:**语义冲突,不能机械合并** ✗(附带两个"py_compile 查不出"的坑)
+
+**过程** ✓:在 `/tmp/vllm-pr-rebase/fork` 切到 `pr2`(1 个提交 ✓,原 +422/−12 ✓)rebase 到上游 `5747d4500` ✓
+⇒ 仅 1 个文件冲突 `nvidia/ops/o_proj.py` ✓ 但**冲突处 3 个** ✓ ⇒ 我先按 pr1 的经验 `--theirs`(rebase 中 = 我方 ✓)
+再补上游的 4 处写法(函数形式 import、`block_size` 参数、recipe 用 `block_size`、`wo_b: Callable` ✓)⇒ **py_compile 通过** ✓ ✓
+
+**随后与上游逐行比对,发现两处严重问题** ✗:
+1. ⚠️ **丢掉了上游的重写** ✗:上游在这些提交里**重写了 `deep_gemm_fp8_o_proj`** ——
+   新增 `use_fp8 = wo_a.weight.dtype == torch.float8_e4m3fn` ✓、`quant_group_size=einsum_recipe[2]` ✓、
+   `quantize=use_fp8` ✓ 以及**非 FP8 的 `torch.bmm` 回退分支** ✓;
+   我方基于**旧上游**的文件整份覆盖 ⇒ **这些全部消失** ✗(功能回退 ✓)
+2. ⚠️ **我自己引入的 import 崩溃** ✗:我把 `wo_b` 注解改成 `Callable[[torch.Tensor], torch.Tensor]` ✓,
+   但我方旧文件里**没有 `from collections.abc import Callable`** ✓(上游有 ✓,被覆盖时丢了 ✗)
+   ⇒ **模块导入即 NameError** ✗ —— **而 `py_compile` 依旧通过** ✗✗(第二类"编译查不出"的坑 ✓)
+
+**结论** ✓:pr2 **不是文本冲突,而是语义冲突** ✓ —— 上游**重写了同一个函数** ✓,
+⇒ 正确做法只能是**在上游新版本之上重新实现我方意图**(SM8/SM12 早返回 + 便携 einsum + scale 优先级 ✓),
+**不能**用"取我方整份文件"的方式 ✓;或**放弃该 PR** ✓(SM8 的 kernel 工作本就留在我们自己的补丁序列里 ✓)
+⚠️ 另注 ✓:上游**仍然无条件调用 DeepGEMM 的 `fp8_einsum`** ✓ ⇒ **SM80 上的问题依旧存在** ✓ ⇒ 我方的意图**仍有价值** ✓(⇒ 倾向"移植"而非放弃 ✓)
+
+**方法论收获(第二例)** ✓:两次实测都表明 **`py_compile` + "文本 clean rebase" 查不出真问题** ✗
+(B229 的 `_needs_intermediate_size_param` ✗、本条的 Callable 丢失与上游逻辑被回退 ✗)⇒
+**任何上游提交前,必须先做"与上游逐行比对 + 多角色独立评审"** ✓✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
