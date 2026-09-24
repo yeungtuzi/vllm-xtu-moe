@@ -174,3 +174,13 @@ LMCACHE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False bash scripts/serve_v
 
 实测(V4.1-Flash,10K 前缀):冷 26.7 s ⇒ **重启后 1.27 s**;连 LMCache 服务端也重启仍 **1.27 s**
 (⇒ 从 **L2 磁盘**命中 ✓)。三条前置条件与 V4.1 的必要补丁见 `docs/MODEL_GUIDES.md` §5 ✓。
+
+## 性能观测:通过 DeepSeek Harness 进行本项目开发的典型性能统计
+
+![通过 DeepSeek Harness 进行本项目开发的一个典型性能统计](docs/assets/dsh-dev-performance.webp)
+
+> 上图是本项目**自建监控栈**在一次典型开发会话中的读数(面板来自 vLLM + LMCache 业务指标与主机
+> NUMA/GPU/CPU 指标)。该次会话中:**前缀命中率(vLLM) 97.1%**、**LMCache 命中率 97.0%**、
+> **投机解码接受率 51.0%**、KV 使用率 15.1%、TTFT p50 ≈ 14 s(p99 ≈ 1.33 min,长预填阶段)。
+
+复现这张图:见 `docs/MODEL_GUIDES.md` §5 与 `dev-docs/HANDOFF.md`(启动监控栈与看板的完整步骤)。
