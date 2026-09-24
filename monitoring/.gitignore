@@ -1,0 +1,14 @@
+# 运行期数据 / 二进制 / 生成物 —— 不入库,只保留源码
+data/
+prometheus/data/
+grafana/data/
+grafana/plugins/
+logs/
+*.log
+__pycache__/
+*.pyc
+node_modules/
+*.tar.gz
+*.db
+*.png
+textfile/

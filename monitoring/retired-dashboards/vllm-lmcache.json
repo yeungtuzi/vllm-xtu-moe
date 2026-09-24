@@ -1,0 +1,1286 @@
+{
+ "title": "vLLM + LMCache",
+ "uid": "vllm-lmcache",
+ "tags": [
+  "vllm",
+  "lmcache"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "5s",
+ "editable": true,
+ "time": {
+  "from": "now-30m",
+  "to": "now"
+ },
+ "templating": {
+  "list": [
+   {
+    "name": "DS",
+    "type": "datasource",
+    "query": "prometheus",
+    "current": {}
+   }
+  ]
+ },
+ "panels": [
+  {
+   "type": "stat",
+   "title": "并发请求",
+   "gridPos": {
+    "h": 5,
+    "w": 4,
+    "x": 0,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "vllm:num_requests_running",
+     "refId": "A",
+     "legendFormat": ""
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "排队请求",
+   "gridPos": {
+    "h": 5,
+    "w": 4,
+    "x": 4,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "vllm:num_requests_waiting",
+     "refId": "A",
+     "legendFormat": ""
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "auto",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "KV 使用率",
+   "gridPos": {
+    "h": 5,
+    "w": 4,
+    "x": 8,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "decimals": 1,
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 70
+       },
+       {
+        "color": "red",
+        "value": 90
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "vllm:kv_cache_usage_perc * 100",
+     "refId": "A",
+     "legendFormat": ""
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "auto",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "前缀命中率(vLLM)",
+   "gridPos": {
+    "h": 5,
+    "w": 4,
+    "x": 12,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "100 * sum(vllm:prefix_cache_hits_total) / clamp_min(sum(vllm:prefix_cache_queries_total),1)",
+     "refId": "A",
+     "legendFormat": ""
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "LMCache 命中率",
+   "gridPos": {
+    "h": 5,
+    "w": 4,
+    "x": 16,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "100 * sum(lmcache_mp_lookup_hit_tokens_total) / clamp_min(sum(lmcache_mp_lookup_requested_tokens_total),1)",
+     "refId": "A",
+     "legendFormat": ""
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "投机接受率",
+   "gridPos": {
+    "h": 5,
+    "w": 4,
+    "x": 20,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "100 * sum(vllm:spec_decode_num_accepted_tokens_total) / clamp_min(sum(vllm:spec_decode_num_draft_tokens_total),1)",
+     "refId": "A",
+     "legendFormat": ""
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "row",
+   "title": "① 延迟与吞吐(点开)",
+   "collapsed": true,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 5
+   },
+   "panels": [
+    {
+     "type": "timeseries",
+     "title": "TTFT p50 / p95 / p99",
+     "gridPos": {
+      "h": 7,
+      "w": 8,
+      "x": 0,
+      "y": 1
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "s",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+       "refId": "A",
+       "legendFormat": "p50"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "",
+     "gridPos": {
+      "h": 7,
+      "w": 8,
+      "x": 8,
+      "y": 1
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "s",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+       "refId": "A",
+       "legendFormat": "p95"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "",
+     "gridPos": {
+      "h": 7,
+      "w": 8,
+      "x": 16,
+      "y": 1
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "s",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+       "refId": "A",
+       "legendFormat": "p99"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "Token 吞吐(prompt / generation)",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 0,
+      "y": 8
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "token/s",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(vllm:prompt_tokens_total[1m])",
+       "refId": "A",
+       "legendFormat": "prompt"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 12,
+      "y": 8
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "token/s",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(vllm:generation_tokens_total[1m])",
+       "refId": "A",
+       "legendFormat": "generation"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "TPOT p50 / p99",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 0,
+      "y": 15
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "s",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:time_per_output_token_seconds_bucket[5m])))",
+       "refId": "A",
+       "legendFormat": "p50"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 12,
+      "y": 15
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "s",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_per_output_token_seconds_bucket[5m])))",
+       "refId": "A",
+       "legendFormat": "p99"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "type": "row",
+   "title": "② LMCache 内部细节(点开)",
+   "collapsed": true,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 6
+   },
+   "panels": [
+    {
+     "type": "timeseries",
+     "title": "LMCache 命中来源拆分",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 0,
+      "y": 1
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "token/s",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(lmcache_mp_lookup_hit_l1_tokens_total[1m])",
+       "refId": "A",
+       "legendFormat": "L1(内存)"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 12,
+      "y": 1
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "token/s",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(lmcache_mp_lookup_hit_l2_tokens_total[1m])",
+       "refId": "A",
+       "legendFormat": "L2(磁盘)"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "L2 store 提交 vs 完成(差值=失败)",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 0,
+      "y": 8
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(lmcache_mp_l2_store_submitted_objects_chunks_total[1m])",
+       "refId": "A",
+       "legendFormat": "提交 chunks/s"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 12,
+      "y": 8
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(lmcache_mp_l2_store_completed_objects_chunks_total[1m])",
+       "refId": "A",
+       "legendFormat": "完成 chunks/s"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "L2 磁盘占用",
+     "gridPos": {
+      "h": 7,
+      "w": 8,
+      "x": 0,
+      "y": 15
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "bytes",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "lmcache_mp_l2_usage_bytes",
+       "refId": "A",
+       "legendFormat": ""
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "L1 写入/读取 chunks",
+     "gridPos": {
+      "h": 7,
+      "w": 8,
+      "x": 8,
+      "y": 15
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(lmcache_mp_l1_write_chunks_total[1m])",
+       "refId": "A",
+       "legendFormat": "write"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "",
+     "gridPos": {
+      "h": 7,
+      "w": 8,
+      "x": 16,
+      "y": 15
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(lmcache_mp_l1_read_chunks_total[1m])",
+       "refId": "A",
+       "legendFormat": "read"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "type": "row",
+   "title": "③ 投机解码(点开)",
+   "collapsed": true,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 7
+   },
+   "panels": [
+    {
+     "type": "timeseries",
+     "title": "投机:draft vs accepted tokens",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 0,
+      "y": 1
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(vllm:spec_decode_num_draft_tokens_total[1m])",
+       "refId": "A",
+       "legendFormat": "draft"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 12,
+      "y": 1
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(vllm:spec_decode_num_accepted_tokens_total[1m])",
+       "refId": "A",
+       "legendFormat": "accepted"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "各位置接受数",
+     "gridPos": {
+      "h": 7,
+      "w": 24,
+      "x": 0,
+      "y": 8
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(vllm:spec_decode_num_accepted_tokens_per_pos_total[1m])",
+       "refId": "A",
+       "legendFormat": ""
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "type": "row",
+   "title": "④ 显存与算力(点开)",
+   "collapsed": true,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 8
+   },
+   "panels": [
+    {
+     "type": "timeseries",
+     "title": "显存读/写带宽(MFU 估算)",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 0,
+      "y": 1
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "Bps",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(vllm:estimated_read_bytes_per_gpu_total[1m])",
+       "refId": "A",
+       "legendFormat": "read"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 12,
+      "y": 1
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "Bps",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(vllm:estimated_write_bytes_per_gpu_total[1m])",
+       "refId": "A",
+       "legendFormat": "write"
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "FLOPs/s(估算)",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 0,
+      "y": 8
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "rate(vllm:estimated_flops_per_gpu_total[1m])",
+       "refId": "A",
+       "legendFormat": ""
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "title": "引擎睡眠状态",
+     "gridPos": {
+      "h": 7,
+      "w": 12,
+      "x": 12,
+      "y": 8
+     },
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "fieldConfig": {
+      "defaults": {
+       "custom": {
+        "lineWidth": 2,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "gradientMode": "opacity",
+        "spanNulls": true
+       }
+      },
+      "overrides": []
+     },
+     "targets": [
+      {
+       "expr": "vllm:engine_sleep_state",
+       "refId": "A",
+       "legendFormat": ""
+      }
+     ],
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    }
+   ]
+  }
+ ]
+}
