@@ -6711,6 +6711,35 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
   比较"我的分支相对上游"必须用 **三点 `A...B`** ✓ ②**先 `git rev-parse --abbrev-ref HEAD` 确认分支**再动手 ✓
   (我曾误以为在 pr1、实际在 pr3 ✗,导致"解冲突"根本没生效却报了成功 ✗)
 
+
+### B229 PR#56118 的**独立评审**(用户要求:pro 模型 + 多 sub-agent)⇒ **一致 REJECT**,且阻断项已逐一核实
+
+**评审方式** ✓:workflow 起 5 个 agent(`provider=deepseek-official`,`model=deepseek-v4-pro` ✓ ——
+探测发现 provider 名是 **`deepseek-official`** ✗ 而非设置段名 `llm-deepseek` ✓);
+4 名评审员各司其职(runtime 正确性 / **维护者视角** / 设备路径 / PR 卫生 ✓)+ 1 名裁决员 ✓;
+评审包 `/tmp/pr1_review/` ✓(diff、提交说明、PR 正文、**我方/上游/旧基点三版文件** ✓)
+⇒ 结果写入 `dev-docs/PR_REVIEW_56118.md` ✓
+
+**四名评审员一致 REJECT;裁决员核实后未推翻任何一条** ✓;我方随后**逐条独立核实** ✓:
+* **B1** ✗:`routed_experts.py:173` 调用全树不存在的 `_needs_intermediate_size_param` ✓,
+  且写入上游已删除的 `intermediate_size_full` ✓,**未门控** ⇒ **默认路径也崩** ✗(旧基点与上游 grep 均 0 命中 ✓)
+* **B2** ⭐ ✗:**开关装错选择器** —— `Mxfp4MoEMethod`(`weight_dtype="mxfp4"`,**DeepSeek-V4 的路径** ✓)
+  在 `quantization/mxfp4.py:487` 调 `select_deepseek_v4_mxfp4_moe_backend` ✗,补丁只改了
+  `select_mxfp4_moe_backend`(**gpt-oss** 路径 ✓)⇒ **对目标模型完全无效** ✗
+* **B3** ⭐ ✗:**强制 `Mxfp4MoeBackend.CPU` 在 CUDA 主机上必然抛错** ✓ ——
+  `CPUExpertsMxfp4._supports_current_device()` 就是 `current_platform.is_cpu()` ✓(AMX 版另需 X86+AMX ✓)
+  ⇒ "权重在 host、其余在 GPU" **在该路径上走不通** ✗
+* **B4** ✗:提交说明称"skip the AMX prepack" ✓,但 `prepare_mxfp4_moe_layer_for_cpu` 两条路径**仍在调用** ✓
+* **B5** ✗:开关位于 `runner_backend != "auto"` 提前返回**之后** ⇒ 显式 `moe_backend` 时失效 ✓
+* 非阻断 ✓:`env_with_choices(..., case_sensitive=False)` **返回原值** ⇒ `=CPU` **静默失效** ✗;
+  `torch.device("cpu")` 未按量化方法门控 ⇒ 对 fp8/GPTQ 等会误伤 ✗;无测试/无文档/缺 DCO 与来源声明 ✓
+
+**战略含义** ✓:生产能跑靠的是**我们补丁里 out-of-tree 引擎的接入** ✓;本 PR 只上游了**机制的一半** ✗
+⇒ **单独提交无法工作且会破坏 main** ✗ ⇒ **建议**:**不按现状提交** ✓;改为 **RFC issue**(说明需要
+"host-expert 消费方挂载点" ✓)或关闭 ✓;#56119(独立的 SM8.x fp8 einsum 修复 ✓)另做一轮同规格评审 ✓
+* **方法论收获** ✓:`py_compile` + "文本干净 rebase" **完全查不出** B1/B2/B3 ✗ ⇒
+  **多角色独立评审 + 更强模型 = 提交前必要环节** ✓(用户此要求直接避免了一次会破坏上游的提交 ✓✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
