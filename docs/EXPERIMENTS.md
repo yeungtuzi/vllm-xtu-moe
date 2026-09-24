@@ -6503,6 +6503,31 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
   ⑤技术复杂度/运维门槛 ⑥成本 ⑦依赖上游且需定期跟版 ⑧单点需**演练**才算数 ✓
 * 结论段明确标注"哪些是实测、哪些是推算",并给出下一步顺序(单机多实例 → 标定 → 两机 → 小池 → 网关 → 扩容+演练)✓
 
+
+### B225 文档归属纠正(用户第三次指出):远景规划**移出公开面** + 立纪律
+
+**用户指正** ✓:"README 是我们项目发布和介绍,这种远景规划为什么要放进去?" ⇒ 我的两处判断都错了 ✗:
+①把远景概览挂进 README 文档索引 ✗;②更早还把 `DEPLOYMENT_FLEET`/`CLUSTER_DESIGN` 也挂进去 ✗
+(而且我一度把"可见文档"当成"适合放进 README"的理由 —— 这本身也是错的 ✗)
+
+**已做** ✓:
+* README 文档索引**撤净**三份规划链接 ✓ ⇒ 现在只剩 5 份**面向用户/发布**的:
+  `RUNBOOK` / `MODEL_GUIDES` / `BENCHMARKS` / `KNOWN_LIMITATIONS` / `INSTALL_MAINLINE` ✓
+* 三份规划文档 **`docs/` → `dev-docs/`** ✓(`ARCHITECTURE_OVERVIEW` 6.4KB / `CLUSTER_DESIGN` 17.3KB /
+  `DEPLOYMENT_FLEET` 20.7KB ✓,`dev-docs/` 为 gitignored ✓,文件仍在磁盘可读 ✓)
+  提交 `968acce`(撤 README 链接)、`e7564b8`(移动 ✓)
+* ⚠️ **历史遗留** ✓:它们**仍在仓库历史里**(公开 ✓)—— 因其中**不含任何敏感信息**(自检通过 ✓),
+  按既有决定**不重写历史** ✓;`docs/EXPERIMENTS.md` 里 B222–B224 提到的旧路径是**当时事实** ⇒ **不改写** ✗ ✓
+
+**纪律(写入 `AGENTS.md`)** ✓:**README = 发布/介绍面**,只放面向用户的内容 ✓;
+**远景规划/路线图/内部设计一律进 `dev-docs/`** ✓;判据 = "**外部用户现在就该看**吗" ✓;
+台账旧路径不改写 ✓
+
+**⚠️ 顺带发现、待用户决定** ✓:`docs/` 里还有几份**偏"计划/内部"**的文档,是否也要移走?
+`SM70_VOLTA_FORK_PLAN.md`(一份"计划" ✓)、`SM70_VOLTA_VERDICT.md`、`PREFILL_KNOWN_ISSUES.md`、
+`ISSUE_vllm_sm8x_sparse_mla_prefill.md`、`HANDOFF_GPU_LONGPREFILL.md`、`HANDOFF_SERVER_RESTART.md`、
+`MIMO26_VS_DSV41_FLASH_BRIEF.md`、`TUNING_GUIDE.md` —— 我**没有擅自移动** ✓,等你指示 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
