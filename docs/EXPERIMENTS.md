@@ -6078,6 +6078,34 @@ vLLM 前缀命中 **97.1%** / LMCache 命中 **97.0%** / 投机接受 **51.0%** 
   (参考同文件 `llm-deepseek` 下的写法 ✓);改 vLLM 需**重启 8070** ⇒ 按纪律**须先经用户同意** ✓
 * 附注 ✓:用户当前把 DSH 的 `contextWindow` 设成 **512000**(vLLM 侧跑的是 768K ✓)⇒ 偏保守、安全 ✓(其选择 ✓)
 
+
+### B212 多模态:脚本改为**默认开启 + 省显存安全组合**;并给出"会不会爆显存"的源码级答案
+
+**用户问题** ✓:"开多模态会额外吃显存吗?有人说不做 CPU 预处理、贴大量图片/视频会爆显存" —— **属实**,且旋钮就在 vLLM 里 ✓
+**源码证据** ✓(`vllm/config/multimodal.py`):
+* `mm_processor_cache_gb: float = Field(default=4, ge=0)` ✓ —— 注释原文:*"This cache is duplicated for
+  each API process and engine core process, resulting in a total memory usage of
+  `mm_processor_cache_gb * (api_server_count + data_parallel_size)`"* ✗ ⇒ **默认 4 GiB × 进程数** ✓
+* `mm_ipc_gpu_memory_gb` 默认 **0** ✓(无需改);`fold_mm_processor_device(...)` ✓ = 预处理设备开关 ✓
+
+**关键结论** ✓:
+| 问题 | 答案 |
+|---|---|
+| 开图会多占**权重**显存吗? | **几乎不会** ✓ —— 我们**没传** `--language-model-only` ⇒ V4.1 视觉塔**一直已加载** ✓(32 层×1024 ≈ **0.59B ⇒ fp16 ≈1.17 GB**,TP 后 ~0.6 GB/卡 ✓,已含在现有 37.6/40.9 GiB 中 ✓)|
+| 爆显存风险在哪? | **每次请求的预处理 + 视觉编码器激活 + 图片 token 占 KV** ✓ ⇒ 大量图片的长 prefill 是爆点 ✓ |
+| 视频? | **天然免疫** ✓ —— 脚本恒定 `"video":0` ✓ |
+
+**脚本改动** ✓(`scripts/serve_v41.sh`,**未重启**,用户后续自行启动 ✓):
+* `MM` 默认由 0 → **1** ✓(顺手修掉旧写法的 `-0` 语义 ✗);新增 **`MM_IMAGES`**(默认 **1**,先少后多 ✓)
+* `MM=1` 时追加 **`--mm-processor-device cpu`** ✓ + **`--mm-processor-cache-gb 0`** ✓
+* 脚本内加了**事实说明块**(视觉塔已加载 / 风险来源 / 旋钮 / 当前显存 92% 的提醒 ✓)
+* `bash -n` ✓ + **干跑**验证参数拼接 ✓ + **`--help` 验证三个旗标真实存在** ✓(避免因未知旗标拒绝启动 ✗)
+* 状态 ✓:**未重启任何服务** ✓;当前 8070 仍是原参数(MM=0)✓
+
+**DSH 侧还差一行** ✗:`~/.dsh/settings.yaml` 的 V4.1 条目需加
+`inputModalities: [text, image]` ✓ —— 否则 DSH 仍会按其源码判据
+(`inputModalities?.includes("image") !== true`)直接抛"不支持图片" ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
