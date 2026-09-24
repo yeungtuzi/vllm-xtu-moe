@@ -25,10 +25,12 @@ fi
 apply_one() {
   local p="$1"
   echo "[xtu-patch] $(basename "$p")"
+  # 严格模式:**不做** patch(1) 回退 —— `patch -f` 会静默跳过打不上的 hunk ✗
+  # 注意:系列必须**逐条顺序**应用(后一条依赖前一条改过的文件),故不支持"整体 dry-run"。
   if [ "$DRY" = "1" ]; then
-    ( cd "$TREE" && git apply --check --whitespace=nowarn "$p" 2>/dev/null || patch -p1 --dry-run -f < "$p" )
+    ( cd "$TREE" && git apply --check --whitespace=nowarn "$p" )
   else
-    ( cd "$TREE" && git apply --whitespace=nowarn "$p" 2>/dev/null || patch -p1 -f < "$p" )
+    ( cd "$TREE" && git apply --whitespace=nowarn "$p" )
   fi
 }
 

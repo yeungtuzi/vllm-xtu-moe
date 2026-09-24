@@ -1,8 +1,8 @@
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index ffc9a5de7e..80f943d297 100644
+index 9b27f50edc..f59c3191aa 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
-@@ -97,7 +97,11 @@ from vllm.version import __version__ as VLLM_VERSION
+@@ -103,7 +103,11 @@ from vllm.version import __version__ as VLLM_VERSION
  logger = init_logger(__name__)
  
  

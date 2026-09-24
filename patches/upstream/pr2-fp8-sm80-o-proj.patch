@@ -1,8 +1,8 @@
 diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
-index e42f43b39c..c993547d23 100644
+index c9888dc3cb..0916f30c87 100644
 --- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 +++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
-@@ -1498,3 +1498,61 @@ def process_fp8_input_tensor_strategy_moe(
+@@ -1500,3 +1500,61 @@ def process_fp8_input_tensor_strategy_moe(
          amax_for_moe_activation_quant(w13_input_scale, enable_eplb),
          amax_for_moe_activation_quant(w2_input_scale, enable_eplb),
      )
@@ -65,10 +65,10 @@ index e42f43b39c..c993547d23 100644
 +
 +
 diff --git a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
-index 72ce43b46c..9287c6bcd8 100644
+index ec36bf763e..e55f32fb0a 100644
 --- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 +++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
-@@ -3,8 +3,10 @@
+@@ -5,8 +5,10 @@ from collections.abc import Callable
  import torch
  import torch.nn as nn
  
@@ -81,7 +81,7 @@ index 72ce43b46c..9287c6bcd8 100644
  )
  from vllm.platforms import current_platform
  from vllm.utils.deep_gemm import fp8_einsum
-@@ -16,11 +18,17 @@ def compute_fp8_einsum_recipe(
+@@ -18,11 +20,17 @@ def compute_fp8_einsum_recipe(
      """fp8_einsum recipe + scale layout for the current GPU arch.
  
      SM90 keeps block-row FP32 scales. SM100 uses packed per-row E8M0 scales.
@@ -99,7 +99,7 @@ index 72ce43b46c..9287c6bcd8 100644
      einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, block_size)
      tma_aligned_scales = cap.major >= 10
      return einsum_recipe, tma_aligned_scales
-@@ -65,18 +73,36 @@ def deep_gemm_fp8_o_proj(
+@@ -69,18 +77,36 @@ def deep_gemm_fp8_o_proj(
          dtype=torch.bfloat16,
      )
      if use_fp8:

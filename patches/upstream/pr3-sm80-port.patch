@@ -1,8 +1,8 @@
 diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
-index cea186e49e..1b70ce534c 100644
+index 62741bbda1..a3419420a9 100644
 --- a/vllm/model_executor/kernels/mhc/tilelang.py
 +++ b/vllm/model_executor/kernels/mhc/tilelang.py
-@@ -753,13 +753,35 @@ def mhc_pre_broadcast_tilelang(
+@@ -755,13 +755,35 @@ def mhc_pre_broadcast_tilelang(
          num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
      )
  
@@ -69,19 +69,19 @@ index 91ae7c44c2..3d35617fac 100644
          for group in groups:
              name = _attention_backend_name(getattr(group, "backend", None))
 diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
-index 9c77980965..8ac03ecd6c 100644
+index 8a151dba1d..7799675085 100644
 --- a/vllm/models/deepseek_v4/attention.py
 +++ b/vllm/models/deepseek_v4/attention.py
-@@ -4,6 +4,8 @@
- DeepseekV4 MLA Attention Layer
- """
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """DeepseekV4 MLA Attention Layer."""
  
 +import os
 +import time
  from abc import ABC, abstractmethod
  from collections.abc import Callable
  from typing import TYPE_CHECKING, Any, ClassVar, cast
-@@ -129,6 +131,9 @@ def _resolve_dsv4_kv_cache_dtype(
+@@ -127,6 +129,9 @@ def _resolve_dsv4_kv_cache_dtype(
      return kv_cache_dtype, torch.bfloat16
  
  
@@ -91,7 +91,7 @@ index 9c77980965..8ac03ecd6c 100644
  class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
      """DeepseekV4 MLA attention layer.
  
-@@ -469,6 +474,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+@@ -467,6 +472,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
          hidden_states: torch.Tensor,
          llama_4_scaling: torch.Tensor | None = None,
      ) -> torch.Tensor:
@@ -100,7 +100,7 @@ index 9c77980965..8ac03ecd6c 100644
          # Pre-allocate attention output with FlashMLA-padded head count.
          # The op writes into `o_padded`; we slice to n_local_heads after.
          num_tokens = hidden_states.shape[0]
-@@ -498,8 +505,37 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+@@ -496,8 +503,37 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
          )
          o = o_padded[:, : self.n_local_heads, :]
  
@@ -165,10 +165,10 @@ index 89209e7e41..400fd318c4 100644
      "fused_inv_rope_fp8_quant",
      "quantize_and_insert_k_cache",
 diff --git a/vllm/models/deepseek_v4/common/ops/cache_utils.py b/vllm/models/deepseek_v4/common/ops/cache_utils.py
-index d98d6a297a..304999d8ca 100644
+index 12fdb04711..d228087388 100644
 --- a/vllm/models/deepseek_v4/common/ops/cache_utils.py
 +++ b/vllm/models/deepseek_v4/common/ops/cache_utils.py
-@@ -35,8 +35,13 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+@@ -34,8 +34,13 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
      triton_scalar_specialization_rep,
  )
  from vllm.platforms import current_platform
@@ -182,7 +182,7 @@ index d98d6a297a..304999d8ca 100644
  from vllm.utils.math_utils import next_power_of_2
  
  
-@@ -138,10 +143,10 @@ def quantize_and_insert_k_kernel(
+@@ -136,10 +141,10 @@ def quantize_and_insert_k_kernel(
  
              # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
              if use_fnuz:
@@ -196,7 +196,7 @@ index d98d6a297a..304999d8ca 100644
  
              # Store as uint8 (1 byte each)
              tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
-@@ -331,14 +336,12 @@ class DequantizeAndGatherKCacheKernel(
+@@ -328,14 +333,12 @@ class DequantizeAndGatherKCacheKernel(
                      # Load quantized fp8 values (stored as uint8)
                      x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
  
@@ -215,7 +215,7 @@ index d98d6a297a..304999d8ca 100644
  
                      # Load and decode UE8M0 scale
                      # UE8M0: scale = 2^(stored_value - 127)
-@@ -518,7 +521,7 @@ def dequantize_and_gather_k_cache(
+@@ -515,7 +518,7 @@ def dequantize_and_gather_k_cache(
      ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
      writes FNUZ on gfx942 and OCP on gfx950).
      """
@@ -224,7 +224,7 @@ index d98d6a297a..304999d8ca 100644
          # lazily import, otherwise some tests fail due to CUDA driver init failure.
          from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
              _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,
-@@ -1686,3 +1689,163 @@ class BuildFlashinferMixedSparseIndicesKernel(
+@@ -1683,3 +1686,163 @@ class BuildFlashinferMixedSparseIndicesKernel(
  _BUILD_FLASHINFER_MIXED_SPARSE_INDICES_KERNEL = (
      BuildFlashinferMixedSparseIndicesKernel()
  )
@@ -389,10 +389,10 @@ index d98d6a297a..304999d8ca 100644
 +        * _SPARSE_PREFILL_TOPK_ALIGNMENT
 +    )
 diff --git a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
-index 326a94f4f4..84b5a7e09c 100644
+index 50ca86558e..d5c8d6a8ba 100644
 --- a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
 +++ b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
-@@ -33,6 +33,9 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+@@ -32,6 +32,9 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
      VllmTritonJitKernel,
  )
  from vllm.platforms import current_platform
@@ -402,7 +402,7 @@ index 326a94f4f4..84b5a7e09c 100644
  from vllm.triton_utils import tl, triton
  from vllm.utils.math_utils import round_up
  
-@@ -290,8 +293,8 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
+@@ -289,8 +292,8 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
      inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
      x_scaled = quant_2d * inv_scales_col
      x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
@@ -413,7 +413,7 @@ index 326a94f4f4..84b5a7e09c 100644
      x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
  
      nope_mask = block < NOPE_HEAD_DIM
-@@ -510,7 +513,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
+@@ -509,7 +512,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
      x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
      x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
      x_uint8 = tl.reshape(
@@ -422,7 +422,7 @@ index 326a94f4f4..84b5a7e09c 100644
          (TRITON_BLOCK_SIZE,),
      )
      tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
-@@ -872,8 +875,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
+@@ -871,8 +874,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
  
      x_scaled = result_bf16 * inv_scale
      x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
@@ -434,7 +434,7 @@ index 326a94f4f4..84b5a7e09c 100644
      tl.store(fp8_ptr + block, x_uint8, mask=mask)
  
 diff --git a/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py b/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
-index cf6e7235f9..f09e45450f 100644
+index 669186edbb..ab15a8c29a 100644
 --- a/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
 +++ b/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
 @@ -6,6 +6,9 @@ from typing import Any
@@ -496,7 +496,7 @@ index cf6e7235f9..f09e45450f 100644
                  shape=(1, compile_key.num_heads, compile_key.index_q_head_dim),
                  strides=(q_stride0, compile_key.index_q_head_dim, 1),
              ),
-@@ -595,7 +600,7 @@ def fused_indexer_q_rope_quant(
+@@ -613,7 +618,7 @@ def fused_indexer_q_rope_quant(
              dtype=torch.uint8,
              device=index_q.device,
          )
@@ -505,7 +505,7 @@ index cf6e7235f9..f09e45450f 100644
              # lazily import, otherwise some tests fail due to CUDA driver init failure.
              from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
                  _INDEXER_Q_MXFP4_KERNEL,
-@@ -651,7 +656,7 @@ def fused_indexer_q_rope_quant(
+@@ -671,7 +676,7 @@ def fused_indexer_q_rope_quant(
      use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
      fp8_max = 224.0 if use_fnuz else 448.0
      index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
@@ -514,7 +514,7 @@ index cf6e7235f9..f09e45450f 100644
          # lazily import, otherwise some tests fail due to CUDA driver init failure.
          from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
              _INDEXER_Q_FP8_KERNEL,
-@@ -699,7 +704,7 @@ def fused_indexer_q_rope_quant(
+@@ -719,7 +724,7 @@ def fused_indexer_q_rope_quant(
              index_weights,
              index_weights_softmax_scale,
              index_weights_head_scale,
@@ -524,10 +524,10 @@ index cf6e7235f9..f09e45450f 100644
              fp8_max=fp8_max,
              use_fnuz=use_fnuz,
 diff --git a/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py b/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
-index 77b1aa2236..25c142b50b 100644
+index dd25c73af7..ed91e3ce66 100644
 --- a/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
 +++ b/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
-@@ -12,6 +12,9 @@ from typing import Any
+@@ -11,6 +11,9 @@ from typing import Any
  
  import torch
  
@@ -537,7 +537,7 @@ index 77b1aa2236..25c142b50b 100644
  from vllm.model_executor.warmup.jit_warmup import kernel_launcher
  from vllm.model_executor.warmup.jit_warmup_triton_helper import (
      LaunchSpec,
-@@ -160,7 +163,9 @@ class FusedInvRopeFP8QuantKernel(
+@@ -159,7 +162,9 @@ class FusedInvRopeFP8QuantKernel(
              ),
              (HEAD_DIM,),
          )
@@ -548,7 +548,7 @@ index 77b1aa2236..25c142b50b 100644
  
          out_base = (
              out_ptr
-@@ -284,7 +289,9 @@ class FusedInvRopeFP8QuantKernel(
+@@ -283,7 +288,9 @@ class FusedInvRopeFP8QuantKernel(
                  shape=(1, compile_key.half_rope * 2),
              ),
              out_buf=TritonWarmupTensor(
@@ -1651,7 +1651,7 @@ index 0ae0d87a14..a5e8b8ec5c 100644
 +                    flush=True,
 +                )
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index b1379cc9eb..cb527e5917 100644
+index 7edff8ae02..7c1ce8fb04 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -1,6 +1,8 @@
@@ -1663,7 +1663,7 @@ index b1379cc9eb..cb527e5917 100644
  from collections.abc import Callable, Iterable
  from inspect import signature
  from itertools import islice
-@@ -1128,6 +1130,9 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+@@ -1188,6 +1190,9 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
      )
  
  
@@ -1673,7 +1673,7 @@ index b1379cc9eb..cb527e5917 100644
  class DeepseekV4DecoderLayer(nn.Module):
      def __init__(
          self,
-@@ -1140,6 +1145,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -1200,6 +1205,7 @@ class DeepseekV4DecoderLayer(nn.Module):
  
          config = vllm_config.model_config.hf_config
          self.hidden_size = config.hidden_size
@@ -1681,9 +1681,9 @@ index b1379cc9eb..cb527e5917 100644
          self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
  
          self.rms_norm_eps = config.rms_norm_eps
-@@ -1266,10 +1272,18 @@ class DeepseekV4DecoderLayer(nn.Module):
-         res_mix: torch.Tensor | None = None,
+@@ -1327,10 +1333,18 @@ class DeepseekV4DecoderLayer(nn.Module):
          residual: torch.Tensor | None = None,
+         mega_gate_metadata: MegaGateRoutingMetadata | None = None,
      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 +        _timing = os.environ.get("XIAOTU_TIMING") == "1"
 +        _t0 = time.perf_counter() if _timing else 0.0
@@ -1700,7 +1700,7 @@ index b1379cc9eb..cb527e5917 100644
              if x.dim() == 2:
                  assert self.hc_attn_fn_broadcast is not None
                  residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
-@@ -1324,9 +1338,22 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -1385,9 +1399,22 @@ class DeepseekV4DecoderLayer(nn.Module):
          if self.use_sequence_parallel:
              x = sp_all_gather(x)[: positions.shape[0]]
  
@@ -1723,10 +1723,10 @@ index b1379cc9eb..cb527e5917 100644
  
          ffn_norm_weight = self.ffn_norm.weight.data
          ffn_norm_eps = self.ffn_norm.variance_epsilon
-@@ -1350,6 +1377,25 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -1411,6 +1438,25 @@ class DeepseekV4DecoderLayer(nn.Module):
          )
  
-         x = self.ffn(x, input_ids)
+         x = self.ffn(x, input_ids, mega_gate_metadata)
 +        if _l3:
 +            print(
 +                f"[L3] {self.prefix} ffn_out={x.abs().mean().item():.3e} "
@@ -1749,7 +1749,7 @@ index b1379cc9eb..cb527e5917 100644
          return x, residual, post_mix, res_mix
  
  
-@@ -1504,6 +1550,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1568,6 +1614,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              input_ids = input_ids.to(torch.int64)
  
          full_num_tokens = positions.shape[0]
@@ -1763,7 +1763,7 @@ index b1379cc9eb..cb527e5917 100644
          if self.use_sequence_parallel:
              if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                  forward_context = get_forward_context()
-@@ -1563,6 +1616,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1638,6 +1691,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              num_tokens = hidden_states.shape[0]
              self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
  
@@ -1776,7 +1776,7 @@ index b1379cc9eb..cb527e5917 100644
          hidden_states = hc_head_fused_kernel_tilelang(
              hidden_states,
              self.hc_head_fn,
-@@ -1919,13 +1978,30 @@ class DeepseekV4ForCausalLM(
+@@ -1994,13 +2053,30 @@ class DeepseekV4ForCausalLM(
          hidden_states: torch.Tensor,
      ) -> torch.Tensor | None:
          logits = self.logits_processor(self.lm_head, hidden_states)
@@ -3614,7 +3614,7 @@ index 0000000000..4da459d8cc
 +        num_warps=4,
 +    )
 diff --git a/vllm/models/deepseek_v4/sparse_mla.py b/vllm/models/deepseek_v4/sparse_mla.py
-index 4953bdc925..26ecdb7ff0 100644
+index a4000183a0..3b79644505 100644
 --- a/vllm/models/deepseek_v4/sparse_mla.py
 +++ b/vllm/models/deepseek_v4/sparse_mla.py
 @@ -93,7 +93,13 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
@@ -3633,12 +3633,12 @@ index 4953bdc925..26ecdb7ff0 100644
  
  @dataclass
 diff --git a/vllm/utils/deep_gemm.py b/vllm/utils/deep_gemm.py
-index 3fc70c0f5d..f14a309fc1 100644
+index 0eb979ce05..b3e465c610 100644
 --- a/vllm/utils/deep_gemm.py
 +++ b/vllm/utils/deep_gemm.py
-@@ -544,6 +544,10 @@ def fp8_fp4_mqa_logits(
-     Returns:
+@@ -623,6 +623,10 @@ def fp8_fp4_mqa_logits(
          Logits tensor of shape [M, N], dtype `torch.float32`.
+ 
      """
 +    if _use_sm12x_mqa_fallback() and q[1] is None:
 +        return _fp8_mqa_logits_sm12x(
@@ -3647,9 +3647,9 @@ index 3fc70c0f5d..f14a309fc1 100644
      _lazy_init()
      if _fp8_fp4_mqa_logits_impl is None:
          return _missing()
-@@ -650,6 +654,10 @@ def fp8_fp4_paged_mqa_logits(
-         Logits tensor of shape [B * next_n, max_model_len], dtype
+@@ -731,6 +735,10 @@ def fp8_fp4_paged_mqa_logits(
          `torch.float32`.
+ 
      """
 +    if _use_sm12x_mqa_fallback() and q[1] is None:
 +        return _fp8_paged_mqa_logits_sm12x(
@@ -3658,7 +3658,7 @@ index 3fc70c0f5d..f14a309fc1 100644
      _lazy_init()
      if _fp8_fp4_paged_mqa_logits_impl is None:
          return _missing()
-@@ -688,6 +696,8 @@ def tf32_hc_prenorm_gemm(
+@@ -941,6 +949,8 @@ def tf32_hc_prenorm_gemm(
  
      See the caller function for shape requirement
      """
@@ -3667,7 +3667,7 @@ index 3fc70c0f5d..f14a309fc1 100644
      _lazy_init()
      if _tf32_hc_prenorm_gemm_impl is None:
          return _missing()
-@@ -803,3 +813,99 @@ __all__ = [
+@@ -1066,3 +1076,99 @@ __all__ = [
      "get_mn_major_tma_aligned_packed_ue8m0_tensor",
      "get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor",
  ]
@@ -3768,10 +3768,10 @@ index 3fc70c0f5d..f14a309fc1 100644
 +        x, fn, out, sqrsum, num_split
 +    )
 diff --git a/vllm/utils/import_utils.py b/vllm/utils/import_utils.py
-index 20c510edc0..6b621ae5da 100644
+index aaacccc7cb..0bcd0c6d40 100644
 --- a/vllm/utils/import_utils.py
 +++ b/vllm/utils/import_utils.py
-@@ -596,9 +596,21 @@ def has_fbgemm_gpu() -> bool:
+@@ -632,9 +632,21 @@ def has_fbgemm_gpu() -> bool:
      return _has_module("fbgemm_gpu")
  
  
@@ -3796,10 +3796,10 @@ index 20c510edc0..6b621ae5da 100644
  
  def has_humming() -> bool:
 diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
-index 2321cf8d13..5bfe1e9b92 100644
+index 1ede0442bc..5c795341b1 100644
 --- a/vllm/v1/attention/backends/mla/indexer.py
 +++ b/vllm/v1/attention/backends/mla/indexer.py
-@@ -74,6 +74,22 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
+@@ -73,6 +73,22 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
      return use_fp4
  
  
@@ -3822,7 +3822,7 @@ index 2321cf8d13..5bfe1e9b92 100644
  class PrepareUniformDecodeKernel(
      VllmTritonJitKernel["PrepareUniformDecodeKernel.CompileKey"]
  ):
-@@ -1463,7 +1479,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+@@ -1591,7 +1607,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
  
              # DeepGEMM is required for the paged MQA logits on CUDA devices
              schedule_metadata = self.scheduler_metadata_buffer
@@ -7480,10 +7480,10 @@ index 0000000000..bd3986c971
 +        num_warps=4,
 +    )
 diff --git a/vllm/v1/attention/backends/mla/sparse_swa.py b/vllm/v1/attention/backends/mla/sparse_swa.py
-index 62c3921b5e..9eddefda9a 100644
+index 7b07dae71c..156c0adafe 100644
 --- a/vllm/v1/attention/backends/mla/sparse_swa.py
 +++ b/vllm/v1/attention/backends/mla/sparse_swa.py
-@@ -201,6 +201,7 @@ class DeepseekSparseSWAMetadata:
+@@ -220,6 +220,7 @@ class DeepseekSparseSWAMetadata:
      prefill_seq_lens: torch.Tensor | None = None
      prefill_seq_lens_cpu: torch.Tensor | None = None
      prefill_gather_lens: torch.Tensor | None = None
@@ -7491,7 +7491,7 @@ index 62c3921b5e..9eddefda9a 100644
      prefill_query_lens_cpu: torch.Tensor | None = None
      prefill_window_size: int = 0
      prefill_max_model_len: int = 0
-@@ -888,10 +889,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
+@@ -941,10 +942,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
              result["prefill_seq_lens"] = seq_lens[num_decodes:]
              result["prefill_seq_lens_cpu"] = seq_lens_cpu[num_decodes:]
              result["prefill_gather_lens"] = pfx_gather_lens

@@ -1,0 +1,600 @@
+diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
+index 9dd5ad6773..b3785b5671 100644
+--- a/vllm/model_executor/layers/mla.py
++++ b/vllm/model_executor/layers/mla.py
+@@ -13,6 +13,7 @@ from vllm.models.common.ops import fused_q_kv_rmsnorm
+ from vllm.platforms import current_platform
+ 
+ if TYPE_CHECKING:
++    from vllm.v1.attention.backend import AttentionBackend
+     from vllm.v1.attention.backends.mla.index_group import (
+         SparseMLAIndexGroupBuilder,
+     )
+@@ -37,6 +38,10 @@ class MLAModules:
+     indexer_rotary_emb: torch.nn.Module | None = None
+     g_proj: torch.nn.Module | None = None
+     index_group_builder: "SparseMLAIndexGroupBuilder | None" = None
++    # Optional explicit MLA backend for this layer. When None (every existing
++    # caller) backend selection is unchanged; model code that knows the generic
++    # candidate pool cannot serve it can bind a backend directly.
++    attn_backend: "type[AttentionBackend] | None" = None
+ 
+ 
+ # --8<-- [start:multi_head_latent_attention]
+@@ -137,6 +142,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+             topk_indices_buffer=mla_modules.topk_indices_buffer,
+             index_group_builder=mla_modules.index_group_builder,
+             non_causal_multi_token_decode=non_causal_multi_token_decode,
++            attn_backend=mla_modules.attn_backend,
+         )
+         indexer_op = getattr(self.indexer, "indexer_op", None)
+         if indexer_op is not None and hasattr(
+diff --git a/vllm/models/glm5next/common/attention.py b/vllm/models/glm5next/common/attention.py
+index 4f776e8a8e..ea2a161046 100644
+--- a/vllm/models/glm5next/common/attention.py
++++ b/vllm/models/glm5next/common/attention.py
+@@ -521,6 +521,31 @@ class Glm5NextMLAAttention(nn.Module):
+ 
+         self.is_v32 = config.index_topk is not None
+ 
++        attn_backend = None
++        if self.is_v32 and current_platform.is_cuda():
++            from vllm.utils.torch_utils import is_quantized_kv_cache
++            from vllm.v1.attention.backends.mla.flashmla_sparse_sm8x import (
++                FlashMLASparseSM8XBackend,
++                sm8x_sparse_mla_enabled,
++            )
++
++            # The SM8x Triton route only serves a bf16 KV cache. An explicit
++            # fp8/fp4 request must stay on the normal (empty-pool) path so it
++            # fails closed with the standard "no valid backend" error instead of
++            # building this bf16 impl against a packed cache.
++            kv_dtype = getattr(cache_config, "cache_dtype", "auto")
++            sm8x_kv_ok = kv_dtype is None or not is_quantized_kv_cache(kv_dtype)
++            if sm8x_sparse_mla_enabled() and sm8x_kv_ok:
++                # No sm8x sparse-MLA entry exists in the platform candidate pool
++                # (all generic sparse-MLA backends are SM90+; the dsv4 enum is a
++                # model-driven marker). Bind the SM8x Triton backend explicitly so
++                # the DSA layers build on Ampere/Ada; KV stays bf16.
++                attn_backend = FlashMLASparseSM8XBackend
++                logger.info_once(
++                    "GLM-5.3 DSA layers using the SM8x Triton sparse-MLA backend "
++                    "(capability floor 8.x); requires --kv-cache-dtype bfloat16."
++                )
++
+         if self.is_v32:
+             self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
+                 qk_rope_head_dim,
+@@ -564,6 +589,7 @@ class Glm5NextMLAAttention(nn.Module):
+             indexer_rotary_emb=self.indexer_rope_emb,
+             is_sparse=self.is_v32,
+             topk_indices_buffer=topk_indices_buffer,
++            attn_backend=attn_backend,
+         )
+ 
+         self.mla_attn = MultiHeadLatentAttentionWrapper(
+diff --git a/vllm/models/glm5next/nvidia/ops/kpool_compress.py b/vllm/models/glm5next/nvidia/ops/kpool_compress.py
+index 416d3b5c48..c2eac63bc8 100644
+--- a/vllm/models/glm5next/nvidia/ops/kpool_compress.py
++++ b/vllm/models/glm5next/nvidia/ops/kpool_compress.py
+@@ -14,6 +14,9 @@ from __future__ import annotations
+ 
+ import torch
+ 
++from vllm.model_executor.layers.quantization.utils.fp8_utils import (
++    _f32_to_e4m3_uint8,
++)
+ from vllm.triton_utils import tl, triton
+ 
+ # The GLM-5.3-Flash indexer head dimension is fixed at 128.
+@@ -101,7 +104,14 @@ def _fwht_quant_kernel(
+     scale = tl.exp2(tl.ceil(tl.log2(absmax * (1.0 / 448.0))))
+     y = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
+ 
+-    tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :], y, mask=rmask[:, None])
++    # The fp8 destinations are uint8 buffers and the e4m3 bytes are encoded
++    # arithmetically, because Triton has no fp8e4nv type on Ampere/Ada (SM8x).
++    # _f32_to_e4m3_uint8 is bit-identical to the old fp8 cast.
++    tl.store(
++        qout_ptr + rows[:, None] * 128 + offs[None, :],
++        _f32_to_e4m3_uint8(y),
++        mask=rmask[:, None],
++    )
+     tl.store(sout_ptr + rows, scale, mask=rmask)
+ 
+ 
+@@ -122,14 +132,16 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+     assert q.dtype == torch.bfloat16
+     assert q.is_contiguous()
+     n_rows = q.shape[0]
+-    q_fp8 = torch.empty((n_rows, 128), dtype=torch.float8_e4m3fn, device=q.device)
++    # uint8 destination: the kernel encodes the e4m3 bytes arithmetically so the
++    # op compiles on SM8x (no Triton fp8e4nv). Viewed back for the caller.
++    q_fp8 = torch.empty((n_rows, 128), dtype=torch.uint8, device=q.device)
+     q_scale = torch.empty((n_rows, 1), dtype=torch.float32, device=q.device)
+     if n_rows == 0:
+-        return q_fp8, q_scale
++        return q_fp8.view(torch.float8_e4m3fn), q_scale
+     BLOCK_R = 32
+     grid = (triton.cdiv(n_rows, BLOCK_R),)
+     _fwht_quant_kernel[grid](q, q_fp8, q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
+-    return q_fp8, q_scale
++    return q_fp8.view(torch.float8_e4m3fn), q_scale
+ 
+ 
+ # Fused pool compression and cache write.
+@@ -244,13 +256,15 @@ def _kpool_softmax_rotate_write_cache_kernel(
+             + S_OFFSET_NBYTES_IN_PAGE // 4
+             + loc_token_offset_in_page
+         )
+-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
++        tl.store(
++            buf_fp8_ptr + out_k_offsets, _f32_to_e4m3_uint8(quantized), mask=mask
++        )
+         tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
+ 
+     if RETURN_COMPRESSED:
+         tl.store(
+             compressed_k_ptr + row * HEAD_DIM + offs,
+-            quantized,
++            _f32_to_e4m3_uint8(quantized),
+             mask=offs < HEAD_DIM,
+         )
+         tl.store(compressed_scale_ptr + row, scale)
+@@ -322,7 +336,6 @@ def kpool_compress_and_write_cache(
+             )
+         return None
+ 
+-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+     buf_fp32 = buf.view(torch.float32)
+     # bytes per page (last dim of kv_cache) viewed as uint8
+     buf_numel_per_page = buf.stride(0)
+@@ -331,18 +344,20 @@ def kpool_compress_and_write_cache(
+     if return_compressed:
+         compressed_k = torch.empty(
+             (slot_k.shape[0], head_dim),
+-            dtype=torch.float8_e4m3fn,
++            dtype=torch.uint8,
+             device=slot_k.device,
+         )
+         compressed_scale = torch.empty(
+             (slot_k.shape[0],), dtype=torch.float32, device=slot_k.device
+         )
+     else:
+-        compressed_k = buf_fp8
++        compressed_k = buf
+         compressed_scale = buf_fp32
+ 
++    # The kernel writes e4m3 bytes arithmetically into uint8 targets (SM8x has
++    # no Triton fp8e4nv), so pass the uint8 view rather than the fp8 one.
+     _kpool_softmax_rotate_write_cache_kernel[(slot_k.shape[0],)](
+-        buf_fp8,
++        buf,
+         buf_fp32,
+         slot_k,
+         slot_score,
+@@ -369,7 +384,7 @@ def kpool_compress_and_write_cache(
+     )
+ 
+     if return_compressed:
+-        return compressed_k, compressed_scale
++        return compressed_k.view(torch.float8_e4m3fn), compressed_scale
+     return None
+ 
+ 
+@@ -608,7 +623,11 @@ def _kpool_decode_update_batched_kernel(
+                 + S_OFFSET_NBYTES_IN_PAGE // 4
+                 + loc_token_offset_in_page
+             )
+-            tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
++            tl.store(
++                buf_fp8_ptr + out_k_offsets,
++                _f32_to_e4m3_uint8(quantized),
++                mask=dim_mask,
++            )
+             tl.store(buf_fp32_ptr + out_s_offset, scale)
+ 
+         # Stash the current token AFTER any completion read so the completion
+@@ -687,7 +706,6 @@ def kpool_decode_update_and_maybe_write_cache_batched(
+ 
+     page_size = kv_cache.shape[1]
+     buf = kv_cache
+-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+     buf_fp32 = buf.view(torch.float32)
+ 
+     # The kernel indexes the int tensors as ``req * next_n + t`` (row-major),
+@@ -699,7 +717,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
+     positions = positions.contiguous()
+ 
+     _kpool_decode_update_batched_kernel[(num_requests,)](
+-        buf_fp8,
++        buf,
+         buf_fp32,
+         tail_kv_cache,
+         tail_slot_mapping,
+diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py b/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
+new file mode 100644
+index 0000000000..f8549e6dfc
+--- /dev/null
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
+@@ -0,0 +1,224 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SM80/86/89 sparse-MLA backend for the generic (V3.2-style) MLA layer.
++
++DeepSeek-V4/V4.1 reach the portable Triton SM8x path through their own
++model-driven attention layer. Non-DSv4 DSA models built on
++``MultiHeadLatentAttentionWrapper`` (``is_sparse=True``) instead route through
++the generic sparse-MLA impl stack, whose FlashMLA/FlashInfer kernels require
++SM90+. On an sm8x card that leaves the platform candidate pool empty
++(``cuda.py`` raises) and the ``FLASHMLA_SPARSE_DSV4(1)`` enum is a model-driven
++marker with no ``impl_cls``, so it cannot be reused here.
++
++This backend closes that gap without touching the platform selector: it reuses
++the whole bf16 gather / logical->physical topk machinery of
++``FlashMLASparseImpl`` and swaps only the final attention kernel for the
++fp8-type-free Triton ``sparse_mla_fwd_with_sink``. Selection is scoped by the
++caller (currently ``glm5next`` under ``sm8x_sparse_mla_enabled()``), so no other
++model's routing changes.
++
++Ported from the LvLLM SM8x work; the kernel itself now lives next to its
++siblings in ``vllm/v1/attention/backends/mla/sparse_mla_kernels.py``.
++"""
++
++from typing import TYPE_CHECKING, Any, ClassVar
++
++import torch
++
++from vllm.config.cache import CacheDType
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++from vllm.platforms.interface import DeviceCapability
++from vllm.v1.attention.backend import MLAAttentionImpl
++from vllm.v1.attention.backends.mla.flashmla_sparse import (
++    FlashMLASparseBackend,
++    FlashMLASparseImpl,
++    FlashMLASparseMetadataBuilder,
++)
++from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
++    sparse_mla_fwd_with_sink,
++)
++from vllm.v1.attention.backends.mla.sparse_utils import (
++    triton_convert_req_index_to_global_index,
++)
++
++if TYPE_CHECKING:
++    pass
++
++logger = init_logger(__name__)
++
++
++def sm8x_sparse_mla_enabled() -> bool:
++    """True when this run must use the portable Triton sparse-MLA path.
++
++    Anchored to the device capability family (Ampere/Ada = 8.x), which is the
++    same predicate the in-tree DSv4 Triton fallback uses
++    (``sparse_mla_env.is_triton_sparse_mla_enabled_for_platform``). Kept local so
++    the glm5next binding is explicit and cannot accidentally flip another
++    model's backend selection.
++    """
++    if not current_platform.is_cuda():
++        return False
++    return current_platform.is_device_capability_family(80)
++
++
++class FlashMLASparseSM8XImpl(FlashMLASparseImpl):
++    """bf16 sparse MLA on SM8x: reuse FlashMLASparse gather, Triton attention."""
++
++    # No sm90+ LSE-returning decode kernel is used; keep the bf16 decode on the
++    # plain (non-LSE) path so spec-decode / DCP gates in the base never trip.
++    can_return_lse_for_decode: bool = False
++    supports_dcp: bool = False
++    # Force every token (prefill included) through the sparse-MQA gather path;
++    # the dense/masked MHA prefill would fall back to FlashAttention (SM90+).
++    supports_dense_mha_prefill: bool = False
++
++    def __init__(self, *args: Any, **kwargs: Any) -> None:
++        super().__init__(*args, **kwargs)
++        self._sink_buf: torch.Tensor | None = None
++
++    def forward_mqa(
++        self,
++        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
++        kv_c_and_k_pe_cache: torch.Tensor,
++        attn_metadata: Any,
++        layer: Any,
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        # The bf16 FlashMLASparse path fuses (q_nope, q_pe) via the CUDA
++        # ``concat_mla_q`` kernel, which hard-requires ``rope_dim == 64``.
++        # GLM-5.3-Flash is a NoPE member (``qk_rope_head_dim == 0``) so that
++        # kernel asserts. Concat in torch instead (q_pe is empty for NoPE), then
++        # reuse the inherited bf16 gather / logical->physical topk machinery.
++        if isinstance(q, tuple):
++            q = q[0] if self.qk_rope_head_dim == 0 else torch.cat(q, dim=-1)
++        num_actual_toks = q.shape[0]
++        assert self.topk_indices_buffer is not None
++        topk_indices = self.topk_indices_buffer[:num_actual_toks]
++        attn_out, _ = self._forward_bf16_kv(
++            q, kv_c_and_k_pe_cache, topk_indices, attn_metadata, q.shape[1]
++        )
++        return attn_out, None
++
++    def _convert_logical_to_physical_topk(
++        self,
++        logical_topk_indices: torch.Tensor,
++        attn_metadata: Any,
++        *,
++        block_stride_rows: int | None,
++        return_valid_counts: bool,
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        # The inherited implementation routes the decode case through
++        # SparseMLAIndexGroup, whose side stream waits on ``logical_topk_ready``.
++        # That event is recorded on the *capturing* stream by the MLA wrapper's
++        # forward (mla.py record_logical_topk_ready), while this attention body
++        # runs eagerly inside a breakable CUDA graph -- so the cross-stream wait
++        # is invalid and CUDA raises cudaErrorInvalidValue on A100 during the
++        # profile/capture run. On SM8x the conversion is a tiny index kernel and
++        # decode batches are a handful of rows, so convert on the current stream
++        # instead of sharing one result across the layer group. This is the same
++        # kernel the prefill branch of _forward_bf16_kv already uses.
++        return triton_convert_req_index_to_global_index(
++            attn_metadata.req_id_per_token[: logical_topk_indices.shape[0]],
++            attn_metadata.block_table,
++            logical_topk_indices,
++            BLOCK_SIZE=attn_metadata.block_size,
++            BLOCK_STRIDE_ROWS=block_stride_rows,
++            NUM_TOPK_TOKENS=logical_topk_indices.shape[1],
++            return_valid_counts=return_valid_counts,
++        )
++
++    def _bf16_flash_mla_kernel(
++        self,
++        q: torch.Tensor,
++        kv_c_and_k_pe_cache: torch.Tensor,
++        topk_indices: torch.Tensor,
++        topk_length: torch.Tensor | None = None,
++        actual_num_heads: int | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        # ``kv_c_and_k_pe_cache`` arrives as the flat [rows, head_dim] gather view
++        # from ``_forward_bf16_kv``; the physical topk ids are rows into it and
++        # ``topk_length`` is the valid prefix (``-1`` padding is masked by length).
++        kv = kv_c_and_k_pe_cache.reshape(-1, kv_c_and_k_pe_cache.shape[-1])
++        if actual_num_heads is None:
++            actual_num_heads = q.shape[1]
++        head_dim = kv.shape[-1]
++        num_tokens = q.shape[0]
++        output = q.new_empty((num_tokens, q.shape[1], head_dim), dtype=q.dtype)
++        if topk_length is None:
++            topk_length = torch.full(
++                (num_tokens,),
++                topk_indices.shape[-1],
++                dtype=torch.int32,
++                device=q.device,
++            )
++        # GLM-5.3 / V3.2 MLA carries no attention sink (``has_sink=False``, as on
++        # the sm120 flashinfer path). The sink-aware kernel folds the sink in as a
++        # pseudo-key with logit ``attn_sink`` and zero value, so "no sink" must be
++        # a very negative logit -- a zero sink would wrongly add ``exp(0-max)`` to
++        # the softmax denominator and dilute every output. Use -1e30: its weight
++        # underflows to 0 for any real score, reducing the kernel to plain softmax;
++        # a fully masked row (capture padding) yields 0/1=0 rather than NaN.
++        if self._sink_buf is None or self._sink_buf.shape[0] < q.shape[1]:
++            self._sink_buf = torch.full(
++                (max(q.shape[1], 1),), -1e30, dtype=torch.float32, device=q.device
++            )
++        sparse_mla_fwd_with_sink(
++            q=q,
++            kv=kv,
++            indices=topk_indices,
++            topk_length=topk_length,
++            scale=self.softmax_scale,
++            attn_sink=self._sink_buf,
++            output=output,
++            num_heads=actual_num_heads,
++        )
++        return output, None
++
++
++class FlashMLASparseSM8XBackend(FlashMLASparseBackend):
++    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
++    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
++
++    @staticmethod
++    def get_name() -> str:
++        return "FLASHMLA_SPARSE_SM8X"
++
++    @staticmethod
++    def get_impl_cls() -> type[MLAAttentionImpl[Any]]:
++        return FlashMLASparseSM8XImpl
++
++    @staticmethod
++    def get_builder_cls() -> type[FlashMLASparseMetadataBuilder]:
++        return FlashMLASparseMetadataBuilder
++
++    @classmethod
++    def get_supported_head_sizes(cls) -> list[int]:
++        # 512 = NoPE (GLM-5.3-Flash); 576 = V3.2 512-nope + 64-rope.
++        return [512, 576]
++
++    @classmethod
++    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
++        # Actual routing is gated by the caller via sm8x_sparse_mla_enabled().
++        # Keep the class honest for any explicit validate pass.
++        return capability.major == 8
++
++    @classmethod
++    def supports_combination(
++        cls,
++        head_size: int,
++        dtype: torch.dtype,
++        kv_cache_dtype: "CacheDType | None",
++        block_size: int | None,
++        use_mla: bool,
++        has_sink: bool,
++        use_sparse: bool,
++        use_mm_prefix: bool,
++        device_capability: DeviceCapability,
++    ) -> str | None:
++        if kv_cache_dtype not in (None, "auto", "bfloat16"):
++            return "FLASHMLA_SPARSE_SM8X supports only a bf16 KV cache"
++        if not use_sparse:
++            return "FLASHMLA_SPARSE_SM8X is a sparse-MLA backend only"
++        if not sm8x_sparse_mla_enabled():
++            return "FLASHMLA_SPARSE_SM8X requires an SM8x device"
++        return None
+diff --git a/vllm/v1/attention/backends/mla/sparse_mla_kernels.py b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
+index bd3986c971..84c1a0ab80 100644
+--- a/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
++++ b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
+@@ -3515,3 +3515,151 @@ def finish_sparse_mla_attention_with_sink(
+         BLOCK_D=block_d,
+         num_warps=4,
+     )
++
++
++@triton.jit
++def _sparse_mla_fwd_with_sink_kernel(
++    q_ptr,
++    kv_ptr,
++    indices_ptr,
++    lens_ptr,
++    attn_sink_ptr,
++    output_ptr,
++    stride_q_t,
++    stride_q_h,
++    stride_q_d,
++    stride_kv_r,
++    stride_kv_d,
++    stride_idx_t,
++    stride_idx_k,
++    stride_out_t,
++    stride_out_h,
++    stride_out_d,
++    qk_scale,
++    num_heads: tl.constexpr,
++    head_dim: tl.constexpr,
++    topk: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++):
++    # One program per (query, head); online softmax over gathered rows.
++    token_idx = tl.program_id(0)
++    head_idx = tl.program_id(1)
++    dim_offsets = tl.arange(0, BLOCK_D)
++    dim_mask = dim_offsets < head_dim
++
++    q = tl.load(
++        q_ptr
++        + token_idx * stride_q_t
++        + head_idx * stride_q_h
++        + dim_offsets * stride_q_d,
++        mask=dim_mask,
++        other=0.0,
++    ).to(tl.float32)
++
++    length = tl.load(lens_ptr + token_idx)
++    running_max = tl.load(attn_sink_ptr + head_idx).to(tl.float32)
++    running_denom = 1.0
++    running_acc = tl.zeros((BLOCK_D,), tl.float32)
++
++    for k_start in range(0, topk, BLOCK_K):
++        candidates = k_start + tl.arange(0, BLOCK_K)
++        k_mask = (candidates < length) & (candidates < topk)
++        row = tl.load(
++            indices_ptr + token_idx * stride_idx_t + candidates * stride_idx_k,
++            mask=k_mask,
++            other=0,
++        ).to(tl.int64)
++        row_safe = tl.where(k_mask, tl.maximum(row, 0), 0)
++        kv = tl.load(
++            kv_ptr + row_safe[:, None] * stride_kv_r + dim_offsets[None, :] * stride_kv_d,
++            mask=k_mask[:, None] & dim_mask[None, :],
++            other=0.0,
++        ).to(tl.float32)
++        scores = tl.sum(kv * q[None, :], axis=1) * qk_scale
++        scores = tl.where(k_mask, scores, -float("inf"))
++        next_max = tl.maximum(running_max, tl.max(scores, axis=0))
++        previous_weight = tl.exp(running_max - next_max)
++        weights = tl.exp(scores - next_max)
++        running_acc = running_acc * previous_weight + tl.sum(
++            kv * weights[:, None], axis=0
++        )
++        running_denom = running_denom * previous_weight + tl.sum(weights, axis=0)
++        running_max = next_max
++
++    tl.store(
++        output_ptr
++        + token_idx * stride_out_t
++        + head_idx * stride_out_h
++        + dim_offsets * stride_out_d,
++        running_acc / running_denom,
++        mask=dim_mask,
++    )
++
++
++def sparse_mla_fwd_with_sink(
++    q: torch.Tensor,
++    kv: torch.Tensor,
++    indices: torch.Tensor,
++    topk_length: torch.Tensor,
++    scale: float,
++    attn_sink: torch.Tensor,
++    output: torch.Tensor,
++    num_heads: int | None = None,
++) -> None:
++    """Sink-aware sparse MLA prefill over gathered BF16 KV rows.
++
++    Kernel-equivalent to the SM90+ ``flash_mla_sparse_fwd`` contract (flat row
++    indices into a shared ``kv`` table plus a per-query ``topk_length``), but
++    written in portable Triton so it runs on SM8x. Ported from the LvLLM SM8x
++    work, itself ported from the SGLang SM80 effort.
++
++    Args:
++        q: ``(Tq, H, D)`` queries (a leading unit head axis is accepted).
++        kv: ``(R, D)`` gathered KV rows shared by all queries.
++        indices: ``(Tq, K)`` int row ids into ``kv``; entries past
++            ``topk_length`` may be negative and are masked.
++        topk_length: ``(Tq,)`` int valid prefix length per query.
++        scale: softmax scale.
++        attn_sink: ``(H,)`` sink logits folded in as an extra softmax term.
++        output: ``(Tq, H, D)`` destination (heads past ``num_heads`` are zeroed).
++        num_heads: number of valid heads; defaults to ``q.shape[1]``.
++    """
++    if q.dim() == 4:
++        assert q.shape[1] == 1
++        q = q[:, 0]
++    if output.dim() == 4:
++        assert output.shape[1] == 1
++        output = output[:, 0]
++    active_heads = num_heads if num_heads is not None else q.shape[1]
++    num_tokens = q.shape[0]
++    topk = indices.shape[-1]
++    head_dim = q.shape[-1]
++    block_d = 512 if head_dim <= 512 else next_power_of_2(head_dim)
++    _sparse_mla_fwd_with_sink_kernel[(num_tokens, active_heads)](
++        q,
++        kv,
++        indices,
++        topk_length,
++        attn_sink,
++        output,
++        q.stride(0),
++        q.stride(1),
++        q.stride(2),
++        kv.stride(0),
++        kv.stride(1),
++        indices.stride(0),
++        indices.stride(1),
++        output.stride(0),
++        output.stride(1),
++        output.stride(2),
++        scale,
++        active_heads,
++        head_dim,
++        topk,
++        BLOCK_K=16,
++        BLOCK_D=block_d,
++        num_warps=8,
++    )
++    if q.shape[1] > active_heads:
++        output[:, active_heads:].zero_()

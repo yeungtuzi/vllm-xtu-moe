@@ -6215,6 +6215,37 @@ YAML 1.1 会把它解析成**布尔 `False`** ✗(与 `on`/`yes`/`no` 同类)⇒
 * **教训** ✓:配置项的真名**必须以包内 schema 为准** ✓,不能凭 README 叙述或内部变量名推断 ✓
   (`input` vs `inputModalities`、`reasoning` 的取值范围 ✓ 都是这么踩出来的 ✓)
 
+
+### B216 ⭐ 代码树治理:**我们的 vLLM 改动正式"patch 化"**(用户 2026-09-24 明确开发模型)
+
+**用户确立的模型** ✓:**vLLM 仓与上游保持一致**(定期 rebase,**不留自有长命分支**)✓;
+功能**全部以 patch 形式**放在 `vllm-xtu-moe` ✓ —— 本次把它落成**可复现、可验证**的机制 ✓
+
+**现状盘点(改前)** ✗:vLLM 仓有 **9 个本地分支** + `main` 自己也带 **16 个提交** ✗;
+插件仓虽有 `patches/upstream/`(15 个手工维护 patch ✓)+ `apply_xtu_patches.sh` ✓,但
+**基线停在 `dabc4362b`(09-14)** ✗ ⇒ 实测 **3/12 已过期**(`glm53-dsa-sm80`/`mimo-mtp-depth-layers`/
+`pr4-sm8x-sparse-mla-2d-tile` ⇒ 找不到文件或 hunk 失败 ✗)⇒ **手工 patch 会腐化** ✓
+
+**新机制(已落地并验证 ✓)**:
+* **patch 系列 = 唯一真源** ✓:`patches/xtu-series/`(`0001…0016*.patch` ✓ + `series` 清单 ✓ + `README.md` 说明生成方式 ✓)
+  —— 由 **`git format-patch origin/main..main`** 从唯一树的提交**直接生成** ✓(带 Subject ✓,可 `git am` 复用 ✓)
+* **apply 脚本重写** ✓:`scripts/apply_xtu_patches.sh <含 vllm/ 的目录>` 默认按 **series 顺序**应用 ✓;
+  旧的 `LEVEL=1|2|3` 降级为 legacy(仅供追溯 ✓);**去掉了 `patch -f` 静默回退** ✗ ⇒ **失败即报错退出** ✓
+  (纪律:`patch -f` 会**静默跳过**打不上的 hunk ✗,与本仓"不许掩盖错误"的规矩冲突 ✓)
+* **实测验证(在 `/tmp` 快照上,用 `git archive` 导出、不注册 worktree、用完即删 ✓)**:
+  * **16/16 干净应用** ✓ 到**最新 `origin/main`(`70fc359d25`)** ✓;**0 个 `.rej`** ✓;规模 **35 文件 / +2383 −209** ✓
+  * patch 触及的 **45 个文件**里,**41 个与"正在服务的树"逐字节一致** ✓
+  * 仅 **4 个不同**(`deepseek_v4/compressor.py`、`deepseek_v4/sparse_mla.py`、
+    `v1/attention/backends/mla/indexer.py`、`sparse_swa.py` ✓)⇒ 经核对是**上游自己前进改过**的文件 ✓
+    ⇒ 差异来自**上游**,不是我们的 patch ✓;而这 4 个文件我们的 patch 仍能**干净应用** ⇒ **零冲突** ✓✓
+
+**结论** ✓:我们的全部改动**已被完整、无冲突地 patch 化** ✓ ⇒ 现在可以安全地:
+① (需用户同意)**把在服务的树 rebase 到最新上游** = 干净上游 + 应用系列 ✓(要重启 8070 ✗,按纪律先问 ✓);
+② (需用户同意)**清理 vLLM 仓分支**:把 9 个本地分支删除(**已在 260 MB `git bundle` 里备份 ✓**)、
+   让 `main` 只跟 `origin/main` ✓ ⇒ 达成"vLLM 与上游一致" ✓
+
+**⚠️ 纪律补充** ✓:`/tmp` 下用 `git archive` 导出快照做预演 ⇒ **不注册 worktree、不污染仓库** ✓(已按用户要求事先声明 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

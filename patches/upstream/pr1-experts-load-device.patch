@@ -1,8 +1,8 @@
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 6158f86f89..2d11b225f6 100755
+index 30b3de8d64..709640cac6 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -87,6 +87,14 @@ if TYPE_CHECKING:
+@@ -88,6 +88,14 @@ if TYPE_CHECKING:
      VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
      VLLM_MEDIA_CONNECTOR: str = "http"
      VLLM_TARGET_DEVICE: str = "cuda"
@@ -17,7 +17,7 @@ index 6158f86f89..2d11b225f6 100755
      VLLM_MAIN_CUDA_VERSION: str = "13.0"
      VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
      VLLM_BATCH_INVARIANT: bool = False
-@@ -602,6 +610,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -611,6 +619,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
      # Target device of vLLM, supporting [cuda (by default),
      # rocm, cpu]
      "VLLM_TARGET_DEVICE": lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda").lower(),
@@ -61,12 +61,12 @@ index 6158f86f89..2d11b225f6 100755
      "VLLM_MAIN_CUDA_VERSION": lambda: (
          os.getenv("VLLM_MAIN_CUDA_VERSION", "").lower() or "13.0"
 diff --git a/vllm/model_executor/layers/fused_moe/oracle/fp8.py b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
-index abe47373de..a824016f8d 100644
+index 5219fff617..bad3bbad49 100644
 --- a/vllm/model_executor/layers/fused_moe/oracle/fp8.py
 +++ b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
-@@ -131,6 +131,12 @@ def _get_priority_backends(
-         # CPU platform uses FP8 W8A16 fused MoE kernel.
+@@ -137,6 +137,12 @@ def _get_priority_backends(
          _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU)
+         _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU_W8A8)
  
 +    # GPU/CPU mixed mode: expert weights live on the host (see
 +    # VLLM_EXPERTS_LOAD_DEVICE), so only the CPU backend can consume them.
@@ -77,7 +77,7 @@ index abe47373de..a824016f8d 100644
      return _AVAILABLE_BACKENDS
  
  
-@@ -579,7 +585,14 @@ def convert_to_fp8_moe_kernel_format(
+@@ -663,7 +669,14 @@ def convert_to_fp8_moe_kernel_format(
              prepare_fp8_moe_layer_for_cpu,
          )
  
@@ -90,11 +90,11 @@ index abe47373de..a824016f8d 100644
 +            pass
 +        else:
 +            w13, w2 = prepare_fp8_moe_layer_for_cpu(w13, w2)
-     else:
-         if fp8_backend not in [
-             Fp8MoeBackend.TRITON,
+     elif fp8_backend == Fp8MoeBackend.CPU_W8A8:
+         from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
+             prepare_fp8_w8a8_moe_layer_for_cpu,
 diff --git a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
-index d47ad9c97e..5c00f3c357 100644
+index ad591d9ea7..cf2bf83344 100644
 --- a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
 +++ b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
 @@ -11,6 +11,7 @@ from compressed_tensors.quantization import (
@@ -105,8 +105,8 @@ index d47ad9c97e..5c00f3c357 100644
  import vllm.model_executor.layers.fused_moe.modular_kernel as mk
  from vllm.config.kernel import MoEBackend
  from vllm.logger import init_logger
-@@ -120,6 +121,10 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
-     """
+@@ -118,6 +119,10 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
+     """Get available backends in priority order based on platform and config."""
      if current_platform.is_cpu():
          return [WNA16MoEBackend.CPU]
 +    # GPU/CPU mixed mode: expert weights live on the host (see
@@ -145,10 +145,10 @@ index d47ad9c97e..5c00f3c357 100644
          blocked_w13,
          blocked_w2,
 diff --git a/vllm/model_executor/layers/fused_moe/oracle/unquantized.py b/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
-index b24f2a9a79..0ca58845ee 100644
+index 2c84e532cc..400093ac9e 100644
 --- a/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
 +++ b/vllm/model_executor/layers/fused_moe/oracle/unquantized.py
-@@ -58,6 +58,17 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
+@@ -59,6 +59,17 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
      ) -> None:
          backends.append(backends.pop(backends.index(backend)))
  
@@ -166,8 +166,8 @@ index b24f2a9a79..0ca58845ee 100644
      if current_platform.is_rocm():
          _AVAILABLE_BACKENDS = [
              UnquantizedMoeBackend.AITER,
-@@ -96,6 +107,12 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
-         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.XPU]
+@@ -103,6 +114,12 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
+         ]
      elif current_platform.is_cpu():
          _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
 +
@@ -180,7 +180,7 @@ index b24f2a9a79..0ca58845ee 100644
  
  
 diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
-index 2dafb6c493..bf8f3c9aa8 100644
+index e3a287ddc2..835daf073c 100644
 --- a/vllm/model_executor/layers/fused_moe/routed_experts.py
 +++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
 @@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
@@ -213,10 +213,10 @@ index 2dafb6c493..bf8f3c9aa8 100644
          self.lora_base_layer_prefix = ""
  
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
-index d8bef7347d..1b449d9654 100644
+index 47df735e89..eec6337635 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
 +++ b/vllm/model_executor/layers/quantization/fp8.py
-@@ -50,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+@@ -47,6 +47,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
      create_fp8_scale_parameter,
      create_fp8_weight_parameter,
      process_fp8_input_tensor_strategy_moe,
@@ -224,7 +224,7 @@ index d8bef7347d..1b449d9654 100644
      process_fp8_weight_tensor_strategy,
      process_fp8_weight_tensor_strategy_moe,
      validate_fp8_block_shape,
-@@ -386,6 +387,28 @@ class Fp8LinearMethod(LinearMethodBase):
+@@ -382,6 +383,28 @@ class Fp8LinearMethod(LinearMethodBase):
                  self.fp8_linear.marlin_input_dtype = self.marlin_input_dtype
              return
  
@@ -253,7 +253,7 @@ index d8bef7347d..1b449d9654 100644
          if self.use_marlin:
              if not self.block_quant:
                  # Canonicalize to (K, N) for the kernel.
-@@ -739,6 +762,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -719,6 +742,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              routing_tables=layer._expert_routing_tables(),
          )
  
