@@ -6987,6 +6987,22 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
 ⇒ ⇒ **判定:#56120 无增量价值,关闭 ✓**;而 **#56119 依然独一无二**
 (上述项目**均未涉及**"Marlin 重打包 block-FP8 + 直接消费方 `is_bmm`" ✓)—— **该推的那一个已经推了** ✓✓
 
+
+### B237 #56119 状态复查(提交后约 13 小时)⇒ 健康、无冲突、**无需 rebase**
+
+* PR `open / 非 draft` ✓;规模 3 文件 +283 ✓;标签 `bug`/`deepseek`/`quantization`/`DSv4` ✓;6 位评审人 ✓
+* ⭐ **上游在 13 小时内推进了 50 个提交** ✗(vLLM 合并速度极快 ✓)⇒ 但 **GitHub 连查三次均为
+  `mergeable: true`** ✓ ⇒ **无冲突** ✓
+* 上游唯一触及 `fp8.py` 的改动 = **`90a951500`【Cleanup】Remove online quantization support**
+  (15 文件 ✓);其 hunk 位于 **`Fp8Config`(93/102/112/182/208)与 `Fp8MoEMethod`(548)** ✓
+  ⇒ **与我们的守卫**(`Fp8LinearMethod.process_weights_after_loading` ✓)不相邻 ✓
+  (锚点行号:我方 408 / 上游 371,差值 ≈ 我们新增的 37 行 ⇒ 自洽 ✓)⇒ **无需 rebase** ✓
+* CI ✓:3 success / 2 skipped / **1 failure = `pre-run-check`**(仓库限流策略 ✓,只有维护者能清 ✓)
+* **人工发言:无** ✓(仅 2 条机器人评论 + `claude[bot]` 因"fork PR"拒审 ✓)⇒ 正常(上游 PR 常以天/周计 ✓)
+* ⚠️ **方法论教训** ✓:**不要用 `git merge-tree` 在 partial clone 上判冲突** ✗ —— 它会拉大量缺失对象 ⇒
+  **400s 超时被杀** ✗ ⇒ 应改用 **GitHub API 的 `mergeable`**(零成本且权威 ✓)
+* **我方动作:无** ✓ —— 不主动 ping ✓(任何评论为他人项目写操作,须用户逐条批准 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
