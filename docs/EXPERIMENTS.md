@@ -7763,6 +7763,92 @@ GLM config 虽写 `qk_rope_head_dim=0` ✓,但运行时走**通用 `MultiHeadLat
   (上游同日又前进,`origin/main` 现为 **`f4917dadc8`**)⇒ 要不要 rebase 由用户决定:
   需重打 17 个 patch、且 `.so` 是 `35d6fb3187` 编译的,前进后**可能需重编** ✓
 
+### B267 🎯 GLM-5.3 fp8 KV **长提示退化 + ~32K 崩溃的根因定位**:预填 gather 传错了 stride(一行修复 + fail-closed 断言)
+
+**用户指示**(2026-09-29):在**不触碰生产环境**的前提下继续推进;GPU 调试只用 GPU2/TP=1;
+重大改动先 commit 并记录。本轮先做 **CPU 侧根因**(零 GPU)。
+
+**症状回顾** ✓:长提示(~8K 起)退化成 `locklock…` 且**贪心不确定**;~32K 起
+`CUDA error: an illegal memory access` **打死 EngineCore**;解码与短提示正常。
+
+**根因(静态定位 + 实测数值交叉验证)** ✓:
+`vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py` 的 `_gather_fp8_prefill_chunk`
+把 `entry_stride` 传成了 **`kv_c_and_k_pe_cache.stride(0)`(每页字节)**,
+而 `_gather_dequant_fp8ds_nope_kernel` 的算式要求它是**每行字节**:
+
+```
+row_ptr = src_ptr + block_idx * cache_block_size * entry_stride   # 页基址
+                 + pos_in_block * entry_stride                    # 行内偏移
+```
+
+**证据链** ✓(全部只读):
+1. 历史探针实测 **616 条**:`cache_bs=64 entry=656` ⇒ `shape[1]=64`、`stride(1)=656`
+   ⇒ `stride(0)=64*656=**41984**(比 656 大 **64×**)`;
+2. **同一文件**里**解码**路径(`_fp8_flash_mla_kernel`)传的是 `cache.stride(1)` = **656** ✓
+   ⇒ 同一函数两个调用方互不一致(**解码对、预填错**),与"解码正常"完全吻合;
+3. 上游 CUDA 版 `cp_gather_and_upconvert_fp8_kv_cache` 的文档约定
+   `src_cache: [num_blocks, block_size, **656**]` ⇒ 行跨步就是 656;
+4. 误导来源 `gather_dequant_fp8ds_nope` 的 docstring 把它写成
+   `block_stride: bytes per cache page (src_cache.stride(0))` —— **参数名与含义都不符**
+   (还写着 528 行宽,实际 656)。
+
+**为什么一个 bug 解释全部现象** ✓:`block_idx` 小时落点仍在缓存分配内 ⇒ 读到**错误 KV 行**
+⇒ 注意力吃垃圾 ⇒ `locklock`(且随内存布局变化 ⇒ 不确定);`block_idx` 大时地址**越出分配**
+⇒ illegal memory access ⇒ 引擎死。**与显存无关**(实测 21 GiB 余量、prefill slack +8.25 GiB 照样坏)✓
+⇒ 同时**撤回交接文档 §3 的归因**("~36K 崩溃是 GPU 预填/staging 的毛病,与本 fp8 实现正交")✗。
+
+**交付物** ✓:`dev-docs/patches/glm-fp8-prefill-entry-stride.patch`
+(= `stride(0)→stride(1)` 一行 + `assert entry_stride == src_cache.stride(1)` fail-closed 断言
++ docstring 修正);对当前生产树 `git apply --check` **干净通过**、`--numstat` = `1/1` + `8/2`;
+**未应用**(应用=改在服务的树 ⇒ 按纪律先问用户)✓。
+说明文档:`dev-docs/GLM_FP8_PREFILL_STRIDE_BUG.md` ✓。
+
+**上机验证待办** ⚠️:GLM 目标口径是 2×A100/TP=2 ⇒ 需 GPU0/1(暂停生产)⇒ **须用户许可**;
+判据沿用交接文档 §6:`locklock退化=False` + 取到代号 + ~32K 不再崩 + 短提示不回归 ✓。
+
+### B268 Qwen3.8-Flash-Next:**官方 FP8 已在本地**,单卡(TP=1)可行性实测通过架构与显存;阻塞是一个 SM80 `fp8e4nv` 内核(已在插件侧修好)
+
+**发现** ✓(本轮,只读盘点):`~/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8`
+**早已完整下载**(131 分片 / **172.76 GiB** / snapshot `236dfdf2…`,Sep 9)—— 而
+`QWEN38_FN_HANDOFF.md` §7 写的是"没有下载任何大 checkpoint"(那句是针对第三方变体的)✓。
+
+**为什么这条路线更便宜** ✓:它是 `quant_method: **fp8**`(vLLM 原生 `Fp8Config`),
+而本插件 **按 `FusedMoEMethodBase` 泛化打 shim** ⇒ `Fp8MoEMethod` 自动走 CPU 专家,
+CPU 引擎是 **`MOE_FP8`(GLM 已在跑)** ⇒ **不需要** tcclaviger 的 117 GiB 下载、
+**不需要** config 字段修正、**不需要**写 2 处新 MoE shim ✓。
+
+**权重分布**(按 safetensors **张量头部**精确统计,只读)✓:路由专家 **114.86 GiB**(留 CPU)、
+**PLE/ngram 表 47.75 GiB**(单卡放不下的那一块)、attention 5.13、embed/lm_head 2.37、
+其余 ~2.7 ⇒ 合计 172.76 GiB。`ple_offload.py` 首行注释正是"该模型 PLE 表约 51.2 GB,
+单张 A100-40GB 装不下"⇒ 它的 `XIAOTU_PLE_CPU=1` UVA offload **就是为 TP=1 单卡写的** ✓。
+
+**零 GPU 配置门** ✓(`dev-docs/patches/probe_official_fp8_gate.py`):
+`ModelConfig` 自动识别 `quantization='fp8'`、`get_quant_config → Fp8Config`、
+`Qwen4ExpConfig` / `Qwen4ExpForConditionalGeneration` / PLE 各类在位 ✓。
+
+**单卡实测(GPU2 / TP=1 / MAXLEN=8192 / dummy)** ✓:模型**构造成功**、KV 池算完、
+`MOE_FP8 engine: E=512 H=2560 I=640 topk=10` 已选中、**GPU2 仅 14.7 GiB**
+⇒ **TP=1 内存可行** ✓;GPU0/1 全程未动 ✓。
+
+**阻塞 + 修复** ✓:JIT 时报
+`ValueError("type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15','fp8e5')")`,
+位置在 **upstream** 的 `qwen4_exp/common/ngram_embedding.py:356`
+`_lookup_ple_embedding_from_pinned_kernel`(由 `Qwen4ExpPLEPinnedHostEmbedding._lookup` 调用)。
+该内核**只搬值、不做算术**,而 **e4m3 与 uint8 同为 1 字节** ⇒ **uint8 视图逐位等价**
+(与 patch 0003/0009 对 DSv4.1/GLM5.3 的同型修法同源)✓。
+`_lookup` 按**模块全局名**调用内核 ⇒ **只改它 `__globals__` 里的名字**即可,
+**无需改 vLLM 树里任何文件**(落点=我们自己的插件)✓:
+`vllm_xiaotu_moe/ple_offload.py` 新增 `_PinnedKernelU8` + `_install_pinned_kernel_u8` + 在 `install()` 调用 ✓。
+零 GPU 单测通过:`[vllm-xtu-moe/ple] … _lookup_ple_embedding_from_pinned_kernel[uint8 view; SM8x has no Triton fp8e4nv]`,
+内核类型已变 `_PinnedKernelU8`、命名空间确认为 `qwen4_exp.common.ngram_embedding`、**幂等** ✓。
+另备**上游形态**等价补丁 `dev-docs/patches/qwen38-ple-lookup-sm80-fp8.patch`
+(`git apply --check` 干净、**未应用**)✓。
+
+**对交接 T1–T12 的影响** ✓:**T1 建议改道**(官方已在本地);走官方路线则 **T2/T3/T4 均不需要**;
+T6/T7/T8 仍适用;T10 仍只属 lovedheart 路线 ✓。文档:`dev-docs/QWEN38_OFFICIAL_FP8_ROUTE.md` ✓。
+新增脚本 `scripts/serve_qwen38.sh`:**默认就是 GPU2 / TP=1 / 8140 / MAXLEN=8192 / PLE_CPU=1**,
+env 桥写**仓库内**、**不碰**生产 `/tmp/xiaotu_env` ✓。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

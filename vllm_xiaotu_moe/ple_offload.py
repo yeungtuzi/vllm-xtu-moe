@@ -72,6 +72,9 @@ def _import_ple_classes():
     `qwen4_exp/nvidia/ngram_embedding.py` (commit dabc4362b), where upstream also
     grew its own host-offload path (`Qwen4ExpPLEPinnedHostEmbedding`, selected by
     `engram_config.cpu_offload`). Try the new module first, then the old one.
+
+    Returns ``(method, ngram, module)``; ``module`` is the module that *defines*
+    the pinned-host lookup kernel (needed by `_install_pinned_kernel_u8`).
     """
     for module in (
         "vllm.models.qwen4_exp.nvidia.ngram_embedding",
@@ -84,15 +87,67 @@ def _import_ple_classes():
         method = getattr(mod, "Qwen4ExpPLEFp8EmbeddingMethod", None)
         ngram = getattr(mod, "Qwen4ExpNGramEmbedding", None)
         if method is not None:
-            return method, ngram
-    return None, None
+            return method, ngram, mod
+    return None, None, None
+
+
+class _PinnedKernelU8:
+    """把 `_lookup_ple_embedding_from_pinned_kernel` 包成"1 字节 dtype 走 uint8"。
+
+    Ampere/Ada(SM8x)**没有 Triton 的 `fp8e4nv` 类型**,而 FP8 PLE 表是
+    `torch.float8_e4m3fn` ⇒ Triton 由张量推断指针元素类型时会直接编译失败:
+
+        triton.compiler.errors.CompilationError: at 1:0:
+        ValueError("type fp8e4nv not supported in this architecture.
+                    The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')")
+
+    该内核**只搬值、不对元素做任何算术**,而 e4m3 与 uint8 都是 1 字节
+    ⇒ 用 uint8 视图传入**逐位等价**(与 patches 0003/0009 对 DSv4.1/GLM5.3 的
+    同型修法一致:在 SM8x 上彻底不用 Triton 的 fp8 类型)。
+    宽于 1 字节的 dtype(如 bf16)原样传递,元素大小不变 ⇒ 指针步长语义不变。
+
+    `_lookup` 是按**模块全局名**调用内核的,所以替换模块全局即可生效 ——
+    **无需改动 vLLM 树里任何文件**。
+    """
+
+    def __init__(self, kernel):
+        self._kernel = kernel
+
+    def __getitem__(self, grid):
+        def launch(weight_ptr, ids_ptr, output_ptr, *args, **kwargs):
+            if isinstance(weight_ptr, torch.Tensor) and weight_ptr.element_size() == 1:
+                weight_ptr = weight_ptr.view(torch.uint8)
+            if isinstance(output_ptr, torch.Tensor) and output_ptr.element_size() == 1:
+                output_ptr = output_ptr.view(torch.uint8)
+            return self._kernel[grid](weight_ptr, ids_ptr, output_ptr, *args, **kwargs)
+
+        return launch
+
+
+def _install_pinned_kernel_u8(pinned_cls) -> str | None:
+    """就地替换 `_lookup` 真正读取的那个命名空间里的查表内核(见 `_PinnedKernelU8`)。
+
+    `_lookup` 定义在 `qwen4_exp/common/ngram_embedding.py`,它按**该模块自己的全局名**
+    调用内核 ⇒ 必须改它 `__globals__` 里的那个名字;改 `nvidia/*` 那层的同名名字无效
+    (那层只是 re-export,并没有定义该内核)。
+    """
+    name = "_lookup_ple_embedding_from_pinned_kernel"
+    lookup = getattr(pinned_cls, "_lookup", None)
+    ns = getattr(lookup, "__globals__", None)
+    if not isinstance(ns, dict):
+        return None
+    kernel = ns.get(name)
+    if kernel is None or isinstance(kernel, _PinnedKernelU8):
+        return None
+    ns[name] = _PinnedKernelU8(kernel)
+    return f"{pinned_cls.__name__}.{name}"
 
 
 def install() -> list[str]:
     """包装 PLE 嵌入的量化方法;返回已安装的钩子名(便于日志/自检)。"""
     if not ple_cpu_enabled():
         return []
-    method_cls, ngram_cls = _import_ple_classes()
+    method_cls, ngram_cls, mod = _import_ple_classes()
     if method_cls is None:
         # Fail LOUD. Silently returning [] here means a single 40 GB card OOMs
         # ~48 GiB later during create_weights, far from the real cause.
@@ -106,6 +161,15 @@ def install() -> list[str]:
         return []
 
     applied: list[str] = []
+    # SM8x 上必须先处理 pinned-host 查表内核:否则 JIT 阶段就 CompilationError
+    # (fp8e4nv),整个引擎起不来 —— 与 create_weights/load_weights 无关。
+    pinned_cls = (
+        getattr(mod, "Qwen4ExpPLEPinnedHostEmbedding", None) if mod is not None else None
+    )
+    if pinned_cls is not None:
+        hooked = _install_pinned_kernel_u8(pinned_cls)
+        if hooked:
+            applied.append(f"{hooked}[uint8 view; SM8x has no Triton fp8e4nv]")
     for cls in (method_cls,):
         cw = cls.__dict__.get("create_weights")
         if cw is not None and not getattr(cw, "_xtu_ple", False):
