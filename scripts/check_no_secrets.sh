@@ -48,8 +48,11 @@ for entry in "${PATTERNS[@]}"; do
   if [ "$MODE" = "--all" ]; then
     hits=$(git grep -nI -E "$re" -- $FILES 2>/dev/null | cut -d: -f1,2)
   else
+    # ⚠️ 交给 awk 前必须把反斜杠再转义一次 ✓:awk 的字符串里 `\.` 会退化成 `.`(任意字符)✗
+    #    ⇒ 会造成假阳性(实测:散文里的 "(:1071-1074)" 被当成内网 IP 拦下 ✗)
+    re_awk="${re//\\/\\\\}"
     hits=$(git diff ${MODE/--staged/--cached} -U0 -- $FILES 2>/dev/null \
-           | awk -v re="$re" 'BEGIN{n=0} /^\+\+\+ b\//{f=substr($0,7)} /^@@/{split($3,a,","); ln=substr(a[1],2)-1} /^\+/ && !/^\+\+\+/{ln++; if (match(substr($0,2), re)) print f":"ln}' 2>/dev/null)
+           | awk -v re="$re_awk" 'BEGIN{n=0} /^\+\+\+ b\//{f=substr($0,7)} /^@@/{split($3,a,","); ln=substr(a[1],2)-1} /^\+/ && !/^\+\+\+/{ln++; if (match(substr($0,2), re)) print f":"ln}' 2>/dev/null)
   fi
   if [ -n "$hits" ]; then
     allowed=0; kept=""

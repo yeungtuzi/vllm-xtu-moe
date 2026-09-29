@@ -7460,6 +7460,37 @@ prefill = 逐 chunk gather 进继承 workspace + 继承的重映射 → 现有 b
 ③"csrc mtime 比 .so 新 ⇒ 过期"是**错判据** ✗(checkout 会重写 mtime ✓)⇒ 已纠正 ✓
 ④备份源用仓库目录 ✗ ⇒ 若上次失败过会"备份到新的" ✗ ⇒ 改 **`git archive HEAD`** ✓
 
+### B257 🎯 GLM-5.3-Flash + fp8 KV 在 SM80 上**首次跑通** ✓ 并发现**新上游拒绝 bf16 KV** ✗
+
+**里程碑** ✓:树更新到新上游 `35d6fb3187` + 新系列 + GLM patch 后,
+`KV_DTYPE=fp8_ds_mla MAXLEN=262144 MBT=4096 SEQS=2 TP=2 GPU_UTIL=0.90` **启动成功** ✓:
+* `[v41] READY` ✓;预热 `input=8192`(35s ✓)与 `input=32768`(90s ✓)**全部成功** ✓ ⇒
+  ⇒ **prefill 与 decode 两条新路径都真跑过了** ✓(预热走 prefill ⇒ 正好验证 `_gather_fp8_prefill_chunk` ✓)
+* `Worker_TP0 attention.py:158] Using DeepSeek's fp8_ds_mla KV cache format.` ✓ ⇒ 走的正是我们的实现 ✓
+* **实测** ✓:`GPU KV cache size: **521,830** tokens`,`Maximum concurrency for 262,144 tokens per request: **1.99x**` ✓
+* GPU 占用 23,761 MiB × 2(util 0.90 ✓),端口 8070 监听 ✓
+
+**🎯 关键发现:新上游【拒绝】bf16 KV** ✗ ——
+`ValueError: DeepseekV4 packed KV layouts only support fp8 kv-cache, got bfloat16. Please set --kv-cache-dtype fp8...`
+(bf16 基线因此启动失败 ✓,与我们的改动无关 ✓)
+⇒ ⇒ **fp8 KV 对本模型已从"优化"变成"唯一可行路径"** ✓✓;也说明本目标的价值比原判更高 ✓
+
+**⚠️ 更正一条我自己的判断** ✓:我曾据"256K 时 bf16 记录 988,081 vs 现 fp8 521,830"怀疑 fp8 更差 ✗ ——
+**该对比不成立** ✗:历史日志显示同一台机器的 KV 池在 **291,535 ~ 2,795,862** tokens 之间浮动 ✓
+⇒ 池大小由 **maxlen/MBT/SEQS/UTIL/常驻层** 等旋钮决定 ✓,不是被行宽限制 ✓
+⇒ 要上 1M,该做的是**调旋钮**,而 fp8 的 **528 B 行宽**提供的是余量 ✓
+
+**修掉的两个真 bug** ✗(均由我 rebase 解 `model.py` 冲突时把上游代码块**贴错函数**造成 ✓):
+1. `UnboundLocalError: previous_aux` —— 我插的 aux 块位于赋值之前 ✓(正确那份本就在内层逐层函数里 ✓)⇒ 删除 ✓
+2. `UnboundLocalError: layer` —— 我把上游尾部(`if layer is not None:`)贴进了外层 forward ✓,
+   而该逻辑本就在我们的 `_collapse()` 里(`:1071-1074` ✓)⇒ 删除 ✓
+⇒ ⇒ **新增针对性静态检查** ✓:遍历函数体,确保**外层不引用内层局部名**(`layer`/`previous_aux`/`idx` ✓)⇒ 通过 ✓
+⇒ ⚠️ **教训** ✓:我此前的 rebase 验证只覆盖"逐字节一致 + 语法 + 可干净应用" ✗ ——
+**这类语义错误只有运行时才暴露** ✗;静态检查只能补一部分 ✓,**必须真跑** ✓
+
+**待办** ✓:①数值验收改用**离线脚本**(`glm_fp8_kv_acceptance.py --device cuda` ✓ —— 两个服务的 A/B 已不可行 ✗)
+②上下文阶梯 + 调旋钮冲 1M ✓ ③把上述两处修复**回灌进系列**(patch 0016 ✓)并重新生成 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
