@@ -1,7 +1,7 @@
 From ad30bffb87f45639aea9ee3432fb21569b083ef4 Mon Sep 17 00:00:00 2001
 From: xtu-v41 <xtu@local>
 Date: Mon, 14 Sep 2026 23:18:33 +0000
-Subject: [PATCH 04/16] feat(DSv4.1/SM80): portable Triton sparse-MLA prefill
+Subject: [PATCH 04/17] feat(DSv4.1/SM80): portable Triton sparse-MLA prefill
  so V4.1 attention runs on A100
 
 DeepSeek-V4.1 ships only FlashMLA (SM90+) and FlashInfer (SM100/SM120) attention.

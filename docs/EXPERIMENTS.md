@@ -7688,6 +7688,32 @@ GLM config 虽写 `qk_rope_head_dim=0` ✓,但运行时走**通用 `MultiHeadLat
 ③表的 576 宽与 RoPE 尾部(NoPE 时为零 ✓)✓ ④`dst_rows` 与上游 workspace 偏移的一致性 ✓
 ⇒ 现有布局事实(656 B 行内交错 + 4×fp32 缩放 ✓,B259 ✓)仍然有效 ✓,可直接用于核查 ✓
 
+### B265 交付物收口:树清掉探针 ✓ → 回灌系列为第 17 个 commit ✓ → 17/17 在纯净快照上干净应用 ✓
+
+**做了什么** ✓(按 `GLM_FP8_KV_SM8X_HANDOFF.md` §5 点名的欠账,边界清晰、不做新实验 ✓):
+1. **清掉树里 7 处调试探针** ✓(`flashmla_sparse.py` 3 处 + `flashmla_sparse_sm8x.py` 4 处 ✓),
+   并移除随之不再使用的 `import os` ✓ ⇒ 全树 `XIAOTU_FP8_DEBUG` 残留 **0** ✓
+2. 把树里 4 个文件(`glm5next/common/attention.py` 绑定门 ✓、`flashmla_sparse.py` 基类重构 ✓、
+   `flashmla_sparse_sm8x.py` 与 `sparse_mla_kernels.py` 的 GLM fp8 实现 ✓)作为
+   **第 17 个 commit**(`dd0d44d` ✓)落到 `/tmp/rb2` ✓
+3. `format-patch` 重新生成 ⇒ **17 个 patch** ✓ ⇒ 打到**纯净上游快照**(`/tmp/upstream_snap` ✓)
+   ⇒ **17/17 干净应用** ✓✓、快照内无探针 ✓、关键符号在位 ✓
+4. 装进唯一真源 `patches/xtu-series/` ✓ ⇒ **17 个 patch 与生成源逐一哈希一致** ✓✓;
+   同时删掉一个误建的**嵌套 `patches/xtu-series/xtu-series/` 目录** ✗(保留 `README.md` 与 `series` ✓)
+
+**⚠️ 本轮的一次自伤与修复(如实记录 ✓)**:我第一版"删探针"脚本用**括号配平**判断探针块边界 ✗
+⇒ 把 `flashmla_sparse.py` 删出了 `IndentationError: unindent does not match any outer indentation level` ✗✗
+⇒ ⇒ 修复 ✓:`git checkout -- <file>` 回到上游版本 ✓ ⇒ 再从 `dev-docs/glm_fp8_kv.patch` **单独取该文件的 hunk**
+(`git apply --include=<path>` ✓)重新应用 ✓ ⇒ 基类重构回来了 ✓、探针 0 ✓、语法通过 ✓
+⇒ 第二版改用**缩进判定**(删到缩进不深于 `if` 的那一行为止 ✓)并**先备份** `/tmp/sm8x.bak` ✓ ⇒ 一次成功 ✓
+⇒ ⇒ **教训** ✓:①批量改代码前**先备份** ✓ ②删块别用括号配平(字符串/续行会骗过它 ✗)③**已跟踪文件**可
+`git checkout` 回上游 + 从 patch 只取该文件 hunk 复用 ✓ —— 这条"单文件 hunk 复用"手法值得记住 ✓
+
+**现状(目标仍未完成 ✗)** ✓:1M + 1.30× 并发 ✅ / 短提示连贯可复现 ✅ /
+**长提示 `locklock` 退化未修** ✗ / 端到端取数未过 ✗ / 台账已记到 B265 ✓
+**唯一待办** ✓:抓一条**真实长请求**的 `[fp8-prefill]` 探针(此前抓到的 308 条全是预热哑跑 ✗)⇒
+定 `workspace_starts` 语义 ⇒ 改 `prefill_row_map` ⇒ 复测"长提示连贯 + 取到代号" ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

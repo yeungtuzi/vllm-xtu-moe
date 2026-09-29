@@ -1,7 +1,7 @@
 From f182196b826bfe8b94c0e560e9c8f58e3a6bc65e Mon Sep 17 00:00:00 2001
 From: xtu-glm53 <xtu@local>
 Date: Fri, 18 Sep 2026 17:19:12 +0000
-Subject: [PATCH 08/16] feat(GLM5.3/SM80): bind SM8x sparse-MLA backend for
+Subject: [PATCH 08/17] feat(GLM5.3/SM80): bind SM8x sparse-MLA backend for
  glm5next DSA layers
 
 GLM-5.3-Flash's 11 sparse-MLA (DSA) layers go through the generic

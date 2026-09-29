@@ -1,7 +1,7 @@
 From 9a9b08235e9330bf464dc9b17c44fff6542b1e65 Mon Sep 17 00:00:00 2001
 From: xtu-v41 <xtu@local>
 Date: Tue, 15 Sep 2026 00:41:41 +0000
-Subject: [PATCH 06/16] fix(DSv4.1/SM80): Engram lookup kernel must not use
+Subject: [PATCH 06/17] fix(DSv4.1/SM80): Engram lookup kernel must not use
  Triton fp8e4nv on Ampere
 
 The last blocker for V4.1 on A100: `_engram_lookup_kernel` gathered the fp8

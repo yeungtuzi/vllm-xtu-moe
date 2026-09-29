@@ -1,7 +1,7 @@
 From 9c408d7c6164fa4de644428a1ee5031f3b373a73 Mon Sep 17 00:00:00 2001
 From: xtu <xtu@local>
 Date: Wed, 23 Sep 2026 15:20:57 +0000
-Subject: [PATCH 15/16] feat(DSv4.1): decoder-side SWA bounded replay for
+Subject: [PATCH 15/17] feat(DSv4.1): decoder-side SWA bounded replay for
  DeepSeek-V4.1
 
 Layers past the last KV source layer own only sliding-window KV, so during prefill they need only each

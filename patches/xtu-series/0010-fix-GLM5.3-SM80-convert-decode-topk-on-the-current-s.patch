@@ -1,7 +1,7 @@
 From e967b83940c9adfeed8b84efc759087d366b25b6 Mon Sep 17 00:00:00 2001
 From: xtu-glm53 <xtu@local>
 Date: Fri, 18 Sep 2026 20:00:54 +0000
-Subject: [PATCH 10/16] fix(GLM5.3/SM80): convert decode topk on the current
+Subject: [PATCH 10/17] fix(GLM5.3/SM80): convert decode topk on the current
  stream, not the index-group side stream
 
 Second A100 bring-up failure, at CUDA graph capture in determine_available_memory:

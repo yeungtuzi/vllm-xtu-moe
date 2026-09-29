@@ -1,7 +1,7 @@
 From 23ce97579672b500bd827e3c0541d679e53ee917 Mon Sep 17 00:00:00 2001
 From: xtu-v41 <xtu@local>
 Date: Mon, 14 Sep 2026 23:18:33 +0000
-Subject: [PATCH 03/16] fix(DSv4.1/SM80): remove Triton fp8e4nv dependency from
+Subject: [PATCH 03/17] fix(DSv4.1/SM80): remove Triton fp8e4nv dependency from
  V4.1 cache/indexer ops
 
 Same class of bug already fixed for DeepSeek-V4: Triton has no fp8e4nv on Ampere

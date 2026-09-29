@@ -1,7 +1,7 @@
 From e3657f29c20255390a552e7b77a660ab9391d8d2 Mon Sep 17 00:00:00 2001
 From: xtu-upgrade <xtu@local>
 Date: Mon, 14 Sep 2026 21:44:59 +0000
-Subject: [PATCH 01/16] snapshot: local SM80/mixed-mode patch set on 6c73b08dec
+Subject: [PATCH 01/17] snapshot: local SM80/mixed-mode patch set on 6c73b08dec
  (pre-upgrade safety commit)
 
 (cherry picked from commit 31e3396f73434f26a80a4e538ad1fb46b4307104)

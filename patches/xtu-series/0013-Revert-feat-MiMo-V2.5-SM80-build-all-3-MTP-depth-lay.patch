@@ -1,7 +1,7 @@
 From 0a1532914615df6cd550b1faf9177aa95836d8dd Mon Sep 17 00:00:00 2001
 From: t <t@t>
 Date: Tue, 22 Sep 2026 04:33:48 +0000
-Subject: [PATCH 13/16] Revert "feat(MiMo-V2.5/SM80): build all 3 MTP depth
+Subject: [PATCH 13/17] Revert "feat(MiMo-V2.5/SM80): build all 3 MTP depth
  layers (was hardcoded to 1)"
 
 This reverts commit eddc6d0eb7be7068083995f29ca05f5dbcd9934a.

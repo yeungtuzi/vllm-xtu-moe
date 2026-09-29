@@ -1,7 +1,7 @@
 From a3280d304af99b8671df48e5f4d5d1e40b300e90 Mon Sep 17 00:00:00 2001
 From: xtu <xtu@local>
 Date: Sat, 19 Sep 2026 22:53:27 +0000
-Subject: [PATCH 11/16] feat(MiMo-V2.5/SM80): build all 3 MTP depth layers (was
+Subject: [PATCH 11/17] feat(MiMo-V2.5/SM80): build all 3 MTP depth layers (was
  hardcoded to 1)
 
 MiMo-V2.5's checkpoint ships model.mtp.layers.{0,1,2} (48 tensors in

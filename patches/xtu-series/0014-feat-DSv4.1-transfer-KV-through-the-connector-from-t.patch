@@ -1,7 +1,7 @@
 From bcb9db987e056c2be2e3b34171294a24b22fc361 Mon Sep 17 00:00:00 2001
 From: xtu <xtu@local>
 Date: Wed, 23 Sep 2026 14:23:21 +0000
-Subject: [PATCH 14/16] feat(DSv4.1): transfer KV through the connector from
+Subject: [PATCH 14/17] feat(DSv4.1): transfer KV through the connector from
  the V4.1 attention layer
 
 The V4.1 attention layer never calls save_kv_layer or wait_for_layer_load, and the only generic caller of

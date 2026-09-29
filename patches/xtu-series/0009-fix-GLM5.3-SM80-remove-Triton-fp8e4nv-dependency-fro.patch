@@ -1,7 +1,7 @@
 From 6049f4d5fb10c88d3e905c71ff0f3920cb43dc0e Mon Sep 17 00:00:00 2001
 From: xtu-glm53 <xtu@local>
 Date: Fri, 18 Sep 2026 19:34:25 +0000
-Subject: [PATCH 09/16] fix(GLM5.3/SM80): remove Triton fp8e4nv dependency from
+Subject: [PATCH 09/17] fix(GLM5.3/SM80): remove Triton fp8e4nv dependency from
  the kpool FP8 quantizers
 
 First A100 bring-up of GLM-5.3-Flash died in determine_available_memory with:

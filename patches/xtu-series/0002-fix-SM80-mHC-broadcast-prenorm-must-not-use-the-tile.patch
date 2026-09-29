@@ -1,7 +1,7 @@
 From baf19d0579593d48e2d2af9af841ae0ad1019621 Mon Sep 17 00:00:00 2001
 From: xtu-upgrade <xtu@local>
 Date: Mon, 14 Sep 2026 22:06:27 +0000
-Subject: [PATCH 02/16] fix(SM80): mHC broadcast prenorm must not use the
+Subject: [PATCH 02/17] fix(SM80): mHC broadcast prenorm must not use the
  tilelang fallback
 
 The tilelang fallback in _hc_prenorm_gemm_outputs asserts

@@ -1,7 +1,7 @@
 From 42b57ebdd88fec16008ee67bd209552774d63d2c Mon Sep 17 00:00:00 2001
 From: t <t@t>
 Date: Tue, 22 Sep 2026 00:53:31 +0000
-Subject: [PATCH 12/16] sparse-MLA prefill: 2-D (BLOCK_H) tile, 2.89x on the
+Subject: [PATCH 12/17] sparse-MLA prefill: 2-D (BLOCK_H) tile, 2.89x on the
  kernel
 
 Applies patches/upstream/pr4-sm8x-sparse-mla-2d-tile.patch from the vllm-xtu-moe plugin

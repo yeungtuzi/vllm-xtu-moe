@@ -1,7 +1,7 @@
 From 2509fd9d1bd4071176ee94cf64d0d3f2604cb581 Mon Sep 17 00:00:00 2001
 From: xtu <xtu@local>
 Date: Wed, 23 Sep 2026 15:22:20 +0000
-Subject: [PATCH 16/16] feat(DSv4.1): integrate decoder-side SWA bounded replay
+Subject: [PATCH 16/17] feat(DSv4.1): integrate decoder-side SWA bounded replay
  into the model
 
 The layer loop becomes _run_layers plus _collapse, and the forward runs only up to decoder_replay_start,

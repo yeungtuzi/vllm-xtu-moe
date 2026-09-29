@@ -1,7 +1,7 @@
 From d277789bd4cca7a5749a833ad8361fc6fe40256a Mon Sep 17 00:00:00 2001
 From: xtu-glm53 <xtu@local>
 Date: Fri, 18 Sep 2026 17:17:15 +0000
-Subject: [PATCH 07/16] feat(GLM5.3/SM80): portable Triton sparse-MLA
+Subject: [PATCH 07/17] feat(GLM5.3/SM80): portable Triton sparse-MLA
  forward-with-sink kernel
 
 Adds `sparse_mla_fwd_with_sink` + `_sparse_mla_fwd_with_sink_kernel`: the

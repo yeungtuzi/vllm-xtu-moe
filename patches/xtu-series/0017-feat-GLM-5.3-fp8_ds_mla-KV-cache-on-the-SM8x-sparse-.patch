@@ -1,0 +1,441 @@
+From dd0d44d37519802981c781d09a0989138105b035 Mon Sep 17 00:00:00 2001
+From: xtu <xtu@local>
+Date: Tue, 29 Sep 2026 11:24:25 +0000
+Subject: [PATCH 17/17] feat(GLM-5.3): fp8_ds_mla KV cache on the SM8x sparse
+ MLA path
+
+Bind the SM8x Triton sparse-MLA backend when the cache is fp8_ds_mla, and replace
+the FlashMLA-only fp8 kernels with portable Triton ones:
+
+* the ds_mla row is 656 bytes and row interleaved -- 512 bytes of e4m3 NoPE data,
+  four fp32 tile scales (block 128) and a 64 element bf16 RoPE tail -- so the
+  gather reads fp32 scales and copies the tail verbatim;
+* decode gathers the rows a call references into a bounded bf16 table and reuses
+  the bf16 body, flattening the leading axes instead of assuming a single batch;
+* prefill reuses the inherited chunked workspace and only swaps the gather, with
+  the block index clamped so a malformed map fails closed.
+---
+ vllm/models/glm5next/common/attention.py      |   8 +-
+ .../attention/backends/mla/flashmla_sparse.py |  51 ++++--
+ .../backends/mla/flashmla_sparse_sm8x.py      | 106 +++++++++++-
+ .../backends/mla/sparse_mla_kernels.py        | 152 ++++++++++++++++++
+ 4 files changed, 298 insertions(+), 19 deletions(-)
+
+diff --git a/vllm/models/glm5next/common/attention.py b/vllm/models/glm5next/common/attention.py
+index 6b4178f..307bf7e 100644
+--- a/vllm/models/glm5next/common/attention.py
++++ b/vllm/models/glm5next/common/attention.py
+@@ -546,7 +546,13 @@ class Glm5NextMLAAttention(nn.Module):
+             # fails closed with the standard "no valid backend" error instead of
+             # building this bf16 impl against a packed cache.
+             kv_dtype = getattr(cache_config, "cache_dtype", "auto")
+-            sm8x_kv_ok = kv_dtype is None or not is_quantized_kv_cache(kv_dtype)
++            # fp8_ds_mla is quantized but the SM8x backend implements the NoPE-512
++            # 528 B row layout, so it must stay a candidate for it.
++            sm8x_kv_ok = (
++                kv_dtype is None
++                or not is_quantized_kv_cache(kv_dtype)
++                or kv_dtype == "fp8_ds_mla"
++            )
+             if sm8x_sparse_mla_enabled() and sm8x_kv_ok:
+                 # No sm8x sparse-MLA entry exists in the platform candidate pool
+                 # (all generic sparse-MLA backends are SM90+; the dsv4 enum is a
+diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+index 014358f..2cb8515 100644
+--- a/vllm/v1/attention/backends/mla/flashmla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+@@ -1085,20 +1085,12 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
+                     assert prefill_ready is not None
+                     current_stream().wait_event(prefill_ready)
+                 elif self.kv_cache_dtype == "fp8_ds_mla":
+-                    ops.cp_gather_and_upconvert_fp8_kv_cache(
+-                        kv_c_and_k_pe_cache,
+-                        chunk_workspace,
+-                        chunk.block_table,
+-                        chunk.workspace_starts,
+-                        len(chunk.block_table),
++                    self._gather_fp8_prefill_chunk(
++                        kv_c_and_k_pe_cache, chunk_workspace, chunk
+                     )
+                 else:
+-                    ops.cp_gather_and_upconvert_nvfp4_kv_cache(
+-                        kv_c_and_k_pe_cache.view(torch.uint8),
+-                        chunk_workspace,
+-                        chunk.block_table,
+-                        chunk.workspace_starts,
+-                        len(chunk.block_table),
++                    self._gather_nvfp4_prefill_chunk(
++                        kv_c_and_k_pe_cache, chunk_workspace, chunk
+                     )
+ 
+                 chunk_q = q[chunk.tokens_slice]
+@@ -1132,6 +1124,41 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
+             lse = q.new_empty((0, q.shape[1]), dtype=torch.float32)
+         return attn_out, lse
+ 
++    def _gather_fp8_prefill_chunk(
++        self,
++        kv_c_and_k_pe_cache: torch.Tensor,
++        chunk_workspace: torch.Tensor,
++        chunk: "FlashMLASparseMetadata.FP8SeparatePrefillDecode.Prefill.Chunk",
++    ) -> None:
++        """Copy this chunk's fp8 rows into the bf16 prefill workspace.
++
++        The default assumes the upstream DS-MLA row layout; a backend whose
++        rows differ in width or scale placement overrides this rather than
++        duplicating the whole prefill forward.
++        """
++        ops.cp_gather_and_upconvert_fp8_kv_cache(
++            kv_c_and_k_pe_cache,
++            chunk_workspace,
++            chunk.block_table,
++            chunk.workspace_starts,
++            len(chunk.block_table),
++        )
++
++    def _gather_nvfp4_prefill_chunk(
++        self,
++        kv_c_and_k_pe_cache: torch.Tensor,
++        chunk_workspace: torch.Tensor,
++        chunk: "FlashMLASparseMetadata.FP8SeparatePrefillDecode.Prefill.Chunk",
++    ) -> None:
++        """NVFP4 counterpart of ``_gather_fp8_prefill_chunk``."""
++        ops.cp_gather_and_upconvert_nvfp4_kv_cache(
++            kv_c_and_k_pe_cache.view(torch.uint8),
++            chunk_workspace,
++            chunk.block_table,
++            chunk.workspace_starts,
++            len(chunk.block_table),
++        )
++
+     def _forward_fp8_kv_mixed_batch(
+         self,
+         q: torch.Tensor,
+diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py b/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
+index f8549e6..7be8d3f 100644
+--- a/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
+@@ -21,6 +21,7 @@ Ported from the LvLLM SM8x work; the kernel itself now lives next to its
+ siblings in ``vllm/v1/attention/backends/mla/sparse_mla_kernels.py``.
+ """
+ 
++
+ from typing import TYPE_CHECKING, Any, ClassVar
+ 
+ import torch
+@@ -36,6 +37,8 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
+     FlashMLASparseMetadataBuilder,
+ )
+ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
++    gather_dequant_fp8ds_nope,
++    prefill_row_map,
+     sparse_mla_fwd_with_sink,
+ )
+ from vllm.v1.attention.backends.mla.sparse_utils import (
+@@ -94,11 +97,91 @@ class FlashMLASparseSM8XImpl(FlashMLASparseImpl):
+         num_actual_toks = q.shape[0]
+         assert self.topk_indices_buffer is not None
+         topk_indices = self.topk_indices_buffer[:num_actual_toks]
++        if self.kv_cache_dtype == "fp8_ds_mla":
++            # The packed NoPE rows need dequantizing before attention, so use
++            # the inherited fp8 orchestration and supply the two SM8x pieces
++            # below (_fp8_flash_mla_kernel for decode, _gather_fp8_prefill_chunk
++            # for prefill).
++            out, _ = self._forward_fp8_kv_separate_prefill_decode(
++                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
++            )
++            return out, None
+         attn_out, _ = self._forward_bf16_kv(
+             q, kv_c_and_k_pe_cache, topk_indices, attn_metadata, q.shape[1]
+         )
+         return attn_out, None
+ 
++    def _fp8_flash_mla_kernel(
++        self,
++        q: torch.Tensor,
++        kv_c_and_k_pe_cache: torch.Tensor,
++        topk_indices: torch.Tensor,
++        kernel_metadata: Any,
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        """Decode over packed NoPE-512 fp8 rows on SM8x.
++
++        Upstream reaches FlashMLA here, which is SM90+. Dequantize the rows this
++        call references into a bounded bf16 table and reuse the bf16 body; the
++        bound keeps a whole context from being materialized.
++        """
++        # q arrives as (batch, seq, heads, dim) from the base reshape; flatten the
++        # leading axes instead of assuming a single batch, then restore them.
++        lead = q.shape[:-2]
++        heads, dim = q.shape[-2], q.shape[-1]
++        q2 = q.reshape(-1, heads, dim)
++        idx = topk_indices.reshape(q2.shape[0], -1)
++
++        cache = kv_c_and_k_pe_cache
++        assert cache.dim() == 3, f"expected [blocks, bs, 528], got {cache.shape}"
++        num_rows = idx.numel()
++        # ds_mla row = 512 B fp8 + 16 B scales + 128 B bf16 RoPE; the kernel
++        # gathers 576 bf16 columns and the v-part output is the first 512.
++        head_dim = 512 + 64
++        # Zero-filled on purpose: rows whose slot id is negative are masked by
++        # the kernel, but uninitialised memory there could still be NaN and
++        # NaN * 0 poisons the softmax.
++        table = torch.zeros(
++            (num_rows, head_dim), dtype=torch.bfloat16, device=cache.device
++        )
++        dst_rows = torch.arange(
++            num_rows, dtype=idx.dtype, device=cache.device
++        ).reshape(idx.shape)
++        dst_rows = torch.where(idx >= 0, dst_rows, -1)
++        gather_dequant_fp8ds_nope(
++            cache,
++            idx.reshape(-1),
++            table,
++            dst_rows.reshape(-1),
++            cache.shape[1],
++            cache.stride(1),
++        )
++        out, _ = self._bf16_flash_mla_kernel(q2, table, dst_rows)
++        out = out[..., :512]
++        return out.reshape(*lead, out.shape[-2], out.shape[-1]), None
++
++    def _gather_fp8_prefill_chunk(self, kv_c_and_k_pe_cache, chunk_workspace, chunk) -> None:
++        """NoPE-512 fp8 rows -> bf16 prefill workspace (GLM-5.3-Flash).
++
++        The upstream op assumes the DS-MLA row layout; GLM has no RoPE tail, so
++        its 528 B row needs a NoPE gather. ``prefill_row_map`` reproduces the
++        upstream row mapping, including its chunk-local workspace offsets.
++        """
++        rows = int(chunk.chunk_tot_seqlen)
++        src_rows, dst_rows = prefill_row_map(
++            chunk.block_table,
++            chunk.workspace_starts,
++            kv_c_and_k_pe_cache.shape[1],
++            rows,
++        )
++        gather_dequant_fp8ds_nope(
++            kv_c_and_k_pe_cache,
++            src_rows,
++            chunk_workspace[:rows],
++            dst_rows,
++            kv_c_and_k_pe_cache.shape[1],
++            kv_c_and_k_pe_cache.stride(0),
++        )
++
+     def _convert_logical_to_physical_topk(
+         self,
+         logical_topk_indices: torch.Tensor,
+@@ -130,20 +213,24 @@ class FlashMLASparseSM8XImpl(FlashMLASparseImpl):
+     def _bf16_flash_mla_kernel(
+         self,
+         q: torch.Tensor,
+-        kv_c_and_k_pe_cache: torch.Tensor,
++        kv: torch.Tensor,
+         topk_indices: torch.Tensor,
+         topk_length: torch.Tensor | None = None,
+         actual_num_heads: int | None = None,
+-    ) -> tuple[torch.Tensor, torch.Tensor]:
++        out: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        # ``out`` is the base prefill path's scratch buffer; the result is
++        # returned and copied by the caller, so the buffer is unused here.
+         # ``kv_c_and_k_pe_cache`` arrives as the flat [rows, head_dim] gather view
+         # from ``_forward_bf16_kv``; the physical topk ids are rows into it and
+         # ``topk_length`` is the valid prefix (``-1`` padding is masked by length).
+-        kv = kv_c_and_k_pe_cache.reshape(-1, kv_c_and_k_pe_cache.shape[-1])
++        kv = kv.reshape(-1, kv.shape[-1])
+         if actual_num_heads is None:
+             actual_num_heads = q.shape[1]
+         head_dim = kv.shape[-1]
+         num_tokens = q.shape[0]
+         output = q.new_empty((num_tokens, q.shape[1], head_dim), dtype=q.dtype)
++        _ = out
+         if topk_length is None:
+             topk_length = torch.full(
+                 (num_tokens,),
+@@ -177,7 +264,11 @@ class FlashMLASparseSM8XImpl(FlashMLASparseImpl):
+ 
+ class FlashMLASparseSM8XBackend(FlashMLASparseBackend):
+     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
++    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
++        "auto",
++        "bfloat16",
++        "fp8_ds_mla",
++    ]
+ 
+     @staticmethod
+     def get_name() -> str:
+@@ -215,8 +306,11 @@ class FlashMLASparseSM8XBackend(FlashMLASparseBackend):
+         use_mm_prefix: bool,
+         device_capability: DeviceCapability,
+     ) -> str | None:
+-        if kv_cache_dtype not in (None, "auto", "bfloat16"):
+-            return "FLASHMLA_SPARSE_SM8X supports only a bf16 KV cache"
++        if kv_cache_dtype not in (None, "auto", "bfloat16", "fp8_ds_mla"):
++            return (
++                "FLASHMLA_SPARSE_SM8X supports a bf16 KV cache or the "
++                "NoPE-512 fp8_ds_mla layout"
++            )
+         if not use_sparse:
+             return "FLASHMLA_SPARSE_SM8X is a sparse-MLA backend only"
+         if not sm8x_sparse_mla_enabled():
+diff --git a/vllm/v1/attention/backends/mla/sparse_mla_kernels.py b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
+index f311fc8..15b3b7a 100644
+--- a/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
++++ b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
+@@ -3738,3 +3738,155 @@ def sparse_mla_fwd_with_sink(
+     )
+     if q.shape[1] > active_heads:
+         output[:, active_heads:].zero_()
++
++
++@triton.jit
++def _gather_dequant_fp8ds_nope_kernel(
++    src_ptr,
++    dst_ptr,
++    src_row_ptr,
++    dst_row_ptr,
++    stride_dst_r: tl.constexpr,
++    stride_dst_d: tl.constexpr,
++    cache_block_size: tl.constexpr,
++    entry_stride: tl.constexpr,
++    data_bytes: tl.constexpr,
++    scale_count: tl.constexpr,
++    rope_bytes: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++):
++    """One ``fp8_ds_mla`` cache row -> bf16, one program per row pair.
++
++    The row is 656 bytes and *row interleaved*, exactly as
++    ``concat_and_cache_ds_mla_kernel`` writes it:
++
++        [0, 512)      512 x e4m3 NoPE data
++        [512, 528)    4 x fp32 tile scales, one per 128-element tile
++        [528, 656)    64 x bf16 RoPE tail (zeroed when pe_dim == 0)
++
++    The writer stores the scales as plain fp32 (rounded to powers of two), so
++    dequantisation is one multiply: no ue8m0 decode and no block of 32.
++    """
++    row_idx = tl.program_id(0)
++    slot_id = tl.load(src_row_ptr + row_idx)
++    if slot_id >= 0:
++        block_idx = slot_id // cache_block_size
++        pos_in_block = slot_id % cache_block_size
++        row_ptr = (
++            src_ptr
++            + block_idx.to(tl.int64) * cache_block_size * entry_stride
++            + pos_in_block * entry_stride
++        )
++
++        offs = tl.arange(0, BLOCK_D)
++        mask = offs < data_bytes
++        x = _e4m3_uint8_to_f32(tl.load(row_ptr + offs, mask=mask, other=0))
++        scale_ptr = (row_ptr + data_bytes).to(tl.pointer_type(tl.uint32))
++        raw = tl.load(scale_ptr + offs // (data_bytes // scale_count), mask=mask, other=0)
++        dequant = x * raw.to(tl.float32, bitcast=True)
++
++        dst_row = tl.load(dst_row_ptr + row_idx)
++        tl.store(
++            dst_ptr + dst_row * stride_dst_r + offs * stride_dst_d,
++            dequant.to(tl.bfloat16),
++            mask=mask,
++        )
++        if rope_bytes > 0:
++            r_offs = tl.arange(0, rope_bytes // 2)
++            rope_ptr = (row_ptr + data_bytes + scale_count * 4).to(tl.pointer_type(tl.uint16))
++            rope = tl.load(rope_ptr + r_offs)
++            # The destination table is bf16, so the data part occupies
++            # ``data_bytes`` *elements* (512), not bytes; the RoPE tail follows
++            # at element offset ``data_bytes``.
++            base = (dst_ptr + dst_row * stride_dst_r).to(tl.pointer_type(tl.uint16))
++            tl.store(base + data_bytes + r_offs, rope)
++
++
++FP8_DS_MLA_DATA_BYTES = 512         # 512 x e4m3 NoPE data
++FP8_DS_MLA_SCALE_COUNT = 4          # one fp32 per 128-element tile
++FP8_DS_MLA_SCALE_BYTES = 16         # 4 x fp32
++FP8_DS_MLA_ROPE_BYTES = 128         # 64 x bf16 RoPE tail
++FP8_DS_MLA_ROW_BYTES = FP8_DS_MLA_DATA_BYTES + FP8_DS_MLA_SCALE_BYTES + FP8_DS_MLA_ROPE_BYTES
++
++
++def gather_dequant_fp8ds_nope(
++    src_cache: torch.Tensor,
++    src_rows: torch.Tensor,
++    dst: torch.Tensor,
++    dst_rows: torch.Tensor,
++    cache_block_size: int,
++    entry_stride: int = 656,
++) -> None:
++    """Dequantize the referenced NoPE-512 fp8 rows into ``dst`` (bf16).
++
++    Args:
++        src_cache: uint8 packed cache ``[num_blocks, cache_block_size, 528]``.
++        src_rows: int32 physical slot ids, negative meaning "skip".
++        dst: bf16 destination table.
++        dst_rows: int32 destination row for each source row.
++        cache_block_size: rows per cache page.
++        block_stride: bytes per cache page (``src_cache.stride(0)``).
++    """
++    assert src_cache.dtype == torch.uint8, src_cache.dtype
++    assert src_cache.dim() == 3, src_cache.shape
++    assert dst.dtype == torch.bfloat16, dst.dtype
++    num_rows = src_rows.numel()
++    if num_rows == 0:
++        return
++    # 656 B ds_mla row: 512 B fp8 data + 16 B scales + 128 B bf16 RoPE.
++    _gather_dequant_fp8ds_nope_kernel[(num_rows,)](
++        src_cache,
++        dst,
++        src_rows,
++        dst_rows,
++        dst.stride(0),
++        dst.stride(1),
++        cache_block_size=cache_block_size,
++        entry_stride=entry_stride,
++        data_bytes=FP8_DS_MLA_DATA_BYTES,
++        scale_count=FP8_DS_MLA_SCALE_COUNT,
++        rope_bytes=FP8_DS_MLA_ROPE_BYTES,
++        BLOCK_D=triton.next_power_of_2(FP8_DS_MLA_DATA_BYTES),
++        num_warps=4,
++    )
++
++
++def prefill_row_map(
++    block_table: torch.Tensor,
++    workspace_starts: torch.Tensor,
++    block_size: int,
++    total: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Map workspace rows to source cache slots for the fp8 prefill gather.
++
++    Reproduces the upstream ``map_gather_page_task`` semantics: one request per
++    span of ``workspace_starts``, whole context, no sequence offset (chunks are
++    split on request boundaries). Rows outside every span are marked -1, which
++    the gather kernel skips.
++    """
++    device = block_table.device
++    if total == 0:
++        empty = torch.empty(0, dtype=torch.int32, device=device)
++        return empty, empty
++    assert workspace_starts.dtype == torch.int32 and workspace_starts.is_contiguous()
++    if workspace_starts.numel() > 1 and bool(
++        (workspace_starts[1:] < workspace_starts[:-1]).any()
++    ):
++        raise ValueError(
++            "workspace_starts must be non-decreasing within a chunk; "
++            f"got {workspace_starts.tolist()}"
++        )
++    rows = torch.arange(total, dtype=torch.int32, device=device)
++    req_of_row = (torch.searchsorted(workspace_starts, rows, right=True) - 1).clamp_(
++        0, workspace_starts.numel() - 1
++    )
++    ends = torch.cat(
++        [workspace_starts[1:], torch.tensor([total], dtype=torch.int32, device=device)]
++    )
++    pos_in_req = (rows - workspace_starts[req_of_row]).clamp_min(0)
++    invalid = pos_in_req >= (ends[req_of_row] - workspace_starts[req_of_row]).clamp_min(0)
++    block_idx = (pos_in_req // block_size).clamp_max(block_table.shape[1] - 1)
++    block = block_table[req_of_row, block_idx]
++    src_rows = (block * block_size + (pos_in_req % block_size)).to(torch.int32)
++    invalid = invalid | (block < 0)
++    return torch.where(invalid, torch.full_like(src_rows, -1), src_rows), rows
