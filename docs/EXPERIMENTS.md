@@ -7633,6 +7633,31 @@ GLM config 虽写 `qk_rope_head_dim=0` ✓,但运行时走**通用 `MultiHeadLat
 **预填侧**是上游 dense-MHA 后端 ✓ —— 若那边对 **656 B + fp32 缩放**的假设有问题 ⇒ 属**上游**范畴 ✓
 (需按只读纪律另行判断是否上报 ✓,不擅自发 ✓)。
 
+### B263 决定性证据:SM80 上**没有 dense-MHA 预填** ⇒ 预填也走稀疏 top-k MQA 路径 ✓(与 B262 的推断相反 ✓)
+
+**日志原文**(两次独立运行都有 ✓,`logs/glm53_fp8_needle.log:70` 与 `logs/glm53_fp8_v6.log:70` ✓):
+```
+ [mla_attention.py:621] WARNING: Sparse MLA layer has no dense-MHA prefill path;
+                        using the top-k MQA path only.
+```
+⇒ ⇒ **B262 的推断(预填 = 独立 dense-MHA 后端)被此证据推翻** ✗ ⇒ 更正 ✓:
+`self.prefill_backend = None` ✓ ⇒ 预填**回到稀疏 impl** ✓(即**我们这条代码** ✓)
+
+**但探针与"预填走我们的代码"矛盾** ✗:两个探针(`_gather_fp8_prefill_chunk` ✓ 与
+我们覆盖的 `_bf16_flash_mla_kernel` ✓)**在 GLM 运行中都是 0 条** ✓
+⇒ ⇒ ⇒ ⭐ **结论:真正的预填入口不是我插探针的那两个方法** ✓ ——
+即 `forward_mqa`(我们的路由 ✓)与基类预填编排之间,还隔着**我没探到的一层** ✓
+⇒ ⇒ 而 **decode 的探针是响的** ✓ ⇒ 说明 decode 与 prefill 走**不同的入口函数** ✓
+⇒ ⇒ ⇒ **长文退化就在这个未被探到的预填入口里** ✓
+
+**下一步(直接 ✓)** ✓:在**入口层**加探针 ——
+①`forward_mqa` 顶部(打印 `kv_cache_dtype` / q 形状 / 是否走 fp8 路由 ✓)
+②基类 `_forward_fp8_kv_separate_prefill_decode` 顶部(是否被进入 ✓、`num_prefill_tokens` ✓)
+⇒ 一次运行即可定位**预填真正调用的函数** ✓,再据其决定修哪里 ✓。
+⚠️ 注意 ✓:我们**从未改过**预填侧代码 ✓ ⇒ 若预填侧对 **656 B + fp32 缩放**的假设有误 ⇒
+那属**上游行为** ✓;但**本目标要求"1M 上下文 + 连贯"** ✓ ⇒ **仍需在目标内解决** ✓
+(可在我们侧适配 ✓,或按只读纪律另行判断是否上报 ✓,不擅自发 ✓)。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
