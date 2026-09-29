@@ -7606,6 +7606,33 @@ GLM config 虽写 `qk_rope_head_dim=0` ✓,但运行时走**通用 `MultiHeadLat
 (模型遇填充直接 stop ⇒ 空输出 ✓),而 GLM 用的是 **chat 问题** ✗ ⇒ **形态不同,不可比** ✓;
 改成同形态后才得到上面这张可用的表 ✓。**对照实验必须同形态** ✓。
 
+### B262 结构性发现:GLM 的**预填走独立后端**(`mla/prefill.py` 的 dense-MHA ✓),与我们的稀疏 MLA impl 无关 ✓
+
+**证据** ✓(`vllm/model_executor/layers/attention/mla_attention.py` ✓):
+```
+ 287: from vllm.v1.attention.backends.mla.prefill import (get_mla_prefill_backend, …)
+ 617: self.prefill_backend: MLAPrefillBackend | None
+ 628: prefill_backend_cls = get_mla_prefill_backend(...)
+ 638: "No MLA prefill backend supports this model; sparse MLA will use the top-k MQA path only"
+ 643: self.prefill_backend = prefill_backend_cls(...)
+```
+⇒ ⇒ **预填 = 独立的 dense-MHA 后端** ✓;**decode = 我们绑定的 `FlashMLASparseSM8XBackend`** ✓
+⇒ 这**完美解释**了 B260 的探针现象 ✓:预填**两条路都不经过我们** ✓
+(既不进 `_gather_fp8_prefill_chunk` ✓,也不进我们覆盖的 `_bf16_flash_mla_kernel` ✓)
+
+**由此得到的推论(重要 ✓)**:
+* 我们修正的 **656 B 行布局只影响 decode** ✓ —— 而 decode 现在**完全正常** ✓(短提示连贯 ✓ 可复现 ✓)
+* **长文退化发生在【预填侧】** ✗ —— 那部分代码我们**一行都没改过** ✓
+* ⚠️ 但**短提示也要预填** ✗ ⇒ 若预填整体错,短提示同样该坏 ✓ ⇒ ⇒ 差别只在 **chunk 数** ✓:
+  `MBT=4096` ⇒ 短提示 = **1 个 chunk** ✓;~8K 提示 = **2 个 chunk** ✗
+  ⇒ ⇒ ⇒ **嫌疑收敛到"多 chunk 预填"**(第 2 个 chunk 的 workspace / context 拼接 ✗)
+
+**下一步** ✓:读 `vllm/v1/attention/backends/mla/prefill.py` 的 fp8 KV 处理与**多 chunk**分支 ✓
+(尤其 chunk_index > 0 时如何取 context ✓),并对照 `MLAPrefillBackend` 对 `fp8_ds_mla` 的假设 ✓。
+⚠️ **本目标的改动边界需重新描述** ✓:我们负责 **decode 侧的 NoPE/656 B 去量化** ✓;
+**预填侧**是上游 dense-MHA 后端 ✓ —— 若那边对 **656 B + fp32 缩放**的假设有问题 ⇒ 属**上游**范畴 ✓
+(需按只读纪律另行判断是否上报 ✓,不擅自发 ✓)。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
