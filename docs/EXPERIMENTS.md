@@ -7252,6 +7252,39 @@ CPU dry-run ✓);`VLLM_PLE_CPU_OFFLOAD` 的实际吞吐(官方只说 4×H100 上
 **纪律** ✓:subagent 全程只读 ✓(未写他人仓库、未启服务、未占卡、`.safetensors` 仅 Range 读头部 ≤300 KB ✓);
 `scripts/check_no_secrets.sh --all` 命中项**全是既有文件**,新报告**零命中** ✓
 
+### B248 rebase 实测(用户要求"及时 rebase"):**只需解 4 处冲突** ✓ —— 全貌与计划已定
+
+**做法** ✓:①fetch + `git archive` 导出**纯上游快照**到 `/tmp/upstream_snap`(134 MB / 7429 文件 ✓,
+`70fc359d25 → 35d6fb3187` ✓,**不注册 worktree、不污染仓库** ✓)②`scripts/apply_xtu_patches.sh` dry-run
+⇒ **0001 即失败** ✗(`attention.py:467` + `o_proj.py:5` ✓),脚本按纪律**失败即停、不静默跳过** ✓
+③改用**三路合并**逐文件评估(`git merge-file` ✓,不需仓库 ✓,因服务树是 **shallow clone** ✗
+——fetch 当源会报 `shallow roots are not allowed to be updated` ✗)
+
+**评估结果(45 个文件 ✓)** ✓:
+| 类别 | 数量 |
+|---|---|
+| 上游未改动(无需处理) | **19** |
+| 上游改过但**自动合并** ✓ | **14** |
+| **需人工解决** ✗ | **3 个文件 / 4 处冲突** |
+| "缺失"(实为**我们新增的文件** ✓) | 9 |
+
+**4 处冲突清单(均为"我们的附加代码" vs "上游重构" ⇒ 两边都要,机械可解 ✓)**:
+1. `vllm/models/deepseek_v41/nvidia/model.py` @969(24 行 ✓):我们的 `_collapse(...)` 调用
+2. `vllm/models/deepseek_v4/attention.py` @482(16 行 ✓):我们的 `XIAOTU_TIMING` 计时 + `o_padded` 预分配
+3. `vllm/models/deepseek_v4/attention.py` @536(36 行 ✓):我们的调试打印 + `o_padded` 切片
+4. `vllm/models/deepseek_v4/nvidia/ops/o_proj.py` @8(13 行 ✓):我们的 `fp8_einsum` import
+   vs 上游新增的 `QuantizedActivation` / `quant_utils` import
+
+**9 个"缺失"文件全部是我们新增的** ✓:`flashmla_sparse_sm8x.py`、`sparse_mla_kernels.py`、
+`sparse_mla_env.py`、`fp8_einsum.py`、`sm12x_deepseek_gemm_fallbacks.py`、`sm12x_mqa.py`、
+`decoder_replay_layers.py` + 2 个测试 ✓ ⇒ **与 apply 脚本的报错逐条对应** ✓(0001 死在 `attention.py` 与
+`o_proj.py` ✓ = 冲突文件之二 ✓✓)
+
+**下一步(rebase 计划 ✓)**:①在 `/tmp` 里按"取上游结构 + 保留我方附加"解掉这 4 处 ✓
+②重打 16 个 patch ⇒ 必须**全部干净** ✓ ③与在服务树逐文件比对 ✓ ④通过后**再**更新在服务树
+(**必须先问用户** ✓,要重启 8070 ✓)⑤重新生成 `patches/xtu-series/`(唯一真源 ✓)
+⚠️ 纪律:**禁止** `patch -f` 回退 ✗(会静默跳过打不上的 hunk ✗)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
