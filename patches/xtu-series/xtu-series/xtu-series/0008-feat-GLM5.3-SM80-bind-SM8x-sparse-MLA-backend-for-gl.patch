@@ -1,4 +1,4 @@
-From f182196b826bfe8b94c0e560e9c8f58e3a6bc65e Mon Sep 17 00:00:00 2001
+From 3a0de1467828642dc070d3063502527f87311895 Mon Sep 17 00:00:00 2001
 From: xtu-glm53 <xtu@local>
 Date: Fri, 18 Sep 2026 17:19:12 +0000
 Subject: [PATCH 08/16] feat(GLM5.3/SM80): bind SM8x sparse-MLA backend for
@@ -39,7 +39,7 @@ and rejects a non-bf16 KV cache.
  create mode 100644 vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
 
 diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
-index 9dd5ad6..b3785b5 100644
+index 9dd5ad6773..b3785b5671 100644
 --- a/vllm/model_executor/layers/mla.py
 +++ b/vllm/model_executor/layers/mla.py
 @@ -13,6 +13,7 @@ from vllm.models.common.ops import fused_q_kv_rmsnorm
@@ -70,10 +70,10 @@ index 9dd5ad6..b3785b5 100644
          indexer_op = getattr(self.indexer, "indexer_op", None)
          if indexer_op is not None and hasattr(
 diff --git a/vllm/models/glm5next/common/attention.py b/vllm/models/glm5next/common/attention.py
-index 25f5111..6b4178f 100644
+index 4f776e8a8e..ea2a161046 100644
 --- a/vllm/models/glm5next/common/attention.py
 +++ b/vllm/models/glm5next/common/attention.py
-@@ -533,6 +533,31 @@ class Glm5NextMLAAttention(nn.Module):
+@@ -521,6 +521,31 @@ class Glm5NextMLAAttention(nn.Module):
  
          self.is_v32 = config.index_topk is not None
  
@@ -105,7 +105,7 @@ index 25f5111..6b4178f 100644
          if self.is_v32:
              self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
                  qk_rope_head_dim,
-@@ -576,6 +601,7 @@ class Glm5NextMLAAttention(nn.Module):
+@@ -564,6 +589,7 @@ class Glm5NextMLAAttention(nn.Module):
              indexer_rotary_emb=self.indexer_rope_emb,
              is_sparse=self.is_v32,
              topk_indices_buffer=topk_indices_buffer,
@@ -115,7 +115,7 @@ index 25f5111..6b4178f 100644
          self.mla_attn = MultiHeadLatentAttentionWrapper(
 diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py b/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
 new file mode 100644
-index 0000000..6fae274
+index 0000000000..6fae274271
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
 @@ -0,0 +1,193 @@

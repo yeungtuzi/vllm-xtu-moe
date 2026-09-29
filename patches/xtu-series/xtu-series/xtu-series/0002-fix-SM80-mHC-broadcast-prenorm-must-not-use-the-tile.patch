@@ -1,4 +1,4 @@
-From baf19d0579593d48e2d2af9af841ae0ad1019621 Mon Sep 17 00:00:00 2001
+From caead0dbec10c2b37cef598fe759c741e8a9b3fe Mon Sep 17 00:00:00 2001
 From: xtu-upgrade <xtu@local>
 Date: Mon, 14 Sep 2026 22:06:27 +0000
 Subject: [PATCH 02/16] fix(SM80): mHC broadcast prenorm must not use the
@@ -16,7 +16,7 @@ kernel consumes.
  1 file changed, 29 insertions(+), 13 deletions(-)
 
 diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
-index c119b9a..a341942 100644
+index c119b9a8fc..a3419420a9 100644
 --- a/vllm/model_executor/kernels/mhc/tilelang.py
 +++ b/vllm/model_executor/kernels/mhc/tilelang.py
 @@ -755,19 +755,35 @@ def mhc_pre_broadcast_tilelang(

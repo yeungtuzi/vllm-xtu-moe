@@ -1,4 +1,4 @@
-From d277789bd4cca7a5749a833ad8361fc6fe40256a Mon Sep 17 00:00:00 2001
+From 7ee3f03e01102bfc8f6407a30ec907305ae4b101 Mon Sep 17 00:00:00 2001
 From: xtu-glm53 <xtu@local>
 Date: Fri, 18 Sep 2026 17:17:15 +0000
 Subject: [PATCH 07/16] feat(GLM5.3/SM80): portable Triton sparse-MLA
@@ -25,7 +25,7 @@ No compatibility impact: the file gains two new top-level symbols only.
  1 file changed, 148 insertions(+)
 
 diff --git a/vllm/v1/attention/backends/mla/sparse_mla_kernels.py b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
-index bd3986c..84c1a0a 100644
+index bd3986c971..84c1a0ab80 100644
 --- a/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
 +++ b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
 @@ -3515,3 +3515,151 @@ def finish_sparse_mla_attention_with_sink(

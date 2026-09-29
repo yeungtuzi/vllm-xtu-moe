@@ -1,4 +1,4 @@
-From 0a1532914615df6cd550b1faf9177aa95836d8dd Mon Sep 17 00:00:00 2001
+From 1f3077ef366e5a5e7902928a606ee512abc14452 Mon Sep 17 00:00:00 2001
 From: t <t@t>
 Date: Tue, 22 Sep 2026 04:33:48 +0000
 Subject: [PATCH 13/16] Revert "feat(MiMo-V2.5/SM80): build all 3 MTP depth
@@ -12,7 +12,7 @@ This reverts commit eddc6d0eb7be7068083995f29ca05f5dbcd9934a.
  1 file changed, 5 insertions(+), 17 deletions(-)
 
 diff --git a/vllm/model_executor/models/mimo_v2_mtp.py b/vllm/model_executor/models/mimo_v2_mtp.py
-index 81987b0..a4e4697 100644
+index ba47820f81..6fd8309350 100644
 --- a/vllm/model_executor/models/mimo_v2_mtp.py
 +++ b/vllm/model_executor/models/mimo_v2_mtp.py
 @@ -48,13 +48,10 @@ from .interfaces import (

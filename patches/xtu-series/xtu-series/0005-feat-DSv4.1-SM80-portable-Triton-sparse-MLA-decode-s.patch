@@ -1,4 +1,4 @@
-From 716dbb77d5e352c742d665abe617f095c94518d2 Mon Sep 17 00:00:00 2001
+From 5ed8417d8e1a75f423e13feff43eb714c10ebbfe Mon Sep 17 00:00:00 2001
 From: xtu-v41 <xtu@local>
 Date: Mon, 14 Sep 2026 23:29:15 +0000
 Subject: [PATCH 05/16] feat(DSv4.1/SM80): portable Triton sparse-MLA decode so
@@ -40,10 +40,10 @@ padded heads verified zeroed. Prefill test re-run: still passes.
  1 file changed, 226 insertions(+)
 
 diff --git a/vllm/models/deepseek_v41/nvidia/flashmla.py b/vllm/models/deepseek_v41/nvidia/flashmla.py
-index abebe9f..f3fc431 100644
+index 1cac6e6cfc..22dbf01c89 100644
 --- a/vllm/models/deepseek_v41/nvidia/flashmla.py
 +++ b/vllm/models/deepseek_v41/nvidia/flashmla.py
-@@ -28,10 +28,15 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
+@@ -27,10 +27,15 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
      is_triton_sparse_mla_enabled,
      triton_sparse_mla_prefill_topk_chunk_size,
      triton_sparse_mla_query_chunk_size,
@@ -59,7 +59,7 @@ index abebe9f..f3fc431 100644
  )
  from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
  from vllm.v1.attention.ops.flashmla import (
-@@ -140,6 +145,21 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
+@@ -152,6 +157,21 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                          ),
                      ]
                  )
@@ -81,7 +81,7 @@ index abebe9f..f3fc431 100644
              current_workspace_manager().get_simultaneous(*specs)
              output.zero_()
              return
-@@ -223,12 +243,41 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
+@@ -235,12 +255,41 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
  
          swa_indices = swa_metadata.decode_swa_indices
          swa_lens = swa_metadata.decode_swa_lens
@@ -123,7 +123,7 @@ index abebe9f..f3fc431 100644
          # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)
          # Use unsqueeze to preserve strides (handles padded blocks correctly)
          swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
-@@ -272,6 +321,183 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
+@@ -284,6 +333,183 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
              out=output.unsqueeze(1),
          )
  

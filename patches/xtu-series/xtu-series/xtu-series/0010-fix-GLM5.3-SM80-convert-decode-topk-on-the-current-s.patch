@@ -1,4 +1,4 @@
-From e967b83940c9adfeed8b84efc759087d366b25b6 Mon Sep 17 00:00:00 2001
+From 4ca0a6a8f8975a7176a33725c44365afb986c63f Mon Sep 17 00:00:00 2001
 From: xtu-glm53 <xtu@local>
 Date: Fri, 18 Sep 2026 20:00:54 +0000
 Subject: [PATCH 10/16] fix(GLM5.3/SM80): convert decode topk on the current
@@ -36,7 +36,7 @@ No impact on other models: the override lives on the SM8x backend only.
  1 file changed, 31 insertions(+)
 
 diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py b/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
-index 6fae274..f8549e6 100644
+index 6fae274271..f8549e6dfc 100644
 --- a/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
 +++ b/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
 @@ -38,6 +38,9 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (

@@ -1,4 +1,4 @@
-From 9a9b08235e9330bf464dc9b17c44fff6542b1e65 Mon Sep 17 00:00:00 2001
+From 5ed48914ac59dc2880cac4120a54e84a5c9f45b5 Mon Sep 17 00:00:00 2001
 From: xtu-v41 <xtu@local>
 Date: Tue, 15 Sep 2026 00:41:41 +0000
 Subject: [PATCH 06/16] fix(DSv4.1/SM80): Engram lookup kernel must not use
@@ -24,12 +24,12 @@ Scope: vllm/models/deepseek_v41/ only -> no other model is affected.
  1 file changed, 19 insertions(+), 3 deletions(-)
 
 diff --git a/vllm/models/deepseek_v41/common/engram.py b/vllm/models/deepseek_v41/common/engram.py
-index 8cd9354..8596e57 100644
+index c415bbaa6e..4b7b8ef0dd 100644
 --- a/vllm/models/deepseek_v41/common/engram.py
 +++ b/vllm/models/deepseek_v41/common/engram.py
 @@ -49,8 +49,12 @@ from vllm.distributed import (
  from vllm.logger import init_logger
- from vllm.model_executor.layers.linear import ColumnParallelLinear
+ from vllm.model_executor.layers.linear import ReplicatedLinear
  from vllm.model_executor.layers.quantization import QuantizationConfig
 +from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 +    _e4m3_uint8_to_f32,

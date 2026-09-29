@@ -1,4 +1,4 @@
-From 23ce97579672b500bd827e3c0541d679e53ee917 Mon Sep 17 00:00:00 2001
+From 46c6ba0c9c39f49e60f746af8053a5bf5c3467b0 Mon Sep 17 00:00:00 2001
 From: xtu-v41 <xtu@local>
 Date: Mon, 14 Sep 2026 23:18:33 +0000
 Subject: [PATCH 03/16] fix(DSv4.1/SM80): remove Triton fp8e4nv dependency from
@@ -26,7 +26,7 @@ float8_e4m3fn bytes exactly (0 mismatches in 1M values, decode error 0.0).
  3 files changed, 29 insertions(+), 12 deletions(-)
 
 diff --git a/vllm/models/deepseek_v41/common/ops/cache_utils.py b/vllm/models/deepseek_v41/common/ops/cache_utils.py
-index ad03c32..d17f083 100644
+index 02fb0d5539..e0dfc56f50 100644
 --- a/vllm/models/deepseek_v41/common/ops/cache_utils.py
 +++ b/vllm/models/deepseek_v41/common/ops/cache_utils.py
 @@ -18,6 +18,10 @@ from typing import Any
@@ -92,7 +92,7 @@ index ad03c32..d17f083 100644
          from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
              _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,
 diff --git a/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py b/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
-index 2ba9dbe..4f42087 100644
+index 2ba9dbea3d..4f420878e6 100644
 --- a/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
 +++ b/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
 @@ -4,6 +4,9 @@
@@ -120,7 +120,7 @@ index 2ba9dbe..4f42087 100644
      s = tl.arange(0, 8)
      max_encoded: tl.constexpr = 254.0 if SANITIZE_CACHE_NANS else 255.0
 diff --git a/vllm/models/deepseek_v41/common/ops/indexer_k_store.py b/vllm/models/deepseek_v41/common/ops/indexer_k_store.py
-index ba8ddbd..a887de0 100644
+index ba8ddbd95a..a887de03c9 100644
 --- a/vllm/models/deepseek_v41/common/ops/indexer_k_store.py
 +++ b/vllm/models/deepseek_v41/common/ops/indexer_k_store.py
 @@ -15,6 +15,9 @@ group-boundary tokens ``(position + 1) % compress_ratio == 0`` produce a key.

@@ -1,4 +1,4 @@
-From 9c408d7c6164fa4de644428a1ee5031f3b373a73 Mon Sep 17 00:00:00 2001
+From 0d8c5f8ddd55de8a9120895e4d8d58bdbe9281e0 Mon Sep 17 00:00:00 2001
 From: xtu <xtu@local>
 Date: Wed, 23 Sep 2026 15:20:57 +0000
 Subject: [PATCH 15/16] feat(DSv4.1): decoder-side SWA bounded replay for
@@ -20,7 +20,7 @@ our SM80 fuse_mhc_all_reduce behaviour preserved inside _collapse.
 
 diff --git a/tests/models/test_deepseek_v41_replay_batch.py b/tests/models/test_deepseek_v41_replay_batch.py
 new file mode 100644
-index 0000000..d903d5a
+index 0000000000..d903d5a336
 --- /dev/null
 +++ b/tests/models/test_deepseek_v41_replay_batch.py
 @@ -0,0 +1,211 @@
@@ -237,7 +237,7 @@ index 0000000..d903d5a
 +    assert (build.slot_mappings[:, num_tokens:] == PAD_SLOT_ID).all()
 diff --git a/tests/v1/spec_decode/test_dspark_context_rows.py b/tests/v1/spec_decode/test_dspark_context_rows.py
 new file mode 100644
-index 0000000..c00d998
+index 0000000000..c00d998711
 --- /dev/null
 +++ b/tests/v1/spec_decode/test_dspark_context_rows.py
 @@ -0,0 +1,42 @@
@@ -285,7 +285,7 @@ index 0000000..c00d998
 +    assert _rows(window, query_lens) is None
 diff --git a/vllm/models/deepseek_v41/decoder_replay_layers.py b/vllm/models/deepseek_v41/decoder_replay_layers.py
 new file mode 100644
-index 0000000..6169db5
+index 0000000000..6169db51e3
 --- /dev/null
 +++ b/vllm/models/deepseek_v41/decoder_replay_layers.py
 @@ -0,0 +1,229 @@

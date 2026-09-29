@@ -1,4 +1,4 @@
-From a3280d304af99b8671df48e5f4d5d1e40b300e90 Mon Sep 17 00:00:00 2001
+From 2938617976ac53784387b98ed36ebc8a5944509f Mon Sep 17 00:00:00 2001
 From: xtu <xtu@local>
 Date: Sat, 19 Sep 2026 22:53:27 +0000
 Subject: [PATCH 11/16] feat(MiMo-V2.5/SM80): build all 3 MTP depth layers (was
@@ -22,7 +22,7 @@ Untested until the MiMo-V2.5 checkpoint is available on this host.
  1 file changed, 17 insertions(+), 5 deletions(-)
 
 diff --git a/vllm/model_executor/models/mimo_v2_mtp.py b/vllm/model_executor/models/mimo_v2_mtp.py
-index a4e4697..81987b0 100644
+index 6fd8309350..ba47820f81 100644
 --- a/vllm/model_executor/models/mimo_v2_mtp.py
 +++ b/vllm/model_executor/models/mimo_v2_mtp.py
 @@ -48,10 +48,13 @@ from .interfaces import (

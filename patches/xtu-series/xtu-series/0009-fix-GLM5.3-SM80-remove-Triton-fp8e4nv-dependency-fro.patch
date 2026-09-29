@@ -1,4 +1,4 @@
-From 6049f4d5fb10c88d3e905c71ff0f3920cb43dc0e Mon Sep 17 00:00:00 2001
+From 13563a12d0740dce67fb1599315b477b548522f3 Mon Sep 17 00:00:00 2001
 From: xtu-glm53 <xtu@local>
 Date: Fri, 18 Sep 2026 19:34:25 +0000
 Subject: [PATCH 09/16] fix(GLM5.3/SM80): remove Triton fp8e4nv dependency from
@@ -30,7 +30,7 @@ Only this model package is touched; dsv4/dsv4.1 have their own copies.
  1 file changed, 32 insertions(+), 14 deletions(-)
 
 diff --git a/vllm/models/glm5next/nvidia/ops/kpool_compress.py b/vllm/models/glm5next/nvidia/ops/kpool_compress.py
-index db496d3..9cbaf9b 100644
+index 416d3b5c48..c2eac63bc8 100644
 --- a/vllm/models/glm5next/nvidia/ops/kpool_compress.py
 +++ b/vllm/models/glm5next/nvidia/ops/kpool_compress.py
 @@ -14,6 +14,9 @@ from __future__ import annotations
@@ -151,7 +151,7 @@ index db496d3..9cbaf9b 100644
              tl.store(buf_fp32_ptr + out_s_offset, scale)
  
          # Stash the current token AFTER any completion read so the completion
-@@ -688,7 +707,6 @@ def kpool_decode_update_and_maybe_write_cache_batched(
+@@ -687,7 +706,6 @@ def kpool_decode_update_and_maybe_write_cache_batched(
  
      page_size = kv_cache.shape[1]
      buf = kv_cache
@@ -159,7 +159,7 @@ index db496d3..9cbaf9b 100644
      buf_fp32 = buf.view(torch.float32)
  
      # The kernel indexes the int tensors as ``req * next_n + t`` (row-major),
-@@ -700,7 +718,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
+@@ -699,7 +717,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
      positions = positions.contiguous()
  
      _kpool_decode_update_batched_kernel[(num_requests,)](

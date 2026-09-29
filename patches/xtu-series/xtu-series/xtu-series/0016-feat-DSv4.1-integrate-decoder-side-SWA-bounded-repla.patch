@@ -1,4 +1,4 @@
-From 2509fd9d1bd4071176ee94cf64d0d3f2604cb581 Mon Sep 17 00:00:00 2001
+From b4456de03791d8ede7dd1a0b425cd8cbe5d0dbe6 Mon Sep 17 00:00:00 2001
 From: xtu <xtu@local>
 Date: Wed, 23 Sep 2026 15:22:20 +0000
 Subject: [PATCH 16/16] feat(DSv4.1): integrate decoder-side SWA bounded replay
@@ -10,14 +10,14 @@ warning when the pipeline stage or parallelism setup cannot follow the smaller r
 fuse_mhc_all_reduce behaviour stays inside _collapse. Verified by importing the module and checking that all
 four helpers and the property are class members.
 ---
- vllm/models/deepseek_v41/nvidia/model.py | 228 ++++++++++++++++++++---
- 1 file changed, 200 insertions(+), 28 deletions(-)
+ vllm/models/deepseek_v41/nvidia/model.py | 226 ++++++++++++++++++++---
+ 1 file changed, 200 insertions(+), 26 deletions(-)
 
 diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
-index 9e7a35f..a466114 100644
+index 22674bf705..8256cf0b59 100644
 --- a/vllm/models/deepseek_v41/nvidia/model.py
 +++ b/vllm/models/deepseek_v41/nvidia/model.py
-@@ -83,6 +83,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
+@@ -72,6 +72,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
      prepare_mega_gate_routing_metadata,
  )
  from vllm.models.deepseek_v41.attention import DeepseekV4Attention
@@ -25,9 +25,9 @@ index 9e7a35f..a466114 100644
  from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import (
      DeepseekV4MegaAttnAttention,
  )
-@@ -741,6 +742,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
-                 if successor.engram is None:
-                     layer.ffn.defer_finalize()
+@@ -648,6 +649,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             prefix=f"{prefix}.layers",
+         )
  
 +        # Decoder-side SWA bounded replay: layers past the last KV source
 +        # prefill only each request's trailing window.
@@ -50,7 +50,7 @@ index 9e7a35f..a466114 100644
          # The n-gram hash needs a slot-keyed rolling store of compressed ids
          # (chunked prefill / decode lookback); key it off the first local
          # layer's sliding-window KV cache. Only PP ranks owning an engram
-@@ -922,11 +941,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -829,11 +848,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
          # Every layer's post runs inside the next layer's fused pre, so aux
          # hidden states are read back from there instead of recomputed.
          aux_hidden_by_layer: dict[int, torch.Tensor] = {}
@@ -79,7 +79,7 @@ index 9e7a35f..a466114 100644
                  hidden_states,
                  positions,
                  input_ids,
-@@ -934,36 +965,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -841,34 +872,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  post_mix,
                  res_mix,
                  residual,
@@ -93,8 +93,6 @@ index 9e7a35f..a466114 100644
 -                if self.use_sequence_parallel:
 -                    previous_aux = sp_all_gather(previous_aux)[:full_num_tokens]
 -                aux_hidden_by_layer[idx] = previous_aux
--        # Without a successor boundary, the last layer finalized its own MoE.
--        assert isinstance(hidden_states, torch.Tensor)
 -        if layer is not None:
 -            # The last layer has no successor to fold its post into.
 -            if self.fuse_mhc_all_reduce:
@@ -125,7 +123,7 @@ index 9e7a35f..a466114 100644
  
          if not get_pp_group().is_last_rank:
              return IntermediateTensors(
-@@ -992,6 +1009,157 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -897,6 +916,157 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              return hidden_states, aux_hidden_states
          return hidden_states
  
@@ -283,7 +281,7 @@ index 9e7a35f..a466114 100644
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
          stacked_params_mapping = [
              # (param_name, shard_name, shard_id)
-@@ -1349,6 +1517,10 @@ class DeepseekV41LLMForCausalLM(
+@@ -1254,6 +1424,10 @@ class DeepseekV41LLMForCausalLM(
  
          self.set_moe_parameters()
  
