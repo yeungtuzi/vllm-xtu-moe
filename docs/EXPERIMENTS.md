@@ -7164,6 +7164,33 @@ fixed workspace size**」⇐ **workspace 固定大小、请求分块适配** ⇒
 **过程教训** ✓:heredoc 结束标记写错(应 `MD` 写成 `PY`)⇒ 后续 Python 代码被当文本追加进计划书 ✗
 ⇒ 已截断修复 ✓;**今后嵌套多段 heredoc 必须逐个核对结束标记,并在写入后立即 `tail` 验证** ✓
 
+### B245 GLM fp8 KV 第 4 轮:设计闭合(避开一个会让方案失效的陷阱 ✗)+ 可干净应用的 patch 草稿 ✓
+
+**⚠️ 推演出的陷阱** ✓:若把**整个上下文**去量化成 bf16 表 ⇒ 1M 上下文需 **~1 GB** ✗;
+若进一步物化整个 KV cache(971,949 行 ×1 KB ≈ 1 GB)⇒ **与 bf16 方案相比毫无优势** ✗✗
+⇒ ⇒ ⇒ **结论:每次 gather 的行数必须有界** ✓ —— 而这恰好被上游设计满足 ✓:
+* **prefill**:workspace 按**请求上下文分块**且"*the workspace holds it once*" ✓ ⇒
+  表按**上下文位置**索引(**不是** topk 并集)⇒ **无需 unique/排序** ✓✓
+* **decode**:topk 并集很小(数十×512 ⇒ ~32 MB ✓)⇒ 允许**重复行**(`dst = t*K+c`)⇒ **同样无需去重** ✓✓
+⇒ **一个 gather+去量化 kernel 服务两种调用** ✓;attention 核心**零改动** ✓✓
+
+**真实来源已核** ✓(`FlashMLASparseImpl.__init__` :690-774 ✓):`kv_cache_dtype` 是**构造参数** ✓;
+⭐ **量化 KV 时上游已预留 workspace**:`self.prefill_workspace_shape = (get_prefill_workspace_size(max_len),
+head_size)` ✓(`:758-774` ✓)⇒ **继承即可,不需自建** ✓
+⚠️ **我此前凭空编了两个属性名** ✗(`kv_cache_block_size` / `..._block_stride_bytes` 树里不存在 ✗)
+⇒ 改为从 cache 张量自身取 ✓:`bs = cache.shape[1]` ✓、`block_stride = cache.stride(0)` ✓
+⇒ **不改签名、不加属性** ✓(并在 kernel 前加 `assert cache.dim() == 3` 兜底 ✓)
+另核:那个 fp8 累加 kernel(`sparse_mla_kernels.py:1273`)在本树**只被定义、无人调用** ✗ ⇒ 是可照抄的**参考实现** ✓
+
+**patch 草稿(已收进 dev-docs ✓,未进 patch 系列 ✗)**:`dev-docs/glm_fp8_kv_gate.patch` ✓(60 行 ✓)
+* 门控放开 ✓:`supported_kv_cache_dtypes` 加 `"fp8_ds_mla"` ✓、`:237` 的 fail-closed 放开 ✓
+* `_bf16_flash_mla_kernel` 内加 fp8 分支 ✓:gather+去量化 ⇒ 继续走**原 bf16 主体**(零改动 ✓)
+* **验证** ✓:对**新鲜副本** `git apply -p1 --check` ⇒ **退出码 0** ✓;应用后 **224 → 246 行**(预期一致 ✓);
+  关键改动逐条 grep 核对就位 ✓ —— **全程未触碰服务树** ✓
+
+**过程自伤(均已修复 ✓)**:①diff 的 `-p1` 前缀与我的 sed 叠错 ⇒ 改用标准 `--src-prefix/--dst-prefix` ✓
+②`cd` 后用相对路径导致源文件找不到 ⇒ 改**绝对路径** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
