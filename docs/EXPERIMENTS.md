@@ -7029,6 +7029,27 @@ KV dtype / TP / max_model_len 等 / 模型名 ✓)
 P3 提供**权重卸载 vs 计算卸载的同硬件对照**(需先跑通 #37190 ✓);P4 把宿主侧记账做成小补丁 ✓。
 (计划全文:`dev-docs/UPSTREAM_CONTRIBUTION_PLAN.md` ✓)
 
+
+### B239 KV dtype 审计(用户质疑"V4.1 是不是反而没用 fp8 KV"⇒ 查出脚本缺陷 + 文档矛盾 ✓)
+
+* **用户记忆正确** ✓:`process_data/scripts/dsv4.sh`(lk_moe 生产 ✓)同时有
+  `--max-model-len 1048576` 与 `--kv-cache-dtype fp8_ds_mla` ✓ ⇒ **fp8 KV 是既成生产配置** ✓
+  ⇒ 我在 `H2D_PATHS_EVALUATION.md` 里"1M 需 fp8 KV"的表述**错误** ✗,已更正 ✓
+* ⚠️ **真问题** ✓:`scripts/serve_v41.sh` 第 83 行 `set -uo pipefail` ✓ 但 **KV_DTYPE 无默认值** ✗
+  (全脚本赋值 0 次 ✓,仅 364 行引用 ✓)⇒ **实测复现**:不带该变量运行 ⇒
+  `line 335: KV_DTYPE: unbound variable` **直接崩** ✗(335 = `nohup env` 起始行 ✓)
+  ⇒ fp8 KV **完全依赖调用方** ✓;`serve_prod_8070.sh`(41/51 ✓)、`tune_sweep_serve.sh`(18 ✓)、
+  `ab_serve_kernel.sh`(35 ✓)、`tune_nsys.sh`(行内默认 ✓)都补上了 ⇒ 生产未暴露 ✓
+  ⇒ **建议修法**:加 `KV_DTYPE="${KV_DTYPE:-fp8_ds_mla}"` ✓(**待用户批准** ✓)
+* ⚠️ **文档矛盾** ✗:KV 体积三处不一致 —— `MODEL_GUIDES.md:160` **400 KiB/token**(⇒1M=400 GiB ✗ 不可能)、
+  `serve_prod_8070.sh` **29.5 KB/token**、同文件"1,876,112 tokens @18 GiB"⇒ **~10.3 KB/token** ✗
+  ⇒ **不手算** ✗(hybrid SWA+压缩+indexer ⇒ 易错 ✓)⇒ **以 vLLM 启动日志的 `# GPU blocks × block size` 为准** ✓,
+  取到后统一修正 ✓
+* **V4 vs V4.1 的 1M 差别(脚本原文 ✓)**:V4-Flash 默认档 `MODE=1m` = **1M + fp8 KV + GPU 预填 + MBT=4096** ✓;
+  V4.1-Flash **硬拦** `MAXLEN>786432 且开 GPU 预填` ✗(768K 峰值 86.4% ✓;1M 峰值 98%、**历史两次 OOM** ✗;
+  逃生门 `VLLM_SERVE_ALLOW_RISKY_1M=1` ✓)⇒ 拦路虎是**激活工作区 ∝ MBT + MLA 索引器缓冲** ✓
+* 探针残留(probe.\*)已清理 ✓;生产 8070 未受影响 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
