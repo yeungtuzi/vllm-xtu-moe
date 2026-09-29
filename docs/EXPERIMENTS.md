@@ -7285,6 +7285,41 @@ CPU dry-run ✓);`VLLM_PLE_CPU_OFFLOAD` 的实际吞吐(官方只说 4×H100 上
 (**必须先问用户** ✓,要重启 8070 ✓)⑤重新生成 `patches/xtu-series/`(唯一真源 ✓)
 ⚠️ 纪律:**禁止** `patch -f` 回退 ✗(会静默跳过打不上的 hunk ✗)
 
+### B249 rebase 在 /tmp 完成 ✓(16/16 重放 + 实质校验通过)⚠️ 含一次严重自伤与教训
+
+**做法** ✓:在 `/tmp/rb` 建真 git 仓库 —— ①用旧基点 `70fc359d25` 建底 ✓ ②`git am` 重放 16 个 patch
+(**旧基点上 16/16 全部干净** ✓)③用**新上游快照**(`35d6fb3187`)建"新基点 commit"(`1b6b112eca` ✓)
+④`git rebase --onto 新基点 旧基点 ours` ✓
+
+**3 处冲突与解法** ✓:
+1. `deepseek_v4/attention.py`(共 2 处 ✓):上游把预分配**重构成 `_alloc_attn_out()` 方法** ✓
+   ⇒ 解 = **取上游结构 + 把我们的计时插桩移植进上游尾部** ✓;⚠️ 我们的两处 `XIAOTU_DEBUG_L4` 打印
+   引用了上游已删除的 `o_padded`/`o` ✗ ⇒ **只能丢弃**(纯诊断、env 门控 ✓),保留 `XIAOTU_TIMING` 计时 ✓
+2. `deepseek_v4/nvidia/ops/o_proj.py` ✓:两侧是**同一多行 import 的不同开头**(共用闭合括号 ✓)
+   ⇒ 解 = **上游 import + 我们的 `fp8_einsum` 作独立完整语句** ✓
+3. `deepseek_v41/nvidia/model.py` ✓:**两个不同关注点**(上游的 aux 记账 + 末层 MoE 折叠 vs
+   我们的 `else: self._collapse(...)` ✓)⇒ 解 = **两边都保留** ✓;⚠️ 两侧未闭合调用**各自都需要 `)`** ⇒
+   合并后给 `mhc_post_tilelang` 与 `_collapse` **各补一个**并删掉共享那行 ✓
+
+**⚠️ 严重自伤(已修复 ✓)**:解 `model.py` 的脚本**断言失败 ⇒ 没写盘** ✗,但 `git add` + `rebase --continue`
+**照样把带 `<<<<<<<` 标记的文件提交了** ✗✗ ⇒ rebase 报"16/16 成功、工作区干净" ✓ **却掩盖了语法错误** ✗
+⇒ 已:行号手术替换标记块 ✓ → 三文件语法复验 ✓ → `git commit --amend` 修掉该 commit(`52231def5` ✓)
+⇒ ⇒ **教训(入纪律 ✓)**:**`git add` 前必须先验证「无冲突标记 + 语法通过」,绝不可只信 rebase 的退出码** ✗
+
+**实质校验(照 `AGENTS.md` 第 ④ 步 ✓)** ✓:
+* 上游**未改动**的 19 个文件 ⇒ 重放后与在服务树**逐字节一致**(19/19 ✓✓ **零回归**)
+* 上游**改动过**的文件 ⇒ 差异**恰好等于上游自身的改动** ✓(`sparse_swa.py` 11/11 ✓、`core.py` 17/17 ✓、
+  `attention.py` 57 → 74 = 57 + 我们的冲突解决 ✓)
+* 关键符号仍在 ✓(`XIAOTU_TIMING`、`deepseek_v4_fp8_einsum`、`decoder_replay_layers`、`sparse_mla_fwd_with_sink` ✓)
+* **全树 44 个改动过的 `.py` 语法抽检:0 错误** ✓✓;全树**冲突标记残留 0** ✓
+* 新系列已生成:**16 个 patch**(`/tmp/new_series` ✓,0001 快照 293 KB ✓)
+
+**遗留待办(已知不完美 ✓)**:`o_proj.py` 的括号修正落在 **commit 16** 而非 commit 1 ✗ ⇒
+series 的**第 1 个 commit 单独 checkout 时语法不过** ✗ ⇒ 计划用 `GIT_SEQUENCE_EDITOR` 脚本化
+`rebase -i` 把该修正 **squash 进 commit 1** ✓
+**下一步** ✓:①修上述遗留 ✓ ②把新系列装进 `patches/xtu-series/`(本仓,允许 ✓)
+③更新在服务树 ⚠️ **必须先问用户**(要重启 8070 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
