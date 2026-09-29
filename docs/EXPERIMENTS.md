@@ -7050,6 +7050,24 @@ P3 提供**权重卸载 vs 计算卸载的同硬件对照**(需先跑通 #37190 
   逃生门 `VLLM_SERVE_ALLOW_RISKY_1M=1` ✓)⇒ 拦路虎是**激活工作区 ∝ MBT + MLA 索引器缓冲** ✓
 * 探针残留(probe.\*)已清理 ✓;生产 8070 未受影响 ✓
 
+
+### B240 fp8 KV 之外还剩多少空间(用户追问"是否已无提升空间")⇒ **KV dtype 到头,但显存大头不在 KV** ✓
+
+* **DeepSeek-V4 / V4.1** ✓:已用 `fp8_ds_mla` ✓;**再往下 `nvfp4_ds_mla`(FP4 KV)被主线在 A100/SM80 拒绝** ✗
+  (`RUNBOOK.md:693` ✓)⇒ **本机该维度到头** ✓
+* **GLM-5.3-Flash** ✓:SM8x 稀疏 MLA 路线**只支持 bf16 KV** ✗(fp8/fp4 fail-closed ✓);
+  文档给出唯一上 1M 的路 = SM8x 稀疏 MLA 的 **fp8 变体**(528 B blob ✓,现成 656 B 只到 ~948K ✓)
+  ⇒ ⛔ **用户已裁定不做 fp8 KV、不追 1M** ✓(`KNOWN_LIMITATIONS.md:43-47` ✓)⇒ **有空间但不做** ✓
+* ⭐ **关键纠正** ✓:**KV 不是显存大头** ✗ —— 交付配置(`MODEL_GUIDES.md:358-365` ✓):
+  **非专家权重 ~15.1 GiB/rank**(self_attn **10.39** ✓)> **Available KV 11.38 GiB** > **staging 7.59 GiB/rank** ✓
+  ⇒ 想扩上下文,**最大单项是非专家权重** ✓;而 V4.1 checkpoint 已是 `dtype:fp8 / expert_dtype:fp4` ✓
+  ⇒ 再压同样撞 **SM80 无 FP4** 的硬件墙 ✗(与 KV 同源 ✓)
+* **剩余真空间(按性价比 ✓)**:①⭐ **抢回服务内 PCIe 争用**(装配 164–204 → 134.9 ms ⇒ prefill +22~51% ✓,
+  **零显存** ✓)②⭐ **staging 槽切细**(回收 2–6 GiB/rank ✓,需实测膝盖点 ✓)③激活工作区 ∝ MBT
+  (V4.1 的 1M 真拦路虎 ✓)④投机 draft 常驻(KV −27% ✓,已有记录 ✓)⑤GLM fp8 KV(用户已裁定不做 ✓)
+* **根因归属** ✓:KV dtype 到头是 **SM80 无 FP4 硬件** ✗,**换 Hopper/Blackwell 后 fp4 KV 即可用** ✓
+  ⇒ 属"换机器"而非"改代码" ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
