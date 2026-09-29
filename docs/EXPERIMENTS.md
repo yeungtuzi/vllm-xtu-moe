@@ -7849,6 +7849,24 @@ T6/T7/T8 仍适用;T10 仍只属 lovedheart 路线 ✓。文档:`dev-docs/QWEN38
 新增脚本 `scripts/serve_qwen38.sh`:**默认就是 GPU2 / TP=1 / 8140 / MAXLEN=8192 / PLE_CPU=1**,
 env 桥写**仓库内**、**不碰**生产 `/tmp/xiaotu_env` ✓。
 
+**⭐ 后续(同日,同一轮目标内):单卡 `LOAD=dummy` 已 READY** ✓✓
+越过第一个内核后,第二个阻塞是 `dequantize` 的
+`RuntimeError: FP8 PLE embedding scale must be on the output device` —— **根因仍是我们插件 shim 的副作用**:
+上游 `Qwen4ExpPLEPinnedHostEmbedding` 在 `__init__` 里**自己**就把大表做成 UVA 视图了
+(所以 `ple_offload._to_uva` **一次都没跑**,日志 0 条 `UVA 视图`),而插件的 `create_weights`
+包装用 `with torch.device("cpu")` 把**整个 layer**(含只有一个 float 的 `weight_scale`)
+都建在 CPU ⇒ 上游检查失败。修法:包装里改成"**大表留 CPU、<1GiB 小参数搬回当前设备**" ✓。
+
+**实测结果(GPU2 / TP=1 / MAXLEN=8192 / dummy)** ✓:
+`✅ READY at ~990s`;**`GPU KV cache 337,510 tokens`,8192-token 请求并发 41.20×**;
+**GPU2 峰值 36,415 / 40,960 MiB(89%)**;**GPU0/1 全程 39,289 MiB 未动** ✓;
+`/v1/models` 正常返回 `Qwen3.8-Flash-Next` ✓;`MOE_FP8 engine: E=512 H=2560 I=640 topk=10` ✓。
+冒烟 48 token/7 s 但**内容为空**(预期:`LOAD=dummy` 的权重是占位值)✓。
+
+⇒ **结论(回答用户"TP=1 能否调试")**:官方 FP8 版**能在单张 A100-40GB 上完成调试**,
+连 8K 上下文都装得下;需要 GPU0/1 的只有"TP=2 正式口径 / 长上下文"验收。
+真权重版(`LOAD=auto`)紧接着在跑(T5)。文档:`dev-docs/QWEN38_OFFICIAL_FP8_ROUTE.md` ✓。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

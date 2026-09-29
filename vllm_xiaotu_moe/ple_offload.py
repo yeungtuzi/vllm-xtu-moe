@@ -176,7 +176,22 @@ def install() -> list[str]:
             @functools.wraps(cw)
             def create_weights(self, layer, *a, **kw):
                 with torch.device("cpu"):
-                    return cw(self, layer, *a, **kw)
+                    res = cw(self, layer, *a, **kw)
+                # 大表(PLE ~48GiB)留在 CPU/锁页内存,但**小的 per-tensor scale 必须回到
+                # 设备**:上游 `Qwen4ExpPLEFp8EmbeddingMethod.dequantize` 会检查
+                # "FP8 PLE embedding scale must be on the output device"。
+                # 上游的 pinned-host 类自己会把大表做成 UVA(pinned+CPU),
+                # 所以这里只需把"<1GiB 的 CPU 参数"搬回当前设备即可。
+                if torch.cuda.is_available():
+                    dev = torch.device("cuda", torch.cuda.current_device())
+                    for _, p in layer.named_parameters(recurse=False):
+                        if (
+                            p is not None
+                            and p.device.type == "cpu"
+                            and p.numel() * p.element_size() < (1 << 30)
+                        ):
+                            p.data = p.data.to(dev)
+                return res
 
             create_weights._xtu_ple = True  # type: ignore[attr-defined]
             cls.create_weights = create_weights
