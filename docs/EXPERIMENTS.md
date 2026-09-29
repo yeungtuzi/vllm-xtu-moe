@@ -7867,6 +7867,26 @@ env 桥写**仓库内**、**不碰**生产 `/tmp/xiaotu_env` ✓。
 连 8K 上下文都装得下;需要 GPU0/1 的只有"TP=2 正式口径 / 长上下文"验收。
 真权重版(`LOAD=auto`)紧接着在跑(T5)。文档:`dev-docs/QWEN38_OFFICIAL_FP8_ROUTE.md` ✓。
 
+**⭐⭐ 真权重结果(同日,已完成)** ✓✓:`LOAD=auto` **READY at ~180s**
+(173 GiB 本地 NVMe + 115 GiB 专家进内存,仅 3 分钟)✓;
+日志确认 `ngram_embedding.weight (320001536, 160) fp8_e4m3fn **47.7 GiB** → CPU 锁页 + UVA 视图` ✓;
+`GPU KV cache 337,510 tokens`、并发 41.20×;**GPU2 = 36,995/40,960 MiB(90%)**;GPU0/1 全程未动 ✓。
+
+**生成质量(贪心)** ✓:内存屏障一问给出
+「内存屏障是一种 CPU 指令,用于限制或强制内存操作的可见性和顺序,确保多线程程序中的读写按预期顺序生效。」
+;固态硬盘一问给出连贯的中文技术描述 ✓;**无任何 `not found in params_dict` 静默漏装** ✓。
+
+**⭐ T7 的第一个实测锚点** ✓:`128 completion tokens / 8.9 s ⇒ **14.4 tok/s**`(端到端含 prefill)。
+口径 = **未调优调试态**:TP=1 / EAGER=1(无 CUDA graph)/ `GPU_PREFILL_MIN=0`(CPU 预填)/
+MAXLEN=8192 / THREADS=60 ⇒ **不代表正式性能**。
+但由此可直接算出交接 §13.2 那个"所有百分比都依赖它"的未知量:
+`topk=10 × 48 层 = 480 专家调用/token` ⇒ `69.4 ms/token` ⇒ **≈ 0.145 ms / CPU 专家调用**
+⇒ 交接 §11 的 60–110 tok/s 外推需按此锚点重算(其固定开销假设偏乐观)——
+但那是**调优**问题,不是可行性问题 ✓。
+
+**当前运行态** ⚠️:`qwen38_real` 仍在 GPU2:8140 上(占 ~37 GiB 显存 + ~600 GiB 内存);
+停法:`bash scripts/proc.sh stop qwen38_real` ✓。
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
