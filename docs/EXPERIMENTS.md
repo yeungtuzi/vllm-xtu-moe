@@ -7093,6 +7093,35 @@ P3 提供**权重卸载 vs 计算卸载的同硬件对照**(需先跑通 #37190 
 * **前置待用户同意** ✓:①**改在服务树**(须回灌 `patches/xtu-series` ✓)②**占两张 A100 测试**(机器有他人 ✓);
   ✅ 无需新工作树、无需重新编译 ✓
 
+
+### B242 GLM fp8 KV 侦察完成(目标 goal-279873bc 第 1 轮 ✓)⇒ 实施结构已定,缺口缩到 2 件
+
+**核心发现(最有价值 ✓)**:我方 `FlashMLASparseSM8XImpl` **继承** `FlashMLASparseImpl` ✓
+(`flashmla_sparse_sm8x.py:65` ✓),而后者**已有整套 fp8 KV 编排** ✓,直接继承即可:
+`use_fp8_kv_cache` 开关 ✓(`:360`)、`_forward_fp8_kv_separate_prefill_decode` ✓(`:920`)、
+`_forward_fp8_kv_mixed_batch` ✓(`:1135`)、`_build_fp8_*` metadata ✓(`:463/479`)、
+`fp8_decode_padded_heads` ✓(`:356`)。**KV 写入**是基类共用 op
+`ops.concat_and_cache_mla(..., kv_cache_dtype, scale)` ✓(`backend.py:1085` ✓)⇒ **fp8 打包写入已存在** ✓。
+**布局约定**上游已支持 `fp8_ds_mla`/`"fp8"` ✓ 且"**按每 token 字节数推断布局**" ✓
+⇒ **528 B = 上游注释中的 V4.1 布局** ⇒ **无需我方发明格式** ✓✓
+
+**必须我方补的两件(上游是 SM90+/V3.2 专用 ✗)**:
+1. **fp8 attention kernel** ✗:上游 `_fp8_flash_mla_kernel` 调
+   `flash_mla_with_kvcache(is_fp8_kvcache=True)` = **SM90+ CUDA** ✗(`:1223-1255` ✓)⇒ 需 **Triton 版**
+   (可照抄本树已有的 fp8 去量化模式 ✓:`_e4m3_uint8_to_f32` ✓ + `tl.exp2(enc-127)` ✓)
+2. **gather+upconvert 的 NoPE 变体** ✗:上游算子文档写明 `src=[blocks,bs,656] → dst=[tokens,576]` ✓
+   (`_custom_ops.py:2936-2938` ✓)= **V3.2 布局专用** ⇒ GLM 的 528→512 需新变体 ✓
+
+**四处改动** ✓:①门控放开(`:180` 加 `"fp8_ds_mla"`、`:218` 放开 ✓)②Triton NoPE kernel
+(`448→512`、去 rope、`block 64→32`、`scale 8→16` ⇒ **528 B 行** ✓)③gather/upconvert NoPE 变体
+④验收(数值 ✓/端到端三次逐字节可复现 ✓/1M 阶梯 ✓/256K×2 回归 ✓)
+
+**附带发现** ✓:`cp_gather_and_upconvert_fp8_kv_cache` 支持 `host_cache/host_row_ids/device_row_ids` ✓
+⇒ 即"部分行在 pinned 主机内存 + 按行重映射" ✓ ⇒ 与 host 侧 KV/权重思路同源 ✓,将来做 host-backed KV
+可复用该接口形状 ✓(本次不做 ✓)
+
+**状态** ✓:本轮为**只读侦察** ✓,未改任何代码 ✓;下一步(改服务树/占卡测试)**待用户同意** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
