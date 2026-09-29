@@ -7714,6 +7714,55 @@ GLM config 虽写 `qk_rope_head_dim=0` ✓,但运行时走**通用 `MultiHeadLat
 **唯一待办** ✓:抓一条**真实长请求**的 `[fp8-prefill]` 探针(此前抓到的 308 条全是预热哑跑 ✗)⇒
 定 `workspace_starts` 语义 ⇒ 改 `prefill_row_map` ⇒ 复测"长提示连贯 + 取到代号" ✓
 
+### B266 vLLM 树收敛为唯一一棵:主 checkout 升到 `origin/main` + 系列,worktree 与两棵第三方 clone 删除
+
+**用户指示**(2026-09-29):"停止目前所有工作,梳理代码树,**确保 vLLM 只有一条主线存在**,
+且 `vllm-xiaotu-moe` 与上游兼容";并定两条纪律:**不得再用 `/tmp` 或单独的树衍生代码**、
+**若必须停掉当前环境才能继续,先告知用户等决定**。
+
+**收敛前实测**有 4 棵 vLLM 树:
+| # | 路径 | 基线 | 状态 |
+|---|---|---|---|
+| 1 | `process_data/ref/repos/vllm-mainline` | `70fc359d25`(09-24) | clean,**落后 `origin/main` 269 提交**;`.so` 为 09-14 |
+| 2 | `vllm-consolidated`(1 的 worktree) | `35d6fb3187` = **`origin/main`** | dirty 45 文件 = 我们的系列;`.so` 为 09-29;**conda 环境 vLLM 的 editable 目标** |
+| 3 | `/home/user/lvllm/Lvllm` | 第三方 `guqiong96/Lvllm` clone,`dd3be2935b`(09-16) | 0 独有提交;709M |
+| 4 | `/home/user/lvllm/_research/lvllm` | 同上 clone,`2f47920`(09-20) | 0 独有提交;174M |
+
+**先做了等价性核验(删之前)** ✓:系列触及 46 个文件;树 2 的 dirty = 36 modified + 9 new;
+两者**逐文件集合一致**,第 46 个 `mimo_v2_mtp.py` **净差为 0**(0011 加、0013 revert)✓
+⇒ 删树 2 不会丢内容 ✓(仅树 2 的 `flashmla_sparse.py` / `flashmla_sparse_sm8x.py` 各多一个**空行**,
+是当初删探针的残留,系列里没有 ⇒ **新树反而更干净** ✓)。
+
+**执行** ✓:①`git bundle` 备份 refs → `_backup/vllm-mainline-refs-20260929.bundle`(251 MB)✓;
+②树 1 `checkout origin/main` 并快进 `main` ✓;③`apply_xtu_patches.sh` 打系列 ⇒ **17/17 干净** ✓;
+④迁移构建产物:18 个 `.so`、`vllm-rs`(58 MB)、被 gitignore 的 vendored 依赖
+(`third_party/deep_gemm` 整目录、`flashmla/flash_mla_interface.py`、`fmha_sm100/.../utils.py`)✓;
+⑤`diff -rq` 复核 ⇒ 除上述 2 个空行外**逐字节一致** ✓;⑥editable finder + `direct_url.json` 改指树 1
+⇒ `import vllm` 解析到新路径、`_C_stable_libtorch` 可加载 ✓;⑦9 个可执行脚本默认树改指树 1
+(历史 `.md`/`.log` **不改写** ✓);⑧`git worktree remove --force` 删树 2、`rm -rf` 删树 3/4 ✓。
+
+**收敛后** ✓:`git worktree list` = **1 行**;全盘 `vllm/__init__.py` 只剩树 1
+(+ `lmcache-fork/lmcache/integration/vllm/`,那是 lmcache 的子包,不是 vLLM 树)✓;
+树 1 = `origin/main` + 45 文件系列、**0 探针**、18 个 `.so` ✓。
+
+**未动** ⚠️:`process_data/ref/repos/Lvllm`(305M,第三方 `guqiong96/Lvllm` 的 v2.3.11 旧 checkout)——
+它位于**专门的 `ref/repos/` 参考仓目录**(与 `ktransformers` / `lktransformers` 并列),
+不是我们的 mainline,**留给用户决定** ✓。
+
+**用户裁定与后续(同日)** ✓:
+* `ref/repos/Lvllm` **保留** —— "我们有时候还需要对比性能";并指示**这些参考库要跟上游保持一致** ✓
+* 已同步:①`ref/repos/Lvllm` **落后 20,686** → `git merge --ff-only origin/main` ⇒ **`43ffc42a54`**
+  (`lvllm-v2.5.2-2`,09-22,behind=0)✓;②`sglang-src` 落后 329 → **`98fce73d`**(09-29,behind=0)✓
+* 本就齐:③`ref/repos/lktransformers`(behind=0,其 `ktransformers/` 子目录**不是** git 仓)、
+  ④`_research/lsglang`(注意它是**另一个项目** `guqiong96/Lsglang`,不是 sglang 上游)✓
+* **无 remote、无法同步**:`lmcache-fork`(纯本地 fork,含我们的 scratch-group 修复)、
+  `diesel-engine-3d`(与 vLLM 无关)⇒ 要同步需先加 remote,属独立决定 ✓
+* **用户裁定**:`sglang` **只留一个干净的树** ⇒ 删除重复克隆 `_research/sglang`(29M,与 `sglang-src`
+  **同一上游** `sgl-project/sglang`,当时两边都已在 `98fce73d`)⇒ 保留的唯一 sglang 树 = **`sglang-src`** ✓
+* ⚠️ **我们的 mainline 树**(`ref/repos/vllm-mainline`)在 fetch 后显示**落后 `origin/main` 32 个提交**
+  (上游同日又前进,`origin/main` 现为 **`f4917dadc8`**)⇒ 要不要 rebase 由用户决定:
+  需重打 17 个 patch、且 `.so` 是 `35d6fb3187` 编译的,前进后**可能需重编** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**

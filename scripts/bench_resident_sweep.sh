@@ -31,7 +31,7 @@ cd "$ROOT"
 ENVDIR="${BENCH_ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}"
 PY="$ENVDIR/bin/python"
 export PATH="$ENVDIR/bin:$PATH" HF_HUB_OFFLINE=1 VLLM_USE_FLASHINFER_SAMPLER=0
-export XTU_TREE="${XTU_TREE:-/home/user/lvllm/vllm-up-133b71e0b}"
+export XTU_TREE="${XTU_TREE:-/home/user/lvllm/process_data/ref/repos/vllm-mainline}"
 
 OUT="${OUT:-/tmp/resident}"; mkdir -p "$OUT"
 LOGD="$ROOT/logs"; mkdir -p "$LOGD"

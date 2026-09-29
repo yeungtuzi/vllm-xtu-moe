@@ -39,7 +39,7 @@ PY="$ENVDIR/bin/python"
 export PATH="$ENVDIR/bin:$PATH"
 export HF_HUB_OFFLINE=1 VLLM_USE_FLASHINFER_SAMPLER=0 FLASHINFER_DISABLE_VERSION_CHECK=1
 # 全部指向 rebase 后的树(修掉原脚本 V4.1 漏传 PYTHONPATH 的问题)
-export XTU_TREE="${XTU_TREE:-/home/user/lvllm/vllm-up-133b71e0b}"
+export XTU_TREE="${XTU_TREE:-/home/user/lvllm/process_data/ref/repos/vllm-mainline}"
 
 OUT="${OUT:-/tmp/rnd2}"; mkdir -p "$OUT"
 LOGD="$ROOT/logs"; mkdir -p "$LOGD"
