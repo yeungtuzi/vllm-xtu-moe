@@ -20,6 +20,20 @@ PATTERNS=(
   '内网域名/主机名|(\.(internal|corp|lan|local)\b|tinyproxy)'
 )
 
+# 允许清单(方案 A ✓):按【文件:行号】精确豁免历史已公开项。
+# 语义与纪律:①只豁免列出的确切位置 ✓ ②清单失配 ⇒ 检查失败闭合(安全方向 ✓)
+ALLOWLIST="${ALLOWLIST:-$(dirname "${BASH_SOURCE[0]}")/secrets_allowlist.txt}"
+ALLOW_FILTER=''
+if [ -f "$ALLOWLIST" ]; then
+  # ⚠️ 必须【逐行】去空白:用 tr -d '[:space:]' 会连换行一起删 ⇒ 清单被拼成一行 ⇒ 永不匹配 ✗
+  ALLOW_FILTER=$(grep -vE '^[[:space:]]*(#|$)' "$ALLOWLIST" \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' | sort -u)
+fi
+_is_allowed() {  # $1 = "file:line"
+  [ -n "$ALLOW_FILTER" ] || return 1
+  printf '%s\n' "$ALLOW_FILTER" | grep -qxF "$1"
+}
+
 case "$MODE" in
   --staged) FILES=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null); READ=(git diff --cached -U0 --) ;;
   --diff)   FILES=$(git diff --name-only --diff-filter=ACM 2>/dev/null);          READ=(git diff -U0 --) ;;
@@ -36,6 +50,18 @@ for entry in "${PATTERNS[@]}"; do
   else
     hits=$(git diff ${MODE/--staged/--cached} -U0 -- $FILES 2>/dev/null \
            | awk -v re="$re" 'BEGIN{n=0} /^\+\+\+ b\//{f=substr($0,7)} /^@@/{split($3,a,","); ln=substr(a[1],2)-1} /^\+/ && !/^\+\+\+/{ln++; if (match(substr($0,2), re)) print f":"ln}' 2>/dev/null)
+  fi
+  if [ -n "$hits" ]; then
+    allowed=0; kept=""
+    while IFS= read -r h; do
+      [ -z "$h" ] && continue
+      if _is_allowed "$h"; then allowed=$((allowed+1)); else kept="${kept}${h}\n"; fi
+    done <<< "$hits"
+    # 过滤后必须掐掉空行:全部被豁免时 kept 只剩换行 ⇒ [ -n ] 会误判为"有命中" ✗
+    hits=$(printf '%b' "$kept" | sed '/^[[:space:]]*$/d')
+    if [ "$allowed" -gt 0 ]; then
+      echo "[secrets] ℹ️ 类别「$label」:豁免 $allowed 处历史已公开项(见 scripts/secrets_allowlist.txt ✓)"
+    fi
   fi
   if [ -n "$hits" ]; then
     rc=1
