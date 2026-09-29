@@ -7068,6 +7068,31 @@ P3 提供**权重卸载 vs 计算卸载的同硬件对照**(需先跑通 #37190 
 * **根因归属** ✓:KV dtype 到头是 **SM80 无 FP4 硬件** ✗,**换 Hopper/Blackwell 后 fp4 KV 即可用** ✓
   ⇒ 属"换机器"而非"改代码" ✓
 
+
+### B241 GLM-5.3-Flash fp8 KV:侦察定稿(用户决定推翻 2026-09-19"不做 fp8 KV"的裁定 ✓)
+
+**结论:可行,且非从零实现** ✓ —— 复用本树已有的 fp8_ds_mla 机制,加 **NoPE-512 变体** ✓
+
+* **已有资产** ✓:`sparse_mla_kernels.py:1273` `_accumulate_fp8ds_global_slots_attention_chunk_kernel`
+  (**本树已有 fp8_ds_mla KV 读取/去量化** ✓,5 处同款模式 ✓);`_e4m3_uint8_to_f32`(fp8_utils ✓);
+  UE8M0 解码 `tl.exp2(enc-127)` ✓;`sparse_swa.py` 的 fp8_ds_mla **paged 布局** ✓;
+  `index_group.py:189` 的 KV 写入分支 ✓ ⇒ **且 DeepSeek 在本机 SM80 上跑 fp8 KV 已投产** ✓
+  (`serve_prod_8070.sh` / `process_data/scripts/dsv4.sh` ✓)⇒ 整条链在 SM8x 可用 ✓
+* **要新增的** ✓:**NoPE-512 变体**(GLM `qk_rope_head_dim=0 / kv_lora_rank=512` ⇒ 无 RoPE 尾 ✓):
+  `token_fp8_dim 448→512` ✓、`token_bf16_dim 64→0` ✓、`quant_block 64→32` ✓、`scale_dim 8→16` ✓
+  ⇒ 行字节 **584 B → 528 B** ✓ —— **正是上游注释里 DeepSeek-V4.1 的布局**(`flashmla_sparse.py:98` ✓)
+* **改动点 3 处(均 Python ⇒ 无需编译 ✓)**:①`flashmla_sparse_sm8x.py` 的
+  `supported_kv_cache_dtypes`(现在 `["auto","bfloat16"]` ✓)与 `:218` 的 fail-closed 检查 ✓
+  ②`sparse_mla_kernels.py` 派生 NoPE kernel ✓ ③KV 写入侧行宽 528 B + 块后交错 scale 区 ✓
+  (⚠️ 待定:`index_group.py:189` 用 `FP8_DS_MLA_ROW_BYTES=656`(V3.2 尺寸 ✓)⇒ 需确认 GLM 是否共用该段 ✗)
+* **验收** ✓:数值(与 bf16 比 token 一致率 + RMS,用 `scripts/test_sparse_mla_fwd_sink.py` ✓)、
+  端到端(贪心连贯 + 三次逐字节可复现 ✓)、上下文阶梯(1M:K V ~11.9–12.3 → ~6 KB/token ⇒ 1M 需 ~5.9 GiB
+  < 6.87 GiB ✓)、回归(256K×2 路不退化 ✓)
+* **风险** ✓:fp8 KV 在 GLM 上**从未验证** ✗(bf16 是逐字节级验证 ✓ ⇒ fp8 须同等级 ✓);
+  去量化在 kernel 内可能拖慢 decode ✗;上游若实现 528 B 需对齐 ✓
+* **前置待用户同意** ✓:①**改在服务树**(须回灌 `patches/xtu-series` ✓)②**占两张 A100 测试**(机器有他人 ✓);
+  ✅ 无需新工作树、无需重新编译 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
