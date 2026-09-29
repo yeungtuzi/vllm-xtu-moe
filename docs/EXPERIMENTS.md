@@ -7658,6 +7658,36 @@ GLM config 虽写 `qk_rope_head_dim=0` ✓,但运行时走**通用 `MultiHeadLat
 那属**上游行为** ✓;但**本目标要求"1M 上下文 + 连贯"** ✓ ⇒ **仍需在目标内解决** ✓
 (可在我们侧适配 ✓,或按只读纪律另行判断是否上报 ✓,不擅自发 ✓)。
 
+### B264 ⚠️ **重要更正**:撤回 B260/B262/B263 的核心论断 —— 探针全部命中,预填**确实走我们的钩子** ✓
+
+**本轮干净运行的探针统计** ✓(`logs/glm53_path2.log` ✓,TAG=glm53_path2 ✓):
+```
+   948 × [path] flashmla_sparse._forward_fp8_kv_separate_prefill_decode called ✓
+   928 × [path] flashmla_sparse_sm8x.forward_mqa called ✓
+   946 × [fp8-shape]   (我们的 _fp8_flash_mla_kernel ✓)
+  1254 × [bf16-kv]     (我们覆盖的 _bf16_flash_mla_kernel ✓✓)
+   308 × [fp8-prefill] (我们的 _gather_fp8_prefill_chunk ✓✓)
+```
+⇒ ⇒ **预填确实经过我们覆盖的两个方法** ✓ ⇒ ⇒
+⇒ ⇒ ⇒ **撤回** ✗:①B260"预填钩子从未被调用" ✗ ②B262"预填 = 独立 dense-MHA 后端" ✗
+③B263"SM80 无 dense-MHA ⇒ 预填回到稀疏路径,但入口不是那两个方法" ✗ —— 第③条的**前半段仍然正确** ✓
+(日志 `mla_attention.py:621` 的 WARNING 是真的 ✓),**后半段(入口不经过我们)是错的** ✗
+
+**错误根源(方法论,已记 ✓)** ✓:那几轮里 GLM **根本没有启动成功** ✗ ——
+上一轮的 **V4.1 对照服务仍占着 8070** ✗,于是:
+* `scripts/serve_glm53_mainline.sh` 报 `OSError: [Errno 98] Address already in use` ✗
+* 而 `READY` 是**占用者**应答的 ✓ ⇒ 我的请求打到了 **V4.1** ✗(模型名 GLM ⇒ 它拒绝 ⇒ 无 `choices` ✓)
+⇒ ⇒ 于是 GLM 一次都没跑 ⇒ **探针自然 0 条** ✓ ⇒ 我却把它解读成"钩子不被调用" ✗✗
+⇒ ⇒ ⇒ **教训** ✓:**"探针为 0"必须先排除"进程压根没跑"** ✓ ——
+**先验证服务身份(模型名 / 端口占用者)再解读探针** ✓;本轮已在脚本里加了"认领占用者 + 打印 `/v1/models`"✓
+
+**由此得到的正确结论(本目标的修复方向 ✓)** ✓:
+⇒ **长上下文退化就发生在【我们的预填 gather】中** ✓(`_gather_fp8_prefill_chunk` ✓ 308 次调用 ✓)
+⇒ ⇒ 修复目标明确 ✓:核对该预填路径的
+①`prefill_row_map` 的 `workspace_starts` 语义 ✓ ②`src_rows` 的 slot→行 映射 ✓
+③表的 576 宽与 RoPE 尾部(NoPE 时为零 ✓)✓ ④`dst_rows` 与上游 workspace 偏移的一致性 ✓
+⇒ 现有布局事实(656 B 行内交错 + 4×fp32 缩放 ✓,B259 ✓)仍然有效 ✓,可直接用于核查 ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
