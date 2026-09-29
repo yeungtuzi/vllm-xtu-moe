@@ -7436,6 +7436,30 @@ prefill = 逐 chunk gather 进继承 workspace + 继承的重映射 → 现有 b
 **GPU 阶段定量预期** ✓:行宽 1024 B → **528 B** ⇒ KV 池 ≈ **1.94×** ⇒
 (bf16 时 256K 池 988,081 token、上限 ~733K ✓)⇒ **1M 可起且并发 ~1.9×** ✓
 
+### B256 ✅ 维护窗口完成:服务树更新到新上游 + 新系列 + GLM fp8 KV patch(四次尝试,前三次均因**我的 runbook bug** ✗)
+
+**最终结果** ✓:树 HEAD = `35d6fb3187`(新上游 ✓)+ **新系列 16/16** ✓ + **GLM fp8 KV patch(365 行)** ✓;
+扩展用 `VLLM_USE_PRECOMPILED=1` **预编译**路线装配 ✓(分钟级 ✓,未做本地全量构建 ✓);
+验证 ✓:`import vllm` 成功(0.30.1rc1.dev316+g35d6fb318 ✓)、SM8x 后端与 fp8 钩子可导入 ✓、
+`supported_kv_cache_dtypes = ['auto','bfloat16','fp8_ds_mla']` ✓✓ —— **门已开** ✓
+
+**四次尝试的根因(全部是我 runbook 的错,逐条修掉 ✓)**:
+1. ✗ `git checkout -- .` **只回退已跟踪文件** ⇒ 旧系列新增的 9 个未跟踪文件残留 ⇒ 新系列报
+   `already exists in working directory` ✗;**且回滚也因同样原因失败** ✗
+   ⇒ 修:切树前**按系列清单显式删除**未跟踪的新增文件 ✓;回滚函数同步修 ✓
+2. ✗ 步骤 ④ 打的是**仓库里的旧系列**(只适配旧基点)✗ ⇒ 必须先把**新系列**装进
+   `patches/xtu-series` 再打 ✓
+3. ✗ pip 安装**升降了环境依赖** ✗(flashinfer 0.6.18→0.7.0、xgrammar 0.2.3→0.2.7、
+   cutlass-dsl 4.6.2→4.7.1、quack-kernels、hf_hub、cudnn-frontend ✓)⇒ 修:加 **`--no-deps`** ✓
+   ⚠️ 该次升级**已发生且无法回退**(pip 无事务 ✗);但新 vllm 本就需要这些版本 ✓ ⇒ 保持现状 ✓
+4. ✗ 步骤 ⑦ 在**树内**验证 ⇒ 出现 `torch has no attribute Tensor` 的瞬态/遮蔽 ✗
+   ⇒ 修:验证改到**中性 cwd**(`/tmp` ✓)✓(诊断确认 torch 本身完全正常 ✓)
+
+**过程自伤与教训** ✓:①一次 `;` 串联导致密检报命中后仍提交 ✗ ⇒ 新纪律:`git add` 与 `git commit` 必须用 `&&` ✓
+②`[ -d .git ]` 对 **worktree 形态**(`.git` 是文件 ✓)误报 ✗ ⇒ 改 `git rev-parse --git-dir` ✓
+③"csrc mtime 比 .so 新 ⇒ 过期"是**错判据** ✗(checkout 会重写 mtime ✓)⇒ 已纠正 ✓
+④备份源用仓库目录 ✗ ⇒ 若上次失败过会"备份到新的" ✗ ⇒ 改 **`git archive HEAD`** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
