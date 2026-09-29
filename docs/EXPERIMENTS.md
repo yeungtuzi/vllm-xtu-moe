@@ -7356,6 +7356,27 @@ series 的**第 1 个 commit 单独 checkout 时语法不过** ✗ ⇒ 计划用
 ②随后**同时**把新系列装进 `patches/xtu-series/` ✓
 ③GLM fp8 KV 的两个 patch 叠到**新系列**上 ✓(现在基点已是最新上游 ✓)
 
+
+### B251 GLM fp8 KV 第 9 轮:prefill 接线位点**精确定位** ✓ + 否决一条省事路 ✗
+
+**上游 fp8 prefill 真实流程**(`flashmla_sparse.py:1050-1105` ✓):非 host-cache 时按
+`fp8_metadata.prefill.chunks` **逐 chunk** 把 packed cache 经
+`ops.cp_gather_and_upconvert_fp8_kv_cache` 升采样进 `prefill_bf16_workspace` ✓;
+配合 `sparse_utils.py:481-487` 原文「HAS_PREFILL_WORKSPACE 时 prefill 索引被映射到 **workspace 偏移**
+而非全局 slot」✓
+⇒ ⇒ **分块(有界 ✓)、workspace 分配 ✓、索引重映射 ✓、bf16 attention 核 ✓ 全部可继承** ✓✓
+⇒ ⇒ ⇒ **唯一 SM8x 缺口 = 那个 V3.2 专用 gather 算子** ✓ ⇒ 换成我们的 NoPE-528 Triton 版即可 ✓
+
+⚠️ **但它不能靠覆盖 `_fp8_flash_mla_kernel` 替换** ✗:gather 在**基类 forward** 里 ✗
+⇒ ⇒ 须在 `FlashMLASparseSM8xImpl` **覆盖 `_forward_fp8_kv_separate_prefill_decode`**(≈60 行拷贝 ✓,
+替换两处算子调用 ✓);代价:该方法是上游会改的代码 ⇒ **每次 rebase 需重核** ✓(已记风险 ✓)
+
+✗ **否决"零新代码"路** ✓:沿用上游现成 **656 B 行**(含 128 B RoPE 尾 ✓)可直接复用上游算子 ✓,
+但 656 B/行 ⇒ **1M 需 ~7.4 GiB > 可用 6.87 GiB** ⇒ **装不下** ✓(省 36% 不够,须省 48% ⇒ 只有 NoPE-528 ✓)
+
+**定稿数据流** ✓:decode = 有界 gather → bf16 表 → 现有 bf16 attention ✓;
+prefill = 逐 chunk gather 进继承 workspace + 继承的重映射 → 现有 bf16 attention ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
