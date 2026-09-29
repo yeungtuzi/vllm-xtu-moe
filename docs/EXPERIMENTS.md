@@ -7191,6 +7191,28 @@ head_size)` ✓(`:758-774` ✓)⇒ **继承即可,不需自建** ✓
 **过程自伤(均已修复 ✓)**:①diff 的 `-p1` 前缀与我的 sed 叠错 ⇒ 改用标准 `--src-prefix/--dst-prefix` ✓
 ②`cd` 后用相对路径导致源文件找不到 ⇒ 改**绝对路径** ✓
 
+### B246 rebase 体检(用户提醒"别忘了及时 rebase"⇒ 立即体检 ✓)+ GLM fp8 patch 签名对齐 ✓
+
+**漂移实测(gh API 逐文件查 ✓)**:上游 main 领先基点 **269 个提交**(基点 `70fc359d25`,2026-09-24 04:09 ✓,
+距今 5 天 ✓);我们 patch 系列触及 **45 个文件**,其中 **17 个上游已改动** ✗ ——
+`envs.py`、`int_wna16.py`、`routed_experts.py`、`fp8.py`、`mimo_v2_mtp.py`、`attention.py`×3、
+`cache_utils.py`×2、`engram.py`、`flashmla.py`、`model.py`、`o_proj.py`、`kpool_compress.py`、
+`sparse_swa.py`、`core.py` ⇒ **rebase 大概率有真冲突** ✗;patch 系列最近生成于 2026-09-24 04:41(已陈旧 ✗)
+⚠️ **过程纠错** ✓:我先用 `compare` API 得到"交集仅 1 个文件"⇒ **不成立** ✗ —— 该 API 的文件列表**被 300 上限截断** ✓;
+改用**逐文件** `commits?path=` 查询才得到真实的 17 个 ✓
+
+**rebase 计划(照 `AGENTS.md` 流程 ✓,dry-run 全程不碰服务树 ✓)**:①fetch ②`git archive origin/main | tar -x -C /tmp/x`
+导出**纯上游快照**(不注册 worktree、不污染仓库 ✓)③把系列打到快照上,**必须全部干净应用**(失败 ⇒ 改 patch,
+**不许 `-f`** ✗)④与在服务树**逐文件比对** ⑤通过后**再**更新在服务树(**必须先问用户** ✓,要重启 ✓)
+
+**GLM fp8 KV 本轮进展** ✓:修正上一轮遗留的**签名不一致** ✗ ⇒ 两个 patch 现已对齐 ✓
+* `dev-docs/glm_fp8_kv_gate.patch`(90 行 ✓):门控放开 + fp8 分支改为**有界**(`_SM8X_FP8_MAX_GATHER_ROWS = 64K` ⇒
+  表最大 64 MiB ✓)+ prefill **显式 fail-closed 断言**(不静默爆显存 ✓)
+* `dev-docs/glm_fp8_kv_kernels.patch`(101 行 ✓):kernel + 包装函数,签名
+  `(src_cache, src_rows, dst, dst_rows, cache_block_size, block_stride)` ✓
+* **核对** ✓:gate 侧 6 个实参与定义**逐一对应** ✓;两个 patch 对**新鲜副本** `git apply -p1 --check` **均退出码 0** ✓;
+  应用后语法通过 ✓(224→269 行 / 3740→3833 行 ✓)
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
