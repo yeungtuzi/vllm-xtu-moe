@@ -7377,6 +7377,65 @@ series 的**第 1 个 commit 单独 checkout 时语法不过** ✗ ⇒ 计划用
 **定稿数据流** ✓:decode = 有界 gather → bf16 表 → 现有 bf16 attention ✓;
 prefill = 逐 chunk gather 进继承 workspace + 继承的重映射 → 现有 bf16 attention ✓
 
+### B252 密检阻断的发现与解决(A 方案,用户批准 ✓)
+
+**问题** ✓:`scripts/check_no_secrets.sh` **恒返回 1** —— 命中全是**既有历史项**
+(`AGENTS.md:76,77,81`、`docs/EXPERIMENTS.md:5869,6316`、检查器自身 `:20`)⇒
+按纪律"退出码 1 = 禁止提交" ⇒ **今后任何提交都无法合规完成** ✗(纪律自相矛盾 ✓)
+**核实** ✓:含 IP 形态的行数 **上一版 6 / 本版 6** ⇒ 相关提交**零新增命中** ✓
+**方案 A(用户选定 ✓)** ✓:新增 `scripts/secrets_allowlist.txt`,按 **`文件:行号`** 精确豁免 ✓
+* 语义 ✓:①只豁免确切位置 ✓ ②**同一文件将来新增的敏感行仍会被拦** ✓(已验证 ✓)
+  ③**行号漂移 ⇒ 清单失配 ⇒ 失败闭合** ✓(安全方向 ✓)
+* 检查器改造 ✓:命中先过滤允许项,并**透明打印"豁免 N 处"** ✓(仍绝不打印值 ✓)
+* **三个模式全部验证** ✓:`--all` 干净 ✓、`--staged` 干净 ✓、已豁免文件里新增行**仍被拦** ✓
+⚠️ **我自己的两次 bug(均已修 ✓)**:①过滤后 `hits` 只剩换行 ⇒ `[ -n ]` 误判为"有命中" ✗
+②`tr -d '[:space:]'` **把换行也删掉** ⇒ 清单 6 条被拼成一行 ⇒ 永不匹配 ✗(用 `od` 实证后改逐行去空白 ✓)
+⚠️ **流程违规(已记纪律 ✓)**:曾用 `;` 串联 ⇒ 密检报命中后 commit/push 仍执行 ✗
+⇒ **新纪律:`git add` 与 `git commit` 之间必须用 `&&`,密检失败即阻断** ✓
+
+### B253 行映射(向量化)实现与验证 ✓
+
+`dev-docs/glm_fp8_kv_rowmap.py` ✓:与上游 `map_gather_page_task` 语义**逐元素对照** ✓,
+8 组用例(单/多请求、跨页、示例 chunk 0/1、空请求、页边界、`total=0` ✓)全部一致 ✓
+* 向量化用 `searchsorted` ⇒ **无需 D2H 同步** ✓;越界行标 `-1`(内核本跳过 `slot_id<0` ✓)
+* ⚠️ **测试初版我写了一个非法用例** ✗(`ws=[0,10,25,0]` 把两个 chunk 混成一个数组 ✓)
+  ⇒ 正确模型是**两个独立 chunk** ✓;顺带暴露"向量化隐含要求 `ws` 单调" ⇒ 已加**显式 fail-closed 断言** ✓
+
+### B254 树更新 runbook + 关键发现 ✓
+
+`dev-docs/update_tree_to_new_upstream.sh` ✓:`CONFIRM=1` 门禁(不带则拒绝,退出码 2 ✓)、`DRY=1` 预演
+**零副作用** ✓、失败自动回滚 ✓、**只有树验证通过才装新系列** ✓
+* ⚠️ **发现 1** ✓:上游(基点→`35d6fb3187`)改了**编译输入** —— `csrc/` 10 文件、`cmake/` 3、
+  `requirements/` 11、`CMakeLists.txt`/`setup.py`/`pyproject.toml` 全改 ⇒ **更新必须换扩展** ✗
+* ⭐ **发现 2** ✓:我们 45 个改动文件**全是 `.py`**、`csrc/` 零改动 ✓ ⇒ 需要的是**上游预编译扩展** ⇒
+  构建步骤改为**两级策略**(先 `VLLM_USE_PRECOMPILED=1` ⇒ 失败才本地全量 ✓)⇒ 窗口有望**分钟级** ✓
+* ⚠️ **发现 3** ✓:服务树是 **git worktree**(`.git` 是文件 ✓)⇒ 我第一版检查 `[ -d .git ]` **误报** ✗
+  ⇒ 已改 `git rev-parse` ✓(**DRY 预演抓到的** ✓)
+* ⚠️ **发现 4** ✓:本树**无任何构建目录** ✗(当初非 CMake-preset 流程)⇒ 本地构建将是**全新全量** ✗;
+  且 `nvcc` 为 CUDA **12.1** 而 torch 为 **13.0** ⇒ 有工具链不匹配风险 ⇒ 更应走预编译 ✓
+* ⚠️ **我一条错判据(已自查纠正 ✓)**:曾说"csrc 比 .so 新 ⇒ 过期" ✗ —— 321 个文件"更新"只是
+  `git checkout` 重写 mtime ✓,**mtime 不是内容证据** ✗
+
+### B255 GLM fp8 KV 代码阶段完成 + 4 个运行期隐患(静态细读抓出 ✓)
+
+`dev-docs/glm_fp8_kv.patch`(**365 行 / 3 文件** ✓):`--check` 对重放后的树**干净** ✓、三文件语法通过 ✓
+**钩子设计(修正后 ✓)**:①`forward_mqa` 在 fp8 时**路由**到继承的 fp8 编排 ✓
+②覆盖 `_fp8_flash_mla_kernel`(**decode** ✓)③覆盖 `_gather_fp8_prefill_chunk`(**prefill** ✓)
+④基类**小重构**抽出 `_gather_fp8_prefill_chunk`/`_gather_nvfp4_prefill_chunk`(行为不变 ✓,可独立成小 PR ✓)
+**抓出并修掉的 4 个运行期隐患** ✓:
+1. ⚠️ 按 `kv_cache_dtype` 在 `_bf16_flash_mla_kernel` 里去量化 ⇒ **prefill 二次去量化** ✗
+   (该函数同时服务 bf16 路径与 fp8 prefill 的 **bf16 workspace** ✓)⇒ **教训:钩子按"数据是什么"选,
+   不能按"配置是什么"选** ✗
+2. ⚠️ 上游 fp8 prefill 调 `_bf16_flash_mla_kernel(..., out=...)` 而我们覆盖签名无 `out` ⇒ **TypeError** ✗
+   ⇒ 已补 `out=None`(接口对齐,不改语义 ✓)
+3. ⚠️ kernel 草稿里的指针 hack(`src_ptr * 0 + ...`)⇒ 已删 ✓
+4. ⚠️ decode 表用 `torch.empty` ⇒ 无效行未初始化,若为 `NaN` ⇒ `NaN×0=NaN` **毒化 softmax** ✗
+   ⇒ 改 `torch.zeros` ✓
+**验收脚本** ✓ `dev-docs/glm_fp8_kv_acceptance.py`:**CPU 可验部分已跑通** ✓
+(布局最差行相对 RMS **0.0296** ≤ 判据 0.035 ✓;行映射 5 组用例一致 ✓);GPU 部分备好命令与判据 ✓
+**GPU 阶段定量预期** ✓:行宽 1024 B → **528 B** ⇒ KV 池 ≈ **1.94×** ⇒
+(bf16 时 256K 池 988,081 token、上限 ~733K ✓)⇒ **1M 可起且并发 ~1.9×** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
