@@ -7142,6 +7142,28 @@ P3 提供**权重卸载 vs 计算卸载的同硬件对照**(需先跑通 #37190 
 
 **本轮未改在服务树 ✓、未占卡 ✓、未启服务 ✓**(符合目标约束 ✓)
 
+### B244 GLM fp8 KV 第 3 轮:数据流证清(kernel 草稿 + CPU 往返验证通过 ✓)
+
+**先纠错** ✓:我一度以为"必须先把 fp8 行 gather 成 bf16 表"⇒ **不成立** ✗ —— 读上游 fp8 前向原文
+(`flashmla_sparse.py:920-1000` ✓)后确认:**decode** 用全局 slot 号直送内核(**去量化在内核内**,无 gather/无 workspace ✓);
+**prefill** 用 workspace + `prefill_workspace_starts` ✓,且注释原文「Prefill requests may be **chunked to fit within the
+fixed workspace size**」⇐ **workspace 固定大小、请求分块适配** ⇒ 我担心的 ~4 GB 不会出现 ✓✓
+⇒ ⇒ **结论回到"只加一个 gather+upconvert kernel"** ✓(第 2 轮结论成立 ✓),且 workspace/重映射**继承自上游** ✓
+
+**kernel 草稿** ✓ `dev-docs/glm_fp8_kv_gather_draft.py`(**未落地服务树** ✗):接口对齐上游
+`cp_gather_and_upconvert_*`(源行号 + 目标行号 ⇒ 写 bf16 workspace ✓);常量取 GLM NoPE-512
+(`token_data_size=512` ✓ `quant_block=32` ✓ `scale_dim=16` ✓ ⇒ 行 **528 B** ✓);去量化复用
+`_e4m3_uint8_to_f32` + `tl.exp2(enc-127)` ✓
+
+**CPU 往返验证通过** ✓ `dev-docs/glm_fp8_kv_layout_ref.py` ✓:ue8m0 block-32 与 fp32 block-128 **两种编码**
+页大小均 **64×528=33792 B** ✓,**kernel 寻址公式 vs 独立解析式 最大绝对差 = 0.000e+00**(逐位一致 ✓);
+原行相对 RMS **0.0259 / 0.0247** ✓(落在第 2 轮区间内 ✓)⇒ 两种编码**都值得试** ✓
+寻址公式与现成 kernel(`sparse_mla_kernels.py:1343-1351`)**逐行同式** ✓
+
+**本轮纪律** ✓:未改在服务树 ✓、未占卡 ✓、未启服务 ✓
+**过程教训** ✓:heredoc 结束标记写错(应 `MD` 写成 `PY`)⇒ 后续 Python 代码被当文本追加进计划书 ✗
+⇒ 已截断修复 ✓;**今后嵌套多段 heredoc 必须逐个核对结束标记,并在写入后立即 `tail` 验证** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
