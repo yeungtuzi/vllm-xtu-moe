@@ -7213,6 +7213,45 @@ head_size)` ✓(`:758-774` ✓)⇒ **继承即可,不需自建** ✓
 * **核对** ✓:gate 侧 6 个实参与定义**逐一对应** ✓;两个 patch 对**新鲜副本** `git apply -p1 --check` **均退出码 0** ✓;
   应用后语法通过 ✓(224→269 行 / 3740→3833 行 ✓)
 
+### B247 调研:Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4(subagent ✓,报告见 dev-docs)
+
+**结论:存在但【不建议投入】✗;但它有一个【可直接借鉴】的东西 ✓**
+
+1. **存在 ✓**:`lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4` ✓ —— **个人二次量化**,
+   2026-09-25 创建,**仅 41 下载 / 0 likes** ✗,414 文件 **120.10 GiB** ✓;无 ModelScope 镜像(未找到 ✓)
+2. ⭐ **"NVFP4 需要 Blackwell ⇒ SM80 跑不了"这个说法对 W4A16 是【错的】** ✓:主线
+   `ModelOptMixedPrecisionConfig.get_min_capability() == 75` ✓,源码注释原文"*Validated end-to-end on … **A100 (SM80)**"* ✓,
+   落地 PR **#45306 已合并** ✓,Marlin MoE 门槛 `has_device_capability((7,5))` ✓,`marlin` 是合法 `--moe-backend` ✓
+   ⇒ (我先前的假设"W4A16 可走 Marlin 在 Ampere 跑"得到**证实** ✓)
+3. ⚠️ **但这个检查点在本机跑不起来**,两个独立原因 ✗:
+   * **载入 bug**:156 个 FP8 注意力投影用 **rank-2 `weight_scale_inv`** 命名(实测文件头 `[80,20]` ✓),
+     主线只注册 `weight_scale` ⇒ **issue #54126(同作者同布局)仍 open ✗,修复 PR #50617 未合并** ✓
+   * **显存算术**:去掉可卸载的 47.68 GiB PLE 后仍需 **~72.4 GiB** 驻留(专家 63.32 + 稠密 7.64 + MTP 1.41 ✓)
+     ⇒ 2×A100-40GB@util0.90 仅 ~72 GiB ⇒ **KV 无空间** ✗ ⇒ 要跑必须做**专家卸载 = 我们已在做的事** ✓
+4. **"速度快"全部不可迁移** ✗:可信的 SM80 数字是 **4×A800-80GB 上 116 tok/s 单流** / 4×CMP 170HX-64GB 上 61 tok/s ✓;
+   网传"A100 97 tok/s"实为**单卡 A100-80G + EXL3 3-bit**(另一项目 ✓);某 dev.to 文称单卡 80GB 跑 **BF16 360 GB 原权重**
+   得 97 tok/s ⇒ **物理不可能,该文不可信** ✗(其依赖包在 PyPI 404 ✓)⇒ **不存在 SM80 + 本检查点的实测** ✓
+5. **#54318 核实** ✓:对象是**纯 FP8** 变体(专家也是 FP8 ✓),**不是**本检查点(本检查点专家走 Marlin,**不经过**那条
+   Triton `fp8e4nv` 路径 ✓);仍 open ✗;社区 workaround `--moe-backend marlin` ✓
+   ⭐ **相关**:#55008/#55010(Ampere 误选 CUTLASS FP8 ✓,修复 PR #53376 **已被 close 且未合并** ✗)
+   —— **与我们提交的 #56119 是同一类问题**(SM80 上量化路径误选 ✓)⇒ **可能是可贡献的切入点** ✓(任何写操作须逐条批准 ✓)
+6. ⭐ **借鉴价值(真正的收获 ✓)**:该检查点把 **24,576 个专家**按 `layer-LLLLL-experts-0000-0127` **每片 128 专家**
+   预先切好 ✓,单专家 **~2.64 MiB** ✓,每片带 **`*.complete.json`**(专家区间 / `output_sha256` / `output_size` ✓)
+   ⇒ ⇒ **这正是"主机侧专家分片 + 校验清单"的现成范式** ✓,与我们 CPU 专家/host 侧布局思路同源 ✓
+   按本机 H2D 26.86 GB/s 算,全专家主机驻留 ⇒ **~20 tok/s 单流天花板** ✓(落在现有四模型 22–40 tok/s 区间内,自洽 ✓)
+   另:上游已有同构 PR #58815(主机侧 gather PLE 行)、#58439、#58835、#57294(CPU 后端)✓
+7. **架构**(基座 `Qwen/Qwen3.8-Flash-Next` ✓):125B + 51B n-gram + 4B MTP ≈ **180B 总 / 6B 激活** ✓;48 层;
+   512 专家 top-10 +1 shared,I=640;hidden 2560;**非 MLA**(12×(3×GatedDeltaNet + 1×Qwen Sparse Attention GQA 24Q/2KV)✓);
+   262K 原生 / 1M YaRN ✓;MTP 1 层 ✓;27 层视觉塔 ✓;FP8 检查点 172.82 GiB / BF16 335.30 GiB ✓
+   ⇒ **参数自洽性已交叉验证** ✓(专家 120.8B × 0.5625 B = 67.95 GB,与实测 67,987,386,688 B **逐字节吻合** ✓)
+
+**未核实(报告 §9 共 10 条 ✓)** ✓:`weight_scale_inv` 是否真装不上(高置信,但**未实跑** load_weights,需一次极廉价的
+CPU dry-run ✓);`VLLM_PLE_CPU_OFFLOAD` 的实际吞吐(官方只说 4×H100 上必须开 ✓);MTP3 在本机的接受率
+(官方 H100 上仅 ~36% 且吞吐反而降 8–36% ✓);ModelScope 只查了 HF(404)⇒ 记"未找到"而非"不存在" ✓
+
+**纪律** ✓:subagent 全程只读 ✓(未写他人仓库、未启服务、未占卡、`.safetensors` 仅 Range 读头部 ≤300 KB ✓);
+`scripts/check_no_secrets.sh --all` 命中项**全是既有文件**,新报告**零命中** ✓
+
 ## C. 上报上游
 
 ### B24 ⚠️ A14 失败(第一臂被 Killed)—— **按预先写明的判据收口,不假装有数据**
