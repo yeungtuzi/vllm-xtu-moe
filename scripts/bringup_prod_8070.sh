@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# ⭐ 生产 8070 固化启动脚本(唯一真源 ✓;用户口径 2026-09-30)
+#
+# 口径:DeepSeek-V4.1-Flash · 768K 上下文 · GPU 预填 on · dspark k=5 on · LMCache on · 监控栈 on
+#
+# 用法:
+#   bash scripts/bringup_prod_8070.sh              # 起全套(幂等:已在跑则跳过 ✓)
+#   bash scripts/bringup_prod_8070.sh --status     # 只看状态
+#   WITH_MONITORING=0 bash scripts/bringup_prod_8070.sh   # 不起监控栈
+#
+# ⚠️ 8070 是【本 agent 自身的推理后端】(AGENTS.md"自服务环境纪律")⇒ 重启它会打断当前会话 ✗
+#    ⇒ 本脚本只用于【机器重启后恢复】;日常调试请用 GPU2 + TP=1,不要动 8070 ✓
+#
+# 关键词(踩过的坑,别再改错):
+#   * LMCache 是口径的一部分 ✗ 不能省(用户明令)⇒ 必须先起 LMCache 服务端(5555),再起 vLLM ✓
+#   * MAXLEN 上限 = 786432(768K)✓;1M + GPU 预填会被 serve_v41.sh 的护栏拒绝(实测必 OOM)✗
+#   * KV_CACHE_BYTES=3 GiB(768K + LMCache 放不下 5.6 GiB 那套)✓
+#   * PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False 必须带 ✓
+#   * EXTRA_ENV 里的变量名是 XIAOTU_GP_ACT_RESERVE_GIB(不是 RESERVED ✗)
+#   * proc.sh 的 PID 文件记的会是【包装脚本】✗(serve_v41.sh 内部 nohup 起真服务)
+#     ⇒ 必须用【端口派生 PID】adopt 真服务 PID ✓,并把真服务日志路径写进日志头 ✓
+set -uo pipefail
+
+R=/home/user/lvllm/vllm-xiaotu-moe
+cd "$R" || exit 1
+PY=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python
+LOGDIR=dev-docs/report/tuning/logs
+PORT="${PORT:-8070}"
+WITH_MONITORING="${WITH_MONITORING:-1}"
+
+# ───────── 参数(唯一真源 ✓;改这里就够)─────────
+VLLM_ENV=(
+  LMCACHE=1
+  MAXLEN=786432
+  MBT=4096
+  MAXSEQS=1
+  GPUS=0,1
+  TP=2
+  GPU_UTIL=0.90
+  COMPILE=1
+  EAGER=0
+  SPEC=1
+  KV_DTYPE=fp8_ds_mla
+  KV_CACHE_BYTES=3221225472
+  VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+  EXTRA_ENV="XIAOTU_GP_ACT_RESERVE_GIB=1.5"
+  WARMUP=1
+  PORT=8070
+  TAG=v41_8070
+  SERVED=DeepSeek-V4.1-Flash
+)
+LMCACHE_ENV=(CHUNK_SIZE=2176 TRANSFER_MODE=lmcache_driven ENABLE_MODULES= L1_GB=100 L2_GB=100)
+MONITORING_ROOT=/home/user/lvllm/monitoring
+
+port_up() { ss -ltnp 2>/dev/null | grep -q ":$1 "; }
+wait_port() { local p="$1" n="${2:-60}"; for _ in $(seq 1 "$n"); do port_up "$p" && return 0; sleep 5; done; return 1; }
+say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+if [ "${1:-}" = "--status" ]; then
+  say "生产状态"
+  printf '  %-24s %s\n' "8070 vLLM" "$(port_up 8070 && echo RUNNING || echo DOWN)"
+  printf '  %-24s %s\n' "5555 LMCache MP" "$(port_up 5555 && echo RUNNING || echo DOWN)"
+  printf '  %-24s %s\n' "8080 LMCache HTTP" "$(port_up 8080 && echo RUNNING || echo DOWN)"
+  for p in 9090 3000 9100 8787; do printf '  %-24s %s\n' "监控 $p" "$(port_up $p && echo RUNNING || echo DOWN)"; done
+  echo "  真服务 PID 文件: $(cat "$LOGDIR/vllm_prod_8070.pid" 2>/dev/null || echo '无')"
+  curl -s --noproxy 127.0.0.1 --max-time 10 "http://127.0.0.1:8070/v1/models" | head -c 200; echo
+  exit 0
+fi
+
+say "① LMCache 服务端(必须先起 ✓)"
+if port_up 5555; then
+  echo "  已在跑 ⇒ 跳过 ✓"
+else
+  bash scripts/proc.sh spawn lmcache_server env "${LMCACHE_ENV[@]}" bash scripts/serve_lmcache.sh
+  wait_port 5555 24 && echo "  ✅ 5555 就绪 ✓" || { echo "  ✗ LMCache 未起来"; exit 1; }
+fi
+
+say "② vLLM 生产(LMCache + 768K + GPU 预填 + dspark ✓)"
+if port_up "$PORT"; then
+  echo "  8070 已在跑 ⇒ 跳过启动 ✓(要重启请先 proc.sh stop vllm_prod_8070)"
+else
+  bash scripts/proc.sh spawn dsv41_prod env "${VLLM_ENV[@]}" bash scripts/serve_v41.sh
+  echo "  等待就绪(约 3–6 分钟;先读日志确认加载在推进 ✓)"
+  # 同步读日志(纪律:不许"发脚本→等结果" ✗)
+  for i in $(seq 1 40); do
+    lines=$(wc -l < "$LOGDIR/v41_8070.log" 2>/dev/null || echo 0)
+    [ "$i" -le 3 ] && tail -2 "$LOGDIR/v41_8070.log" 2>/dev/null | cut -c1-140 | sed 's/^/    /'
+    curl -s --noproxy 127.0.0.1 --max-time 8 "http://127.0.0.1:$PORT/v1/models" 2>/dev/null | grep -q DeepSeek && break
+    sleep 10
+  done
+  curl -s --noproxy 127.0.0.1 --max-time 10 "http://127.0.0.1:$PORT/v1/models" | grep -q DeepSeek \
+    || { echo "  ✗ 未就绪 ⇒ 尾部日志:"; tail -15 "$LOGDIR/v41_8070.log" | cut -c1-160 | sed 's/^/    /'; exit 1; }
+  echo "  ✅ 8070 就绪 ✓"
+fi
+
+say "③ 认领【真】PID + 记日志(按用户定的策略 ✓)"
+APIP=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1)
+if [ -n "$APIP" ]; then
+  PG=$(ps -o pgid= -p "$APIP" 2>/dev/null | tr -d ' ')
+  bash scripts/proc.sh adopt vllm_prod_8070 "$APIP"
+  {
+    echo "[adopt] name=vllm_prod_8070 api_pid=$APIP pgid=$PG adopted_at=$(date -Is)"
+    echo "[adopt] real_service_log=$LOGDIR/v41_8070.log"
+    echo "[adopt] proc.sh 的 dsv41_prod.pid 是【包装脚本】✗(会立刻退出)⇒ 停服务用 vllm_prod_8070 ✓"
+  } >> "$LOGDIR/vllm_prod_8070.log"
+  echo "  ✅ 真 PID=$APIP(PGID=$PG)已写入 vllm_prod_8070.pid ✓;真服务日志=$LOGDIR/v41_8070.log ✓"
+else
+  echo "  ✗ 端口 $PORT 无监听 ⇒ 无法认领"; exit 1
+fi
+
+say "④ 监控栈"
+if [ "$WITH_MONITORING" = "1" ]; then
+  M="$MONITORING_ROOT"
+  port_up 9090 || bash scripts/proc.sh spawn prometheus "$M/prometheus-2.45.6.linux-amd64/prometheus" \
+    --config.file="$M/prometheus/prometheus.yml" --storage.tsdb.path="$M/prometheus/data" \
+    --web.listen-address=127.0.0.1:9090 --web.enable-lifecycle
+  port_up 3000 || bash scripts/proc.sh spawn grafana "$M/grafana-v11.4.0/bin/grafana" server \
+    --homepath "$M/grafana-v11.4.0" --config "$M/grafana/grafana.ini"
+  port_up 9100 || bash scripts/proc.sh spawn node_exporter "$M/node_exporter-1.8.2.linux-amd64/node_exporter" \
+    --web.listen-address=127.0.0.1:9100 --collector.textfile.directory="$M/textfile"
+  bash scripts/proc.sh spawn xtu_exporter "$PY" "$M/textfile_exporter.py" "$M/textfile/xtu.prom"
+  port_up 8787 || bash scripts/proc.sh spawn coremap "$PY" "$M/web/serve.py"
+  bash scripts/proc.sh spawn coremap_png "$PY" "$M/coremap_png.py" "$M/web/coremap.png"
+  sleep 10
+else
+  echo "  跳过(WITH_MONITORING=0)✓"
+fi
+
+say "⑤ 汇总"
+for p in 8070 5555 8080 9090 3000 9100 8787; do
+  printf '  %-5s %s\n' "$p" "$(port_up "$p" && echo RUNNING ✓ || echo DOWN)"
+done
+echo "  看板: http://127.0.0.1:3000/d/dsh-overview"
+echo "  冒烟: curl -s --noproxy 127.0.0.1 http://127.0.0.1:8070/v1/models"
