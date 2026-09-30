@@ -176,20 +176,46 @@ curl -s --noproxy 127.0.0.1 http://127.0.0.1:8080/metrics | grep -E "lookup_(req
 **改善** ✓:**让新会话的开头尽量逐字节不变**(只**追加**,不要**重排/改写** system prompt、技能清单、handoff 等开头内容 ✓)
 ⇒ 直接抬高命中率 ✓。
 
-### 10.2 GPU 预填的真实瓶颈是 **PCIe H2D**,不是 GPU 算力 ✗
+### 10.2 ⭐ 为什么 `MBT=4096` 时 GPU 预填【比纯 CPU 还慢】(实测 + 原码)
 
-```
-GPU prefill ACTIVE(首次 1468 tokens ≥ 阈值 384 ✓)
-   preflight: staging ~10.73 GiB, required ≥ 13.30 GiB, had 16.96 GiB ⇒ slack 【+3.66 GiB】(正)✓
-nvidia-smi: GPU0/1 = 100%,37,979 / 40,960 MiB(92.7%)
-Avg prompt throughput ≈ 104–160 tokens/s   ⇒ 20 分钟 ≈ 16 万 token
-```
-* 专家权重常驻 **CPU 内存** ✓;GPU 预填时**逐层把权重 H2D 搬进 GPU staging** ✓(日志里的 `staging ~10.73 GiB` ✓)
-* 通道 = **PCIe,无 NVLink**,本机上限 **≈26.86 GB/s** ✗ ⇒ 台账实测 `dma = 599.2 ms/层`,占单层 **98.9%** ✗
-* ⇒ **GPU 的 100% 绝大部分是 DMA 搬运/等待** ✓ —— 所以"看起来像 CPU 预填性能",其实是 **PCIe 受限的 GPU 预填** ✓
-* 同一原因解释了:**为什么显存占到 92.7%** ✓ 以及 **为什么 1M + GPU 预填必 OOM** ✗
+**结论先给** ✓:本配置下 ~154 tok/s 是**正常但吃亏**的值 ✗ —— **GPU 流式有「每 chunk ~5.6 s」的固定代价**,
+而 `MBT=4096` 把 768K 切成 **192 个 chunk** ✗ ⇒ 5.6 s × 192 ≈ **18 分钟** ✓ ✓。
 
-**判据(本仓纪律 ✓)**:`GPU prefill ACTIVE` **不等于**已启用 ⇒ **必须看 slack 正负** ✓(本次 +3.66 GiB 为正 ⇒ 真启用 ✓)。
+**证据链(全部仓库原文 ✓)**:
+
+| 事实 | 出处 |
+|---|---|
+| GPU 流式在 **≤4K token 时耗时基本不变(≈5.6 s)**,之后近似线性 | `docs/BENCHMARKS.md` §3 |
+| `MBT=4096` ⇒ **154.5 tok/s**(4 chunks / 16,384 token / TTFT 106.1 s) | `docs/EXPERIMENTS.md` **B2** MBT 曲线 |
+| **纯 CPU** ≈ **3.9 ms/token = ~256 tok/s**("13.8K × 3.9 ms ≈ 54 s")| `docs/BENCHMARKS.md`(V4.1 修复前后对照) |
+| **~2000 tok/s 是「纯 MoE 核级」吞吐**(1,918 / 1,994,不计注意力/采样)| `docs/BENCHMARKS.md` §3 |
+| **1,725 tok/s** 那组的前提是"**能吃满 chunk**" | `docs/BENCHMARKS.md`(原文:"V4.1-Flash 能吃满 chunk,所以是另一个量级") |
+| 每层装配 **207 ms**(权重 H2D 3.62 GB/rank)⇒ **装配占 90%**;隔离环境 134.9 ms = **26.86 GB/s**(本机 H2D 天花板)| `docs/BENCHMARKS.md` |
+
+⇒ ⇒ ⇒ **算式**:`MBT=4096` 时 `154 tok/s`(= 6.5 ms/token)✗ **慢于**纯 CPU 的 256 tok/s ✓
+⇒ **所以"GPU 预填 ACTIVE"并不等于"更快"** ✗ —— 它在本 MBT 下是净亏 ✓
+(日志里**没有** `GPU prefill DISABLED for this process -> staying on CPU` ✓ ⇒ 路径没被拒 ✓,
+是**路径本身在 4096 这一档不划算** ✓ —— 原码 `mixed_experts.py:1628` 就是那句回退提示 ✓)
+
+**⚠️ 我之前写错的两处,已撤销** ✗:
+1. ✗ "staging 与 MBT 无关 ⇒ 加大 MBT 几乎免费" —— **错** ✓:`staging_bytes()` 里确实没有 MBT ✓,
+   但 **vLLM 的激活工作区 ∝ MBT** ✓(`scripts/serve_v41.sh:121` 原文:"激活工作区 ∝ MBT")⇒ **加大 MBT 要吃显存** ✓(你说得对 ✓)
+2. ✗ "像 CPU 预填是 PCIe 的天然性能" —— **不准确** ✓:准确说法是**每 chunk 的固定代价摊不薄** ✓(见上表 ✓)
+
+**⚠️ 另一条你点出的**:`max_num_seqs` **成比例吃 KV** ✓ —— 原码 `vllm_xiaotu_moe/vram_policy.py:195`:
+`kv_gib = kv_per_m × (maxlen/1e6) × max_num_seqs` ✓ ⇒ **KV 需求线性 ∝ 并发数** ✓
+⇒ 所以 `MAXSEQS=1` 是**有意为之** ✓(它不是配置错误 ✓,是锁定配置的一部分 ✓)。
+
+### 10.2.1 可选的改进(⚠️ 需用户决定;重启 8070 会打断当前会话 ✗)
+
+| 方案 | 做法 | 代价 / 前提 |
+|---|---|---|
+| **A ⭐ 最省** | 把门槛提到 **> MBT**(如 `MBT=4096` + `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=8192`)⇒ **GPU 预填永不触发** ⇒ 走纯 CPU(**~256–310 tok/s**)⇒ 比现在(154)**≈ 快 2×** | **零显存代价** ✓;只是放弃 GPU 流式 ✓ |
+| **B** | **加大 MBT**(8192 / 16384)⇒ chunk 数 192→96/48 ⇒ 5.6 s 摊薄 ⇒ 才可能接近 1,000+ tok/s | ⚠️ **激活工作区 ∝ MBT** ⇒ 要吃显存 ✗;本配置峰值已 86.4%、余量仅 ~5.5 GiB ⇒ **必须实测**,可能 OOM ✗ |
+| **C** | 缩 **staging 字节**(换更小位宽权重 / 少常驻)⇒ 直接降每 chunk 固定代价 | 依台账,这是**唯一已量化**的杠杆 ✓ |
+
+⇒ ⚠️ **判别方法**:改完先用 `[fp8-asm]`(需 `_trace` ✓)或 `Avg prompt throughput` 实测复核 ✓ ——
+**"GPU prefill ACTIVE" 不能单独当"更快"的判据** ✗(本次就是反例 ✓)。
 
 ### 10.3 诊断速查
 
