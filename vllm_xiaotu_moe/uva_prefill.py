@@ -578,6 +578,9 @@ def gpu_moe_layer_shards(x, topk_ids, topk_weights, sh, H: int, I: int, K: int, 
     # ⭐【验收①】读粒度是主因(§20:顺序读=100% 线速;跨步读崩到 0.38 GiB/s ✗)
     #   现状每次只读 BK//2 = 32 字节的连续段 ✗ ⇒ 正是"跨步小读" ✗
     #   ⇒ 故把 BM/BN/BK/NS 接到环境变量以便扫描 ✓(默认与插件一致 ✓)
+    # BM 官方默认 64(与既有 GPU 预填路径一致 => 数值已验证等价)。
+    #   BM=128 更快(稳态 595->425ms)但同会话 md5 复现性下降 => 未验证等价,
+    #   故【仅作可选旋钮】(XIAOTU_GPF_UVA_BM=128),不设为默认。见 §75/§76
     BM = int(os.environ.get("XIAOTU_GPF_UVA_BM", "64")) if BM is None else BM
     BN = int(os.environ.get("XIAOTU_GPF_UVA_BN", "64")) if BN is None else BN
     BK = int(os.environ.get("XIAOTU_GPF_UVA_BK", "64")) if BK is None else BK
@@ -587,6 +590,7 @@ def gpu_moe_layer_shards(x, topk_ids, topk_weights, sh, H: int, I: int, K: int, 
     _layertag = sh.get("_tag", "?")    # 层名(装配处塞入 ✓)
     _CALL_SEQ[0] += 1
     _seq = _CALL_SEQ[0]
+    _SEQ[0] += 1
     from vllm_xiaotu_moe.gpu_prefill import _build_segmentation
     device = torch.device(device)
     # ⚠️ 几何一律【从张量形状推导】✓ —— 禁止用公式 ✗
@@ -613,7 +617,8 @@ def gpu_moe_layer_shards(x, topk_ids, topk_weights, sh, H: int, I: int, K: int, 
     if _UVA_TIME:
         torch.cuda.synchronize()
     _t_seg = time.perf_counter()
-    inter = _pooled(("inter", device.index, I2), (A, I2), torch.bfloat16, device)
+    # ⭐ 假设(默认关):40 层共用一块 inter ⇒ 跨层 WAR 依赖可能抬高稳态墙钟
+    inter = _pooled(("inter", device.index, I2, _inter_slot()), (A, I2), torch.bfloat16, device)
     W13_E = int(w13_0.numel() // E)
     S13_E = int(s13_0.numel() // E)
     for n in range(ns):
@@ -674,7 +679,8 @@ def gpu_moe_layer_shards(x, topk_ids, topk_weights, sh, H: int, I: int, K: int, 
 
 _UVA_SYNC = os.environ.get("XIAOTU_GPF_UVA_SYNC", "0") == "1"   # 诊断:逐段同步 ✓
 _UVA_TIME = os.environ.get("XIAOTU_GPF_UVA_TIME", "0") == "1"   # 验收①:逐层计时 ✓
-_CALL_SEQ = [0]        # 全局调用序(查清"6 遍"是什么 ✓)
+_CALL_SEQ = [0]        # 全局调用序
+_SEQ = [0]             # 层调用序(供 parity 池键 ✓)(查清"6 遍"是什么 ✓)
 
 
 # ── 【0.2.5 主线】分片视图缓存:每 (engine, layer) 建一次 ✓ ─────────────────────
@@ -686,16 +692,43 @@ _SHARD_CACHE: dict = {}
 #   ⚠️ `out` 不复用 ✗(它是返回值,调用方会持有 ✓)⇒ 仍每次 zeros ✓(仅 17.7 MB ✓)
 _BUF_POOL: dict = {}
 _PINNED: dict = {}   # ⭐ 每引擎只 pin 一次(§68.3 ✓)
+# §78.4/§79 缓冲复用模式:0=40 层共用(已发布 ✓)/ 1=每层一块(实测崩 ✗)/ 2=按层奇偶双缓冲 ⭐
+    # ⭐ 默认 8(实测 N=1→8 单调变快:req1 350→285 ms ✓ 且不崩 ✓);只影响缓冲分配,计算不变 ✓
+_POOL_N = max(1, int(os.environ.get("XIAOTU_GPF_UVA_POOL_N", "8") or 1))  # 池槽数(1=共用 ✓)
+
+
+def _inter_slot():
+    """inter 的池槽:把"跨层 WAR 依赖"按 N 个槽轮转打断 ✓。
+
+    实测规律(§79/§80):
+      N=1(共用)⇒ req1 350 ms · 不崩 ✓
+      N=2(奇偶)⇒ req1 319.6 ms · 不崩 ✓
+      每层一块(≈N=80)⇒ req1 267-268 ms(≈线速理想 ✓)但【崩 16 次】✗
+    ⇒ ⇒ 本函数按 `XIAOTU_GPF_UVA_POOL_N` 轮转,用于找"不崩前提下的最优 N" ✓
+    """
+    n = _POOL_N
+    if n <= 1:
+        return 0
+    return int(_SEQ[0]) % n
+
 
 
 def _pooled(key, shape, dtype, device, zero=False):
-    t = _BUF_POOL.get(key)
-    if t is None or tuple(t.shape) != tuple(shape) or t.dtype != dtype:
-        t = torch.zeros(shape, dtype=dtype, device=device) if zero \
-            else torch.empty(shape, dtype=dtype, device=device)
-        _BUF_POOL[key] = t
-    elif zero:
-        t.zero_()
+    # ⚠️【必须保留旧缓冲】✗:形状变化时若【丢掉】旧张量 ⇒ 分配器复用其内存 ✗,
+    #   而排队的 kernel 可能仍在读它 ⇒ 【use-after-free】⇒ illegal memory access ✓
+    #   (实测:per-layer 池键换形状时崩 16 次 ✓;故改为【每个 key 保留一个列表】✓)
+    slot = _BUF_POOL.get(key)
+    if not isinstance(slot, list):
+        slot = [] if slot is None else [slot]
+        _BUF_POOL[key] = slot
+    for t in slot:
+        if tuple(t.shape) == tuple(shape) and t.dtype == dtype:
+            if zero:
+                t.zero_()
+            return t
+    t = torch.zeros(shape, dtype=dtype, device=device) if zero \
+        else torch.empty(shape, dtype=dtype, device=device)
+    slot.append(t)          # ⭐ 保留(不释放 ✓)
     return t
 
 
