@@ -947,6 +947,14 @@ static void bind_moe_class(py::module& m, const char* name) {
         // which: 0 = w13 shard(node), 1 = w2 shard(node), 2 = w13 scales, 3 = w2 scales
         // 【§610】一次性把自有 host 分片锁页(幂等;返回成功个数)。
         .def("pin_hostbufs", [](MOE& self) -> size_t { return self.pin_hostbufs(); })
+        // 【0.2.5 UVA】暴露【只读】宿主分片指针 ⇒ Python 侧可建 UVA 零拷贝视图 ✓
+        // 依据:host_wbuf() 早已存在(moe_v2.hpp ✓),此前只被 copy_hostbuf_to_device 内部使用。
+        // 语义与既有 API 完全一致(which: 0=w13分片 1=w2分片 2=w13scale 3=w2scale)✓
+        // 不改任何现有行为 ✓;返回 0 表示无效参数(与 copy_hostbuf_to_device 的返回 0 对齐 ✓)。
+        .def("hostbuf_ptr",
+             [](MOE& self, int which, int node) -> uintptr_t {
+                 return reinterpret_cast<uintptr_t>(self.host_wbuf(which, node));
+             }, py::arg("which"), py::arg("node"))
         .def("copy_hostbuf_to_device",
              [](MOE& self, int which, int node, uintptr_t dst, uintptr_t stream) -> size_t {
             const void* src = self.host_wbuf(which, node);

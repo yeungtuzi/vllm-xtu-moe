@@ -829,6 +829,17 @@ def install_profile_guard() -> list[str]:
                           "captured) -> GPU prefill allowed subject to VRAM preflight",
                           flush=True)
 
+                    # 【0.2.5 验收④】UVA 开关打开时,在**此**把全部层镜像预建完 ✓
+                    # (此刻 KV 已定容、CUDA graph 已捕获、服务尚未开始 ⇒ 请求内零构建 ✓)
+                    try:
+                        import vllm_xiaotu_moe.uva_prefill as _uva_pb
+                        if _uva_pb.uva_enabled():
+                            # ⚠️ 本方法作用域里没有 `device` 变量 ✗ ⇒ 用当前 CUDA 设备 ✓
+                            import torch as _t_pb
+                            _uva_pb.prebuild_all(_t_pb.device("cuda", _t_pb.cuda.current_device()))
+                    except Exception as _e:  # noqa: BLE001
+                        print(f"[uva] prebuild 跳过: {type(_e).__name__}: {_e}", flush=True)
+
         compile_or_warm_up_model._xtu_shim = True  # type: ignore[attr-defined]
         Worker.compile_or_warm_up_model = compile_or_warm_up_model
         applied.append("Worker.compile_or_warm_up_model(per-worker startup anchor)")

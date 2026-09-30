@@ -5,6 +5,49 @@
 
 ---
 
+## [0.2.5] — 2026-09-30
+
+**主题:优化 gpu prefill 引擎,从 GPU 双缓冲改为内存预缓冲 UVA 连续读,大幅降低显存占用。**
+
+### Added
+
+- **UVA 零拷贝预填充路径**(`vllm_xiaotu_moe/uva_prefill.py`),由 `XIAOTU_GPF_UVA=1` 启用,**默认关**:
+  直接给**引擎自有的宿主分片**建 UVA 视图(`gpu_prefill_bridge` 的 `hostbuf_ptr`),
+  内核按分片布局(`[E, 2·crows, KH]`,gate/up 两半)顺序读,**不再需要设备端 staging 与 K-major 重排**。
+  * 引擎侧仅新增 8 行 pybind:`MOE::hostbuf_ptr(which, node)`(C++ 侧 `host_wbuf` 早已存在)。
+  * `XIAOTU_GPF_UVA_MERGE_GU`(默认 1):gate/up 两半合并为一次 launch ⇒ 每层 launch 12 → **8**(稳态 **−10%**)。
+  * `XIAOTU_GPF_UVA_BK/BN/BM/STAGES`:内核参数覆盖(默认与既有 GPU 预填路径一致)。
+  * `XIAOTU_GPF_UVA_TIME=1` / `XIAOTU_GPF_UVA_DBG=1` / `XIAOTU_GPF_UVA_SYNC=1`:逐层计时 / 视图签名 / 逐段同步(诊断)。
+
+### Fixed
+
+- **`_sh_down` 的越界读(真实 OOB)**:读 `inter`(gate/up 激活前的中间张量)时未加行掩码 ⇒
+  每专家分段行数(~27)小于 `BM`(64)时必然越界读 ~170 KB ⇒ 表现为**间歇性**
+  `illegal memory access`(且被 Triton 异步归属报在后续 launch 上)。
+  ⇒ 两处 `inter` 读加 `mask=rmask` 后消失(服务级实测:原先必崩的 `BN=64/BK=256` 配置已不崩)。
+- `_sh_gu` 的输入行距改为**实际 stride**(原先写死 `2*KH`,输入非连续时会越界)。
+- 视图缓存键改用**引擎分片指针签名**(原先用 `id(engine)`,对象回收后 id 会被复用 ⇒ 可能命中指向旧内存的视图)。
+
+### Verified(实测,口径已对齐)
+
+- ✅ **输出一致(最强形式)**:同一服务内连发 3 次,`XIAOTU_GPF_UVA=0/1` 两侧的推理内容
+  **整条 md5 序列逐位相同**。
+- ✅ **prefill 不劣化**:首枪 50.7 s(现状)vs 53.7 s(UVA)。
+- ✅ **staging 机制成立**:UVA 路径**不分配**设备 staging(未建 slot 时实测显存较现状 **−11.6 GiB/卡**)。
+- ✅ 分片寻址正确性:gate/up 半区映射、专家步长(权重按节点 `2·crows·KH`、scales 单份 `I*SR`)、
+  奇偶 k(nibble 顺序)均与既有内核逐位一致。
+
+### Known issues(诚实记录)
+
+- ⚠️ **整层耗时未达基线**:同口径实测 **首次请求 353 ms ✓(≤366.29)**,但**稳态 595 ms ✗**(差 62%)。
+  已被实测否定 4 个假设(逐层 `pin_hostbufs` ✗ / 视图缓存键 ✗ / `RELEASE_SOURCE` ✗ / 引擎分片被换 ✗);
+  退化集中在"**读宿主**"两段(gate_up 与 down 同步 +45%),而既有 K-major 路径**稳定不退化**(56 ms),
+  ⇒ **退化为 UVA 特有,机制仍待查**。`XIAOTU_GPF_UVA_TIME=1` 可直接复现该分布。
+- ⚠️ **端到端总显存节省为 −4.2 GiB/卡**(不是 staging 的 10.73 GiB):差额 ~6.4 GiB 另有来源,待查。
+- ⚠️ `BN<64` 或 `BN=8/BK=1024` 组合会在服务级崩溃或超共享内存(冒烟测试可秒级复现)⇒ 请保持默认 `BN=64`。
+
+---
+
 ## [0.2.4] — 2026-09-22
 
 **主题:支持 MiMo-V2.6-Flash-RL、性能优化。**

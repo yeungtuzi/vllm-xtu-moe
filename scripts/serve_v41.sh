@@ -388,6 +388,39 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
     PORT="$PORT" LENS="${WARMUP_LENS:-8192 32768}" CKPT="$CKPT" MODEL=DeepSeek-V4.1-Flash \
       bash "$ROOT/scripts/warmup_shapes.sh" || echo "[v41] ⚠️ 预热失败(不致命,继续启动)"
   fi
+  # ══════════════════════════════════════════════════════════════════════
+  # 【0.2.5 验收④】UVA:post-startup 预热(仅 XIAOTU_GPF_UVA=1 时执行 ✓)
+  #
+  # 为什么必须有(实测链条,见 dev-docs/UVA_ZEROCOPY_EXPERIMENT.md §18 ✓):
+  #   * 插件**故意**在 startup 期禁用 GPU 预填(原码:"profile run 期间绝不走 GPU 路径" ✓)
+  #     ⇒ 上面那次形状预热走的是 **CPU 预填** ✗ ⇒ UVA 分支(在 `elif _gpu_pf:` 里)不被进入 ✗
+  #   * 引擎**逐层惰性创建** ⇒ 镜像只能在该层第一次真正 forward 时建 ✓
+  #   * ⇒ 若不在此主动触发,这 ~280 s 就落在**第一发真实请求**上 ⇒ 引擎 RPC 超时死 ✗
+  #     (实测 B2/B4/B5/B6 全部如此:282.6 s / 300.03 s ✗)
+  #   ⇒ 守卫解除后立刻发**一次 ≥ GPU 预填阈值(384 token)**的请求,让 forward 走完 40 层
+  #     ⇒ 40 层镜像一次建齐 ⇒ 用户流量内零构建 ✓✓
+  #   ⚠️ 一次性代价:约 3–6 分钟;宿主常驻 pin ≈ 134 GiB/worker(本机 1.5 TB ✓)
+  # ══════════════════════════════════════════════════════════════════════
+  if [ "${XIAOTU_GPF_UVA:-0}" = "1" ]; then
+    _uw_tmp="$(mktemp /tmp/xtu_uva_warm.XXXXXX.json)"
+    "$PY" - "$_uw_tmp" <<'PYEOF_UVA'
+import json, sys
+body = ("UVA prebuild placeholder text. " * 90)   # ≈1300+ token ⇒ 远超阈值 384 ✓
+sys.stdout.write(json.dumps({"model": "DeepSeek-V4.1-Flash",
+                             "messages": [{"role": "user", "content": body}],
+                             "max_tokens": 1, "temperature": 0}))
+PYEOF_UVA
+    if [ -s "$_uw_tmp" ]; then
+      echo "[v41] UVA post-startup 预热:触发 GPU 预填以建宿主镜像(约 3-6 分钟,一次性)…"
+      _uw_t0=$(date +%s)
+      curl -s --noproxy 127.0.0.1 --max-time 1800 \
+        "http://127.0.0.1:$PORT/v1/chat/completions" \
+        -H 'Content-Type: application/json' --data-binary "@$_uw_tmp" >/dev/null 2>&1 \
+        && echo "[v41] UVA 预热完成($(( $(date +%s) - _uw_t0 ))s)✓ 40 层镜像已就绪" \
+        || echo "[v41] ⚠️ UVA 预热失败(不致命;但首枪可能变慢 ✗)"
+    fi
+    rm -f "$_uw_tmp"
+  fi
   exit 0
   fi
   if ! kill -0 "$(cat "$OUTDIR/$TAG.pid")" 2>/dev/null; then

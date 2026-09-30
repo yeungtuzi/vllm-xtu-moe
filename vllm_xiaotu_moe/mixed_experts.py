@@ -1769,9 +1769,60 @@ class _XiaotuExpertsMixin:
                         (_E, _I // 2, hidden_size),
                         (_E, _I // _gk, hidden_size),
                     ), _dev, nslots=1)   # 【§601】同步路径单槽即安全(同流有序),省 3.59 GiB
-                    _km = _gp_mod.kmajor_from_engine_shards(
-                        engine, _dev, hidden_size, _I, _E, _gk, dst=_slot.bufs
-                    )
+                    # 【0.2.5】UVA 路径:装配一次 ⇒ 拷宿主 + 预排 + pin/UVA ⇒ 随即释放设备端 ✓
+                    # XIAOTU_GPF_UVA=0(默认)时走原路,逐字节不变 ✓
+                    # ⚠️ 捕获期绝不做(cudaHostRegister 会作废捕获 ✗)⇒ 自动回退原路 ✓
+                    _uva_on = False
+                    if not torch.cuda.is_current_stream_capturing():
+                        try:
+                            import vllm_xiaotu_moe.uva_prefill as _uva_mod
+                            _uva_on = _uva_mod.uva_enabled()
+                        except Exception:  # noqa: BLE001
+                            _uva_on = False
+                    # ⭐【分层二分钩子】XIAOTU_GPF_UVA_MIN_LAYER=<n> ✓
+                    #   层号 < n ⇒ 走 K-major(现状 ✓);≥ n ⇒ 走 UVA ✓
+                    #   ⇒ 二分即可定位【首个分岔层】✓(比猜/比 token 可靠 ✓)
+                    _uva_minlayer = int(os.environ.get("XIAOTU_GPF_UVA_MIN_LAYER", "0") or 0)
+                    if _uva_on:
+                        _lname0 = getattr(layer, "layer_name", "") or ""
+                        _lidx0 = _gp_layer_index(_lname0)
+                        if _lidx0 is not None and int(_lidx0) < _uva_minlayer:
+                            _uva_on = False          # 该层强制走 K-major ✓
+                    if _uva_on:
+                        # ⭐【0.2.5 主线】直接给**引擎自有的宿主分片**建 UVA 视图 ✓
+                        #   ⇒ 宿主 1× ✓、零新增锁页 ✓、无需镜像/预建/sweep ✗
+                        #   (镜像路线见 dev-docs/UVA_ZEROCOPY_EXPERIMENT.md §20–§25 ✓,已退为对照 ✓)
+                        #   依据:引擎分片就是"本来就在"的那份数据 ✓(bridge §508 ✓);
+                        #        就地锁页已实现且零额外内存 ✓(_pin_engine_hostbufs ✓);
+                        #        hostbuf_ptr 已由本仓 C++ 暴露 ✓(6 变体 ✓)
+                        _lname = getattr(layer, "layer_name", "") or ""
+                        _lidx = _gp_layer_index(_lname)
+                        _ukey = (_dev.index,
+                                 _lidx if _lidx is not None else _lname or id(layer))
+                        # ⚠️ 缓存键【必须含引擎身份】✗:引擎可能在 warmup/profile 期被【重建】✓
+                        #    ⇒ 旧键只含 (dev, layer_idx) ✗ ⇒ 重建后仍返回【指向旧缓冲】的视图 ✗✓
+                        #    ⇒ 表现为"只有最前面的几层错"(它们经历过 warmup ✓)
+                        #    (依据:二分实测 §52.6 —— 全程 UVA 错 ✗、层≥10 对 ✓、层≥20 对 ✓)
+                        # ⚠️ 用【分片实际指针】而非 id(engine) ✗:
+                        #   Python 的 id() 在对象回收后会【被复用】✗ ⇒ 新引擎可能撞键 ⇒
+                        #   命中【指向旧(已释放)内存的视图】✗ ⇒ 读它更慢/更错 ✓
+                        #   ⇒ 指针变了才说明引擎真的换了缓冲 ✓(更可靠 ✓)
+                        try:
+                            _sig = int(engine.hostbuf_ptr(0, 0)) ^ (int(engine.hostbuf_ptr(1, 0)) << 1)
+                        except Exception:  # noqa: BLE001
+                            _sig = id(engine)
+                        _ukey2 = (_ukey, _sig)
+                        # ⭐【退化诊断】把引擎分片指针签名打进日志 ✓
+                        #   ⇒ 若它随请求变化 ⇒ 引擎重建了分片 ⇒ 退化与"分片/页被换"有关 ✓
+                        if os.environ.get("XIAOTU_GPF_UVA_DBG", "0") == "1":
+                            print(f"[uva-sig] layer={_lname or _lidx} sig={_sig:#x} "
+                                  f"cached={_ukey2 in _uva_mod._SHARD_CACHE}", flush=True)
+                        _km = _uva_mod.shard_views_cached(engine, _dev, _ukey2)   # dict ✓
+                        _km["_tag"] = _lname or str(_lidx)      # 【验收①】逐层计时标签 ✓
+                    else:
+                        _km = _gp_mod.kmajor_from_engine_shards(
+                            engine, _dev, hidden_size, _I, _E, _gk, dst=_slot.bufs
+                        )
                     if _t_split:
                         torch.cuda.synchronize()
                         _asm = (_time.perf_counter() - _t0) * 1e3
@@ -1869,12 +1920,22 @@ class _XiaotuExpertsMixin:
                 _t1 = _time.perf_counter() if _t_split else 0.0
                 _a_before = torch.cuda.memory_allocated(_dev) if (
                     os.environ.get("XIAOTU_GPF_STAGE") == "1") else 0
-                out = _gp_mod.gpu_moe_layer(
-                    h_bf16, ids_i32, wts_f32, _km[0], _km[1], _km[2], _km[3],
-                    H=hidden_size, I=_I,
-                    K=int(self.moe_config.experts_per_token),
-                    device=_dev, slot=_slot,
-                )
+                if _uva_on and isinstance(_km, dict):
+                    # ⭐【0.2.5 主线】分片驱动:直接读引擎分片的 UVA 视图 ✓
+                    #   (几何一律由驱动从张量形状推导 ✓ —— 禁止公式 ✗,见 §32 ✓)
+                    out = _uva_mod.gpu_moe_layer_shards(
+                        h_bf16, ids_i32, wts_f32, _km,
+                        H=hidden_size, I=_I,
+                        K=int(self.moe_config.experts_per_token),
+                        device=_dev,
+                    )
+                else:
+                    out = _gp_mod.gpu_moe_layer(
+                        h_bf16, ids_i32, wts_f32, _km[0], _km[1], _km[2], _km[3],
+                        H=hidden_size, I=_I,
+                        K=int(self.moe_config.experts_per_token),
+                        device=_dev, slot=_slot,
+                    )
                 if _a_before:
                     _a_after = torch.cuda.memory_allocated(_dev)
                     print(f"[gpf-split2] qlen={qlen} "

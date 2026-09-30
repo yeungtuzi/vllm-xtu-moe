@@ -1,0 +1,67 @@
+# v0.2.5 —— 优化 gpu prefill 引擎,从 GPU 双缓冲改为内存预缓冲 UVA 连续读,大幅降低显存占用
+
+> 主题原文(用户给定,逐字保留):
+> **0.2.5:优化gpu prefill引擎,从GPU双缓冲改为内存预缓冲UVA连续读,大幅降低显存占用**
+
+---
+
+## 一、这次做了什么
+
+把 GPU 预填充的权重来源,从「**设备双缓冲 + K-major 重排**」换成「**引擎宿主分片 + UVA 连续读**」:
+
+* **不再需要设备端 staging**(不建 slot):权重直接从**引擎自有的宿主分片**读。
+* **不再需要 K-major 重排**:内核按分片**原生布局** `[E, 2·crows, KH]`(每专家 `[gate crows][up crows]`)读。
+* **宿主内存 1×**:复用引擎本来就持有的那一份,**不复制、不额外锁页**。
+* 开关:`XIAOTU_GPF_UVA=1` 启用;**默认关**(关闭时行为与 0.2.4 一致,已回归核对)。
+
+引擎侧只加了 **8 行 pybind**:`MOE::hostbuf_ptr(which, node)`(C++ 侧 `host_wbuf` 早已存在,只是未暴露)。
+
+## 二、实测结果(真实模型 · 真 prompt · TP=2 · 同场次 A/B)
+
+| 项 | 结果 |
+|---|---|
+| **输出一致性** | ✅ **最强形式**:同一服务内连发 3 次,`UVA=0/1` 两侧推理内容**整条 md5 序列逐位相同** |
+| **prefill 不劣化** | ✅ 首枪 50.7 s(现状)vs 53.7 s(UVA) |
+| **staging 机制** | ✅ UVA 路径**不分配** staging(未建 slot 时实测 **−11.6 GiB/卡**,≈ 预期的 10.73 GiB) |
+| **端到端总显存** | ⚠️ **−4.2 GiB/卡**(不是 10.73 GiB;差额 ~6.4 GiB 待查) |
+| **整层耗时** | ⚠️ **首次请求 353 ms ✅(≤366.29 基线)/ 稳态 595 ms ✗** |
+| **稳定性** | ✅ 修掉一处真实越界读(`_sh_down` 读 `inter` 无掩码)⇒ 此前所有间歇 `illegal memory access` 消失 |
+
+### 2.1 gate/up 合并(默认开)
+
+`XIAOTU_GPF_UVA_MERGE_GU=1`(默认):gate/up 两半在分片里是**相邻行段** ⇒ 合并为一次 launch
+⇒ 每层 launch **12 → 8**,稳态 **−10%**,且数值更稳(与 `=0` 同口径对照实测)。
+
+## 三、已知问题(诚实记录)
+
+1. **整层耗时未达基线**:首次请求达标(353 ms),但**稳态 595 ms**(差 62%)。
+   * 退化集中在「**读宿主**」两段:gate_up 与 down **同步 +45%**。
+   * 既有 K-major 路径**稳定不退化**(56 ms)⇒ **退化为 UVA 特有**。
+   * 已被实测**否定**的假设:逐层 `pin_hostbufs` ✗ / 视图缓存键(`id` 复用)✗ /
+     `XIAOTU_RELEASE_SOURCE` 源释放 ✗ / 引擎分片被换(指针签名恒定)✗ /
+     `BK` 读粒度 ✗ / `num_stages` ✗ / GPU 争用 ✗。
+   * 复现:`XIAOTU_GPF_UVA_TIME=1` 会打印逐层 `uva_layer_ms` 与 `seg/gu/down` 分段,以及 `seq` 序号。
+2. **端到端总显存只降 4.2 GiB**:staging 确实为 0,但差额 ~6.4 GiB 另有来源(首请求后的 KV/引擎缓冲,待查)。
+3. **参数限制**:请保持默认 `BN=64`;`BN<64` 或 `BN=8/BK=1024` 会在服务级崩溃或超共享内存
+   (可用 `dev-docs/` 的编译级冒烟测试秒级复现)。
+
+## 四、诊断开关
+
+| 变量 | 作用 |
+|---|---|
+| `XIAOTU_GPF_UVA_TIME=1` | 逐层计时:`[uva-time] seq=… uva_layer_ms=… seg_ms=… gu_ms=… down_ms=…` |
+| `XIAOTU_GPF_UVA_DBG=1` | 打印引擎分片指针签名与缓存命中:`[uva-sig]` |
+| `XIAOTU_GPF_UVA_SYNC=1` | 逐段 `torch.cuda.synchronize()`(把 Triton 的**异步归属**钉死) |
+| `XIAOTU_GPF_UVA_MIN_LAYER=<n>` | 层号 `<n` 走既有路径、`≥n` 走 UVA(用于**二分定位**) |
+| `XIAOTU_GPF_UVA_MERGE_GU=0` | 回退为 gate/up 分两次 launch |
+| `XIAOTU_GPF_UVA_BK/BN/BM/STAGES` | 内核参数覆盖(默认与既有路径一致) |
+
+## 五、上版对比
+
+* 0.2.4:支持 MiMo-V2.6-Flash-RL、性能优化(见 `RELEASE_NOTES_v0.2.4.md`)。
+* 本版:新增 UVA 路径(**默认关**)、修一处真实越界读、gate/up launch 合并;其余不变。
+
+## 六、过程与原始数据
+
+全部实验(含**负结果与被否定的假设**)见仓库内 `dev-docs/UVA_ZEROCOPY_EXPERIMENT.md`
+(本版期间约 4400 行,§1–§72)。`dev-docs/` 目前**未纳入版本控制**,将在后续统一整理发布。
