@@ -147,5 +147,59 @@ bash scripts/bringup_prod_8070.sh --status
 * 启动后 GPU ≈ **23 GiB/卡**;首次预填后 staging 驻留 ⇒ 峰值更高(GPU2 空闲 ✓)
 * 冷启动首个请求可能 **~19 s**(CPU 专家权重页缓存冷);热后 ~0.4 s
 
+
+---
+
+## 10. ⭐ 已知限制与诊断(2026-09-30 实测,别再猜 ✓)
+
+### 10.1 LMCache 的命中规则:**只按"逐字节完全相同的前缀"命中** ✓
+
+**实测证据** ✓(同一 prompt 连发两次,vLLM 侧 `usage.prompt_tokens_details.cached_tokens` 是权威 ✓):
+```
+第 1 次: prompt_tokens=5235  cached_tokens=0        ← 首次全未命中
+第 2 次: prompt_tokens=5235  cached_tokens=5120     ← 命中 97.8% ✓
+LMCache 侧: Retrieved 609,280 tokens in 0.040 s     ← 60 万 token 检索仅 40 毫秒 ✓
+```
+⇒ ⇒ **服务重启后"又等 20 分钟"不是 LMCache 失效** ✗,而是**新会话的 prompt 开头就不同** ✗ ——
+**第一个分叉 token 之后的所有 chunk 全部失效** ✓ ⇒ 整段上下文重新 prefill ✓。
+
+**为什么分叉这么致命** ✓:LMCache 按 **chunk**(本机 `chunk_size=2176` ✓,blake3 ✓)存/取,
+命中要求从第 0 个 chunk 起**连续**一致 ✓ ⇒ 开头差一个 token ⇒ 后面全部落空 ✓。
+
+**看命中率的三个计数器** ✓(`/metrics` ✓):
+```bash
+curl -s --noproxy 127.0.0.1 http://127.0.0.1:8080/metrics | grep -E "lookup_(requested|hit)|hit_l[12]"
+```
+本次实测 ✓:`lookup_requested_tokens=6,238,592` / `lookup_hit_tokens=3,579,520` ⇒ **命中率 ≈ 57.4%** ✓;
+⚠️ `lookup_hit_l1_tokens=0` ✗ ⇒ **重启会清空 L1(CPU 内存层)**,之后全部走 L2 磁盘 ✓(慢于 L1,但远快于重算 ✓)。
+
+**改善** ✓:**让新会话的开头尽量逐字节不变**(只**追加**,不要**重排/改写** system prompt、技能清单、handoff 等开头内容 ✓)
+⇒ 直接抬高命中率 ✓。
+
+### 10.2 GPU 预填的真实瓶颈是 **PCIe H2D**,不是 GPU 算力 ✗
+
+```
+GPU prefill ACTIVE(首次 1468 tokens ≥ 阈值 384 ✓)
+   preflight: staging ~10.73 GiB, required ≥ 13.30 GiB, had 16.96 GiB ⇒ slack 【+3.66 GiB】(正)✓
+nvidia-smi: GPU0/1 = 100%,37,979 / 40,960 MiB(92.7%)
+Avg prompt throughput ≈ 104–160 tokens/s   ⇒ 20 分钟 ≈ 16 万 token
+```
+* 专家权重常驻 **CPU 内存** ✓;GPU 预填时**逐层把权重 H2D 搬进 GPU staging** ✓(日志里的 `staging ~10.73 GiB` ✓)
+* 通道 = **PCIe,无 NVLink**,本机上限 **≈26.86 GB/s** ✗ ⇒ 台账实测 `dma = 599.2 ms/层`,占单层 **98.9%** ✗
+* ⇒ **GPU 的 100% 绝大部分是 DMA 搬运/等待** ✓ —— 所以"看起来像 CPU 预填性能",其实是 **PCIe 受限的 GPU 预填** ✓
+* 同一原因解释了:**为什么显存占到 92.7%** ✓ 以及 **为什么 1M + GPU 预填必 OOM** ✗
+
+**判据(本仓纪律 ✓)**:`GPU prefill ACTIVE` **不等于**已启用 ⇒ **必须看 slack 正负** ✓(本次 +3.66 GiB 为正 ⇒ 真启用 ✓)。
+
+### 10.3 诊断速查
+
+| 想知道 | 命令 |
+|---|---|
+| 服务/监控是否都在 | `bash scripts/bringup_prod_8070.sh --status` |
+| GPU 预填是否真启用 | `grep "GPU prefill ACTIVE" dev-docs/report/tuning/logs/v41_8070.log \| tail -1`(看 **slack 正负** ✓) |
+| 缓存命中率 | `curl -s --noproxy 127.0.0.1 http://127.0.0.1:8080/metrics \| grep -E "lookup_(requested\|hit)"` |
+| 单次请求命中多少 | 看响应 `usage.prompt_tokens_details.cached_tokens` ✓ |
+| 预填吞吐 | `grep "Avg prompt throughput" dev-docs/report/tuning/logs/v41_8070.log \| tail -5` |
+
 ---
 *相关记录:`docs/EXPERIMENTS.md` B142–B214(生产配置演进)、B160(思考强度配方)、B198(LMCache chunk)、B214(DSH 配置字段)。*
