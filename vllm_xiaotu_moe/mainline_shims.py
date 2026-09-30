@@ -1795,6 +1795,75 @@ def _wrap_model_forward(orig_model, st):
     return forward
 
 
+def _install_ds_mla_prefill_stride_guard() -> list[str]:
+    """Correct a page-stride passed where the row stride is required (env-gated).
+
+    GLM-5.3's fp8 prefill gather passes ``src_cache.stride(0)`` (bytes per page)
+    as ``entry_stride``, but ``_gather_dequant_fp8ds_nope_kernel`` needs bytes per
+    row (``src_cache.stride(1)``). That over-strides by ``cache_block_size`` and
+    either reads wrong KV rows (``locklock...`` degeneration) or runs off the end
+    of the cache (illegal memory access -> engine death).
+
+    The canonical fix is the one-line change in ``patches/xtu-series``. This shim
+    exists so the fix can be verified on a single card (GPU2/TP=1) before it lands
+    in the serving tree, and it degrades to a no-op once the caller passes
+    ``stride(1)``. Enabled only by ``XIAOTU_DS_MLA_PREFILL_STRIDE_FIX=1``.
+    """
+    if os.environ.get("XIAOTU_DS_MLA_PREFILL_STRIDE_FIX", "0") != "1":
+        return []
+    orig = None
+    try:
+        for modname in (
+            "vllm.v1.attention.backends.mla.sparse_mla_kernels",
+            "vllm.v1.attention.backends.mla.flashmla_sparse_sm8x",
+        ):
+            mod = importlib.import_module(modname)
+            candidate = getattr(mod, "gather_dequant_fp8ds_nope", None)
+            if candidate is not None:
+                orig = candidate
+                break
+    except Exception as exc:  # noqa: BLE001
+        _log(f"ds_mla prefill stride guard: import failed: {exc}")
+        return []
+    if orig is None or getattr(orig, "_xtu_stride_guard", False):
+        return []
+
+    @functools.wraps(orig)
+    def gather_dequant_fp8ds_nope(
+        src_cache, src_rows, dst, dst_rows, cache_block_size, entry_stride=656
+    ):
+        # Only rewrite the "page stride used as a row stride" mistake; anything
+        # else (including the decode path, which already passes stride(1)) is
+        # forwarded untouched.
+        if (
+            isinstance(src_cache, torch.Tensor)
+            and src_cache.dim() == 3
+            and entry_stride == src_cache.stride(0)
+            and src_cache.stride(1) != entry_stride
+        ):
+            entry_stride = src_cache.stride(1)
+        return orig(
+            src_cache, src_rows, dst, dst_rows, cache_block_size, entry_stride
+        )
+
+    gather_dequant_fp8ds_nope._xtu_stride_guard = True  # type: ignore[attr-defined]
+    # The caller module bound the name at import time, so patch every namespace
+    # that holds a reference.
+    patched = []
+    for modname in (
+        "vllm.v1.attention.backends.mla.sparse_mla_kernels",
+        "vllm.v1.attention.backends.mla.flashmla_sparse_sm8x",
+    ):
+        try:
+            mod = importlib.import_module(modname)
+        except Exception:  # noqa: BLE001
+            continue
+        if getattr(mod, "gather_dequant_fp8ds_nope", None) is not None:
+            setattr(mod, "gather_dequant_fp8ds_nope", gather_dequant_fp8ds_nope)
+            patched.append(modname.rsplit(".", 1)[-1])
+    return [f"gather_dequant_fp8ds_nope[page->row stride guard: {','.join(patched)}]"]
+
+
 def apply_mainline_shims() -> list[str]:
     """Idempotently install all shims; returns the list of things applied."""
     if not mixed_mode_enabled():
@@ -1826,6 +1895,7 @@ def apply_mainline_shims() -> list[str]:
         _install_router_extras_shim,
         _install_gpu_prefill_profile_guard,
         _install_lvllm_engine_substitution,
+        _install_ds_mla_prefill_stride_guard,
     ):
         try:
             applied += step()
