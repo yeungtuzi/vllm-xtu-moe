@@ -200,7 +200,7 @@ step 9 "汇总"
 {
   echo "### 逐步验证(GPU 预填充是否真的走了)"; cat "$OUT/verify.txt" 2>/dev/null
   echo; echo "### 缺口分析"; cat "$OUT/gap.txt" 2>/dev/null
-  echo; echo "### 下界参照(见 HANDOFF_GPU_LONGPREFILL.md §2)"
+  echo; echo "### 下界参照(见 dev-docs/archive/handoff/HANDOFF_GPU_LONGPREFILL.md §2)"
   echo "  每层 H2D 3.38 GiB @ 26.86 GB/s = 135 ms ⇒ 44 层 = 5.9 s/趟"
   echo "  理论 prefill = MBT / 5.9 s = 690 tok/s(与 prompt 长度无关)"
   echo "  文档记录的三种模式(同一 13.8K prompt):纯 CPU ~54 s / 纯 GPU 应 ~13 s / 混合 76.5 s"

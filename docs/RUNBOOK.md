@@ -424,7 +424,7 @@ settings,只能走 `~/.dsh/profiles/web/cordis.patch.yml`)。
 = ~25.2 GiB   ⇒ 留给「激活工作区」的只剩 ~7 GiB
 ```
 而**长 prefill 的激活正比于 chunk 大小**(MBT),4,148-token 级的请求会超过这 7 GiB
-⇒ **实测 `torch.OutOfMemoryError` → EngineCore 死**。诊断见 `dev-docs/HANDOFF_PERF_TOPN.md` §10。
+⇒ **实测 `torch.OutOfMemoryError` → EngineCore 死**。诊断见 `dev-docs/archive/handoff/HANDOFF_PERF_TOPN.md` §10。
 
 ⇒ **GLM 上"GPU 预填充 + 投机 + 长上下文"三者不可兼得**,而投机只值 +3%,**最不值得保**。
 
@@ -516,7 +516,7 @@ export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384     # 0 = 全部 CPU
 
 ### 4.2 目标 FP8 模型(暂不声明支持)
 
-> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `内部交接 HANDOFF_v0.2pre.md` §5.1。
+> ⏸️ **暂不声明支持**:该模型的实测数据早于 v0.2 的改动(执行模型 / 小 batch 路径 / EP 存储分片),**未在当前代码上复验**。复验计划见 `dev-docs/archive/handoff/HANDOFF_v0.2pre.md`(内部交接) §5.1。
 
 ### 4.3 其它 MoE 模型
 
@@ -946,7 +946,7 @@ TAG=gpf KV_CACHE_BYTES=4729960528 GP_MIN=1024 MAXLEN=1048576 SEQS=2   bash <内�
 > **26.86 GB/s** ⇒ **只跑到 24%,有 ~4.2× 空间**(地板 144 ms/层 ⇒ 6.0 s/chunk)。
 > 待查:插桩自身的 `cuda.synchronize()` 会放大串行(需用 CUDA event 复核)、host 回调是否
 > 真与 attention 重叠、环形槽只有 2 个是否退化成串行。诊断细节见
-> `dev-docs/HANDOFF_PERF_TOPN.md` §12。
+> `dev-docs/archive/handoff/HANDOFF_PERF_TOPN.md` §12。
 | chunk | 当前 11.6 s | 修掉转置 7.4 s | 线速+重叠 5.74 s |
 |---|---|---|---|
 | 2048 | 174 | 277 | 357 |

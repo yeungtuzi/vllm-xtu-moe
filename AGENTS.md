@@ -72,7 +72,11 @@
    只要有一丝可能,就改用 PID 文件 / 端口派生 PID 的精确写法 ✓。
 
 
-## 其它既有纪律(见 dev-docs/HANDOFF_v0.2.5.md §5)
+## 其它既有纪律(见 `dev-docs/report/tuning/IRON_RULES.md` 的 **R24 / R25**)
+
+> ⚠️ 原先此处指向 `dev-docs/HANDOFF_v0.2.5.md §5`;那份 handoff 记录的是**已回滚的 UVA 路线**,
+> 已归档到 `dev-docs/archive/handoff/`,其 §5「铁律与陷阱」**已迁入 `IRON_RULES.md` 的 R24**
+> (测量/插桩类教训在 **R25**)。
 
 - 修改 shell 脚本:`bash -n` **不够**(查不出续行链被注释打断),必须加"续行链结构校验"。
 - 启动服务后**必须同步读启动日志**确认,不许"发脚本→等结果"。

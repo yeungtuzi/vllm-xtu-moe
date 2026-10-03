@@ -97,7 +97,7 @@ fi
 #   * **而且它是长 prompt OOM 的元凶**:util 0.82 下
 #     `非专家 ~7.5 + KV 6 + staging 8.35 + draft 3.38 ≈ 25.2 GiB`,留给**激活工作区**
 #     的只剩 ~7 GiB,长 prefill 的激活会超过它 ⇒ **实测 CUDA OOM / EngineCore 死**
-#     (dev-docs/HANDOFF_PERF_TOPN.md §10)。
+#     (dev-docs/archive/handoff/HANDOFF_PERF_TOPN.md §10)。
 #     ⇒ GLM 上"GPU 预填充 + 投机 + 长上下文"**不可兼得**,而投机的 +3% 最不值得保。
 #   * MiMo 不受此限:draft 是 **dense 3 层**(很小),GPU 预填充与投机共存 ——
 #     实测 4,148-token × C=4 拿到 **1,845 tok/s** prefill 且投机开着。
