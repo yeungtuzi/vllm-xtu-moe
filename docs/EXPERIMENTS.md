@@ -8290,3 +8290,58 @@ G-10's measurement question remains open. Before retrying, either verify the inj
 sampling memory_allocated from a separate process during the request, looking for a per-layer step
 of about 0.5 GiB. The latter is clearly better: it answers the same question with zero risk of a
 dirty tree." && git log --oneline -1
+
+---
+
+### B269(2026-10-03)🔴 生产事故:vLLM 稀疏索引器的 fp32 logits 用满 512 MB 预算 ⇒ EngineCore OOM 死(**已修,一行配置**)
+
+**现象**:17:45:42,生产 8070(`1M / MBT 8192 / KV 2.5 GiB / dspark`)崩溃,
+API server 报 `EngineDeadError`,客户端 `POST /v1/chat/completions` 收到 **500**。
+
+**根因(三个因素叠加)**
+
+1. **索引器的 `[q, kv]` fp32 logits 被一次性物化** ——
+   `vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py:79`
+   `logits = torch.zeros((seq_len, seq_len_kv), dtype=torch.float32)`(**我们 patch 的 SM80 回退**)。
+   框架按 `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`(**默认 512**)在 query 维分块
+   (`vllm/v1/attention/backends/mla/indexer.py:1285-1318`)⇒ **分块器会把 m×n 填满预算**。
+   **算术核对**:崩溃请求 `num_computed_tokens=11904`,`max_q = (512MB/4) // 11904 = 11274`
+   ⇒ `11274 × 11904 = 134.2M` 元素 × 4 B = **恰好 512 MB** ✓
+2. **显式传 `KV_CACHE_BYTES` ⇒ vLLM 跳过显存剖析** ⇒ 剖析本会用 dummy 分配**为这块 logits 预留 512 MB**
+   (`vllm/envs.py:1139` 注释原文:*"Bounds the [M, N] float32 logits tensor to prevent CUDA OOM"*)
+   ⇒ **从未预留**。(即 IRON_RULES **R24 第 8 条**记过的那个副作用。)
+3. **碎片化**:LMCache 要求 `expandable_segments:False` ⇒ OOM 消息显示
+   *"**2.27 GiB is reserved by PyTorch but unallocated**"* 而**真空闲只有 421.94 MiB**
+   ⇒ 拿不出 512 MiB **连续**块。
+
+**⚠️ 记一次我的误判**:最初判定"改回退、分块算 top-k",但**读调用方后才发现不可行** ——
+`vllm/model_executor/layers/sparse_attn_indexer.py:586-628` 在拿到 logits 后还有
+**v4.1 的两级候选块选择/掩码**(`_select_candidate_blocks` / `_apply_candidate_mask`),
+之后才 `top_k_per_row_prefill` ⇒ **全量 logits 是调用方契约** ✗。
+⇒ 正解不是改代码,而是**用框架自带的预算旋钮** ✓
+
+**修复(一行配置,无需改代码)**
+
+```bash
+# scripts/bringup_prod_8070.sh
+EXTRA_ENV="XIAOTU_GP_ACT_RESERVE_GIB=1.5 VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128"
+```
+⇒ 同样的请求只申请 ≤128 MB,在碎片空间里放得下;框架按预算分块且**优雅退化**
+(`max(1, budget // chunk_n)`,最坏一次只算 1 个 query token)。
+
+**验证**
+
+| | 崩溃时(旧配置) | **修复后** |
+|---|---|---|
+| 上下文 | **11,904** tokens ⇒ **OOM 崩** ✗ | **56,139 / 112,151** tokens ⇒ **0 OOM、0 EngineDead** ✓ |
+| prefill | — | **975.6 / 892.9 tok/s** |
+| GPU1/2 空闲 | **421 MiB** | **2,404 MiB** |
+| 索引器单次申请上限 | 512 MB | **≤128 MB** |
+
+进程环境已核实注入(直接读 `/proc/<pid>/environ`:APIServer / EngineCore / Worker_TP0 / Worker_TP1 四处均有)。
+
+**顺带记录**:LMCache 服务端三卡共占 **1,390 MiB**(416 / 488 / 486);
+在 2.4 GiB 余量下**不是瓶颈** ⇒ 保留(它保的是 L2 持久前缀缓存)。
+
+**仍未修**:`vram_policy` 的预算模型**没有把这块 O(context) 的索引器缓冲计入** ⇒
+对长上下文**系统性乐观**(它的 1M 方案号称 KV + GPU 预填 + 投机都放得下)。

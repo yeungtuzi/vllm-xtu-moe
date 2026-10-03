@@ -55,7 +55,18 @@ VLLM_ENV=(
   KV_CACHE_BYTES=2684354560
   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
-  EXTRA_ENV="XIAOTU_GP_ACT_RESERVE_GIB=1.5"
+  # 【2026-10-03 事故修复】索引器 logits 预算 512 → 128 MB。
+  #   事故:长 prompt 时 `sparse_attn_indexer` 的 `fp8_fp4_mqa_logits` 回退会分配
+  #   `[q, kv]` 的 fp32 logits,分块器把 m×n 填到 `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`
+  #   (默认 512 MB)⇒ 实测崩溃那次请求 num_computed_tokens=11904,
+  #   max_q = 512MB/4 // 11904 = 11274 ⇒ 11274×11904 = 134.2M 元素 = **恰好 512 MB**,
+  #   而当时只剩 421.94 MiB 空闲(且 PyTorch 有 2.27 GiB reserved-but-unallocated 的碎片,
+  #   因 LMCache 要求 expandable_segments:False 无法回收)⇒ OOM ⇒ EngineCore 死。
+  #   为什么以前没预留:显式传 KV_CACHE_BYTES 会让 vLLM **跳过显存剖析**,
+  #   而剖析本来会用 dummy 分配为这块 logits 预留 512 MB(见 IRON_RULES R24 第 8 条)。
+  #   ⇒ 降到 128 MB 后,同样的请求只申请 ≤128 MB,在碎片空间里就能放下 ✓
+  #   (框架按此预算在 query 维分块,可优雅退化到 1 token:vllm/v1/attention/backends/mla/indexer.py:1285-1318)
+  EXTRA_ENV="XIAOTU_GP_ACT_RESERVE_GIB=1.5 VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128"
   WARMUP=1
   PORT=8070
   TAG=v41_8070
