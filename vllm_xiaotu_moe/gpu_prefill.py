@@ -860,6 +860,10 @@ def staging_bytes(n_experts: int, hidden: int, inter: int, group_k: int = 32,
     raw = w13d + w2d
     # 暂存现在**每张量一份**(见 `_dma_hostbuf`),所以是"一个 node 的量"而不是全部 node 之和
     tmp = (w13d + w2d + s13d + s2d) / n
+    # 【方案 B】逐 node 直填 K-major 时**不再分配 raw 规范布局缓冲** ⇒ 预检口径必须同步,
+    # 否则"改了却没省"会被误读(⚠️ 实测踩过:拿这条公式的数当验收判据是错的)。
+    if os.environ.get("XIAOTU_GPF_KMADAPTIVE", "1") != "0":
+        return slots + tmp
     return slots + raw + tmp
 
 
@@ -918,6 +922,9 @@ def fits_device(need_bytes: int, device, margin: float = 1.10,
 # 造成的 allocator churn(NOTES §466)。这些缓冲在同一 stream 上是安全可复用的:
 # 下一层的 copy_ 排在前一层 kernel 之后,stream 会保证顺序。
 _BUF_CACHE: dict = {}
+
+# 方案 B(逐 node 直填 K-major)是否已经报过到 —— 只打一次,作为"路径真的走了"的正向证据
+_KMADAPTIVE_LOGGED = False
 
 
 def _reuse(key, shape, device):
@@ -1137,6 +1144,76 @@ def _pin_engine_hostbufs(engine) -> None:
               f"{type(exc).__name__}: {exc}", flush=True)
 
 
+def kmajor_from_engine_shards_noraw(engine, device, hidden: int, inter: int,
+                                    n_experts: int, group_k: int, dst=None):
+    """【§459 / 方案 B】逐 NUMA node 直接转置进 K-major —— **不需要 raw 规范布局缓冲**。
+
+    与 `kmajor_from_engine_shards` 的区别:后者先把各 node 分片重组进设备上的
+    ``w13_raw``/``w2_raw``(canonical ``[E,2I,H/2]`` / ``[E,H,I/2]``,共 **3.16 GiB/rank**),
+    再做一次**连续** K-major 转置;本函数**跳过重组**,把每个 node 的块直接转置写进
+    ``dst`` 的对应**列区间**(见 `byte_transpose.ktranspose_into`)。
+
+    几何(node n,``cr`` = rowsplit):gate 行 → ``dst[0][:, :, n·cr:(n+1)·cr)``;
+    up 行 → ``dst[0][:, :, I+n·cr : I+(n+1)·cr)``;w2 → ``dst[2][:, :, n·cr2:(n+1)·cr2)``。
+    因 ``rowsplit`` 是 64 的整数倍,每个 BN=64 块整体落在一个 node 内(§459)。
+
+    ⚠️ 我一度以为"strided 写是稀疏的 ⇒ 会比旧路径慢" —— **实测是错的**:旧路径自己那次
+    `copy_` 重组就是一遍 strided 搬运,新路径省掉它 ⇒ **两个维度都赚**。离线同层 A/B:
+    **四个张量逐字节相同**、**364.91 → 341.31 ms(−23.6 ms/层)**、**峰值 24.92 → 20.70 GiB**;
+    服务级:预检 staging **10.73 → 7.56 GiB**、16k prefill **510.3 → 527.0 tok/s**。
+
+    ⇒ **默认开启**;`XIAOTU_GPF_KMADAPTIVE=0` 退回旧路径(行为逐字不变)。
+    """
+    from vllm_xiaotu_moe.byte_transpose import ktranspose_into
+
+    # 正向证据:路径真的被走了(⚠️ env 桥在 setdefault 模式下对"已在环境中且相等"的键
+    # **不打印**,所以"日志里没有这个键"≠"没生效";必须由路径自己吭一声)。
+    global _KMADAPTIVE_LOGGED
+    if not _KMADAPTIVE_LOGGED:
+        _KMADAPTIVE_LOGGED = True
+        print("[vllm-xtu-moe] kmajor 装配:逐 NUMA node 直填 K-major"
+              "(方案 B,无 raw 缓冲)✓", flush=True)
+
+    geo = engine.shard_geometry()
+    ns = int(geo["ns"])
+    if ns < 2 or not geo["w13_node_bytes"] or not geo["w2_node_bytes"]:
+        return None
+    H, I, E = int(hidden), int(inter), int(n_experts)
+    rb13, rb2 = H // 2, I // 2
+    gk = int(group_k) if int(group_k) > 0 else 1
+    if dst is None:
+        dst = (torch.empty((E, rb13, 2 * I), dtype=torch.uint8, device=device),
+               torch.empty((E, H // gk, 2 * I), dtype=torch.uint8, device=device),
+               torch.empty((E, rb2, H), dtype=torch.uint8, device=device),
+               torch.empty((E, I // gk, H), dtype=torch.uint8, device=device))
+    c13, cr13 = int(geo["w13_cbytes"]), int(geo["w13_crows"])
+    c2, cr2 = int(geo["w2_cbytes"]), int(geo["w2_crows"])
+    # ⚠️ 暂存仍是"每张量一份"(_dma_hostbuf 内部 _reuse),同一 stream 上 DMA/copy 有序 ⇒ 复用安全
+    for n in range(ns):
+        buf = _dma_hostbuf(engine, 0, n, int(geo["w13_node_bytes"]), device)
+        blk = buf.view(E, 2, c13)
+        c0 = n * cr13
+        # gate 块 -> K-major 的列 [c0, c0+cr13);up 块 -> 列 [I+c0, I+c0+cr13)
+        ktranspose_into(blk[:, 0, :].reshape(E, cr13, rb13),
+                        dst[0][:, :, c0:c0 + cr13])
+        ktranspose_into(blk[:, 1, :].reshape(E, cr13, rb13),
+                        dst[0][:, :, I + c0:I + c0 + cr13])
+        del buf, blk
+    for n in range(ns):
+        buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
+        c0 = n * cr2
+        ktranspose_into(buf.view(E, cr2, rb2), dst[2][:, :, c0:c0 + cr2])
+        del buf
+    # scales 只有 ~0.13 / 0.07 GiB,且引擎给的是一整块(非按 node)⇒ 沿用原来的连续路径
+    s13_raw = _dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device) \
+        .view(E, 2 * I, H // gk)
+    s2_raw = _dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device) \
+        .view(E, H, I // gk)
+    _kmajor_bytes(s13_raw, dst[1])
+    _kmajor_bytes(s2_raw, dst[3])
+    return tuple(dst)
+
+
 def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
                               n_experts: int, group_k: int, dst=None):
     """K-major device weights built from the engine's OWN host buffers.
@@ -1160,6 +1237,11 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
     ``PrefetchSlot``), or ``None`` when the engine has no shards (e.g. NOSHARD) --
     the caller then falls back to the source tensors.
     """
+    # 【方案 B 开关】默认 **0 = 走下面这条旧路径**(行为逐字不变);=1 才逐 node 直填、
+    # 省掉 raw 缓冲。取舍见 kmajor_from_engine_shards_noraw 的文档。
+    if os.environ.get("XIAOTU_GPF_KMADAPTIVE", "1") != "0":
+        return kmajor_from_engine_shards_noraw(
+            engine, device, hidden, inter, n_experts, group_k, dst)
     geo = engine.shard_geometry()
     ns = int(geo["ns"])
     if ns < 2 or not geo["w13_node_bytes"] or not geo["w2_node_bytes"]:
