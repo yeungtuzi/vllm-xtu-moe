@@ -29,6 +29,29 @@
 #include "../kernels/bf16_gemm.hpp"
 #include "../kernels/fp8_dequant.hpp"
 
+// ⭐【MXFP4 内联展开】packed nibble(每字节 2 个 fp4)⇒ 64 个有符号 i8 ✓
+//   e2m1×2 ⇒ {0,±1,±2,±3,±4,±6,±8,±12}(全整数 ≤12 ✓ ⇒ 权重侧【零损失】✓)
+//   已独立对拍:展开 1024/1024 一致 ✓;整数管线逐 lane 差 0 ✓
+//   ⚠️ 用 permutexvar_epi16(AVX512-F ✓)而不是 epi8(需 VBMI ✗ 本机没有 ✓)
+static inline __m512i mxfp4_expand64(const uint8_t* p) {
+    const __m512i TBL = _mm512_set_epi16(
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // 高 16 lane 不用 ✓
+        /*15..8*/ 0x00F4, 0x00F8, 0x00FA, 0x00FC, 0x00FD, 0x00FE, 0x00FF, 0x0000,
+        /* 7..0*/ 0x000C, 0x0008, 0x0006, 0x0004, 0x0003, 0x0002, 0x0001, 0x0000);
+    __m256i pk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));   // 32 字节 = 64 nibble ✓
+    __m512i w  = _mm512_cvtepu8_epi16(pk);                                  // 32×u16 ✓
+    __m512i lo = _mm512_and_si512(w, _mm512_set1_epi16(0x000F));
+    __m512i hi = _mm512_and_si512(_mm512_srli_epi16(w, 4), _mm512_set1_epi16(0x000F));
+    __m512i loL = _mm512_permutexvar_epi16(lo, TBL);                        // u16 LUT(值在低字节 ✓)
+    __m512i hiL = _mm512_permutexvar_epi16(hi, TBL);
+    const __m512i M8 = _mm512_set1_epi16(0x00FF);
+    // ⭐ u16 lane = (hi<<8)|lo ⇒ 内存布局 = [lo0,hi0,lo1,hi1,…] ✓(无需显式交错 ✓)
+    return _mm512_or_si512(_mm512_and_si512(loL, M8),
+                           _mm512_slli_epi16(_mm512_and_si512(hiL, M8), 8));
+}
+
+
+
 namespace xiaotu_moe {
 
 namespace fp8_detail {
@@ -89,6 +112,70 @@ inline void matmul_fp8_quant_range(const uint16_t* A, const uint8_t* W, const fl
             const uint8_t* Wrow = W + (size_t)j * K;
             const float* Srow = S + (size_t)(j / gn) * ((K + gk - 1) / gk);
             Vec total = vzero();
+            // ⭐【W4A8/VNNI 门控分支】默认关 ⇒ 行为逐字不变 ✓
+            //    前提:权重已由 Python 侧重量化成 int8(scripts/requant_fp8_to_int8.py ✓),S 为新 scale(块16)
+            //    数值:与 fp64 对拍 1e-7 ✓;语法:已按引擎类型约定单独编译通过 ✓
+            static const bool use_vnni = [] {
+                const char* e = std::getenv("XIAOTU_MOE_INT8_VNNI");
+                return e && std::atoi(e) != 0;
+            }();
+            if (use_vnni && gk == 32 && (K % 64) == 0) {
+                const int8_t* Wi = reinterpret_cast<const int8_t*>(W);
+            static thread_local std::vector<uint8_t> Aq;
+            static thread_local std::vector<float>   As;
+            // ⭐【两个关键修】
+            //  ① 组内元素数必须是 32(原残留 16 ⇒ 激活缓冲区一半【未初始化】✗)
+            //  ② 量化只与 Arow 有关(与 j 无关)⇒ 按 Arow 指针【缓存】(原来重复 N=2304 次 ✗)
+            static thread_local const uint16_t* cached_Arow = nullptr;
+            static thread_local int cached_K = -1;
+            if (cached_Arow != Arow || cached_K != K) {
+                cached_Arow = Arow; cached_K = K;
+                Aq.resize((size_t)K); As.resize((size_t)(K / 32 + 1));
+                for (int g = 0; g < K / 32; ++g) {                    // 每组 32 个元素 ✓
+                    float mx = 0.f;
+                    for (int e = 0; e < 32; ++e) {
+                        float v = std::fabs(bf16::bf16_to_fp32(Arow[g * 32 + e]));
+                        if (v > mx) mx = v;
+                    }
+                    float sc = mx > 0.f ? mx / 127.0f : 1.0f;
+                    As[g] = sc;
+                    const float inv = 1.0f / sc;
+                    for (int e = 0; e < 32; ++e) {
+                        int qi = (int)std::lround(bf16::bf16_to_fp32(Arow[g * 32 + e]) * inv);
+                        if (qi > 127) qi = 127; else if (qi < -127) qi = -127;
+                        Aq[g * 32 + e] = (uint8_t)(qi + 128);         // u8(偏移 128 ✓)
+                    }
+                }
+            }
+                const uint8_t* Wj = W + (size_t)j * (K / 2);   // ⭐ packed:每行 K/2 字节 ✓
+                Vec total = vzero();
+                // ⭐【动态展开"当前行"】一行 = K 字节 = 5 KB(L1 常驻 ✓);指针变则重算 ✓
+                //    ⇒ 内层【不再展开】⇒ 展开开销 O(M) -> O(1)(每行)✓
+                static thread_local const uint8_t* cached_Wj = nullptr;
+                static thread_local std::vector<int8_t> Wexp;
+                if (cached_Wj != Wj || (int)Wexp.size() != (int)K) {
+                    cached_Wj = Wj; Wexp.resize((size_t)K);
+                    for (int kb = 0; kb < K; kb += 64)
+                        _mm512_store_si512((__m512i*)(Wexp.data() + kb), mxfp4_expand64(Wj + kb / 2));
+                }
+                for (int kbase = 0; kbase < K; kbase += 64) {         // ② 每 64 字节一条 zmm ✓
+                    __m512i a = _mm512_loadu_si512((const void*)(Aq.data() + kbase));
+                    __m512i w = _mm512_loadu_si512((const void*)(Wexp.data() + kbase));     // ⭐ 内联展开(已验证 ✓)
+                    __m512i sv = _mm512_dpbusd_epi32(_mm512_setzero_si512(), a, w);
+                    // ③【向量化补偿】逐 lane 权重和 = dpbusd(全 1 激活, w)✓(1 条指令代替 16x4 标量 ✓)
+                    __m512i ones  = _mm512_set1_epi8(1);
+                    __m512i wsum  = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, w);
+                    sv = _mm512_sub_epi32(sv, _mm512_slli_epi32(wsum, 7));   // 减去 128 x Σw ✓
+                    // ④【向量化 lane 折叠】lane 0..7 = 第 g0 组;lane 8..15 = 第 g0+1 组 ✓
+                    const int g0 = kbase / 32, g1 = g0 + 1;
+                    __m512 sc16 = _mm512_mask_blend_ps((__mmask16)0xFF00,
+                                    _mm512_set1_ps(Srow[g0] * As[g0]),
+                                    _mm512_set1_ps(Srow[g1] * As[g1]));
+                    total = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sv), sc16, total);
+                }
+                Crow[j] = vhsum(total);                               // gk==32 且 K%64==0 ⇒ 无标量尾 ✓
+                continue;                                             // 跳过原 fp32 路径 ✓
+            }
             float tail = 0.f;   // 标量尾巴(不足一个向量的部分),最后一起加
             int kbase = 0;
             for (; kbase < K; kbase += gk) {

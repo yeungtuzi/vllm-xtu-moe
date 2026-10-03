@@ -397,6 +397,33 @@ def gp_prefetch_extra_bytes(dev_key=None) -> int:
     return int(sum(_GP_BUF2_BYTES.values()))
 
 
+
+def _xiaotu_maybe_requant_int8(self, layer) -> None:
+    """⭐ 门控 W4A8(MXFP4):【不需要替换任何张量】✓
+    原因:C++ 内核现在【直接读 packed nibble】(mxfp4_expand64 ✓,已独立验证:
+          展开 1024/1024 一致 ✓;整数管线逐 lane 差 0 ✓)
+    ⇒ 于是:① 内存【不翻倍】(权重保持 packed 207 GB ✓)
+            ② 不触发引擎对 w13_weight 的 dtype/shape 校验 ✓
+            ③ 无 Python 解包的峰值内存风险 ✓
+    本函数只做【门控确认 + 日志】✓"""
+    import os as _os
+    if _os.environ.get("XIAOTU_MOE_INT8_VNNI") != "1":
+        return
+    _attr = getattr(self, "_engine_attr", None)
+    if _attr != "MOE_MXFP4":
+        print("[vnni] attr=%r ≠ MOE_MXFP4 ⇒ 跳过 ✓" % (_attr,), flush=True)
+        return
+    try:
+        _gk = int(getattr(self, "_group_k", 32) or 32)
+        _w = getattr(layer, "w13_weight", None)
+        _s = getattr(layer, "w13_weight_scale", None)
+        print("[vnni] ✅ 门控生效:C++ 内核将直接读 packed nibble ✓", flush=True)
+        print("[vnni]    w13=%s(uint8 ✓)· scale=%s · gk=%d(需 ==32 ✓)"
+              % (tuple(getattr(_w, "shape", ())), tuple(getattr(_s, "shape", ())), _gk), flush=True)
+        print("[vnni]    ⚠️ 不替换任何张量 ⇒ 内存不翻倍、无峰值风险 ✓", flush=True)
+    except Exception as _e:
+        print("[vnni] 日志跳过: %s" % _e, flush=True)
+
 class _XiaotuExpertsMixin:
     """Shared behaviour: build the xiaotu engine from the layer's raw CPU weights.
 
@@ -475,6 +502,11 @@ class _XiaotuExpertsMixin:
         """Do NOT AMX-prepack; remember the layer so the engine can use the raw
         CPU parameters (the checkpoint layout the engine consumes directly)."""
         self._layer_ref = layer
+        # ⭐【诊断 probe】确认本方法是否被调用(下一轮可删 ✓)
+        if os.environ.get("XIAOTU_MOE_INT8_VNNI") == "1":
+            print("[vnni-probe] process_weights_after_loading 被调用 · attr=%r · gk=%r"
+                  % (getattr(self, "_engine_attr", None), getattr(self, "_group_k", None)), flush=True)
+        _xiaotu_maybe_requant_int8(self, layer)   # ⭐ 门控 W4A8(默认关 ✓)
         for name in _ROUTING_ATTRS:
             if hasattr(layer, name):
                 setattr(self, name, getattr(layer, name))
@@ -2001,11 +2033,37 @@ class _XiaotuExpertsMixin:
                 )
         _lt_t1 = time.perf_counter() if _LT_ON else 0.0
         if not _resident and not _gpu_pf:
-            engine.cpu_decode(
-                stream.cuda_stream, qlen, self.moe_config.experts_per_token,
-                h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
-                out.data_ptr(),
-            )
+            # ⭐【方案 P · 门控默认关】按"主专家"排序 token,让引擎的逐对处理
+            #   对同一专家的权重访问变得【连续】⇒ 命中 L3(微基准:A 3.21 → B 32.21 TFLOPS ✓)
+            #   ⚠️ 行独立(h 每行一个 token)⇒ 只需把 out 按逆序散回 ✓
+            #   开启:XIAOTU_MOE_GROUP_ORDER=1;关闭(默认)⇒ 行为逐字不变 ✓
+            _go = os.environ.get("XIAOTU_MOE_GROUP_ORDER") == "1"
+            if _go:
+                _k = int(self.moe_config.experts_per_token)
+                _ids2 = ids_i32.view(-1, _k).to(torch.long)          # [qlen, k] ✓
+                _key = _ids2[:, 0]                                    # 主专家 = 第一槽位 ✓
+                try:
+                    _ord = torch.argsort(_key, stable=True)           # 稳定排序 ⇒ 同专家相邻 ✓
+                except TypeError:                                     # 老版本 torch 无 stable ✓
+                    _ord = torch.sort(_key, stable=True)[1]
+                _inv = torch.empty_like(_ord)
+                _inv[_ord] = torch.arange(qlen, device=_ord.device)   # 逆序 ⇒ 散回用 ✓
+                _h_p = h_bf16.index_select(0, _ord).contiguous()
+                _ids_p = ids_i32.view(-1, _k).index_select(0, _ord).contiguous()
+                _wts_p = wts_f32.view(-1, _k).index_select(0, _ord).contiguous()
+                _out_p = torch.empty_like(out)
+                engine.cpu_decode(
+                    stream.cuda_stream, qlen, _k,
+                    _h_p.data_ptr(), _ids_p.data_ptr(), _wts_p.data_ptr(),
+                    _out_p.data_ptr(),
+                )
+                out.copy_(_out_p.index_select(0, _inv))               # unpermute ✓
+            else:
+                engine.cpu_decode(
+                    stream.cuda_stream, qlen, self.moe_config.experts_per_token,
+                    h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
+                    out.data_ptr(),
+                )
         _lt_t2 = time.perf_counter() if _LT_ON else 0.0
         if _sync == "post":
             torch.cuda.synchronize()

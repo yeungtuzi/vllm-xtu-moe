@@ -630,7 +630,8 @@ def gpu_moe_layer_shards(x, topk_ids, topk_weights, sh, H: int, I: int, K: int, 
                   ((0, n * crows13, crows13), (crows13, I + n * crows13, crows13))
         for (lrow0, grow0, nrows) in _halves:
             _sh_gu[(E, triton.cdiv(nrows, BN))](
-                sh["w13"][n], sh["s13"], x, x.stride(0), tok, seg, inter, inter.stride(0),
+                (_stage_mod.stage_tensor(sh["w13"][n]) if _stage_mod is not None
+                 else sh["w13"][n]), sh["s13"], x, x.stride(0), tok, seg, inter, inter.stride(0),
                 lrow0, grow0, nrows, W13_E, S13_E, W13_E, S13_E,
                 I2=I2, KH=KH, SR=SR13, BM=BM, BN=BN, BK=BK, NS=NS,
                 # ⚠️ 必须与插件【同默认】✗:插件 NW = XIAOTU_GPU_PREFILL_WARPS 默认【4】✓
@@ -654,7 +655,8 @@ def gpu_moe_layer_shards(x, topk_ids, topk_weights, sh, H: int, I: int, K: int, 
         #    ⇒ 每 node 只启动一次 ✗(我曾错用 gate/up 两半 ✗)
         for (lrow0, grow0, nrows) in ((0, n * crows2, crows2),):
             _sh_down[(E, triton.cdiv(nrows, BN))](
-                sh["w2"][n], sh["s2"], inter, tok, wts, seg, out, out.stride(0),
+                (_stage_mod.stage_tensor(sh["w2"][n]) if _stage_mod is not None
+                 else sh["w2"][n]), sh["s2"], inter, tok, wts, seg, out, out.stride(0),
                 lrow0, grow0, nrows, W2_E, S2_E, W2_E, S2_E,
                 H=H, K2=KH2, SR=SR2, BM=BM, BN=BN, BK=BK, NS=NS,
                 num_warps=int(os.environ.get("XIAOTU_GPU_PREFILL_WARPS", "4")))
