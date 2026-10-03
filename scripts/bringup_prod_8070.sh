@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 # ⭐ 生产 8070 固化启动脚本(唯一真源 ✓;用户口径 2026-09-30)
 #
-# 口径:DeepSeek-V4.1-Flash · 768K 上下文 · GPU 预填 on · dspark k=5 on · LMCache on · 监控栈 on
+# 口径:DeepSeek-V4.1-Flash · **1M 上下文** · GPU 预填 on · dspark k=5 on · LMCache on · 监控栈 on
+#
+# 【2026-10-03 变更(用户指示)】MAXLEN 768K → **1M**;MBT 4096 → **8192**。
+#   为什么现在能开 1M(此前被护栏拒绝):
+#     * 方案 B 去掉了每 rank 3.16 GiB 的 raw 重组缓冲(staging 10.73 → 7.56 GiB/rank);
+#     * CED 真正生效后每 token KV 从 ~5437 B 降到 ~2106 B(2.6×)⇒ **1M 只需 KV ~2.2 GiB**
+#       (而不是 v0.2.5 那套的 5.6 GiB)。
+#   实测(TP=2/GPU1,2/MBT=8192/dspark/KV 2.5 GiB):池 1,190,518 tok、
+#     16k prefill **988 tok/s**、峰值 **38,399/40,960 MiB = 93.8%** ✅
+#   ⚠️ KV 给到 5.3 GiB 时峰值 98.4%(太贴);历史 5.6 GiB 时 98% 且两次 OOM ✗
+#     ⇒ **1M + GPU 预填 的成败由 KV 池预算决定,不是由 maxlen 决定。**
 #
 # 用法:
 #   bash scripts/bringup_prod_8070.sh              # 起全套(幂等:已在跑则跳过 ✓)
@@ -13,8 +23,9 @@
 #
 # 关键词(踩过的坑,别再改错):
 #   * LMCache 是口径的一部分 ✗ 不能省(用户明令)⇒ 必须先起 LMCache 服务端(5555),再起 vLLM ✓
-#   * MAXLEN 上限 = 786432(768K)✓;1M + GPU 预填会被 serve_v41.sh 的护栏拒绝(实测必 OOM)✗
-#   * KV_CACHE_BYTES=3 GiB(768K + LMCache 放不下 5.6 GiB 那套)✓
+#   * MAXLEN = **1048576(1M)** ✓ —— 护栏已改成按 **KV 池预算**判定(见 serve_v41.sh);
+#     1M + GPU 预填在 KV ≤ 3 GiB 时成立(实测 KV 2.5 GiB ⇒ 峰值 93.8% ✅)
+#   * KV_CACHE_BYTES=2684354560(2.5 GiB):1M 实测只需 ~2.2 GiB;给到 5.3 GiB 会顶到 98.4% ✗
 #   * PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False 必须带 ✓
 #   * EXTRA_ENV 里的变量名是 XIAOTU_GP_ACT_RESERVE_GIB(不是 RESERVED ✗)
 #   * proc.sh 的 PID 文件记的会是【包装脚本】✗(serve_v41.sh 内部 nohup 起真服务)
@@ -31,8 +42,8 @@ WITH_MONITORING="${WITH_MONITORING:-1}"
 # ───────── 参数(唯一真源 ✓;改这里就够)─────────
 VLLM_ENV=(
   LMCACHE=1
-  MAXLEN=786432
-  MBT=4096
+  MAXLEN=1048576
+  MBT=8192
   MAXSEQS=1
   GPUS=1,2        # 【2026-10-03 用户明令】TP=2 一律 GPU1+GPU2(GPU0 只有 PCIe x8)⇒ IRON_RULES R19
   TP=2
@@ -41,7 +52,7 @@ VLLM_ENV=(
   EAGER=0
   SPEC=1
   KV_DTYPE=fp8_ds_mla
-  KV_CACHE_BYTES=3221225472
+  KV_CACHE_BYTES=2684354560
   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
   EXTRA_ENV="XIAOTU_GP_ACT_RESERVE_GIB=1.5"
@@ -83,9 +94,16 @@ else
   bash scripts/proc.sh spawn dsv41_prod env "${VLLM_ENV[@]}" bash scripts/serve_v41.sh
   echo "  等待就绪(约 3–6 分钟;先读日志确认加载在推进 ✓)"
   # 同步读日志(纪律:不许"发脚本→等结果" ✗)
-  for i in $(seq 1 40); do
+  # 【2026-10-03 修】原为 `seq 1 40`(=400 s):而真权重加载实测 **360 s**,再加 KV/CUDA graph
+  #   初始化 ⇒ **必然超时** ⇒ 后面"认领真 PID"与"起监控栈"两步被跳过(PID 文件因此留着
+  #   上一轮的陈旧 PID、看板一直没起)。改为 150×10 s = 25 min,足够覆盖加载+编译。
+  READY_TRIES="${READY_TRIES:-150}"
+  for i in $(seq 1 "$READY_TRIES"); do
     lines=$(wc -l < "$LOGDIR/v41_8070.log" 2>/dev/null || echo 0)
-    [ "$i" -le 3 ] && tail -2 "$LOGDIR/v41_8070.log" 2>/dev/null | cut -c1-140 | sed 's/^/    /'
+    if [ "$i" -le 3 ] || [ $((i % 12)) -eq 0 ]; then
+      printf '    [%3d/%s] 日志 %s 行 | %s\n' "$i" "$READY_TRIES" "$lines" \
+        "$(tail -1 "$LOGDIR/v41_8070.log" 2>/dev/null | cut -c1-100)"
+    fi
     curl -s --noproxy 127.0.0.1 --max-time 8 "http://127.0.0.1:$PORT/v1/models" 2>/dev/null | grep -q DeepSeek && break
     sleep 10
   done

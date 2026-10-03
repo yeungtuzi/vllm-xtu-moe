@@ -526,10 +526,22 @@ def _install_engram_last_shim() -> list[str]:
     """
     if not _engram_last_on():
         return []
-    try:
-        from vllm.models.deepseek_v41.nvidia import engram as _e
-    except Exception as exc:  # noqa: BLE001
-        _log(f"skip engram-last shim: {type(exc).__name__}: {exc}")
+    # 【2026-10-03 rebase 修复】上游把该模块从 `deepseek_v41.nvidia.engram` 挪到了
+    # `deepseek_v41.common.engram`(rebase 到 bc21cba967/f03026a548 之后)。
+    # 老路径 import 失败会被下面的 except 静默跳过 ⇒ `_ENGRAM_LAST_PENDING` 恒空 ⇒
+    # `_materialize_engram_tables` 不做事 ⇒ **`_pin_inplace` 从未执行** ⇒ 回到上游
+    # `pin_memory=True` 的 2 的幂取整路径 ⇒ 每 worker **RssShmem 141.4 GiB**
+    # (实测 2026-10-03;修好后应为 ~9.4 GiB)。两路径都试,兼容新旧上游。
+    _e = None
+    for _mod in ("vllm.models.deepseek_v41.common.engram",
+                 "vllm.models.deepseek_v41.nvidia.engram"):
+        try:
+            _e = importlib.import_module(_mod)
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    if _e is None:
+        _log("skip engram-last shim: engram 模块在 common/ 与 nvidia/ 下都找不到")
         return []
     cls = getattr(_e, "ParallelEngramEmbedding", None)
     if cls is None:

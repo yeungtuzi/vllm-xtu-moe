@@ -97,32 +97,42 @@ GPUS="${GPUS:-1,2}"            # 【2026-10-03 用户明令】TP=2 **一律用 G
 # TP=1 每层 6.72 GiB ⇒ 只能放 1 层。TP=1 只在"单卡/没有第二张卡"时才用。
 TP="${TP:-2}"
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║ ★ 最佳性能配置(实测锁定 2026-09-23;用户要求写死,勿凭记忆 ✗)              ║
+# ║ ★ 最佳性能配置(2026-10-03 重定为 **1M + MBT=8192**;用户指示,勿凭记忆 ✗)   ║
 # ╠══════════════════════════════════════════════════════════════════════════════╣
-# ║ 口径:768K 上下文 + GPU 预填 + dspark(k=5)+ FULL_DECODE_ONLY + LMCache      ║
-# ║   MAXLEN=786432  MBT=4096  MAXSEQS=1  GPUS=1,2  TP=2  GPU_UTIL=0.90        ║
-# ║   EAGER=0 COMPILE=1  SPEC=1  KV_DTYPE=fp8_ds_mla                          ║
-# ║   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384  XIAOTU_GP_ACT_RESERVE_GIB=1.5    ║
-# ║   KV_CACHE_BYTES=3221225472(3 GiB;768K 只需 ~1.4 GiB)                    ║
-# ║   LMCACHE=1  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False              ║
+# ║ 口径:1M 上下文 + GPU 预填 + dspark(k=5)+ FULL_DECODE_ONLY + LMCache         ║
+# ║   MAXLEN=1048576  MBT=8192  MAXSEQS=1  GPUS=1,2  TP=2  GPU_UTIL=0.90        ║
+# ║   EAGER=0  COMPILE=1  SPEC=1  KV_DTYPE=fp8_ds_mla                          ║
+# ║   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384  XIAOTU_GP_ACT_RESERVE_GIB=1.5     ║
+# ║   KV_CACHE_BYTES=2684354560(2.5 GiB)  LMCACHE=1                            ║
+# ║   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False                         ║
 # ║                                                                            ║
-# ║ 实测显存(2026-09-23):首填后峰值 35,403/40,960 MiB = 86.4%(余量 ~5.5 GiB)║
-# ║ ⚠️ **1M(1048576)+ GPU 预填 = 必定 OOM** ✗(历史两次 OOM:MLA 索引器缓冲      ║
-# ║    382→512 MiB,slack 仅 +0.29/+1.39;峰值 ≈40.1/41.0 GiB = 98% ✗)          ║
-# ║ ⚠️ 1M 那套的 KV 池是 5.6 GiB ⇒ 768K + LMCache 必须把 KV 池降到 ~3 GiB       ║
+# ║ 实测(2026-10-03,TP=2/GPU1,2/dspark/KV 2.5 GiB):                            ║
+# ║   池 1,190,518 tok(≥1M ✓)、16k prefill **988 tok/s**、                    ║
+# ║   峰值 **38,399 / 40,960 MiB = 93.8%** ✅                                   ║
+# ║ ⚠️ 1M 的成败由 **KV 池预算**决定,不是由 maxlen 决定:                       ║
+# ║     KV 2.5 GiB ⇒ 池 1.19M tok、峰值 **93.8%** ✅                            ║
+# ║     KV 5.3 GiB ⇒ 池 2.52M tok、峰值 **98.4%** ⚠️(太贴)                    ║
+# ║     KV 5.6 GiB ⇒ 历史 98% 且两次 OOM ✗(方案 B 之前)                       ║
+# ║ ⚠️ 为什么 1M 的 KV 只要 ~2.2 GiB:**CED 生效后每 token KV 从 ~5437 B 降到    ║
+# ║    ~2106 B(2.6×)** —— 21-39 层只保留 128 token 滑动窗口 ⇒ 不随上下文涨。    ║
 # ║ ⚠️ fp8/fp4 indexer 与显存**无关**(那是每层仅 1 块的环形暂存,可忽略)✗        ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 MAXLEN="${MAXLEN:-786432}"
-# ── 护栏:1M + GPU 预填会 OOM(见上),显式拦住而不是让它崩 ──────────────────────
-if [ "${MAXLEN}" -gt 786432 ] && [ "${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-0}" != "0" ]; then
-  echo "[serve_v41] ⛔ 拒绝启动:MAXLEN=${MAXLEN} > 786432 且开启了 GPU 预填 —— 实测必定 OOM ✗" >&2
-  echo "[serve_v41]    实测最佳为 768K(MAXLEN=786432),峰值 86.4%;1M 峰值 98% 且历史上两次 OOM。" >&2
-  echo "[serve_v41]    确有需要请显式设 VLLM_SERVE_ALLOW_RISKY_1M=1(自负风险)。" >&2
+# ── 护栏:**按 KV 池预算**判定(2026-10-03 改;原按 maxlen 判,已不成立)──────────
+# 实测:1M 只需 KV ~2.2 GiB ⇒ KV 2.5 GiB 时峰值 93.8% ✅;给到 5.3 GiB 就顶到 98.4% ⚠️。
+# 所以真正的危险组合是"1M + GPU 预填 + KV 池给太大",不是 1M 本身。
+if [ "${MAXLEN}" -gt 786432 ] && [ "${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-0}" != "0" ] \
+   && [ "${KV_CACHE_BYTES:-0}" -gt 3221225472 ]; then
+  echo "[serve_v41] ⛔ 拒绝启动:MAXLEN=${MAXLEN} > 786432 + GPU 预填 + KV_CACHE_BYTES=${KV_CACHE_BYTES:-未设} > 3 GiB ✗" >&2
+  echo "[serve_v41]    实测:1M 只需 KV ~2.2 GiB;给 2.5 GiB 时峰值 93.8% ✅、给 5.3 GiB 时 98.4% ⚠️。" >&2
+  echo "[serve_v41]    请显式设 KV_CACHE_BYTES=2684354560(2.5 GiB)。确有需要请设 VLLM_SERVE_ALLOW_RISKY_1M=1。" >&2
   [ "${VLLM_SERVE_ALLOW_RISKY_1M:-0}" != "1" ] && exit 2
-fi    # 【本机+V4.1 默认】1M 上下文(实测:KV 6 GiB ⇒ 池 3,174,221 token)
-# 【2026-09-21 用户定的生产口径】**MBT=4096**(本脚本原默认 0 = 不传,由 vLLM 自选)。
-# 生产要保证 **1M 上下文**(MAXLEN=1048576):激活工作区 ∝ MBT,MBT=4096 才给 1M 的 KV 留得下。
-# 生产调用示例:`GPUS=1,2 TP=2 MAXLEN=1048576 MBT=4096 SEQS=64 LOAD=auto bash scripts/serve_v41.sh`
+fi
+# 【2026-10-03 用户定的生产口径】**MBT=8192**(原 4096)。
+#   原为 MBT=4096 是为了给 1M 的 KV 腾地方;现在 CED 让 KV 只占 ~2.2 GiB,
+#   且 MBT=8192 的 GPU 预填 chunk 更饱满(实测 988 tok/s vs MBT=4096 的 ~648)。
+# 生产调用示例(单行即可):
+#   GPUS=1,2 TP=2 MAXLEN=1048576 MBT=8192 KV_CACHE_BYTES=2684354560 LMCACHE=1 bash scripts/bringup_prod_8070.sh
 # ⚠️ 【2026-10-03 用户明令】TP=2 一律 GPU1+GPU2;GPU0 只有 x8 ⇒ 只做单卡调试(IRON_RULES R19)。
 # (本脚本默认 MAXLEN=2048 是**冒烟**口径,别拿默认值当生产。)
 MBT="${MBT:-4096}"
@@ -336,7 +346,18 @@ export XIAOTU_ENV_FILE
 #   EAGER:默认 1(全 eager);可试 COMPILE=1 EAGER=0(FULL_DECODE_ONLY)对比
 #   SPEC=1 ⇒ dspark k=5
 #   ⚠️ 这些注释必须在 nohup env 语句**之外** —— 续行链里出现 # 会打断链,后续参数会变成新命令(2026-09-23 踩过)
-nohup env \
+# 【2026-10-03 用户要求(已重复多次)】日志必须按**真服务 PID** 命名,不再互相覆盖/重叠。
+#   根因:原先 `LOG="$OUTDIR/$TAG.log"` 由 **TAG** 命名,而生产的 TAG 固定(v41_8070)⇒
+#   每次重启都用 `> "$LOG"` 截断同一个文件:上一轮日志被销毁,两轮还会互相穿插。
+#   做法:`( … ) &` 里的 `$BASHPID` 是**子 shell 的真实 PID**,`exec` 之后就是 python 的 PID
+#   ⇒ 日志名 = `<TAG>.<pid>.log`;同时把 `<TAG>.log` 做成指向最新一次的**符号链接**,
+#   既杜绝覆盖,又让既有读取方式(proc.sh / 排查脚本)继续可用 ✓
+(
+  LOGFILE="$OUTDIR/$TAG.$BASHPID.log"
+  ln -sfn "$(basename "$LOGFILE")" "$LOG" 2>/dev/null || true
+  exec > "$LOGFILE" 2>&1
+  echo "[v41] service log=$LOGFILE pid=$BASHPID"
+  exec nohup env \
   PYTHONPATH="${XTU_TREE:-/home/user/lvllm/process_data/ref/repos/vllm-mainline}" \
   HF_HUB_OFFLINE=1 \
   VLLM_ENGINE_READY_TIMEOUT_S=7200 \
@@ -378,9 +399,12 @@ nohup env \
         || printf -- '--limit-mm-per-prompt {"image":0,"video":0}' ) \
     $( [ "${MM:-1}" = "1" ] && echo --mm-processor-device cpu --mm-processor-cache-gb 0 ) \
     --kernel-config '{"enable_jit_warmup": false}' \
-    --port "$PORT" > "$LOG" 2>&1 &
+    --port "$PORT"
+) &
 echo $! > "$OUTDIR/$TAG.pid"
-echo "[v41] pid=$(cat "$OUTDIR/$TAG.pid")"
+SVC_PID="$(cat "$OUTDIR/$TAG.pid")"
+echo "[v41] pid=$SVC_PID"
+echo "[v41] 日志(按 PID 命名)= $OUTDIR/$TAG.$SVC_PID.log;稳定符号链接 $LOG → $TAG.$SVC_PID.log"
 
 # Wait for readiness. Model construction alone took ~23 min with dummy weights.
 DEADLINE=$(( SECONDS + ${READY_TIMEOUT:-3600} ))
