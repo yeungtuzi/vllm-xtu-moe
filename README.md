@@ -21,11 +21,11 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 当前版本：v0.2.4**（2026-09-22）—— **支持 MiMo-V2.6-Flash-RL + 性能优化**：
-> **MiMo-V2.6-Flash-RL 接入**（专家是 MXFP4 ⇒ 复用 V4.1 那条引擎路径；**TP=2 / 1M 上下文 / 多模态 / MTP k=1** 全部实测）；
-> **GPU 预填充「0=关闭」陷阱修复**（MiMo 长 prefill **313 → 811 tok/s**）；**`--max-num-seqs` 默认统一为 4**（修掉 C≥2 被退化成串行）；
-> **decode 口径改为 median ITL**（真实解码争用只有 **1.13–1.77×**）。
-> 发行说明：[`RELEASE_NOTES_v0.2.4.md`](RELEASE_NOTES_v0.2.4.md)
+> **📌 当前版本：v0.2.5**（2026-10-03）—— **优化 GPU prefill 内存机制**：
+> **为 GPU 算子增加对 NUMA 切片权重的处理路径，节省了一层权重空间** —— 对 **DeepSeek-V4.1-Flash 节约 6.33 GiB**，**2 个 GPU（TP=2）时每卡节约 3.16 GiB**（单层 staging 10.73 → **7.56 GiB/rank**，离线同层 364.91 → **341.31 ms**，数值逐字节相同）；
+> **支持 1M 上下文 + GPU 预填充**（CED 让每 token KV 从 ~5437 B 降到 ~2106 B ⇒ 1M 只需 KV ~2.2 GiB）；**Engram pinned 浪费修复（宿主内存 −75 GiB）**；
+> rebase 到上游后 **CED 恢复生效**（V4.1 16k prefill **527.8 → 982.4 tok/s**）；**TP=2 一律用 GPU1+GPU2**（GPU0 只有 PCIe x8）；服务日志按 **PID** 命名。
+> 发行说明：[`RELEASE_NOTES_v0.2.5.md`](RELEASE_NOTES_v0.2.5.md)
 
 ---
 
@@ -142,6 +142,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 
 | 版本 | 主题 |
 |---|---|
+| **v0.2.5** | **优化 GPU prefill 内存机制** —— **为 GPU 算子增加对 NUMA 切片权重的处理路径,节省了一层权重空间**(对 DeepSeek-V4.1-Flash **节约 6.33 GiB**;2 个 GPU 时**每卡节约 3.16 GiB**):单层 staging 10.73→**7.56 GiB/rank**、离线同层 364.91→**341.31 ms**、数值逐字节相同;**支持 1M 上下文 + GPU 预填充**(CED 让每 token KV 5437→2106 B,1M 只需 KV ~2.2 GiB);**Engram pinned 浪费修复**(宿主内存 **−75 GiB**);rebase 到上游后 **CED 恢复生效**(16k prefill 527.8→**982.4** tok/s);**TP=2 一律用 GPU1+GPU2**(GPU0 只有 x8);服务日志按 **PID** 命名 |
 | **v0.2.4** | **支持 MiMo-V2.6-Flash-RL + 性能优化** —— 新模型接入（MXFP4/TP=2/1M/多模态/MTP k=1，**层内数值门禁 94/94 层通过**、312K 针测试命中、多模态真图通过）；**GPU 预填充「0=关闭」陷阱修复**（长 prefill 313→**811** tok/s）；**`--max-num-seqs` 默认统一为 4**（短 C=2 prefill 236→**367**）；**decode 口径改为 median ITL**（真实争用 1.13–1.77×）；修好 MXFP4 上的层内数值门禁 |
 | **v0.2.3** | **跟进上游 + GLM/MiMo 的 MTP** —— 补丁栈 rebase 到上游 `133b71e0b`(11 补丁/40 文件);**GLM-5.3-Flash 的 MTP 落地**(draft 层识别 + GPU 常驻,`SPEC_K=1..4`);**MiMo-V2.5(310B/15B)单卡端到端支持**,MTP k=1 decode +10%;显存契约重标定(GLM `GPU_UTIL` 0.85 → **0.82**) |
 | **v0.2.2** | **支持 GLM-5.3-Flash** —— FP8 GPU 预填充接线(4K prompt TTFT 29.3 → 22.8 s)、256K × 2 路并发交付配置;修掉 e4m3 次正规数解码缺陷 + 新增全码字门禁 |
@@ -150,7 +151,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 | v0.1.0 | 首个公开版:混合模式(CPU 专家 + GPU 其余)、AVX2 / AVX-512 多 ISA、DeepSeek-V4 系列 |
 
 改动清单、性能对照与运行参数变更:
-[**v0.2.4**](RELEASE_NOTES_v0.2.4.md) · [**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
+[**v0.2.5**](RELEASE_NOTES_v0.2.5.md) · [**v0.2.4**](RELEASE_NOTES_v0.2.4.md) · [**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
 (归档:[v0.2pre](RELEASE_NOTES_v0.2pre.md))
 
 ---

@@ -5,6 +5,62 @@
 
 ---
 
+## [0.2.5] — 2026-10-03
+
+**主题:优化 GPU prefill 内存机制。**
+
+### Changed
+
+* **GPU 预填充:为 GPU 算子增加对 NUMA 切片权重的处理路径,节省了一层权重空间。**
+  原先一层专家的权重在设备侧要走"先按 node 拼成规范布局、再转置成 K-major"两步,因此必须常驻
+  一块 `raw` 重组缓冲(TP=2 时 = `w13 + w2`)。现在**逐 NUMA node 的切片直接转置进 K-major
+  目标的列区间** ⇒ `raw` 从流程里彻底消失。
+  * 对 **DeepSeek-V4.1-Flash**:**节约 6.33 GiB**;**2 个 GPU(TP=2)时每卡节约 3.16 GiB**。
+  * 单层 staging **10.73 → 7.56 GiB/rank**;预检 `required` **13.30 → 9.82 GiB**。
+  * 离线同层实测:364.91 → **341.31 ms**;峰值设备显存 24.92 → **20.70 GiB**。
+  * **数值逐字节相同**(`w13` / `w2` / `s13` / `s2` 四个张量全部一致)。
+  * 回退开关:`XIAOTU_GPF_KMADAPTIVE=0`(退回旧路径,行为逐字不变)。
+* **TP=2 一律使用 GPU1 + GPU2**(此前脚本默认 `0,1`)。GPU0 只有 PCIe **x8**,实测 pinned H2D
+  **12.5 GB/s vs GPU1 25.0 / GPU2 23.3** ⇒ GPU0 恰好是另外两张的一半。GPU0 保留给单卡调试。
+* vLLM 基线 rebase 到上游最新 `origin/main`,我们的实现继续**仅以 patch 形式**保存在本仓
+  (`patches/xtu-series/`,由 17 条精简为 **15** 条)。经此对齐,**CED(decoder-side SWA
+  bounded replay)恢复生效**:V4.1 16k prefill **527.8 → 982.4 tok/s(1.86×)**。
+
+### Added
+
+* **支持 1M 上下文 + GPU 预填充**(此前被判定"必定 OOM")。CED 之后每 token KV 成本从
+  ~5437 B 降到 ~2106 B ⇒ **1M 上下文只需 KV ~2.2 GiB**。实测 KV 2.5 GiB ⇒ KV 池
+  **1,190,518 tokens**、峰值显存 **87.8–91.7%**。`serve_v41.sh` 的护栏由"按 maxlen 拒绝"
+  改为**按 KV 池预算判定**。
+* 生产口径 **MBT = 8192**(原 4096):16k prefill **~648 → 982 tok/s**。
+* 服务日志**按 vLLM 真 PID 命名**(`<TAG>.<pid>.log`),`<TAG>.log` 作为指向最新一次的
+  符号链接 ⇒ 多次启动的日志不再互相覆盖。
+
+### Fixed
+
+* **Engram pinned 表的内存浪费(实测释放 ~75 GiB 宿主内存)**。`pin_memory=True` 会被 pinned
+  分配器**向上取整到 2 的幂**、并被 `cudaHostAlloc` **整块锁页驻留**(实测每 worker
+  `RssShmem` **141.4 GiB**)⇒ 改为"普通分配 + 就地 `cudaHostRegister`"后降到 **9.4 GiB**。
+  两 rank 合计:系统 `Anon + Shmem` **805.8 → 731.0 GiB**。
+* **上游 rebase 后 `engram-last` shim 静默失效**:上游把该模块从 `deepseek_v41.nvidia.engram`
+  移到 `deepseek_v41.common.engram`,旧路径 import 失败被 `except` 吞掉 ⇒ 该 shim 不再生效,
+  Engram 表既退回上述浪费路径、也不再推迟到专家阶段之后分配。已改为两路径兼容。
+* `bringup_prod_8070.sh` 的就绪等待过短(40 × 10 s,而真权重加载实测需 360 s+)⇒ 每次必然
+  超时,导致"认领真服务 PID"与"启动监控栈"两步被跳过(留下陈旧 PID 文件、看板一直不起)。
+
+### Performance
+
+| 项 | 0.2.4 口径 | **0.2.5** |
+|---|---|---|
+| V4.1 16k prefill(TTFT 14.4 s) | 527.8 tok/s | **982.4 tok/s**(1.86×) |
+| 单层 GPU 预填 staging | 10.73 GiB/rank | **7.56 GiB/rank** |
+| 单层 GPU 预填(raw 缓冲) | 3.16 GiB/rank | **0** |
+| 峰值 / 稳态宿主内存之差 | ~470 GiB | **~23 GiB** |
+| 每 worker `RssShmem` | 141.4 GiB | **9.4 GiB** |
+| 1M 上下文 KV | 5.6 GiB(且与 GPU 预填冲突) | **2.5 GiB** ✅ |
+
+---
+
 ## [0.2.4] — 2026-09-22
 
 **主题:支持 MiMo-V2.6-Flash-RL、性能优化。**

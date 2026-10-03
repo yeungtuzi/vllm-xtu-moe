@@ -22,12 +22,15 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.2.4** (2026-09-22) — **MiMo-V2.6-Flash-RL support + performance work**:
-> **MiMo-V2.6-Flash-RL is supported** — its experts are MXFP4, so it reuses V4.1's engine path, and TP=2,
-> 1M context, multimodal input and MTP k=1 have all been measured. The **GPU prefill "zero means off" trap is
-> fixed** (long prefill 313 -> **811** tok/s), **`--max-num-seqs` now defaults to 4** so C>=2 no longer degrades
-> to serial execution, and the **decode metric is now median ITL** (real contention is only 1.13-1.77x).
-> Release notes: [`RELEASE_NOTES_v0.2.4.md`](RELEASE_NOTES_v0.2.4.md)
+> **📌 Current release: v0.2.5** (2026-10-03) — **GPU prefill memory rework**:
+> **The GPU operator now consumes NUMA-sharded experts directly, dropping one layer of weight staging** —
+> for **DeepSeek-V4.1-Flash that is 6.33 GiB saved, or 3.16 GiB per card with 2 GPUs** (per-layer staging
+> 10.73 -> **7.56 GiB/rank**; offline single layer 364.91 -> **341.31 ms**; weights byte-identical).
+> **1M context with GPU prefill is now supported** (CED cuts KV from ~5437 B to ~2106 B per token, so 1M
+> needs only ~2.2 GiB of KV), the **Engram pinned over-allocation is fixed (-75 GiB of host memory)**, and
+> after rebasing onto upstream **CED works again** (V4.1 16k prefill 527.8 -> **982.4** tok/s). TP=2 now
+> always uses GPU1+GPU2 (GPU0 is PCIe x8 only), and service logs are named by PID.
+> Release notes: [`RELEASE_NOTES_v0.2.5.md`](RELEASE_NOTES_v0.2.5.md)
 
 ---
 
@@ -119,6 +122,8 @@ Per-model recipes, memory budgeting, self-checks and troubleshooting →
 
 | Version | Theme |
 |---|---|
+| **v0.2.5** | **GPU prefill memory rework** — the GPU operator consumes NUMA-sharded experts directly, dropping one layer of weight staging (**6.33 GiB saved for DeepSeek-V4.1-Flash, 3.16 GiB per card at TP=2**; per-layer staging 10.73 → **7.56 GiB/rank**; byte-identical results); **1M context + GPU prefill** (CED: KV 5437 → 2106 B/token, so 1M needs ~2.2 GiB); **Engram pinned over-allocation fixed (−75 GiB host)**; rebasing onto upstream restores **CED** (16k prefill 527.8 → **982.4** tok/s); **TP=2 uses GPU1+GPU2**; service logs named by PID |
+| **v0.2.4** | **MiMo-V2.6-Flash-RL support + performance work** — MXFP4 experts over V4.1's engine path (TP=2 / 1M context / multimodal / MTP k=1 all measured); the **GPU prefill "zero means off" trap fixed** (long prefill 313 → **811** tok/s); **`--max-num-seqs` now defaults to 4**; decode metric switched to median ITL |
 | **v0.2.3** | **Upstream tracking + GLM/MiMo MTP** — patch stack rebased onto upstream `133b71e0b` (11 patches / 40 files); **GLM-5.3-Flash MTP wired up, ON by default** (`SPEC_K=1`, decode 21.9 → 22.6 tok/s at the cost of a 27% smaller KV pool); **MiMo-V2.5 (310B/15B) runs end-to-end on one A100-40GB** with MTP k=1 at +10% decode; GLM memory contract re-calibrated (`GPU_UTIL` 0.85 → **0.82**) |
 | **v0.2.2** | **GLM-5.3-Flash support** — FP8 GPU prefill wired up (4K-prompt TTFT 29.3 → 22.8 s), delivered as 256K × 2 concurrent; fixes an e4m3 subnormal-decode defect and adds an all-codeword gate |
 | **v0.2.1** | **Major CPU-engine performance work** — the CPU MoE engine now **beats `lk_moe` on every real shape**; DeepSeek-V4-Flash benefits too |
