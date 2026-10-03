@@ -88,7 +88,10 @@ PY="$ENV/bin/python"
 CKPT="${CKPT:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master}"
 TAG="${TAG:-v41}"
 PORT="${PORT:-8070}"           # 【生产约定】生产端口固定 8070,不随模型漂移(2026-09-23 用户规则)
-GPUS="${GPUS:-0,1}"            # 【本机+V4.1 默认】TP=2 需要两张卡
+GPUS="${GPUS:-1,2}"            # 【2026-10-03 用户明令】TP=2 **一律用 GPU1+GPU2**;GPU0 只做单卡调试。
+#   【依据 · IRON_RULES R19】GPU0 的 PCIe 只有 **x8**(根端口能力 x16、当前协商到 x8;AER 全 0 且稳定
+#   ⇒ 稳态配置,非错误降宽)⇒ 实测 pinned H2D:GPU0=12.5 GB/s vs GPU1=25.0 / GPU2=23.3 ⇒ **GPU0 是另两张的一半**。
+#   ⚠️ 已知取舍:GPU1 在 NUMA node 0、GPU2 在 node 4(另一个 socket)⇒ TP=2 必然跨 socket,当前接受。
 # 【R-VRAM/§507】**TP 默认 2**(用户 2026-09-16 指示:TP=1 不满足就明确说、并以 TP=2 为默认)。
 # 按显存优先级算同一张 40 GB 卡:TP=2 每层常驻 3.36 GiB ⇒ 1M KV 之后还能放 3 层(20-22)+投机;
 # TP=1 每层 6.72 GiB ⇒ 只能放 1 层。TP=1 只在"单卡/没有第二张卡"时才用。
@@ -97,7 +100,7 @@ TP="${TP:-2}"
 # ║ ★ 最佳性能配置(实测锁定 2026-09-23;用户要求写死,勿凭记忆 ✗)              ║
 # ╠══════════════════════════════════════════════════════════════════════════════╣
 # ║ 口径:768K 上下文 + GPU 预填 + dspark(k=5)+ FULL_DECODE_ONLY + LMCache      ║
-# ║   MAXLEN=786432  MBT=4096  MAXSEQS=1  GPUS=0,1  TP=2  GPU_UTIL=0.90        ║
+# ║   MAXLEN=786432  MBT=4096  MAXSEQS=1  GPUS=1,2  TP=2  GPU_UTIL=0.90        ║
 # ║   EAGER=0 COMPILE=1  SPEC=1  KV_DTYPE=fp8_ds_mla                          ║
 # ║   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384  XIAOTU_GP_ACT_RESERVE_GIB=1.5    ║
 # ║   KV_CACHE_BYTES=3221225472(3 GiB;768K 只需 ~1.4 GiB)                    ║
@@ -119,7 +122,8 @@ if [ "${MAXLEN}" -gt 786432 ] && [ "${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-0}" !=
 fi    # 【本机+V4.1 默认】1M 上下文(实测:KV 6 GiB ⇒ 池 3,174,221 token)
 # 【2026-09-21 用户定的生产口径】**MBT=4096**(本脚本原默认 0 = 不传,由 vLLM 自选)。
 # 生产要保证 **1M 上下文**(MAXLEN=1048576):激活工作区 ∝ MBT,MBT=4096 才给 1M 的 KV 留得下。
-# 生产调用示例:`GPUS=0,1 TP=2 MAXLEN=1048576 MBT=4096 SEQS=64 LOAD=auto bash scripts/serve_v41.sh`
+# 生产调用示例:`GPUS=1,2 TP=2 MAXLEN=1048576 MBT=4096 SEQS=64 LOAD=auto bash scripts/serve_v41.sh`
+# ⚠️ 【2026-10-03 用户明令】TP=2 一律 GPU1+GPU2;GPU0 只有 x8 ⇒ 只做单卡调试(IRON_RULES R19)。
 # (本脚本默认 MAXLEN=2048 是**冒烟**口径,别拿默认值当生产。)
 MBT="${MBT:-4096}"
 LOAD="${LOAD:-auto}"           # 【本机+V4.1 默认】真实权重(dummy 只用于开发自测)

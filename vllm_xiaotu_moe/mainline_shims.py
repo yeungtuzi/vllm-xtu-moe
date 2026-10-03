@@ -306,6 +306,26 @@ def _load_format_is_dummy() -> bool:
         return False
 
 
+def _pin_inplace(t: torch.Tensor) -> torch.Tensor:
+    """就地锁页(**不拷贝、尺寸精确**);失败才退回 ``pin_memory()``。
+
+    ⚠️【2026-10-03 实测,见 dev-docs/PREFILL_CPU_VS_GPU_2026-10-03.md §6】
+    **不要对大表用 `pin_memory=True`**:pinned 分配器把请求向上取整到 **2 的幂**
+    (实测 3→4、5→8、9→16、17→32 GiB),再叠加 `cudaHostAlloc`「整块锁页驻留」
+    ⇒ 一张 **45.78 GiB** 的 Engram 表实际驻留 **64.00 GiB**(进程 maxrss 64.58 GiB),
+    **白扔 18.2 GiB**。改成「普通分配 + 就地 cudaHostRegister」后 maxrss = **46.36 GiB**。
+    V4.1 每 rank 2 张表 ⇒ 每 rank 省 **36.4 GiB**,两 rank 共省 **~72.8 GiB**。
+    """
+    try:
+        rt = torch.cuda.cudart()
+        err = rt.cudaHostRegister(t.data_ptr(), t.numel() * t.element_size(), 0)
+        if int(err) == 0 and t.is_pinned():
+            return t
+    except Exception:  # noqa: BLE001 - driver/cudart 不可用时退回旧路径
+        pass
+    return t.pin_memory()
+
+
 def _materialize_engram_tables(model=None, model_path=None) -> int:
     """把延后的 Engram pinned 大表真正建出来(专家阶段全部结束之后调用)。
 
@@ -319,14 +339,16 @@ def _materialize_engram_tables(model=None, model_path=None) -> int:
     dummy = _load_format_is_dummy()
     for m in list(_ENGRAM_LAST_PENDING):
         try:
-            w = torch.empty(
+            # ⚠️ 用 `_pin_inplace`,**不要用 `pin_memory=True`** —— 后者会让每张表多占
+            # 18.2 GiB(pinned 分配器 2 的幂取整 + cudaHostAlloc 整块驻留)。
+            w = _pin_inplace(torch.empty(
                 m.part_num_embeddings, m.dim,
-                dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True,
-            )
-            s = torch.empty(
+                dtype=torch.float8_e4m3fn, device="cpu",
+            ))
+            s = _pin_inplace(torch.empty(
                 m.part_num_embeddings, m.dim // m.block_size,
-                dtype=torch.uint8, device="cpu", pin_memory=True,
-            )
+                dtype=torch.uint8, device="cpu",
+            ))
             # 真实权重优先:分块流式读真正的表(dummy 才 fill)
             w.fill_(1.0)      # 与主线 set_weight_attrs(dummy_weight_value=1.0) 一致
             s.fill_(127)      # ue8m0 的 1.0 = 指数 127
