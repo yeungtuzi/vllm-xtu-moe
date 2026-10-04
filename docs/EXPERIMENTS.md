@@ -9984,3 +9984,45 @@ vLLM 的 `_ACTIVATION_QUANTIZATION_FORMATS` 只有 naive/int/float/nvfp4_pack,
 
 **纪律**:补丁**只进 dev 服务**(`XTU_TREE=/tmp/w4a8/devpatch:<vllm 树>`),
 **生产树零改动**;若最终要进主线,再按"patch 形式"落到 `patches/xtu-series/` 并走用户批准 ✓
+
+---
+
+### B311(2026-10-04)🔴 **fp8 KV 在 A100(SM80) 上不可用** ⇒ "256K×2 可行"的结论**撤回**;压测(最大 prompt×c=2)抓到的是内核缺失,不是显存
+
+**动因(用户指示)**:按 DS 服务的教训,**用服务允许的最大 prompt 灌压、c=2**,以暴露"显存设不准"的问题,
+并把数据**永久留存作参照**。脚本:`/tmp/w4a8/stress_qfn.py`;结果目录 `dev-docs/report/qfn_ref/`。
+
+**结果:两个请求都 500,服务直接死** ✗
+```
+READY 200s · GPU KV cache size: 1,048,576 tokens · GPU0 峰值 35,791 MiB
+POST /v1/chat/completions → 500 ×2 → EngineDeadError
+```
+
+**根因(不是显存!)**
+```
+triton.compiler.errors.CompilationError:
+ValueError("type fp8e4nv not supported in this architecture.
+            The supported fp8 dtypes are ('fp4e2m1fn', 'fp8e4b15', 'fp8e5')")
+```
+⇒ **`--kv-cache-dtype fp8` 需要 A100 上没有的 FP8 attention 内核** ⇒ 启动能算池子(纯算术),
+**第一个真实请求就崩** ✗(与 B268 的 SM80 `fp8e4nv` 同源)✓
+
+**⇒ 重要更正:我在 B309 里"fp8 KV 让 256K×2 可行"的结论【撤回】**
+* 那个 17,216 B/token / 1,103,626 tokens 都是**启动期的池子算术**,配置本身**不可服务** ✗
+* 回到 **bf16 KV(72,368 B/token)**,**最初那张预算表才是对的**:
+
+| 方案(bf16) | KV 需求 | +15.7 非KV | +8.5 staging | 40.9 GiB |
+|---|---|---|---|---|
+| **256K × 2** | **35.3 GiB** | 51.0 | 59.5 | **✗ 差 18.6** |
+| 256K × 1 | 17.7 | 33.4 | 41.9 | ✗ 差 1.0 |
+| **128K × 1** | **8.8** | 24.5 | **33.0** | ✅ 余 7.9 |
+
+⇒ **256K × numseq 2 在单张 40GB 上装不下**;能同时开 GPU prefill 的上限 ≈ **232K tokens** ✓
+
+**⭐ 两条教训**
+1. **"启动成功"不等于"可服务"**:池子大小是**纯算术**,能在内核缺失的情况下照样算出来
+   ⇒ **必须用真实请求压到极限**才能暴露(B311 正是用户让做的这个压测抓到的)✓
+2. **我犯了"乐观锚定"**:看到 4.2× 就宣布"可行",**没有先跑一个请求验证 fp8 KV 能不能用** ✗
+   ⇒ 报"配置可行"之前,**至少要发一个真实请求**(与 B308 "找判定行而非宣告行"同源)✓
+
+**现场**:服务已死无残留;GPU0 回到 625 MiB;**生产 8070 全程 200** ✓;MemAvailable 754 GiB ✓
