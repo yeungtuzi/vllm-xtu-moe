@@ -54,7 +54,9 @@ while :; do
   if   [ "${U:-0}" -ge 50 ] && [ "${CORES:-0}" -lt 40 ]; then WHO="GPU 在干 ✓"
   elif [ "${CORES:-0}" -ge 40 ] && [ "${U:-0}" -lt 50 ]; then WHO="CPU 在干 ✓"
   elif [ "${U:-0}" -ge 50 ] && [ "${CORES:-0}" -ge 40 ]; then WHO="GPU+CPU 并行 ✓"
-  elif [ "${Rn:-0}" -gt 0 ]; then WHO="⚠️ 两者都不忙却有请求 ⇒ 可疑"
+  elif [ "${Rn:-0}" -gt 0 ] && [ "${U:-0}" -lt 15 ] && [ "${CORES:-0}" -lt 10 ]; then
+    WHO="⚠️ 两者都几乎不动却有请求 ⇒ 可疑"
+  elif [ "${Rn:-0}" -gt 0 ]; then WHO="进行中(GPU ${U}% / CPU ${CORES}核)"
   else WHO="空闲"; fi
   cur="$P/$G"
   [ "$cur" != "$lastsum" ] && { lastchg=$(date +%s); lastsum="$cur"; }
