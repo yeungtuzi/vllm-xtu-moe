@@ -2052,6 +2052,23 @@ class _XiaotuExpertsMixin:
                 )
         _lt_t1 = time.perf_counter() if _LT_ON else 0.0
         if not _resident and not _gpu_pf:
+            # ---- 【2026-10-05】CPU 路径进度心跳(用户要求:两条路都要报 ✓)-------------
+            # ⚠️ 关键教训(QA #25):**"CPU 预填"与"CPU 解码"是同一个入口 `engine.cpu_decode`** ✓,
+            #    区别只在 `qlen`(预填时 qlen 很大 ✓)⇒ 找它不能用 `cpu_prefill`(引擎里另有一套 ✗,
+            #    本路径根本不调用 ✓)。我第一次就是搜错了名字,才误判"生产不走 CPU 预填" ✗。
+            # 目的与 GPU 侧一致:长预填期间每 ~10s 报一次,带 qlen ⇒ 卡死时知道停在哪层、多少 token ✓
+            if os.environ.get("XIAOTU_PF_PROGRESS", "1") == "1":
+                try:
+                    _nowc = time.perf_counter()
+                    if _nowc - _PF_HB.get("tc", 0.0) >= 10.0:
+                        _PF_HB["tc"] = _nowc
+                        _PF_HB["nc"] = int(_PF_HB.get("nc", 0)) + 1
+                        print("[xtu-pf-progress] %s device=cpu layer=%s qlen=%d report#%d"
+                              % (time.strftime("%H:%M:%S"),
+                                 getattr(layer, "layer_name", "?"), qlen, _PF_HB["nc"]),
+                              flush=True)
+                except Exception:  # noqa: BLE001  心跳绝不影响主流程 ✓
+                    pass
             engine.cpu_decode(
                 stream.cuda_stream, qlen, self.moe_config.experts_per_token,
                 h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
