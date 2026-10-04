@@ -8868,3 +8868,41 @@ A 时间轴: 3.2s(0.21s) → 11.2s(7.95s) → 19.3s(8.15) → 27.7s(8.38) → 36
 `XIAOTU_GP_ASM_PREFETCH` / `XIAOTU_GP_SPLIT` / `XIAOTU_GP_ASM_SIDE_STREAM`;
 必要时上一轮 kernel 级 profile(torch profiler / nsys)✓
 ⚠️ 这条线**已超出目标 (B) 的范围**(B 是 CPU 引擎),但它是 (A)"对真问题给出修复"的**唯一真杠杆** ✓
+
+---
+
+### B282(2026-10-04)⭐⭐ **预填逐层分解拿到真瓶颈**:`asm`(权重装配)= **250 ms/层**,`kernels` 只 44–52 ms
+
+**⚠️ 先更正 B281**:我上轮审计的是 **`gpu_prefill.py`**,但**生效的装配路径在 `mixed_experts.py`**
+(`[gpf-split2]` / `[gp-split]` / `asm=` 都在那里)⇒ B281 的"缺口在空泡"结论**方向对但依据错** ✗
+
+**新工具**:`XIAOTU_GP_SPLIT=1` ⇒ 逐层打印 `[gp-split] layer=… qlen=… asm=X ms` 与 `kernels=X ms` ✓
+
+**实测(V4.1,32768-token 预填,chunk≈3545–3591)**
+| 项 | 值 |
+|---|---|
+| 墙钟 | **57.4 s ⇒ 568–573 tok/s** |
+| `asm`(权重装配) | **中位 249.8 ms**,p90 350.6,min 181.6,max 440.1(样本 588)|
+| `kernels`(MoE GEMM) | **44–52 ms**(样本中位 98.7)|
+| 每层合计 | ≈ **250–350 ms** ⇒ 与 40 层 × 实测一致 ✓ |
+
+**⇒ 两条硬结论**
+1. **`asm` 是绝对大头**(≈ 每层的 70–85%)✓;`kernels` 只占 15–20% ✓
+2. **`asm` = 每卡 1.7 GB 的 H2D** ⇒ `1.7 GB / 0.25 s` = **6.8 GB/s** ✗
+   而**本机 pinned H2D 实测 23.1–24.2 GB/s**(512 MiB,GPU1/GPU2,已含非 pinned 对照 25.1)✓
+   ⇒ **装配只跑到链路的 28%** ⇒ **~3.5× 的预填提速空间** ✓✓
+   (按 B277/(A):预填 3.5× ⇒ 饿死窗口缩 3.5× ✓)
+
+**③ 跨层预取(`XIAOTU_GP_ASM_PREFETCH`)的 A/B —— 无效,且我判为【不作数】**
+- 代码注释写得很清楚:*"层 L 的装配是 135–200 ms 纯 H2D,层内只能藏 attn(~80 ms)+ kernels(~23 ms);
+  **在算 L 时装配 L+1** ⇒ 每层成本从 `attn+asm+kernels` 变成 `max(asm, attn+kernels)+kernels`;
+  代价是第二套 K-major 缓冲(3.35 GiB),40 GB 卡上显存是硬约束 ⇒ **opt-in**"* ✓
+- 用**文件开关**(`XIAOTU_GP_ASM_PREFETCH_FILE`,仓库推荐的同进程诚实 A/B ✓)测得:**57.3 s vs 57.2 s** ✗
+- ⚠️ **但判据显示开关没生效**:42 条 `staging ~7.56 GiB` **完全一致**(若启用,预检应为额外槽计费而变大)✗;
+  且**没有任何** `DENIED`/prefetch 痕迹;当时 `free=4.68–5.18 GiB`,而额外槽需 3.35 GiB
+  ⇒ 两臂实为同一配置 ⇒ **该 A/B 不作数,不能据此否定预取** ✗
+- 另注:`XIAOTU_GP_ASM_SIDE_STREAM`(旁路流)**默认关是因为会必崩**
+  (`cudaErrorIllegalAddress, illegal=12`,异步竞态,复现条件已定死)⇒ **不要开** ✗
+
+**⇒ 下一步(未做)**:把 `asm` 的 H2D 效率从 28% 提上去(2D memcpy 的 stride/分块方式、
+或让源布局真正连续);并**先确认**跨层预取在当前显存下能否启用(需 3.35 GiB 额外槽)✓
