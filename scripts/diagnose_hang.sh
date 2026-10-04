@@ -5,6 +5,7 @@
 # GPU 93–96% / 245–258 W 却 **零 token 产出** ⇒ 若当时有这一条命令,证据链就完整了 ✓
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; L="$HERE/../dev-docs/report/tuning/logs"
+GAP="${GAP:-8}"
 TS=$(date +%Y%m%d-%H%M%S); OUT="$L/hang_$TS"; mkdir -p "$OUT"
 log(){ echo "$@" | tee -a "$OUT/summary.txt"; }
 
@@ -12,7 +13,6 @@ log "=== 卡死取证 $TS ==="
 log ""
 log "--- 1) 推理是否在推进(两次采样间隔 ${GAP}s,默认 8s)---"
 log "    ⚠️ 判据:冻结 <2 分钟【不算卡死】(大预填一个 step 就要数秒,累计计数 step 完成才更新)✓"
-GAP="${GAP:-8}"
 for i in 1 2; do
   curl -s --noproxy 127.0.0.1 --max-time 8 http://127.0.0.1:8070/metrics 2>/dev/null \
     | grep -E "^vllm:(num_requests_(running|waiting)|prompt_tokens_total|generation_tokens_total)" \
@@ -20,6 +20,18 @@ for i in 1 2; do
   [ "$i" = 1 ] && { log "    ---(等待 ${GAP}s)---"; sleep "$GAP"; }
 done
 
+log ""
+log "--- 1b) ★ 引擎心跳(每 10s 一行)⇒ 【多久没心跳 = 引擎卡了多久】,比 metrics 更可靠 ✓"
+S0=$(ls -t "$L"/v41_8070.*.log 2>/dev/null | head -1)
+if [ -n "$S0" ]; then
+  hb=$(grep -E 'Engine 000: Avg prompt throughput' "$S0" 2>/dev/null | tail -1)
+  hts=$(echo "$hb" | grep -oE '[0-9]{2}-[0-9]{2} [0-9:]{8}' | tail -1)
+  if [ -n "$hts" ]; then
+    hage=$(( $(date +%s) - $(date -d "$(date +%Y)-$hts" +%s 2>/dev/null || date +%s) ))
+    log "    最后心跳: $hts   距今 ${hage}s   $([ "$hage" -gt 40 ] && echo '✗ 引擎循环卡住' || echo '✓ 正常')"
+    log "    $hb" | cut -c1-170
+  fi
+fi
 log ""
 log "--- 2) GPU(满载却零产出 = 自旋的指纹)---"
 nvidia-smi --query-gpu=index,utilization.gpu,memory.used,power.draw --format=csv,noheader \
