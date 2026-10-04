@@ -89,6 +89,12 @@ ARGS=(
 #   "No compressed-tensors compatible scheme was found for … in_proj_qkvz" ✗
 #   ⇒ 用 --hf-overrides 把融合名补进 targets(不改 vLLM 代码)。见 EXPERIMENTS B307。
 [ -n "${HF_OVERRIDES:-}" ] && ARGS+=(--hf-overrides "$HF_OVERRIDES")
+# 通用透传(测投机/图模式等一次性实验用;生产口径请写进本脚本而不是靠这个)
+# ⭐ 2026-10-04【显式 KV 预算,照 DS-4.1 的做法】:给了 --kv-cache-memory 之后 vLLM 会
+#   【跳过显存剖析】⇒ --gpu-memory-utilization 失效(R24 第 8 条)⇒ 剩下的显存留给
+#   GPU-prefill 的 staging。QFN 实测 ≈72,368 B/token ⇒ 预算 = 目标 token 数 × 该值。
+[ -n "${KV_CACHE_BYTES:-}" ] && ARGS+=(--kv-cache-memory "$KV_CACHE_BYTES")
+[ -n "${EXTRA_ARGS:-}" ] && ARGS+=($EXTRA_ARGS)
 
 echo "[qwen38] tag=$TAG port=$PORT gpus=$GPUS tp=$TP maxlen=$MAXLEN mbt=$MBT load=$LOAD"
 echo "[qwen38] PLE_CPU=$PLE_CPU(必须=1,否则单卡 OOM)  eager=$EAGER  gpu_prefill_min=$GPU_PREFILL_MIN"
