@@ -10026,3 +10026,33 @@ ValueError("type fp8e4nv not supported in this architecture.
    ⇒ 报"配置可行"之前,**至少要发一个真实请求**(与 B308 "找判定行而非宣告行"同源)✓
 
 **现场**:服务已死无残留;GPU0 回到 625 MiB;**生产 8070 全程 200** ✓;MemAvailable 754 GiB ✓
+
+---
+
+### B305(2026-10-05)🔬 **A/B 开始:`LMCACHE=0` 跑生产,验证"卡死是否由 LMCache 传输路径引起"**
+
+**背景(两次同形态复现的卡死)**
+| 次 | 卡死时刻 | 卡死前 | 卡死后 |
+|---|---|---|---|
+| 1 | 14:42:36 | 预填 1792-token(GPU prefill)| 心跳停;worker `State=R/wchan=0`;GPU 100%/243 W |
+| 2 | 15:29:44 | 预填中 `prompt=172.7 tok/s`(有进展 ✓)| **心跳停 4.7 分钟**;`num_requests_running=0` 而 **GPU 仍 100%/230 W** ✗ |
+
+**⇒ 关键判据(新增,比 metrics 可靠 ✓)**:`Engine 000: Avg prompt throughput` **心跳每 10s 一行**;
+**它距今多久 = 引擎卡了多久** ✓(卡死时 `/metrics` 等三个端点仍 **200/0.01s** ✓ —— 因为 HTTP 在独立进程、指标是缓存值 ✓)
+
+**LMCache 的实锤(支持用户怀疑 1)**
+```
+[15:33:18] Stored 8704 tokens = 4 × CHUNK_SIZE(2176)
+[15:33:41] Stored 8704 tokens   ← 同一份反复存 ✗
+[15:34:29] Stored 6528 tokens = 3 × 2176
+store 180 行 / retrieve 2915 行 / hit 0 / miss 0
+且在引擎【已断心跳之后】仍在搬运 ✗
+```
+⇒ **写入了但没被复用**(命中的话不需要重算重存 ✓)⇒ 元凶很可能在 **`TRANSFER_MODE=lmcache_driven`** 的传输路径 ✓
+
+**A/B 设置**:生产用 **`LMCACHE=0`** ✓(= 断开 LMCache 外部连接器;vLLM **自带 in-GPU 前缀缓存仍开启** ✓)
+**判据**:
+* 几天内**不再卡死** ⇒ 元凶 = **LMCache 传输路径** ✓ ⇒ 再考虑换 `TRANSFER_MODE` 或永久弃用 ✓
+* 仍卡死 ⇒ 元凶在**引擎自身** ✓ ⇒ 转查 GPU prefill 路径 ✓
+**代价**:失去 L2 持久性(重启后首次要重算 ✓)—— 但**当前它本来也不命中** ✗ ⇒ 几乎无损失 ✓
+**监控方法**:`bash scripts/diagnose_hang.sh` ✓(看"心跳距今"+"running=0 却 GPU 满载"两条 ✓)
