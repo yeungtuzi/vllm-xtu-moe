@@ -9858,3 +9858,26 @@ weight_quant=QuantizationArgs(num_bits=8, type='float', ...)
    ⚠️ 但它是"全量模型" ⇒ 按纪律**需要用户明确许可**,且属于"最终验收"场景。
 3. 只保留**离线层内证据**(已有:QFN 1.503× / V4.1 2.098×,精度 maxabs/max 3.5e-2)⇒
    **不足以替代语义门禁** ✗
+
+#### B307 补充(2026-10-04):**出路 1 试过了 —— 不是配置问题,是 vLLM 的能力缺口**
+
+**做法**:用 `--hf-overrides` 把融合名 `in_proj_qkvz` 补进 `group_2.targets`
+(override JSON 2002 B;`serve_qwen38.sh` 已加 `HF_OVERRIDES` 支持)。
+**结果**:`hf_overrides` **确实生效**(启动参数里可见完整 `quantization_config`),但错误照旧 ✗
+
+**完整 traceback 揭示的更深处**
+```
+QwenGatedDeltaNetAttention.__init__        (qwen_gdn_linear_attn.py:434)
+  → compressed_tensors.get_scheme(layer, layer_name='….linear_attn.in_proj_qkvz')
+  → _get_scheme_from_parts(weight_quant = 8-bit float, strategy=block, block_structure=[128,128],
+                           zp_dtype=fp8_e4m3fn;  input_quant = 8-bit group/dynamic)
+  → NotImplementedError: No compressed-tensors compatible scheme was found
+```
+⇒ **不是"正则没命中",而是 vLLM 的 compressed-tensors 集成里【没有这个组合的 scheme】**:
+**GDN 线性注意力层 × FP8 分块量化**在 vLLM 侧未实现 ✗
+⇒ **不是配置能修的**(要改 vLLM 代码;而 vLLM 树受"只跟上游 + patch 形式"治理)✓
+
+**⇒ 出路 1 的成本被我低估了**:我原判"用 hf-overrides 补个正则即可",实际是**给 vLLM 增加一种量化 scheme**
+(涉及 `qwen_gdn_linear_attn.py` 与该 scheme 的 weight loader / kernel 选择)。
+**教训**:报"修法很便宜"之前,必须先看到**抛错点的完整调用栈**,而不是只看那一行消息 ✓
+(与 R31「先算分母」、QA 第 16 条「先分清哪一层」同源:都要**先看清失败发生在哪一层**)✓
