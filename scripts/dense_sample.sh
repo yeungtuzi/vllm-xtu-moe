@@ -16,7 +16,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"; L="$HERE/../dev-docs/report/tuning/logs"
 INTERVAL="${INTERVAL:-1}"; DURATION="${DURATION:-2400}"
 TS=$(date +%Y%m%d-%H%M%S); OUT="$L/dense_$TS"; mkdir -p "$OUT"
 CSV="$OUT/samples.csv"; PFLOG="$OUT/pf_progress.txt"
-echo "t,epoch,running,waiting,prompt_tok,gen_tok,gpu_max,power_max,cpu_cores,verdict" >"$CSV"
+echo "t,epoch,running,waiting,prompt_tok,gen_tok,gpu_max,power_max,cpu_cores,verdict,kv_usage_pct,avail_gib,lmc_stored" >"$CSV"
 SLOG=$(ls -t "$L"/v41_8070.*.log 2>/dev/null | head -1)
 echo "=== dense sample start $TS  interval=${INTERVAL}s duration=${DURATION}s" | tee -a "$OUT/run.log"
 echo "    服务日志: $(basename "${SLOG:-无}")" | tee -a "$OUT/run.log"
@@ -55,7 +55,10 @@ while [ "$(date +%s)" -lt "$end" ]; do
       pfseen=$cur
     fi
   fi
-  echo "$(date +%H:%M:%S),$NOW,$R,$W,${P:-},${G:-},${U:-0},${PW:-0},${CORES:-0},$V" >>"$CSV"
+  KV=$(echo "$M" | grep -E "^vllm:gpu_cache_usage_perc" | sed 's/.*} //' | head -1)
+  AV=$(awk '/^MemAvailable:/{printf "%.0f",$2/1048576}' /proc/meminfo)
+  LS=$(grep -ac "Stored" "$L/lmcache_server.log" 2>/dev/null || echo 0)
+  echo "$(date +%H:%M:%S),$NOW,$R,$W,${P:-},${G:-},${U:-0},${PW:-0},${CORES:-0},$V,${KV:-},${AV:-},${LS:-}" >>"$CSV"
   # ★ 铁证 ⇒ 立刻全量留档
   if [ "${Rn:-0}" -eq 0 ] && [ "${Wn:-0}" -eq 0 ] && [ "${U:-0}" -gt 50 ] && [ "${PW:-0}" -gt 150 ]; then
     echo "★★★ $(date +%H:%M:%S) 铁证:零请求但 GPU ${U}%/${PW}W ⇒ 留档" | tee -a "$OUT/run.log"
