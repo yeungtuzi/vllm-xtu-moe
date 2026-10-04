@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # 【规则·用户 2026-10-05 定】PID 对应的进程【已消失满 N 天】(默认 3)⇒ 打包归档其 .pid 与同批 .log
 #
-# 判据说明:"进程何时消失"无法直接观测 ⇒ 用**该实例日志的最后修改时间**作为代理
-# (日志 mtime ≈ 它最后一次活动;不再更新的日志即"已死且无人再看")✓
+# 【判据·用户 2026-10-05 指出】"**活着的进程会不停更新它的 log**" ⇒
+#   **日志 mtime 就是"它还活着"的直接证据** ✓ ⇒ 主判据 = 该实例最新日志的 mtime 距今是否 > DAYS 天 ✓
+#   好处:不需要 liveness 探测,而且**天然躲开 PID 回收的坑** ✗(旧 PID 被无关进程复用会让 kill -0 误判"还活着")
+#   兜底:`kill -0` 仍保留,仅用于"**活着但安静**(长时间无输出)"的实例 ⇒ **绝不归档活进程的 PID 文件** ✓
 # 永不触碰:①活着进程的 PID 文件与日志 ②_launch_audit.log ③archive/ 本身
 #
 # 用法:bash scripts/archive_stale_logs.sh          # 执行(按 3 天)
@@ -38,13 +40,21 @@ for f in *.pid; do
   [ -f "$f" ] || continue
   case "$KEEP" in *" $f "*) continue;; esac
   n="${f%.pid}"
+  # 主判据:日志 mtime(活着的进程会持续写日志 ✓);无日志时才退回 pid 文件的 mtime
   newest=0
-  for g in "$f" "$n.log" "$n.mem.log"; do
+  for g in "$n.log" "$n.mem.log"; do
     [ -f "$g" ] || continue
     m=$(stat -c %Y "$g" 2>/dev/null || echo 0); [ "$m" -gt "$newest" ] && newest=$m
   done
+  if [ "$newest" -eq 0 ] && [ -f "$f" ]; then
+    newest=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+  fi
   age=$(( ( $(date +%s) - newest ) / 86400 ))
   [ "$age" -ge "$DAYS" ] || continue
+  p2="$(tr -dc '0-9' <"$f" 2>/dev/null)"
+  if [ -n "$p2" ] && kill -0 "$p2" 2>/dev/null; then
+    continue          # 活着但安静 ⇒ 保留(绝不归档活进程的 PID 文件)✓
+  fi
   echo "$f" >>/tmp/_asl_list.txt
   for g in "$n.log" "$n.mem.pid" "$n.mem.log" "$n.pid.bak"; do
     [ -f "$g" ] && echo "$g" >>/tmp/_asl_list.txt
