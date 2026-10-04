@@ -319,7 +319,9 @@ _GP_BUF2: dict = {}        # dev_key -> {slot: (km13, km2)}
 _GP_LAYERS: dict = {}      # layer_index -> module (first registration wins)
 _GP_BUF2_BYTES: dict = {}
 _GP_BUF2_DENIED: dict = {}  # dev_key -> sticky "no room"
-_GP_PF_WARNED: dict = {}   # dev_key -> the reason was already reported
+_GP_PF_WARNED: dict = {}
+# 【2026-10-05】prefill 进度心跳状态(用户设计:执行者主动上报,而非外部猜 ✓)
+_PF_HB: dict = {}   # dev_key -> the reason was already reported
 
 
 def gp_prefetch_enabled() -> bool:
@@ -1763,6 +1765,28 @@ class _XiaotuExpertsMixin:
                     # 每层新分配 3.589 GiB 会造成不可回收的碎片(`reserved` 单调上涨),
                     # 直接导致上面的混合模式;改成写进复用的 slot.bufs 后,驻留量恒定。
                     _gk = int(self._group_k)
+                    # ---- 【2026-10-05】prefill 进度心跳(用户设计)------------------------
+                    # 为什么:长 prefill 期间 vLLM 的统计日志【只在 step 完成时更新】⇒
+                    # 卡死与"极慢的 step"看起来一样 ✗(实测 130k 预填让心跳停 130 秒而请求在推进 ✓)。
+                    # 装配点【每层必过】⇒ 在这里 10 秒节流上报一次,长 step 期间也持续有输出 ✓,
+                    # 并且带【真实进度】(qlen/层号/显存)⇒ 卡死时一眼看出"停在哪一层、当时处理多少 token" ✓
+                    # 关闭:XIAOTU_PF_PROGRESS=0 ✓
+                    if os.environ.get("XIAOTU_PF_PROGRESS", "1") == "1":
+                        try:
+                            _now = _time.perf_counter()
+                            if _now - _PF_HB.get("t", 0.0) >= 10.0:
+                                _PF_HB["t"] = _now
+                                _PF_HB["n"] = int(_PF_HB.get("n", 0)) + 1
+                                print("[xtu-pf-progress] %s device=%s layer=%s qlen=%d report#%d "
+                                      "alloc=%.1fGiB reserved=%.1fGiB"
+                                      % (time.strftime("%H:%M:%S"), _dev,
+                                         getattr(layer, "layer_name", "?"), qlen,
+                                         _PF_HB["n"],
+                                         torch.cuda.memory_allocated(_dev) / 2**30,
+                                         torch.cuda.memory_reserved(_dev) / 2**30),
+                                      flush=True)
+                        except Exception:  # noqa: BLE001  心跳绝不能影响主流程 ✓
+                            pass
                     # ---- 【2026-10-05 goal】MXFP4 **跨层预取**(与 FP8 对齐的语义,但**单文件**实现)----
                     # 背景:FP8 那套 ping/pong 全在 `mixed_experts.py` 的一个块里 ✓;而 MXFP4 的
                     # **装配**在本文件、**内核**在 `hybrid_model.py` ⇒ 无法照抄"内核之后再提交" ✗
