@@ -3,9 +3,11 @@
 # 用法: bash scripts/analyze_dense_run.sh [采样目录] [额外等待秒数]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; L="$HERE/../dev-docs/report/tuning/logs"
-D="${1:-$(ls -dt "$L"/dense_* 2>/dev/null | head -1)}"
+# ⚠️ 必须【只匹配目录】:dense_* 会命中 dense_analysis.log / dense_sample.log ✗(已踩过 ✓)
+if [ -n "${1:-}" ] && [ -d "${1:-}" ]; then D="$1"
+else D="$(find "$L" -maxdepth 1 -type d -name 'dense_20*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d" " -f2-)"; fi
 WAIT="${2:-120}"
-[ -d "$D" ] || { echo "找不到采样目录 $D"; exit 1; }
+[ -d "$D" ] || { echo "找不到采样目录 [$D]  (L=$L)"; ls -d "$L"/dense_20* 2>/dev/null | head -3; exit 1; }
 # 1) 等采样器自己结束(DURATION 到点)+ 宽限
 if [ "${SKIP_WAIT:-0}" = "1" ]; then
   echo "[analyze] SKIP_WAIT=1 ⇒ 跳过等待,直接分析现有数据(用于自测 ✓)"
