@@ -9822,3 +9822,39 @@ chunk 仍 2176 ⇒ 恢复后 L2 命中应立刻回来)。
    **把客户端留在半死状态**(既不报错停止、也不再工作)⇒ 比"直接报错"更隐蔽 ✗
 3. **归因 NUMA 不均要看"哪个 node 的 anon 异常 + 谁的 Private 大"**:`numastat -p` 一次就能
    把"总量不够"与"单一 node 被某个进程打满"分开 ✓(与 R28 的诊断心得同源)
+
+---
+
+### B307(2026-10-04)🔴 **QFN-MXFP4 检查点在这个 vLLM 上【起不来】⇒ 目标的"语义验收"暂时没有可服务的载体**
+
+**现象**(GPU0/TP=1/PORT=8140/MXFP4 检查点,vLLM 报 EngineCore 初始化失败):
+```
+NotImplementedError: No compressed-tensors compatible scheme was found for
+layer_name='language_model.model.layers.0.linear_attn.in_proj_qkvz',
+weight_quant=QuantizationArgs(num_bits=8, type='float', ...)
+```
+
+**根因(不是专家,是检查点自身不一致)**:`Qwen3.8-Flash-Next-MXFP4-FP8/config.json` 的
+`quantization_config.config_groups.group_2.targets` 写的是
+`re:.*\.linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$`,而新版 transformers 已把
+`in_proj_qkv` + `in_proj_z` **融合成 `in_proj_qkvz`** ⇒ **没有规则命中** ⇒ 抛错 ✗
+
+**由此产生的两难(必须一起记住)**
+
+| 检查点 | 专家格式 | 引擎路径 | 能否服务 | 能否验证本优化 |
+|---|---|---|---|---|
+| **QFN-FP8**(hf, 已验 READY) | `F8_E4M3` | `MOE_FP8` → `moe_v2_fp8.hpp` | ✅ | ❌ **绕开 packed4** |
+| **QFN-MXFP4**(ms) | `U8` packed + e8m0 | `MOE_MXFP4` → **packed4** | ❌ 起不来 | ✅(若可服务) |
+
+⇒ **选 QFN 作替代模型时,"结构相似"只对了一半**:它相似的是**架构**(512 专家 top-10 + 主机侧 PLE),
+但**可服务的那个变体不走我们要优化的 packed4 内核** ✗
+⇒ 教训:**"替代模型"还要确认"它能不能走到被测代码路径"** —— 只对架构相似不够 ✓
+
+**可行出路(待用户裁决)**
+1. **修可服务性**:用 `--hf-overrides` 把 `in_proj_qkvz` 补进 `group_2.targets`(或用别的等价修法)
+   —— 不改 vLLM 代码,但要在 QFN 启动脚本里加 override;需试。
+2. **换验收载体**:**V4.1 的专家也是 `MOE_MXFP4`**(引擎 banner 实证)⇒ 它**同样走 packed4**,
+   而且 `AB_W4A8_ACCEPTANCE.md` 的预注册门禁(GSM8K 198–199/200 等)**本来就是为 V4.1 写的** ✓
+   ⚠️ 但它是"全量模型" ⇒ 按纪律**需要用户明确许可**,且属于"最终验收"场景。
+3. 只保留**离线层内证据**(已有:QFN 1.503× / V4.1 2.098×,精度 maxabs/max 3.5e-2)⇒
+   **不足以替代语义门禁** ✗
