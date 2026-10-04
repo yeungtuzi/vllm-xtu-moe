@@ -9881,3 +9881,42 @@ QwenGatedDeltaNetAttention.__init__        (qwen_gdn_linear_attn.py:434)
 (涉及 `qwen_gdn_linear_attn.py` 与该 scheme 的 weight loader / kernel 选择)。
 **教训**:报"修法很便宜"之前,必须先看到**抛错点的完整调用栈**,而不是只看那一行消息 ✓
 (与 R31「先算分母」、QA 第 16 条「先分清哪一层」同源:都要**先看清失败发生在哪一层**)✓
+
+---
+
+### B308(2026-10-04)⭐ QFN-FP8 起得来 + **GPU prefill 为何被关**:预算是量化出来的
+
+**背景**:B307 说 QFN-MXFP4 起不来,用户改走"用能起的 **QFN-FP8** 先量投机/GPU prefill 的收益"。
+
+**① QFN-FP8 单卡跑通**(GPU0/TP=1/PORT=8140/60 线程/taskset 48-95/nice 19):
+READY **260 s**,GPU0 峰值 **15.4 GiB**,MemAvailable 571 GiB,**生产 8070 全程 http=200** ✓
+引擎 banner 证实它走另一条路:`xiaotu MOE_FP8 engine: E=512 H=2560 I=640 topk=10 **group=128x128**`
+⇒ **不经过 packed4**(与 B307 的判断一致)✓
+
+**② 基线(GPU prefill 关,CPU 引擎)** —— 三次波动 <1.2%,很干净:
+
+| prompt tokens | 1114 | 3977 | 7802 |
+|---|---|---|---|
+| TTFT | 3.92 s | 13.85 s | 27.05 s |
+| **prefill** | 284.6 | 287.1 | **288.5 tok/s** |
+
+**③ 门槛设 384 后:没有任何变化(3.99/14.11/27.60)⇒ 因为路径被关掉了** ✗
+日志三行连起来才是真相(**正是 R24 第 3 条**):`ACTIVE` 在**预检之前**打印,
+之后才是决定性的一行:
+
+```
+slack -5.46 GiB
+GPU prefill DISABLED for this process -> staying on CPU
+per-layer staging ~5.0 GiB; preflight wants ~8.5 GiB free VRAM
+  (staging x1.10 + 3.0 GiB activation reserve), only 3.0 GiB is free
+```
+
+**根因(可算)**:`GPU_UTIL=0.90` ⇒ vLLM 把 36.8 GiB 拿走(其中 **KV = 22.67 GiB**)
+⇒ **只剩 3.0 GiB 空闲** < 预检需要的 **8.5 GiB** ⇒ 自动关闭 ✗
+
+**⇒ 结论(用户问题的量化答案)**:**TP=1 上 GPU prefill 与"大 KV"不能同时给** ——
+要开 GPU prefill 就得**腾出 ≈8.5 GiB**,例如把 `--kv-cache-memory` 从 22.67 降到 **~14 GiB**,
+或把 `GPU_UTIL` 降到 **~0.70**(QFN 的 per-layer staging 只 **5.0 GiB**,代价不大)✓
+
+**教训**:报"某个开关打开了但没有效果"之前,必须先找到**该功能自己的判定行**
+(本例 `slack`),而不是只看 `ACTIVE` —— 与 R24#3 完全同源,我这次是**照着那条规则去查的** ✓
