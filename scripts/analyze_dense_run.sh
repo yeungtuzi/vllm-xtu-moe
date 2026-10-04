@@ -7,10 +7,14 @@ D="${1:-$(ls -dt "$L"/dense_* 2>/dev/null | head -1)}"
 WAIT="${2:-120}"
 [ -d "$D" ] || { echo "找不到采样目录 $D"; exit 1; }
 # 1) 等采样器自己结束(DURATION 到点)+ 宽限
-for i in $(seq 1 90); do
-  bash "$HERE/proc.sh" status dense_sample 2>/dev/null | grep -q RUNNING || break
-  sleep 60
-done
+if [ "${SKIP_WAIT:-0}" = "1" ]; then
+  echo "[analyze] SKIP_WAIT=1 ⇒ 跳过等待,直接分析现有数据(用于自测 ✓)"
+else
+  for i in $(seq 1 90); do
+    bash "$HERE/proc.sh" status dense_sample 2>/dev/null | grep -q RUNNING || break
+    sleep 60
+  done
+fi
 sleep "$WAIT"
 CSV="$D/samples.csv"; PF="$D/pf_progress.txt"; OUT="$D/ANALYSIS.md"
 {
@@ -32,7 +36,7 @@ awk -F, 'NR>1{r=$3+0; tk=$5"/"$6; if(r>0){if(tk==prev){cnt++}else{cnt=0;prev=tk;
 echo
 echo "## 4. 状态量趋势(哪个先异常)"
 awk -F, 'NR>1{av=$12+0; kv=$11+0; ls=$13+0;
-  if(mn==""||av<mn)mn=av; if(kv>mk)mk=kv; if(ls>ml)ml=ls;
+  if(mn==0||av<mn)mn=av; if(kv>mk)mk=kv; if(ls>ml)ml=ls;
   if($7+0>mu)mu=$7; if($8+0>mp)mp=$8} END{
   printf "- **MemAvailable 最低**: %d GiB(⚠️ <50 需警惕)\n", mn;
   printf "- **KV 池使用率峰值**: %s%%\n", (mk==""?"n/a":mk);
