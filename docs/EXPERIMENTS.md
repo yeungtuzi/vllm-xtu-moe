@@ -8963,3 +8963,31 @@ nvidia-smi 的 `utilization.gpu` 定义是"**采样期内有一个或多个 kern
 - ⇒ `engine.pin_hostbufs()` 锁的是那 **10 个 DMA 暂存缓冲**(本就小、可能已锁),
   **不是 253 GiB 的引擎分片** ✗ ⇒ 想拿到作者实测的 **26.85 GB/s**,必须锁**分片本身** ✓
 - ⇒ 该修复**保留**(无害、幂等 ✓),但**不得据此宣称提速** ✗;`VmLck` 是唯一有效判据 ✓
+
+---
+
+### B285(2026-10-04)🎯 **靶子修正**:装配的瓶颈是**设备侧 strided 转置**,不是 H2D
+
+**更正 B284 的一个判据错误**:我用 `VmLck` 判断锁页是否生效 —— **这个判据不成立** ✗
+`moe_v2.hpp:1729` 的 `pin_hostbufs()` **锁的正是分片**(`w13_shard_[i]`/`w2_shard_[i]` + 两个 scale)✓,
+且报 **10/10 成功** ✓ ⇒ 对象是对的 ✓;而 `cudaHostRegister` 走**驱动级 GUP 固定页**,
+**不必计入** `/proc/<pid>/status: VmLck` ✗ ⇒ `VmLck=0` **不能**证明没锁 ✓
+⇒ **唯一有效判据是时间**,而时间是 **60.3 s vs 57.3 s ⇒ 无改善** ✗
+
+**⇒ 由"锁页成功却无改善"反推:装配的瓶颈不在 H2D** ✓
+代码自己的注释就是答案(`mixed_experts.py` / `gpu_prefill_fp8.py`):
+> *"the **strided** form measured **~84 GB/s** against **~1361 GB/s contiguous**, and one staging
+> buffer per weight block forced every DMA in the layer to wait for the previous copy."*
+
+**每层 `asm` ≈ 250 ms 的分解(推算)**
+| 子项 | 量 | @速率 | 时间 |
+|---|---|---|---|
+| H2D(规范布局 MXFP4,3.16 GiB/卡 + scales) | ~3.84 GB | 15–27 GB/s | 140–250 ms |
+| **设备侧 K-major 转置(strided)** | ~3.16 GiB 读+写 | **84 GB/s**(strided ✗) | **~75 ms** |
+
+⇒ 两项同量级 ⇒ **必须同时压** ✓;而 **strided→contiguous 有 16× 的潜在空间**(84 → 1361 GB/s)✓✓
+⇒ **这是 (A) 这条线上目前最有依据的方向**:把转置改成**连续/分块**形式(或直接用
+`cudaMemcpy2DAsync` 让驱动的 2D 引擎做,避开 SM 上的 strided gather ✗)
+
+**另:字节宽度上已无可省** ✗ —— 装配用的**已经是原生 4-bit 打包**(MXFP4 规范布局 **3.16 GiB/卡**,
+与发布说明"节约 6.33 GiB / 每卡 3.16 GiB"一致 ✓),不是 FP8 的 6.33 GiB ✓
