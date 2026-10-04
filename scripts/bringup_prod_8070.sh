@@ -53,9 +53,12 @@ VLLM_ENV=(
   SPEC=1
   KV_DTYPE=fp8_ds_mla
   KV_CACHE_BYTES=2684354560
-  # 【2026-10-05 改】原 384 是 **ds-v4-flash** 时代的甜点 ✗,该模型已退役 ⇒ 归档 ✓
-  # 4.1-flash / TP=2 的盈亏平衡据用户记忆 **≈2560**(GPU prefill 才有正收益)⇒ 按此设默认 ✓
-  # ⚠️ 该值来自用户记忆、**尚未本轮实测** ⇒ 记为"待实测"(见台账 B308 ✓)
+  # 【2026-10-05 改】原 384 是 **ds-v4-flash** 时代的甜点 ✗(该模型已退役)⇒ 归档 ✓
+  # 现依据【本仓实测】`dev-docs/PREFILL_CPU_VS_GPU_2026-10-03.md` §3:
+  #   TP=1 交叉点 ≈ **5700** token/层;TP=2 每 rank 的 DMA 减半 ⇒ 交叉点 **~2500–2900** ✓
+  #   ⇒ 生产 TP=2 取 **2560**(正好在交叉点)✓:≥2560 走 GPU(实测 chunk=8192 时 GPU 快 1.41× ✓),
+  #      <2560 走 CPU(实测 chunk=1019 时 GPU 只有 0.40× ✗)
+  #   机理:胜负由 **chunk = min(prompt, MBT)** 决定,不是 prompt 总长 ✓
   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="${GPU_PREFILL_MIN_TOKENS:-2560}"
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
   # 【2026-10-03 事故修复】索引器 logits 预算 512 → 128 MB。
