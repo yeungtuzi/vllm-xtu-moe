@@ -10,12 +10,14 @@ log(){ echo "$@" | tee -a "$OUT/summary.txt"; }
 
 log "=== 卡死取证 $TS ==="
 log ""
-log "--- 1) 推理是否在推进(两次采样,间隔 8s)---"
+log "--- 1) 推理是否在推进(两次采样间隔 ${GAP}s,默认 8s)---"
+log "    ⚠️ 判据:冻结 <2 分钟【不算卡死】(大预填一个 step 就要数秒,累计计数 step 完成才更新)✓"
+GAP="${GAP:-8}"
 for i in 1 2; do
   curl -s --noproxy 127.0.0.1 --max-time 8 http://127.0.0.1:8070/metrics 2>/dev/null \
     | grep -E "^vllm:(num_requests_(running|waiting)|prompt_tokens_total|generation_tokens_total)" \
     | sed 's/^/    /' | tee -a "$OUT/summary.txt"
-  [ "$i" = 1 ] && { log "    ---(8s)---"; sleep 8; }
+  [ "$i" = 1 ] && { log "    ---(等待 ${GAP}s)---"; sleep "$GAP"; }
 done
 
 log ""
@@ -27,6 +29,7 @@ log ""
 log "--- 3) 进程状态(关键:wchan=0 + State=R ⇒ 用户态自旋)---"
 for pid in $(ls /proc | grep -E '^[0-9]+$'); do
   cl=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null) || continue
+  [ -n "$cl" ] || continue        # 进程可能刚退出 ⇒ 静默跳过,避免刷屏 ✗
   case "$cl" in *VLLM::*|*vllm.entrypoints*)
     printf "    pid=%-9s %-18s %s\n" "$pid" "$(grep -m1 '^State:' /proc/$pid/status 2>/dev/null | cut -f2- | tr -d '\t')" \
       "$(echo "$cl" | grep -oE 'VLLM::[A-Za-z_0-9]+' | head -1)" ;;
@@ -38,6 +41,14 @@ log "--- 4) ★ 有没有【别的实例】在抢 GPU/显存(用户 2026-10-05 �
 nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null \
   | sed 's/^/    /' | tee -a "$OUT/compute_apps.txt" | sed 's/^/  /'
 log "    (上面若出现非 8070 那 4 个 pid 的进程 ⇒ 就是【第二个实例在抢资源】✗)"
+PROD=$(tr -dc '0-9' < "$L/v41_8070.pid" 2>/dev/null)
+nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ' | while read ap; do
+  [ -z "$ap" ] && continue
+  par=$(grep -m1 '^PPid:' /proc/$ap/status 2>/dev/null | tr -dc '0-9')
+  if [ "$par" != "$PROD" ] && [ "$ap" != "$PROD" ]; then
+    log "    ⚠️ 非生产进程 $ap 正占用 GPU(父=$par)⇒ 竞争资源 ✗"
+  fi
+done
 for p in $(seq 8090 8099); do ss -ltn 2>/dev/null | grep -q ":$p " && log "    ⚠️ 端口 $p 有实例在监听"; done
 
 log ""
@@ -52,6 +63,7 @@ log "--- 6) Python 栈(若装了 py-spy 就能直接看到卡在哪一行)---"
 if command -v py-spy >/dev/null 2>&1; then
   for pid in $(ls /proc | grep -E '^[0-9]+$'); do
     cl=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null) || continue
+  [ -n "$cl" ] || continue        # 进程可能刚退出 ⇒ 静默跳过,避免刷屏 ✗
     case "$cl" in *VLLM::Worker*) log "    --- py-spy dump $pid ---"
       py-spy dump --pid "$pid" 2>&1 | head -40 | sed 's/^/      /' | tee -a "$OUT/pyspy_$pid.txt" >/dev/null ;;
     esac
