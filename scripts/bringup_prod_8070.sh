@@ -53,7 +53,10 @@ VLLM_ENV=(
   SPEC=1
   KV_DTYPE=fp8_ds_mla
   KV_CACHE_BYTES=2684354560
-  VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384
+  # 【2026-10-05 改】原 384 是 **ds-v4-flash** 时代的甜点 ✗,该模型已退役 ⇒ 归档 ✓
+  # 4.1-flash / TP=2 的盈亏平衡据用户记忆 **≈2560**(GPU prefill 才有正收益)⇒ 按此设默认 ✓
+  # ⚠️ 该值来自用户记忆、**尚未本轮实测** ⇒ 记为"待实测"(见台账 B308 ✓)
+  VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="${GPU_PREFILL_MIN_TOKENS:-2560}"
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
   # 【2026-10-03 事故修复】索引器 logits 预算 512 → 128 MB。
   #   事故:长 prompt 时 `sparse_attn_indexer` 的 `fp8_fp4_mqa_logits` 回退会分配
