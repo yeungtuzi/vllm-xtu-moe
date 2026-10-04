@@ -9472,3 +9472,50 @@ qlen=48  样本=120  |  period=6.145ms  compute=4.616ms  rest=1.560ms
 **⇒ 下一步(重写,而非修补)**:按 kt 的三要素重写 `async_loop` 与握手;重写前先把
 `rest` 拆成 **host-func / D2H / 等待 / H2D / GPU** 五项(在 `cpu_decode` 内打时间戳)✓,
 避免再用"推测 + 被污染的样本"推理 ✗
+
+---
+
+### B298(2026-10-05)⭐⭐⭐ **8 轮后的最终结构结论:解码是严格串行链,CPU MoE 只占 27% ⇒ 完全藏掉也只有 1.37×**
+
+**决定性依据 = 代码作者自己的注释**(`binding.cpp:855-860`,原文):
+> *"period = callback-entry to callback-entry: **the TRUE serialized per-layer time**
+> (the decode path is a **strict layer-by-layer chain GPU -> D2H -> CPU -> H2D -> GPU**).
+> compute = the CPU MoE itself. period - compute = GPU work + copies + host-fn dispatch latency,
+> **i.e. the part a GPU-resident layer removes**."*
+
+**把实测代进去(I 组:`SPEC=0`,批=1 token,24.1 tok/s,每层 period 1.18 ms)**
+| 每层 1.18 ms | 值 | 占比 | 来源 |
+|---|---|---|---|
+| **CPU MoE** | **0.32 ms** | **27%** | `compute` ✓ |
+| GPU 工作 + 空隙 | ~0.68 ms | 58% | `rest` − 拷贝 − 派发 ✓ |
+| D2H + H2D | ~0.14 ms | 12% | E vs F(`FAKE_COPY`)✓ |
+| host-func 派发 | ~0.04 ms | 3% | 36 µs/层 ✓ |
+
+**⇒ 三条硬结论**
+1. ⭐ **理论上限 = 1/(1−0.27) = 1.37×** —— 即"**把 CPU MoE 完全藏掉**"的极限 ✓
+   ⇒ **1.4× 目标 ≈ 这个上限** ✓ ⇒ 目标本身把"完美重叠"当成前提 ✓
+2. **而严格串行链里藏不掉它** ✗:`GPU → D2H → CPU → H2D → GPU` 每一步都依赖上一步 ✓
+   CPU 算的时候 GPU **没有本层可做的活** ✗(attention 在本层 MoE 之前 ✓,下一层的又在之后 ✓)
+   ⇒ **单流内的重叠在数学上不可得** ✓(不是实现问题)
+3. **能用的替代**(全部有明确的代价):
+   - **多请求相位交错**(A 的 GPU 段 ‖ B 的 CPU 段 ✓):需要引擎并发处理不同请求的层 ✗ ⇒ **调度层** ✓
+   - **GPU 常驻层**(作者的注释指明它"removes the rest" ✓):显存限制 **1–2/40** ⇒ **2.5–5%** ✗
+   - **更快的 CPU MoE**:B275/276/278/280 已证头寸 **≤2%** ✗
+   - **减少拷贝/派发**:合计仅 ~15% ✓,且已在 sync 路径里做到接近最优 ✓
+
+**⇒ 对目标(`goal-e5d81755`)的判断**
+步骤 ① 已完成 ✓(`[cd-timing]` 的 `period/compute/rest` + 固定批大小的口径纪律 ✓);
+步骤 ② 已定位 ✓(**`XIAOTU_MOE_ASYNC` 是死路**:带投机 2.4× 慢、`SPEC=0` 慢 **5.6×** 且批异常 47 ✗);
+步骤 ③ 的**前提被证否** ✗ —— 单流重叠的**上限只有 1.37×**,且**在严格串行链内不可达** ✓
+⇒ **建议:把目标改判为"记录结论 + 转评估多请求相位交错"**,而不是继续在单流重叠上投入 ✓
+
+**⚠️ 本会话在测量上栽过的坑(供后续复用)**
+1. **批大小必须先验**:`XIAOTU_MOE_ASYNC` 会改变批组成(`SPEC=0` 下仍报 47 ✗)⇒ 同 build A/B
+   若两边 `qlen` 不同,结论**无效** ✗(此坑踩了三次)
+2. **相位必须分开**:预填(compute 91%)/draft(2%)/解码(27%)差异巨大 ⇒ 混在一起平均会得出相反结论 ✗
+3. **`utilization.gpu` 的语义**:= "有 kernel 在执行的时长占比" ⇒ 47% 意味着 **53% 时间没有 kernel** ✓
+   (不是"持续忙碌" ✓)
+4. **同步口径 vs event 口径**:`torch.cuda.synchronize()` 会把并发工作算进来 ⇒ 曾把 dma 量成 537 ms
+   而 event 口径只有 167–206 ms ✗
+5. **打点自身会撒谎**:per-node 的值被当成 per-layer(累加器在 `key=="tr"` 时复位 ✓)、
+   两个引擎的交错日志混在一起反解出**负值** ✗
