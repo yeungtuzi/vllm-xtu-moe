@@ -74,9 +74,29 @@ Every performance number below was taken on this machine:
 
 * Metric: **aggregate throughput** -- `prefill (tok/s) = concurrency x prompt_tokens / TTFT`, `decode (tok/s) = concurrency x 1000 / median(TPOT)`
   (at C=1 this is just the per-stream rate; equivalently "total tokens of that phase / that phase's wall clock"), both from the same `vllm bench serve` run; `decode` uses the **median** TPOT.
-  > **The long/C=2 decode aggregate is still below C=1** -- that is a **measured concurrency regression**
-  > (V4.1 per-stream median TPOT 51.8 -> 129.4 ms), not a metric artefact; its prefill does rise as expected
-  > (903.9 -> 1204.2).
+  > **Correction (2026-10-04): the long/C=2 decode figure is largely a metric artefact.** `median TPOT`
+  > counts **prefill steps in its denominator**, so a handful of mixed-in chunks wrecks it. On the clean
+  > metric (**median ITL**) the real per-stream decode contention is only **1.13-1.77x** (see **B126**).
+  > The MiMo 203.6 ms and GLM 700.8 ms figures are wrong for the same reason.
+  > **What is real** is that mixing a long prefill with a decoding request on one engine starves the
+  > decoder (measured, **B277**/**B279**): its inter-token latency is bounded below by the prefill
+  > scheduled between its steps divided by prefill throughput. Injecting a 32768-token prompt into a
+  > running decode took that request's ITL from a **64.8 ms median to about 8.4 s, sustained for the
+  > whole 57.6 s prefill window** -- it gets exactly one token per step, and each step is filled by one
+  > `MBT`-sized prefill chunk. Shrinking the chunk (`--long-prefill-token-threshold`) also destroys
+  > prefill efficiency, because every chunk re-streams all forty layers of weights (a 2048-token chunk
+  > runs at about 410 tok/s against roughly 1000 for 8192), so it makes the throughput **worse**
+  > (1.25 -> 0.57 tok/s). There is no scheduler knob that fixes this.
+  > * **Single-stream serving** (what this repo's 8070 does): use `--max-num-seqs 1`, which serialises
+  >   requests so nothing is mixed; per-stream ITL stays a steady ~65 ms.
+  > * **Multi-user concurrency**: use **prefill/decode disaggregation**, not `max-num-seqs`,
+  >   `max-num-batched-tokens` or `long-prefill-token-threshold`.
+  > * **Root cause**: prefill throughput is **GPU-compute-bound** -- the A100 has no native FP4 and must
+  >   unpack, giving **94-100% SM utilisation against only 5-48% memory-controller utilisation**. Faster
+  >   prefill needs GPU-side MoE kernel/quantisation work, not scheduling.
+  > * The old note that "`--max-num-seqs` must be >=2" holds only for **benchmarking**: with `seqs=1` a
+  >   `C=2` run degrades to serial and depresses short-C=2 aggregate prefill to 54 (a **configuration**
+  >   problem, **B124**). Use `seqs>=2` for concurrency benchmarks and `seqs=1` for single-stream serving.
 * Dataset: **random tokens**, with `--random-input-len` pinned to short 128 / long 16384 and output 128; prefix caching on; 8 requests per cell with **a distinct seed per cell**.
 * "actual tokens" = `total_input_tokens / completed` (includes a small chat-template overhead).
   Configuration details, criteria and the `MBT` trade-off live in `docs/TUNING_GUIDE.md` section 8 and `docs/EXPERIMENTS.md`.
