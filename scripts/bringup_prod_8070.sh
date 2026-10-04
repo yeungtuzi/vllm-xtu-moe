@@ -148,6 +148,11 @@ if [ "$WITH_MONITORING" = "1" ]; then
     --homepath "$M/grafana-v11.4.0" --config "$M/grafana/grafana.ini"
   port_up 9100 || bash scripts/proc.sh spawn node_exporter "$M/node_exporter-1.8.2.linux-amd64/node_exporter" \
     --web.listen-address=127.0.0.1:9100 --collector.textfile.directory="$M/textfile"
+  # 【2026-10-05 修】回收上一批监控助手 —— 否则 **每次 bringup 都留 2 个孤儿** ✗
+  # 实测:一天内 10 次 bringup ⇒ 33 个孤儿(`coremap_png.py` / `textfile_exporter.py`,
+  # 各 7–19 MB、ppid=1)。根因:这两个 helper 常驻,而 PID 文件每次被**覆盖** ⇒ 旧 PID 丢失 ✗
+  bash scripts/proc.sh stop coremap_png  >/dev/null 2>&1 || true
+  bash scripts/proc.sh stop xtu_exporter >/dev/null 2>&1 || true
   bash scripts/proc.sh spawn xtu_exporter "$PY" "$M/textfile_exporter.py" "$M/textfile/xtu.prom"
   port_up 8787 || bash scripts/proc.sh spawn coremap "$PY" "$M/web/serve.py"
   bash scripts/proc.sh spawn coremap_png "$PY" "$M/coremap_png.py" "$M/web/coremap.png"
