@@ -78,7 +78,9 @@ VLLM_ENV=(
   TAG=v41_8070
   SERVED=DeepSeek-V4.1-Flash
 )
-LMCACHE_ENV=(CHUNK_SIZE=2176 TRANSFER_MODE=lmcache_driven ENABLE_MODULES= L1_GB=100 L2_GB=100)
+LMCACHE_ENV=(CHUNK_SIZE=2176 TRANSFER_MODE=lmcache_driven ENABLE_MODULES= L1_GB=64 L2_GB=100)
+  # 【2026-10-05】L1 100→64 GiB:各 node 仅剩 5.9–20.1 GiB 空闲 ⇒ 100 GiB 即使 interleave 也偏紧;
+  # 64 GiB ⇒ 每节点 8 GiB ✓ 宽裕;保留 interleave(用户:lmcache 性能要求不高,不必锁 local ✓)
 MONITORING_ROOT=/home/user/lvllm/monitoring
 
 port_up() { ss -ltnp 2>/dev/null | grep -q ":$1 "; }

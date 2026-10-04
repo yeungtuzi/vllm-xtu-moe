@@ -321,7 +321,8 @@ _GP_BUF2_BYTES: dict = {}
 _GP_BUF2_DENIED: dict = {}  # dev_key -> sticky "no room"
 _GP_PF_WARNED: dict = {}
 # 【2026-10-05】prefill 进度心跳状态(用户设计:执行者主动上报,而非外部猜 ✓)
-_PF_HB: dict = {}   # dev_key -> the reason was already reported
+_PF_HB: dict = {}
+_PF_CALL: dict = {"n": 0}   # 全局调用计数 ⇒ 心跳里带上它可区分"原地重来"与"在推进" ✓   # dev_key -> the reason was already reported
 
 
 def gp_prefetch_enabled() -> bool:
@@ -1774,16 +1775,17 @@ class _XiaotuExpertsMixin:
                     if os.environ.get("XIAOTU_PF_PROGRESS", "1") == "1":
                         try:
                             _now = _time.perf_counter()
-                            if _now - _PF_HB.get("t", 0.0) >= 10.0:
+                            if _now - _PF_HB.get("t", 0.0) >= float(os.environ.get("XIAOTU_PF_PROGRESS_SEC", "2")):
                                 _PF_HB["t"] = _now
                                 _PF_HB["n"] = int(_PF_HB.get("n", 0)) + 1
-                                print("[xtu-pf-progress] %s device=%s layer=%s qlen=%d report#%d "
-                                      "alloc=%.1fGiB reserved=%.1fGiB"
+                                _PF_CALL["n"] = int(_PF_CALL.get("n", 0)) + 1
+                                print("[xtu-pf-progress] %s device=%s layer=%s qlen=%d call=%d "
+                                      "ids0=%s alloc=%.1fGiB"
                                       % (time.strftime("%H:%M:%S"), _dev,
                                          getattr(layer, "layer_name", "?"), qlen,
-                                         _PF_HB["n"],
-                                         torch.cuda.memory_allocated(_dev) / 2**30,
-                                         torch.cuda.memory_reserved(_dev) / 2**30),
+                                         _PF_CALL["n"],
+                                         int(ids_i32[0, 0]) if ids_i32.numel() else -1,
+                                         torch.cuda.memory_allocated(_dev) / 2**30),
                                       flush=True)
                         except Exception:  # noqa: BLE001  心跳绝不能影响主流程 ✓
                             pass
@@ -2060,12 +2062,14 @@ class _XiaotuExpertsMixin:
             if os.environ.get("XIAOTU_PF_PROGRESS", "1") == "1":
                 try:
                     _nowc = time.perf_counter()
-                    if _nowc - _PF_HB.get("tc", 0.0) >= 10.0:
+                    if _nowc - _PF_HB.get("tc", 0.0) >= float(os.environ.get("XIAOTU_PF_PROGRESS_SEC", "2")):
                         _PF_HB["tc"] = _nowc
                         _PF_HB["nc"] = int(_PF_HB.get("nc", 0)) + 1
-                        print("[xtu-pf-progress] %s device=cpu layer=%s qlen=%d report#%d"
+                        _PF_CALL["n"] = int(_PF_CALL.get("n", 0)) + 1
+                        print("[xtu-pf-progress] %s device=cpu layer=%s qlen=%d call=%d ids0=%s"
                               % (time.strftime("%H:%M:%S"),
-                                 getattr(layer, "layer_name", "?"), qlen, _PF_HB["nc"]),
+                                 getattr(layer, "layer_name", "?"), qlen, _PF_CALL["n"],
+                                 int(ids_i32[0, 0]) if ids_i32.numel() else -1),
                               flush=True)
                 except Exception:  # noqa: BLE001  心跳绝不影响主流程 ✓
                     pass
