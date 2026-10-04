@@ -41,7 +41,7 @@ WITH_MONITORING="${WITH_MONITORING:-1}"
 
 # ───────── 参数(唯一真源 ✓;改这里就够)─────────
 VLLM_ENV=(
-  LMCACHE=1
+  LMCACHE="${LMCACHE:-1}"   # 【2026-10-05 修】原来硬编码 ⇒ 覆盖外部 env,令 LMCACHE=0 的 A/B 从未生效 ✗
   MAXLEN=1048576
   MBT=8192
   MAXSEQS=1

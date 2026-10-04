@@ -10079,3 +10079,30 @@ store 180 行 / retrieve 2915 行 / hit 0 / miss 0
    ⇒ **">40 秒无心跳 = 卡死"会误报** ✗ ⇒ ⚠️ **我此前至少有 1 次可能误判并重启了生产** ✗
    ⇒ ⇒ **真正可靠的铁证只有一条**:**`num_requests_running=0` 却 GPU 满载烧 250 W** ✓✓
    (零请求还满载 = 逃逸内核 ✓;有请求时满载 = **可能只是慢** ✓)
+
+---
+
+### B307(2026-10-05)⭐ **生产【从不走 CPU 预填】**(所以"给 CPU 预填也加进度上报"没有对象);且 GPU 进度心跳已验证生效
+
+**用户要求**:*"cpu 也可以报告的,[Device] 就是代指当前设备"* ✓ —— 我照做前先核实了"CPU 预填在生产里是否真的被调用" ✓
+
+**三条证据(都指向"没有")**
+| 证据 | 结果 |
+|---|---|
+| vLLM 树里 `cpu_prefill` 的调用点 | **全树 0 处** ✗(只在**引擎绑定** `binding.cpp:1002` 定义 ✓ 和 shim 的注释里被提到 ✓)|
+| 本次启动日志 | `GPU prefill ACTIVE` **42 次** ✓ / CPU 预填相关 **0 次** ✓ |
+| 看门狗 | `CPU 在干`(85/76 核)只出现在 **16:00:56–16:01:30 = 模型加载期** ✓;真正预填时是 `gpu=97%/86W cpu=2cores` ✓ = **GPU 预填** ✓ |
+
+⇒ ⇒ **⇒ 结论**:`MBT=8192` + `GPU_PREFILL_MIN_TOKENS=384` 之下,≥384 token 的提示**一律走 GPU prefill** ✓;
+而**更短的提示也不走**引擎的 `cpu_prefill` ✗(主树里没有这个调用 ✓)⇒ **CPU 预填路径在生产中【不存在】** ✓
+
+**⇒ 所以"谁在干活"这个信号,实际由两件事构成(都已在看门狗里 ✓)**
+1. **GPU 预填**:引擎**自报**进度 ✓(本会话新增 ✓,已验证 ✓):
+```
+[xtu-pf-progress] 16:01:49 device=cuda:0 layer=…layers.0.ffn.experts qlen=1792 report#1 alloc=20.7GiB
+[xtu-pf-progress] 16:01:59 device=cuda:0 layer=…layers.11.ffn.experts qlen=8188 report#2 alloc=29.4GiB
+[xtu-pf-progress] 16:02:09 device=cuda:0 layer=…layers.18.ffn.experts qlen=8188 report#3 alloc=31.1GiB
+```
+   ⇒ 10 秒一行 ✓、**带层号 + qlen + 显存** ✓ ⇒ 卡死时能直接看出**停在第几层、当时多少 token** ✓✓
+2. **CPU 侧的活**(解码的 CPU MoE / 加载 ✓):看门狗的 **`cpu=Ncores`** ✓(实测加载 85 核 ✓ / 纯 GPU 预填 2 核 ✓)
+   ⇒ 已足够区分 ✓,**无需**再给"CPU 预填"埋点(它不存在 ✓)

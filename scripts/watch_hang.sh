@@ -39,6 +39,8 @@ while :; do
   R=$(num "$M" num_requests_running); W=$(num "$M" num_requests_waiting)
   P=$(num "$M" prompt_tokens_total); G=$(num "$M" generation_tokens_total)
   R=${R:-?}; W=${W:-?}; P=${P:-0}; G=${G:-0}
+  # 【2026-10-05 修】指标是浮点(0.0)⇒ 一律取整数部分再做数值比较,避免 "0.0" != "0" 的误判 ✗
+  Rn=${R%%.*}; Wn=${W%%.*}; [ -z "$Rn" ] && Rn=-1; [ -z "$Wn" ] && Wn=-1
   U=$(gpu | awk -F, '{gsub(/ /,"",$2); if($2+0>mx) mx=$2+0} END{print mx+0}')
   PW=$(gpu | awk -F, '{gsub(/[^0-9.]/,"",$3); if($3+0>mx) mx=$3+0} END{print int(mx)}')
   # CPU 核数(本次采样与前次的差)⇒ 判断谁在干 ✓
@@ -52,19 +54,19 @@ while :; do
   if   [ "${U:-0}" -ge 50 ] && [ "${CORES:-0}" -lt 40 ]; then WHO="GPU 在干 ✓"
   elif [ "${CORES:-0}" -ge 40 ] && [ "${U:-0}" -lt 50 ]; then WHO="CPU 在干 ✓"
   elif [ "${U:-0}" -ge 50 ] && [ "${CORES:-0}" -ge 40 ]; then WHO="GPU+CPU 并行 ✓"
-  elif [ "$R" != "0" ]; then WHO="⚠️ 两者都不忙却有请求 ⇒ 可疑"
+  elif [ "${Rn:-0}" -gt 0 ]; then WHO="⚠️ 两者都不忙却有请求 ⇒ 可疑"
   else WHO="空闲"; fi
   cur="$P/$G"
   [ "$cur" != "$lastsum" ] && { lastchg=$(date +%s); lastsum="$cur"; }
   stall=$(( $(date +%s) - lastchg ))
   log "running=$R waiting=$W tok=$cur stall=${stall}s | gpu=${U}%/${PW}W cpu=${CORES}cores | $WHO"
   # ★ A 铁证
-  if [ "$R" = "0" ] && [ "$W" = "0" ] && [ "${U:-0}" -gt 50 ] && [ "${PW:-0}" -gt 150 ]; then
+  if [ "${Rn:-0}" -eq 0 ] && [ "${Wn:-0}" -eq 0 ] && [ "${U:-0}" -gt 50 ] && [ "${PW:-0}" -gt 150 ]; then
     log "★★★ 铁证:零请求 + GPU ${U}%/${PW}W ⇒ 逃逸内核!开始留档"
     bash "$HERE/diagnose_hang.sh" >>"$OUT" 2>&1 || true
     log "★★★ 已留档到 $L/hang_*"; alerted=1
   # ☆ B 可疑
-  elif [ "$R" != "0" ] && [ "$stall" -gt "$MAXSTALL" ] && [ "${U:-0}" -gt 80 ]; then
+  elif [ "${Rn:-0}" -gt 0 ] && [ "$stall" -gt "$MAXSTALL" ] && [ "${U:-0}" -gt 80 ]; then
     log "☆☆ 可疑:有请求但 ${stall}s 无进展,且 GPU ${U}% ⇒ 可能是超慢 step,也可能卡死 ⇒ 留档"
     bash "$HERE/diagnose_hang.sh" >>"$OUT" 2>&1 || true
   fi
