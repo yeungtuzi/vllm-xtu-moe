@@ -9362,3 +9362,43 @@ sync 路径(`XIAOTU_MOE_ASYNC=0`)自带 `[cd-timing]` 打印 ✓(`binding.cpp:89
    (在 `binding.cpp` 的 `cpu_decode` 里给 D2H/H2D 加时间戳,并入 `[cd-timing]` 一行 ✓)
 ② 若拷贝占 `rest` 的大头 ⇒ **按 B291 的 deferred/ping-pong 修 async 协议** ✓,直接冲那 2× ✓
 ③ 若 `rest` 主要是 GPU 工作 ⇒ 目标回到"多请求相位交错"(调度层 ✗)
+
+---
+
+### B295(2026-10-05)⭐⭐⭐ **`rest` 的真身查清:不是拷贝,是 `cudaLaunchHostFunc` 的派发(= CUDA graph 的代价)**;async 结构上也已定位
+
+**① 拷贝不是大头(F 组:`XIAOTU_MOE_FAKE_COPY=1`,跳过 D2H/H2D)**
+| 组 | period | compute | rest |
+|---|---|---|---|
+| **E**(正常,sync)| 1.88 ms | 0.92 | 0.96 |
+| **F**(跳过拷贝)| **1.72** | 0.89 | **0.82** |
+⇒ **拷贝只占 ~0.16 ms** ✗ ⇒ 去掉拷贝后 `rest` **仍有 0.82 ms** ✓
+
+**② `rest` 的真身 = host-func 派发**
+`binding.cpp:661-664` 注释写明:CPU MoE 跑在 **CUDA host-function 节点**里 ✓ —— 而
+`binding.cpp:109-110` 另一处写明:**host-func 每层 36 µs**(因它阻塞整条流并由驱动派发回调 ✓)
+⇒ **40 层 × 36 µs = 1.44 ms/pass** ✓✓ ⇒ 一个 pass 的 period 只有 1.88 ms ⇒
+**⇒ host-func 的派发是最大单项**(比 CPU MoE 本体 0.92 ms 还大 ✗!)
+
+**③ host-func 不能简单删掉 —— 它是 CUDA graph 捕获所必需的**
+段注释原话:*"async D2H copies are **recorded into the graph** …, the host callback computes on
+pinned CPU buffers and writes back with an async H2D memcpy"* ✓
+⇒ `COMPILE=1`(图开启)时,**图内注入主机工作只能靠 host-func** ✗
+⇒ 三条路:**(a)** host-func(36 µs/层 ✗)/ **(b)** mapped-flag 握手(= `XIAOTU_MOE_ASYNC` ✓ 图兼容 ✓
+但实测 2.3× 慢 ✗)/ **(c)** 关图 + 主机阻塞(会丢掉图的 launch 节省 ✗,粗估 40 层×~10 kernel
+× 3–5 µs = 1.2–2 ms ✗ 可能抵消收益)
+
+**④ async 的结构定位(G 组,`ASYNC=1` + 钉住 qlen)**
+| qlen | 样本 | period | compute | rest |
+|---|---|---|---|---|
+| 47(dspark draft)| 518 | 5.80 ms | **4.64** | 1.21 |
+| **6(解码)** | **4** ✗ | **863.8** ✗ | 584 | 252 |
+| 8192(预填)| 2 | 1454.7 | 1268.1 | 186.6 |
+⇒ `qlen=6` 的 **`MIN compute` = 0.835 ms 正常** ✓ 但 `period` 高达 **670–860 ms** ✗✗
+⇒ **不是算得慢,是"没被及时服务"** ✓ —— 与 `async_loop` 的**单 worker 线程**轮询所有槽位一致 ✓
+⚠️ **但只有 4 个样本,且与"整体 2.3× 慢"对不上**(670 ms/pass 应慢 100× ✗)⇒
+**那几个样本来自预热/捕获期,不代表稳态** ✗ ⇒ **采样窗口仍混相位** ⇒ 下一步要专门在稳态解码窗口里取 ✓
+
+**⇒ 目标现在的靶子很明确**:让**图兼容的握手**变便宜(取代 1.44 ms/pass 的 host-func ✓)
+⇒ 收益上限 **~2–4×**(远超 1.4× 目标 ✓);但 async 的现有实现需要**重设计**
+(单 worker 线程 ✗、等槽位归还 ✗、两侧自旋 PCIe 映射内存 ✗)
