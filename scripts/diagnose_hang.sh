@@ -28,8 +28,8 @@ nvidia-smi --query-gpu=index,utilization.gpu,memory.used,power.draw --format=csv
 log ""
 log "--- 3) 进程状态(关键:wchan=0 + State=R ⇒ 用户态自旋)---"
 for pid in $(ls /proc | grep -E '^[0-9]+$'); do
-  cl=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null) || continue
-  [ -n "$cl" ] || continue        # 进程可能刚退出 ⇒ 静默跳过,避免刷屏 ✗
+  cl=$(cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ')   # 静默:进程可能刚退出 ✓
+  [ -n "$cl" ] || continue
   case "$cl" in *VLLM::*|*vllm.entrypoints*)
     printf "    pid=%-9s %-18s %s\n" "$pid" "$(grep -m1 '^State:' /proc/$pid/status 2>/dev/null | cut -f2- | tr -d '\t')" \
       "$(echo "$cl" | grep -oE 'VLLM::[A-Za-z_0-9]+' | head -1)" ;;
@@ -42,15 +42,18 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,nohead
   | sed 's/^/    /' | tee -a "$OUT/compute_apps.txt" | sed 's/^/  /'
 log "    (上面若出现非 8070 那 4 个 pid 的进程 ⇒ 就是【第二个实例在抢资源】✗)"
 PROD=$(tr -dc '0-9' < "$L/v41_8070.pid" 2>/dev/null)
-nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ' | while read ap; do
+LMC=$(tr -dc '0-9' < "$L/lmcache_server.pid" 2>/dev/null)
+# 沿 PPid 向上追溯,判断某 pid 是否属于【生产那棵树】或【LMCache】(两者都合法用 GPU ✓)
+in_tree(){ local x="$1" hop=0; while [ -n "$x" ] && [ "$x" != "0" ] && [ "$x" != "1" ] && [ $hop -lt 12 ]; do
+    [ "$x" = "$PROD" ] && return 0; [ "$x" = "$LMC" ] && return 0
+    x=$(grep -m1 '^PPid:' /proc/$x/status 2>/dev/null | tr -dc '0-9'); hop=$((hop+1)); done; return 1; }
+nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ' | sort -u | while read ap; do
   [ -z "$ap" ] && continue
-  par=$(grep -m1 '^PPid:' /proc/$ap/status 2>/dev/null | tr -dc '0-9')
-  if [ "$par" != "$PROD" ] && [ "$ap" != "$PROD" ]; then
-    log "    ⚠️ 非生产进程 $ap 正占用 GPU(父=$par)⇒ 竞争资源 ✗"
+  if ! in_tree "$ap"; then
+    log "    ⚠️ 非生产进程 $ap 正占用 GPU ⇒ 竞争资源 ✗"
+    log "       命令行: $(cat /proc/$ap/cmdline 2>/dev/null | tr '\0' ' ' | cut -c1-120)"
   fi
 done
-for p in $(seq 8090 8099); do ss -ltn 2>/dev/null | grep -q ":$p " && log "    ⚠️ 端口 $p 有实例在监听"; done
-
 log ""
 log "--- 5) 日志最后一次非 metrics 活动(= 卡死起点)---"
 S=$(ls -t "$L"/v41_8070.*.log 2>/dev/null | head -1)
@@ -62,8 +65,8 @@ log ""
 log "--- 6) Python 栈(若装了 py-spy 就能直接看到卡在哪一行)---"
 if command -v py-spy >/dev/null 2>&1; then
   for pid in $(ls /proc | grep -E '^[0-9]+$'); do
-    cl=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null) || continue
-  [ -n "$cl" ] || continue        # 进程可能刚退出 ⇒ 静默跳过,避免刷屏 ✗
+    cl=$(cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ')   # 静默:进程可能刚退出 ✓
+  [ -n "$cl" ] || continue
     case "$cl" in *VLLM::Worker*) log "    --- py-spy dump $pid ---"
       py-spy dump --pid "$pid" 2>&1 | head -40 | sed 's/^/      /' | tee -a "$OUT/pyspy_$pid.txt" >/dev/null ;;
     esac
