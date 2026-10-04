@@ -9028,3 +9028,43 @@ nvidia-smi 的 `utilization.gpu` 定义是"**采样期内有一个或多个 kern
 **已抽验**:Tier A 的 9 条 `scripts/test_*.py` 全部可执行(7 条 exit=0;2 条需 `XIAOTU_LAYER1_NPZ` fixture ✓),
 且已把"**不要只看 exit code**"(block23 的 `[BAD] me=1` 是预期既有档)与 fixture 前提写进用法节 ✓
 最大缺口:GLM fp8 预填 stride bug(B267)有补丁 + fail-closed 断言,**但无自动化回归且未上机** ✗
+
+---
+
+### B287(2026-10-04)⭐⭐⭐ **装配已是硬件极限(H2D 27.4 GB/s ≈ pinned 26.85)⇒ 唯一杠杆是"重叠"**
+
+**做法**:把 `_stage_begin/_stage_mark` 的 **event 口径**打点从 `gpu_prefill_fp8.py`/`v2` 接到
+**实际生效路径 `kmajor_from_engine_shards_noraw`** 上(此前那条路径**一个打点都没有** ⇒
+`XIAOTU_GPF_STAGE=1` 只出 `[gpf-split2]`/`[gpf-ptr]` ✗)
+
+**实测(event 口径,无 sync)**
+```
+[gpf-stage] n=1320 dma=17.5ms asm=0.0ms tr=0.9ms total=18.4ms/层 (CUDA event,**无 sync**)
+```
+⇒ **17.5 ms 是【每 node】**:×8 = **140 ms/层** ⇒ 3.84 GB ÷ 0.140 s = **27.4 GB/s** ✓✓
+⇒ **正是作者在本文件里实测的 pinned 速率(26.85)** ✓ ⇒ **H2D 已在硬件极限,没有余量** ✗✗
+
+**⚠️ 两个口径坑(都会把人带偏)**
+1. `mixed_experts.py` 的 `asm=250 ms` 是 **sync 口径** —— 计时末 `torch.cuda.synchronize()` 等的是
+   **设备上全部工作(含并发的 attention/GEMM)** ⇒ 250 ms 里混了别人的时间 ✗
+   (本文件 `_stage_begin` 的注释早就记录同一坑:**sync 537 ms vs event 167–206 ms,差 ~3×** ✓)
+2. **我第一版打点有 bug**:把 `"tr"` 打在 per-node 循环里 ⇒ `_stage_mark` 在 `key=="tr"` 时会
+   **收割并复位累加器** ⇒ 打印出来的"每层"其实是"每 node" ✗;已改用未占用的 `"asm"` 键,
+   只在**末层**打一次 `"tr"` 才收割 ✓(这条也要记:诊断打点本身会撒谎 ✓)
+
+**⇒ 由此得到的硬下限**
+| | |
+|---|---|
+| 每层 H2D | 3.84 GB ÷ 26.85 GB/s = **143 ms**(实测 140 ✓)|
+| 每 chunk(40 层) | **5.7 s** |
+| §602 记录的固定成本 | **8.9 s** ⇒ 差额 ~3.2 s = 转置 + 环形槽 + 同步等(**可压** ✓)|
+| ⇒ 结论 | **纯传输的 5.7 s 是硬的**;不重叠就不可能更好 ✗ |
+
+**⭐ 下一步(唯一出路:重叠)**
+1. **侧流** `XIAOTU_GP_ASM_SIDE_STREAM=1`:本就是为"把装配藏到 attention 后面"写的
+   (注释见 `mixed_experts.py`:装配只碰暂存与 host 分片,attention 都不读)✓ —— **但它会必崩**
+   (`cudaErrorIllegalAddress`,异步竞态,复现条件已定死)✗ ⇒ 需先修流间同步 ✓
+2. **跨层预取** `XIAOTU_GP_ASM_PREFETCH=1`:在算 L 时装配 L+1 ⇒ 每层
+   `attn+asm+kernels → max(asm, attn+kernels)+kernels` ✓ —— **需额外 3.35 GiB 显存**
+   (第二套 K-major 槽),当时 `free` 仅 4.68–5.18 GiB ⇒ 需先腾显存(降 KV 池 / 降 act reserve)✓
+   预期:**568 → ~730 tok/s** ✓;若同时压掉那 3.2 s ⇒ 上限 **~1200** ✓

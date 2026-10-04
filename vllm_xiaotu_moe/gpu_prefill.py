@@ -1188,29 +1188,47 @@ def kmajor_from_engine_shards_noraw(engine, device, hidden: int, inter: int,
                torch.empty((E, I // gk, H), dtype=torch.uint8, device=device))
     c13, cr13 = int(geo["w13_cbytes"]), int(geo["w13_crows"])
     c2, cr2 = int(geo["w2_cbytes"]), int(geo["w2_crows"])
+    # 【2026-10-04 goal-A 诊断】把 `dma`/`tr` 两相接**实际生效路径**上。
+    # WHY:`mixed_experts.py` 打出的 `asm=` 是 **sync 口径** —— 计时末 `torch.cuda.synchronize()`
+    # 等的是**设备上全部工作(含与之并发的 attention/GEMM)**,所以那 250 ms/层是被污染的 ✗
+    # (本文件 `_stage_begin` 的注释记着同一坑:sync 口径 537 ms vs **event 口径 167–206 ms**,差 ~3×)
+    # ⇒ 只有 event 口径才能裁决"装配卡在 H2D 还是卡在转置" ✓
+    # 关闭 `XIAOTU_GPF_STAGE` 时 `_stage_begin` 只返回 `perf_counter()`(不建事件)✓ 零开销 ✓
     # ⚠️ 暂存仍是"每张量一份"(_dma_hostbuf 内部 _reuse),同一 stream 上 DMA/copy 有序 ⇒ 复用安全
     for n in range(ns):
+        _t = _stage_begin()
         buf = _dma_hostbuf(engine, 0, n, int(geo["w13_node_bytes"]), device)
+        _stage_mark(_t, "dma")
         blk = buf.view(E, 2, c13)
         c0 = n * cr13
         # gate 块 -> K-major 的列 [c0, c0+cr13);up 块 -> 列 [I+c0, I+c0+cr13)
+        _t = _stage_begin()
         ktranspose_into(blk[:, 0, :].reshape(E, cr13, rb13),
                         dst[0][:, :, c0:c0 + cr13])
         ktranspose_into(blk[:, 1, :].reshape(E, cr13, rb13),
                         dst[0][:, :, I + c0:I + c0 + cr13])
+        _stage_mark(_t, "asm")   # ⚠️ 不能用 "tr":tr 会**收割并复位**累加器 ⇒ 每 node 复位一次 ✗
         del buf, blk
     for n in range(ns):
+        _t = _stage_begin()
         buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
+        _stage_mark(_t, "dma")
         c0 = n * cr2
+        _t = _stage_begin()
         ktranspose_into(buf.view(E, cr2, rb2), dst[2][:, :, c0:c0 + cr2])
+        _stage_mark(_t, "asm")
         del buf
     # scales 只有 ~0.13 / 0.07 GiB,且引擎给的是一整块(非按 node)⇒ 沿用原来的连续路径
+    _t = _stage_begin()
     s13_raw = _dma_hostbuf(engine, 2, 0, int(geo["w13_scale_bytes"]), device) \
         .view(E, 2 * I, H // gk)
     s2_raw = _dma_hostbuf(engine, 3, 0, int(geo["w2_scale_bytes"]), device) \
         .view(E, H, I // gk)
+    _stage_mark(_t, "dma")
+    _t = _stage_begin()
     _kmajor_bytes(s13_raw, dst[1])
     _kmajor_bytes(s2_raw, dst[3])
+    _stage_mark(_t, "tr")   # key == "tr" ⇒ 收割并打印本层已完成的 dma/tr 两相 ✓
     return tuple(dst)
 
 
