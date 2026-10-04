@@ -324,6 +324,23 @@ static inline const float* e8m0_table() {
 // lut: 16-entry float table mapping nibble -> weight value.
 // E8M0: when true, S is a raw uint8 fp8_e8m0 byte buffer (fork MXFP4 feeding),
 // decoded as 2^(byte-127); when false, S is fp32 values (WNA16/NVFP4 feeding).
+// 【2026-10-04 goal-B②】行预取距离(以"输出列行"为单位)。默认 **1 = 原行为**(零回归)。
+// WHY:单行解码路径逐 j(输出列)流式读权重行(W 每行 K/2 字节);原实现只对**下一行**做
+// 前瞻,而 1 个 j 迭代(80 个 group ≈ 400–800 cycle ≈ 130–260 ns)**刚好等于 DRAM 延迟**
+// ⇒ 余量太小,行首/行尾仍在停等。实测每线程只有 ~1.24 GB/s,而单核流式可达 ~36 GB/s。
+// 纯预取、不改任何数值语义 ⇒ 数值门禁天然通过;A/B 靠本 env 在同一 build 内切换 ✓
+// ⚠️ 必须放在下面 `template<...>` **之前** —— 否则会把模板参数与函数拆开(本次已踩一次)✗
+inline int matmul_pf_rows() {
+    static const int v = []() {
+        const char* s = std::getenv("XIAOTU_MOE_PF_ROWS");
+        int n = s ? std::atoi(s) : 1;
+        if (n < 1) n = 1;
+        if (n > 8) n = 8;
+        return n;
+    }();
+    return v;
+}
+
 template <bool E8M0 = false, bool FAST_FP4 = false>
 inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                                  const float* lut, const void* S,
@@ -832,10 +849,11 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
             // 整行预取:下一行有 K/2 字节(4096 维 ⇒ 2048 B = 32 条 cache line),
             // 原实现只预取前 4 条 ⇒ 每行的前 28 条线仍要现取,worker 在行首停等
             // DRAM(实测每核只有 1.2 GB/s,而单核流式能到 36 GB/s)。
-            const uint8_t* next_row = (j + 1 < n1)
-                ? W + (size_t)(j + 1 - rowshift) * (K / 2) : nullptr;
-            if (j + 1 < n1) {
-                const char* nr = (const char*)(W + (size_t)(j + 1 - rowshift) * (K / 2));
+            const int pf_rows = matmul_pf_rows();   // 【goal-B②】默认 1 = 原行为
+            const uint8_t* next_row = (j + pf_rows < n1)
+                ? W + (size_t)(j + pf_rows - rowshift) * (K / 2) : nullptr;
+            for (int pr = 1; pr <= pf_rows && j + pr < n1; ++pr) {
+                const char* nr = (const char*)(W + (size_t)(j + pr - rowshift) * (K / 2));
                 _mm_prefetch(nr, _MM_HINT_T0);
                 _mm_prefetch(nr + 64, _MM_HINT_T0);
                 _mm_prefetch(nr + 128, _MM_HINT_T0);

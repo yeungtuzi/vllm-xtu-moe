@@ -136,6 +136,21 @@ fi
 # ⚠️ 【2026-10-03 用户明令】TP=2 一律 GPU1+GPU2;GPU0 只有 x8 ⇒ 只做单卡调试(IRON_RULES R19)。
 # (本脚本默认 MAXLEN=2048 是**冒烟**口径,别拿默认值当生产。)
 MBT="${MBT:-4096}"
+# ── 【2026-10-04 补救】让长预填**不饿死正在解码的请求** ────────────────────────────
+# 实测(本机 V4.1,`MAXSEQS=4`,prompt 32768):
+#   `LPT=0`(默认,即 vLLM 原行为)⇒ 一个 32768-token 的 prompt 按 `MBT=8192` 连跑 4 个 step,
+#     每个 ~2.5 s ⇒ **正在解码的请求要等完这 4 个 step** ⇒ p50 ITL 只慢 1.34–2.16×,
+#     但 **p99 ITL = 8.2–8.7 s**(C=1 时仅 82 ms)✗ 这就是"C 增大导致单流崩溃"的真身 ——
+#     **与 CPU 争用无关**(聚合反而 1.85×)。
+#   `LPT=<N>` ⇒ 长 prompt 每步最多吃 N 个 token ⇒ 预填与解码**交替** ✓
+#     ⚠️ 关键:vLLM 的实现是 **"cap 只在批里有别的请求时才生效"**(见 `SchedulerConfig` docstring:
+#        *"The cap is not applied when the request is the only one in the batch, since there is no
+#          other request for it to starve."*) ⇒ **C=1 的长预填速度不受影响** ✓✓
+#     ⇒ 这比"降 MBT"好得多:降 MBT 会把**所有**预填一起拖慢,并毁掉 GPU prefill 的 chunk 经济性 ✗
+#   `LPT_ADAPTIVE=1` ⇒ 阈值下限取 `MBT / (排队+运行数)`(**公平份额**),避免固定 N 在低并发时过保守 ✓
+# 默认 **0 = 保持 vLLM 原行为**(不改变既有口径);生产要开多路并发时应设 `LPT=2048 LPT_ADAPTIVE=1`。
+LPT="${LPT:-0}"
+LPT_ADAPTIVE="${LPT_ADAPTIVE:-0}"
 LOAD="${LOAD:-auto}"           # 【本机+V4.1 默认】真实权重(dummy 只用于开发自测)
 GPU_UTIL="${GPU_UTIL:-0.90}"   # 【本机+V4.1 默认】生产值
 EXTRA_ENV="${EXTRA_ENV:-}"
@@ -424,6 +439,8 @@ fi
     --load-format "$LOAD" \
     --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-2}" \
     $( [ "${MBT}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
+    $( [ "${LPT:-0}" -gt 0 ] 2>/dev/null && echo --long-prefill-token-threshold "$LPT" ) \
+    $( [ "${LPT_ADAPTIVE:-0}" = "1" ] && echo --long-prefill-token-threshold-adaptive ) \
     --gpu-memory-utilization "$GPU_UTIL" \
     $( [ -n "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-6442450944}}" ] && printf -- '--kv-cache-memory %s' "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ) \
     $( [ -n "$HF_OVERRIDES" ] && printf -- '--hf-overrides %s' "${HF_OVERRIDES// /}" ) \
