@@ -18,6 +18,8 @@ L="$HERE/../dev-docs/report/tuning/logs"
 cd "$L" || exit 0
 [ -d archive ] || mkdir -p archive
 
+# ---- 【R32】显式服务名单:即使 ppid=1 / 无日志更新,这些**服务**也绝不归档 ----
+SERVICES_KEEP=" prometheus grafana node_exporter coremap coremap_png xtu_exporter lmcache_server "
 # ---- 活着的一律保留(含其日志)----
 KEEP=" _launch_audit.log "
 for f in *.pid; do
@@ -38,6 +40,7 @@ done
 : >/tmp/_asl_list.txt
 for f in *.pid; do
   [ -f "$f" ] || continue
+  case "$SERVICES_KEEP" in *" $n "*) continue;; esac     # 【R32】服务名显式豁免 ✓
   case "$KEEP" in *" $f "*) continue;; esac
   n="${f%.pid}"
   # 主判据:日志 mtime(活着的进程会持续写日志 ✓);无日志时才退回 pid 文件的 mtime
