@@ -92,7 +92,7 @@ def _lt_record(pre_ms: float, eng_ms: float, post_ms: float, name: str = "") -> 
             # ⇒ 一跑就能把每层拆成「MoE(apply 内)」 vs 「apply 之外(注意力/indexer/…）」,
             # 不需要 nsys、也不动任何计算路径。用法:XIAOTU_LAYER_TIMING=1
             # XIAOTU_LAYER_TIMING_EVERY=1(每层一行)。
-            print(f"[layer-timing] t={time.perf_counter():.6f} n={n} "
+            print(f"[layer-timing] t={time.perf_counter():.6f} pid={os.getpid()} n={n} "
                   f"layer={name} "
                   f"pre={_LT_ACC['pre']/n:.3f}ms "
                   f"eng={_LT_ACC['eng']/n:.3f}ms post={_LT_ACC['post']/n:.3f}ms "
