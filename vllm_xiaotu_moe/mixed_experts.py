@@ -1763,15 +1763,103 @@ class _XiaotuExpertsMixin:
                     # 每层新分配 3.589 GiB 会造成不可回收的碎片(`reserved` 单调上涨),
                     # 直接导致上面的混合模式;改成写进复用的 slot.bufs 后,驻留量恒定。
                     _gk = int(self._group_k)
-                    _slot = slot_for_shapes((
-                        (_E, hidden_size // 2, 2 * _I),
-                        (_E, hidden_size // _gk, 2 * _I),
-                        (_E, _I // 2, hidden_size),
-                        (_E, _I // _gk, hidden_size),
-                    ), _dev, nslots=1)   # 【§601】同步路径单槽即安全(同流有序),省 3.59 GiB
-                    _km = _gp_mod.kmajor_from_engine_shards(
-                        engine, _dev, hidden_size, _I, _E, _gk, dst=_slot.bufs
-                    )
+                    # ---- 【2026-10-05 goal】MXFP4 **跨层预取**(与 FP8 对齐的语义,但**单文件**实现)----
+                    # 背景:FP8 那套 ping/pong 全在 `mixed_experts.py` 的一个块里 ✓;而 MXFP4 的
+                    # **装配**在本文件、**内核**在 `hybrid_model.py` ⇒ 无法照抄"内核之后再提交" ✗
+                    # 本实现改在**装配处**提交下一层:层 L 装配完(侧流)后,**立刻**把 L+1 装进
+                    # **另一个槽** ⇒ 它与 L 的内核(GPU)天然重叠 ✓
+                    # 槽安全:用一条**主流的 event**表示"此刻之前入队的一切(含 L-1 的内核)已完成" ✓,
+                    # 侧流先 wait 它再覆写那个槽 ✓
+                    # ⚠️ 全程 try/except + 回退**原单槽同步路径** ✓;`XIAOTU_GP_ASM_PREFETCH` 未设时
+                    #    `_pf_on=False` ⇒ 行为与改动前**完全一致** ✓
+                    _pf_on = bool(gp_prefetch_enabled()) and not gp_capturing()
+                    _pf_dk = _gp_dev_key(_dev)
+                    _pf_idx = _gp_layer_index(getattr(layer, "layer_name", "") or "")
+                    _km = None
+                    _slot = None
+                    if _pf_on and _pf_idx is not None:
+                        _pf = _GP_READY.pop((_pf_dk, _pf_idx), None)
+                        if _pf is not None:
+                            try:
+                                _km, _ev_ready, _slot = _pf
+                                torch.cuda.current_stream(_dev).wait_event(_ev_ready)
+                            except Exception:  # noqa: BLE001
+                                _km = None
+                                _slot = None
+                    if _km is None and _pf_on and _pf_idx is not None:
+                        _stry = _GP_SLOT.get(_pf_dk, 0)
+                        try:
+                            _dbufs = list(_gp_slot_buffers(
+                                _gp_mod, _dev, _E, hidden_size, _I, _stry))
+                            _slot = _stry
+                        except Exception as _exc:  # noqa: BLE001  (显存门禁拒绝 / OOM)
+                            torch.cuda.empty_cache()
+                            _dbufs = None
+                            _slot = None
+                            if not _GP_PF_WARNED.get(_pf_dk):
+                                _GP_PF_WARNED[_pf_dk] = True
+                                try:
+                                    _fr, _ = torch.cuda.mem_get_info(_dev)
+                                except Exception:  # noqa: BLE001
+                                    _fr = -1
+                                print(f"[vllm-xtu-moe] MXFP4 ping/pong NOT active "
+                                      f"({type(_exc).__name__}: {_exc}); free="
+                                      f"{_fr / 2**30:.2f} GiB ⇒ 回退单槽同步路径 ✓",
+                                      flush=True)
+                        if _dbufs is not None:
+                            try:
+                                _side = _gp_side_stream(_dev)
+                                _evf = _GP_SLOT_FREE.get(_pf_dk, {}).get(_slot)
+                                if _evf is not None:
+                                    _side.wait_event(_evf)
+                                with torch.cuda.stream(_side):
+                                    _km = _gp_mod.kmajor_from_engine_shards(
+                                        engine, _dev, hidden_size, _I, _E, _gk,
+                                        dst=_dbufs)
+                                if _km is not None:
+                                    _evr = torch.cuda.Event()
+                                    _evr.record(_side)
+                                    torch.cuda.current_stream(_dev).wait_event(_evr)
+                            except Exception:  # noqa: BLE001
+                                _km = None
+                    if _km is None:
+                        # 回退:原单槽同步路径(行为与改动前一致 ✓)
+                        _slot = slot_for_shapes((
+                            (_E, hidden_size // 2, 2 * _I),
+                            (_E, hidden_size // _gk, 2 * _I),
+                            (_E, _I // 2, hidden_size),
+                            (_E, _I // _gk, hidden_size),
+                        ), _dev, nslots=1)   # 【§601】同步路径单槽即安全(同流有序),省 3.59 GiB
+                        _km = _gp_mod.kmajor_from_engine_shards(
+                            engine, _dev, hidden_size, _I, _E, _gk, dst=_slot.bufs
+                        )
+                    elif _pf_idx is not None and _slot is not None:
+                        # 本层已就位 ⇒ **立刻**提交下一层(侧流)⇒ 与本层内核重叠 ✓
+                        _nxt_idx = _pf_idx + 1
+                        _nxt = _GP_LAYERS.get(_nxt_idx)
+                        if _nxt is not None and getattr(_nxt, "engine", None) is not None:
+                            try:
+                                _nE, _nI, _nH = _nxt.gp_shapes()
+                                if (_nE, _nI, _nH) == (_E, _I, hidden_size):
+                                    _s2 = 1 - _slot
+                                    _dst2 = list(_gp_slot_buffers(
+                                        _gp_mod, _dev, _E, hidden_size, _I, _s2))
+                                    _side2 = _gp_side_stream(_dev)
+                                    _evm = torch.cuda.Event()
+                                    _evm.record(torch.cuda.current_stream(_dev))
+                                    _side2.wait_event(_evm)
+                                    with torch.cuda.stream(_side2):
+                                        _km2 = _gp_mod.kmajor_from_engine_shards(
+                                            _nxt.engine, _dev, hidden_size, _I, _E, _gk,
+                                            dst=_dst2)
+                                    if _km2 is not None:
+                                        _ev2 = torch.cuda.Event()
+                                        _ev2.record(_side2)
+                                        _GP_READY[(_pf_dk, _nxt_idx)] = (_km2, _ev2, _s2)
+                                        _GP_SLOT_FREE.setdefault(_pf_dk, {})[_s2] = _ev2
+                                        _GP_SLOT[_pf_dk] = _s2
+                            except Exception:  # noqa: BLE001
+                                _GP_READY.pop((_pf_dk, _nxt_idx), None)
                     if _t_split:
                         torch.cuda.synchronize()
                         _asm = (_time.perf_counter() - _t0) * 1e3
