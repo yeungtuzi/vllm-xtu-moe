@@ -1237,6 +1237,17 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
     ``PrefetchSlot``), or ``None`` when the engine has no shards (e.g. NOSHARD) --
     the caller then falls back to the source tensors.
     """
+    # 【2026-10-04 goal-A 修】把引擎的 host 分片**就地锁页一次**。
+    # 为什么必须在这里:默认走的是下面的 `noraw`/kmadaptive 分支
+    # (`XIAOTU_GPF_KMADAPTIVE` 默认 "1" ⇒ 直接 return),而**那条路径没有这个调用** ✗
+    # ⇒ 装配一直在 **pageable** 内存上跑:实测生产 worker 的 `VmLck` 全程 **0.0 GiB**,
+    # 装配速率 **15.4 GB/s**,而作者在本文件里实测 pinned 为 **26.85 GB/s**
+    # (原话:"每 chunk 固定成本 **8.9 s → ~5.4 s**")⇒ 白丢 ~1.65× 的预填吞吐 ✗
+    # 证据:锁页的成功/失败消息在当前生产与我所有测试实例的日志里都是 **0 行**,
+    # 但在旧日志(`abB2…abB10.log`)里有 `[pin] host 分片锁页: 10/10 个缓冲成功` ✓
+    # 本调用幂等、失败只告警(自动退回 pageable),且**已有 env 门控** `XIAOTU_GPF_PIN=0`
+    # ⇒ A/B 不需要新增开关 ✓
+    _pin_engine_hostbufs(engine)
     # 【方案 B 开关】默认 **0 = 走下面这条旧路径**(行为逐字不变);=1 才逐 node 直填、
     # 省掉 raw 缓冲。取舍见 kmajor_from_engine_shards_noraw 的文档。
     if os.environ.get("XIAOTU_GPF_KMADAPTIVE", "1") != "0":
