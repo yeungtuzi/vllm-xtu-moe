@@ -8439,3 +8439,37 @@ __m512i w64v_[NRT], ws7v_[NRT], wshv_[NRT];        // 1127 声明
    但 V4.1 真值是 **`swiglu_limit=10.0` ⇒ `activation_type=1`**
    (证据:服务 banner `swiglu=clamp@10.0`)。离线 harness 越方便,越容易忘记对齐口径。
 2. **路由分布同上** ⇒ 必须复刻团队记录的真实形状,不能用自造分布。
+
+---
+
+### B270(2026-10-04)🔴 **第二个实例把生产杀了**:同机多实例的内存互斥与三条修复
+
+**现象**:04:26:29,8070 再次 `EngineDeadError`。但这次**没有 `torch.OutOfMemoryError`** ——
+根因是 `multiproc_executor`:*"Worker proc VllmWorker-0 died unexpectedly (exit code: None)"*(被**信号**杀死),
+EngineCore 随后以 `RuntimeError: cancelled` 退出。`/proc/vmstat` 的 `oom_kill` 计数 1 → 2。
+
+**定位过程(证据链)**:
+
+1. 主机内存**总量不是问题**:Prometheus `node_memory_*` 显示崩前 4 小时 `AnonPages 712 GiB`、
+   `MemFree 260 GiB` **完全平稳**(无泄漏)⇒ 不是累积性 OOM。
+2. 改用 **60 s 分辨率**看崩前 15 分钟 ⇒ 抓住一次**尖峰**:
+   `MemFree 260 → 226 → 7 → 5 → 4 GiB`,`AnonPages 713 → 752 → 983 GiB`(**2 分钟 +270 GiB**)⇒ 死后立刻回落。
+3. 再查我们 exporter 的**逐 NUMA node** 指标(`xtu_numa_mem_free_bytes`,30 s 分辨率)⇒
+   **8 个 node 的空闲同时掉到 0.2–1.0 GiB**(逐 node 已用合计 +276 GiB)⇒ 这是**内核
+   `CONSTRAINT_MEMORY_POLICY` 式的单 node 耗尽**,不是总量不足。
+4. 查日志目录的 mtime ⇒ 在 04:22 有**另一个实例**启动:`w4a8_off`(TP=1,port 8090,
+   pid 1445288),04:24 开始加载权重;当时实测其 `EngineCore` **RssAnon 464 GiB**。
+5. ⇒ **一个进程在 90 秒内分配了 ~276 GiB(≈ 一整套专家分片)** ⇒ OOM killer 挑中**最大的进程** ——
+   **8070 的生产 worker**,而不是新来的测试实例 ✗
+
+**⚠️ 我的第一次判断偏了**:我一度怀疑"我们插件重新物化了源张量"(`XIAOTU_RELEASE_SOURCE` 失效)。
+**但证据否定它**:插件在崩前**零输出**,且 `released=80`(40 层 × 2 rank,全部释放)、`deferring=0` ✓
+⇒ 是**另一个实例**,与我们的释放逻辑无关。
+
+**为什么 1.5 TB 也起不了两个**:单实例稳态 **460–713 GiB**,加载期峰值更高;两个必然打架,
+而内核牺牲的是**已在服务的生产**。
+
+**三条修复(已落地,详见 `AGENTS.md`「同机多实例纪律」与 `IRON_RULES` R28)**
+① 非生产实例默认 `oom_score_adj=+800`(唯一可行的用户态手段;调低需 root);
+② `serve_v41.sh` 前置门禁:`MemAvailable < 1200 GiB` 且有其它实例 ⇒ **拒绝启动**;
+③ 纪律:**测试禁止用巨模型**,改用 `~/.cache` 下的小模型(13 MB / 7.9 GB / 30 GB 三档)。

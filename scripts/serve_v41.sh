@@ -346,6 +346,36 @@ export XIAOTU_ENV_FILE
 #   EAGER:默认 1(全 eager);可试 COMPILE=1 EAGER=0(FULL_DECODE_ONLY)对比
 #   SPEC=1 ⇒ dspark k=5
 #   ⚠️ 这些注释必须在 nohup env 语句**之外** —— 续行链里出现 # 会打断链,后续参数会变成新命令(2026-09-23 踩过)
+# ── 【2026-10-04 事故修复 ③】同机多实例**前置门禁**:内存不够就明确拒绝,别拖死生产 ──────
+#   事故:第二个实例(TP=1 的 `w4a8_off`)加载权重时把 8 个 NUMA node 全填满
+#   (逐 node 空闲同时掉到 0.2–1.0 GiB),内核 OOM killer 杀了 **8070 的生产 worker** ✗
+#   本机 1.5 TB,但**单个完整实例**稳态就要 ~460–713 GiB(专家分片 + Engram),加载期更高
+#   ⇒ 两个"完整实例"必然打架,而内核挑最大进程(常常是**已在服务的生产**)✗
+#   判据:已有实例在跑 且 MemAvailable < MEM_GATE_GIB(默认 1200)⇒ **拒绝启动**。
+#   小模型/小配置确实放得下时:显式 `ALLOW_LOW_MEM=1` 放行 ✓
+#   ⚠️ CPU prefill 一类的**测试请用小模型**(清单见 AGENTS.md),不要用 DS4.1F 这种巨模型。
+if [ "${ALLOW_LOW_MEM:-0}" != "1" ]; then
+  _other=""
+  if [ "$PORT" != "8070" ] && ss -ltn 2>/dev/null | grep -q ':8070 '; then _other="8070"; fi
+  for _p in $(seq 8090 8099); do
+    [ "$PORT" = "$_p" ] && continue
+    ss -ltn 2>/dev/null | grep -q ":$_p " && _other="$_other $_p"
+  done
+  if [ -n "$_other" ]; then
+    _avail=$(awk '/^MemAvailable:/{printf "%d", $2/1048576}' /proc/meminfo)
+    _gate="${MEM_GATE_GIB:-1200}"
+    echo "[v41] 已有实例在端口:$_other ⇒ MemAvailable=${_avail} GiB(门禁 ${_gate} GiB)"
+    if [ "$_avail" -lt "$_gate" ]; then
+      echo "[v41] ⛔ 拒绝启动:内存不足以同时安全运行两个【完整】实例。" >&2
+      echo "[v41]    实测:单个完整实例稳态 ~460–713 GiB、加载期峰值更高;两个会触发 OOM," >&2
+      echo "[v41]    而内核往往杀掉**已在服务的那个** ⇒ 2026-10-04 曾因此杀掉 8070 生产 ✗" >&2
+      echo "[v41]    对策:① 测试改用**小模型**(AGENTS.md 有清单);② 显式 ALLOW_LOW_MEM=1;" >&2
+      echo "[v41]          ③ 或调低 MEM_GATE_GIB(自担风险)。" >&2
+      exit 3
+    fi
+  fi
+fi
+
 # 【2026-10-03 用户要求(已重复多次)】日志必须按**真服务 PID** 命名,不再互相覆盖/重叠。
 #   根因:原先 `LOG="$OUTDIR/$TAG.log"` 由 **TAG** 命名,而生产的 TAG 固定(v41_8070)⇒
 #   每次重启都用 `> "$LOG"` 截断同一个文件:上一轮日志被销毁,两轮还会互相穿插。
@@ -357,6 +387,20 @@ export XIAOTU_ENV_FILE
   ln -sfn "$(basename "$LOGFILE")" "$LOG" 2>/dev/null || true
   exec > "$LOGFILE" 2>&1
   echo "[v41] service log=$LOGFILE pid=$BASHPID"
+  # 【2026-10-04 事故修复 ②】OOM 牺牲优先级 —— 让调试实例替生产去死。
+  #   事故:另一个会话起了**第二个实例**(TP=1 的 `w4a8_off`)加载权重时把 8 个 NUMA node
+  #   全填满,内核 OOM killer **杀掉了 8070 的生产 worker**(它是最大的进程),而不是新来的 ✗
+  #   非特权进程(本机 uid 1000、CapEff=0)**只能调高** oom_score_adj(更易被杀),
+  #   **不能调低**(需 CAP_SYS_RESOURCE)⇒ 保护生产只能靠"把调试实例标成首选牺牲品" ✓
+  #   默认:PORT=8070 不动;其它端口 ⇒ **+800**。覆盖:`OOM_SCORE_ADJ=<值>`,禁用:=0
+  if [ "${PORT}" != "8070" ]; then OOM_SCORE_ADJ="${OOM_SCORE_ADJ:-800}"; fi
+  if [ -n "${OOM_SCORE_ADJ:-}" ]; then
+    if echo "${OOM_SCORE_ADJ}" > /proc/self/oom_score_adj 2>/dev/null; then
+      echo "[v41] oom_score_adj=${OOM_SCORE_ADJ} ⇒ 内存告急时内核**优先牺牲本实例**,保护 8070 ✓"
+    else
+      echo "[v41] ⚠️ 设 oom_score_adj=${OOM_SCORE_ADJ} 失败(需权限)⇒ OOM 时可能与生产互相残杀 ✗"
+    fi
+  fi
   exec nohup env \
   PYTHONPATH="${XTU_TREE:-/home/user/lvllm/process_data/ref/repos/vllm-mainline}" \
   HF_HUB_OFFLINE=1 \
