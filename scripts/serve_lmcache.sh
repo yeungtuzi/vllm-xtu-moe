@@ -22,10 +22,18 @@ CHUNK_SIZE="${CHUNK_SIZE:-2176}"                       # 跨模型公共值(见 
 # 与之配对(否则报 "Connector enables transfer_query but server does not",见 EXPERIMENTS B175)
 ENABLE_MODULES="${ENABLE_MODULES:-}"
 PORT="${PORT:-5555}"                        # connector 默认 tcp://localhost:5555
+# ⭐ 2026-10-04【NUMA 修正】:L1 是**一次性大缓冲**,默认策略是"首次触碰的本地节点" ⇒
+#   实测(python 2026-10-04)100 GB L1 里 **92.2 GiB 全落在 node7**、10.5 GiB 在 node5
+#   ⇒ 8 个 NUMA node 严重不均(node7 空闲只剩 13.1 GiB),而引擎 TP=1 会按 8 node 分片权重
+#   ⇒ 起第二个实例时 node7 直接 OOM 风险。
+#   修法:用 `numactl --interleave=all` 让 L1 均摊(100 GB ⇒ ~12.5 GB/node)。
+#   可用 NUMACTL="" 关掉(例如单节点机器)。
+NUMACTL="${NUMACTL-numactl --interleave=all}"
 mkdir -p "$L2_DIR"
 echo "[lmcache] modules=${ENABLE_MODULES:-none}"
 echo "[lmcache] L1=${L1_GB}GB L2=${L2_DIR}(${L2_GB}GB) port=${PORT} transfer=${TRANSFER_MODE} chunk=${CHUNK_SIZE}"
-exec "$LMCACHE_BIN" server \
+echo "[lmcache] numactl='${NUMACTL}'(空=不限制;interleave 避免 L1 全压单一 NUMA node ✓)"
+exec ${NUMACTL} "$LMCACHE_BIN" server \
   --chunk-size "$CHUNK_SIZE" \
   --separate-object-groups \
   --l1-size-gb "$L1_GB" \
