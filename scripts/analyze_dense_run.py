@@ -84,7 +84,7 @@ out.append("- **LMCache 已存块数**(末值): %s" % ("%.0f" % ls[-1] if ls els
 out.append("- **GPU 峰值**: %.0f%% / **功耗峰值**: %.0fW" % (gu, gp))
 out.append("")
 # 5 心跳细节
-out.append("## 5. 心跳细节(判定"原地重来"还是"推进")")
+out.append("## 5. 心跳细节(判定「原地重来」还是「推进」)")
 if hb:
     lay = {}; ql = {}; dev = {}
     for _, _, d, l, q in hb:
