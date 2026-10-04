@@ -8906,3 +8906,33 @@ A 时间轴: 3.2s(0.21s) → 11.2s(7.95s) → 19.3s(8.15) → 27.7s(8.38) → 36
 
 **⇒ 下一步(未做)**:把 `asm` 的 H2D 效率从 28% 提上去(2D memcpy 的 stride/分块方式、
 或让源布局真正连续);并**先确认**跨层预取在当前显存下能否启用(需 3.35 GiB 额外槽)✓
+
+---
+
+### B283(2026-10-04)⭐⭐ **预填装配的诊断收敛到"pin 没生效"**(含我自己的口径更正:头寸是 ~1.7×,不是 3.5×)
+
+**⚠️ 更正 B282 的算术**:我把"每卡 1.7 GB/层"当成了搬运量 ✗。按**规范布局**的**实际字节**:
+- MXFP4 路径:w13 `[E,2I,H]` 0.5 B + w2 `[E,H,I]` 0.5 B + e8m0 scales
+  = 2.26 + 1.13 + 0.45 = **3.84 GB/卡/层**
+- ⇒ `asm` 250 ms ⇒ **15.4 GB/s**(不是 6.8 ✗)
+⇒ **头寸是 ~1.7×**(15.4 → 26.85),**不是 3.5×** ✗
+
+**但成因反而更清楚了 —— 代码注释里作者早就写过同一件事**(`gpu_prefill_fp8.py:257-272`):
+> *"Page-lock the engine's shards before the first DMA. They are **mmap'd/numa_alloc_onnode**
+> (pageable), and **pageable H2D measured 16.5 GB/s here vs 26.85 GB/s pinned** ——
+> **the assembly is 91% of the FP8 prefill wall time**, so this is the single biggest lever."*
+> *"…the strided form measured ~84 GB/s against ~1361 GB/s contiguous, and one staging buffer per
+> weight block forced every DMA in the layer to wait for the previous copy."*
+
+**⇒ 关键对照**:实测 **15.4 GB/s ≈ 作者标注的 pageable 16.5**,而**远低于 pinned 26.85**
+⇒ **`_pin_engine_hostbufs()` 在实际服务里很可能没有真正锁住**(或只锁住一部分)✗
+⇒ 与"装配占 91% 墙钟"的自我诊断完全一致 ⇒ **这是 (A) 那条线上唯一有据可依的 ~1.7× 杠杆** ✓
+
+**验证方法(已定,未做)**:跑一次 GPU 预填,**同时**读 worker 的 `/proc/<pid>/status: VmLck`
+(该字段 = 已锁定内存 ✓)—— 若 `VmLck ≈ 0` 而装配在跑 ⇒ pin 确实没生效 ✓
+(注:加载阶段查过一次 `VmLck=0.0 GiB`,但那时引擎还没跑到 GPU 预填,不能作为判据 ✗)
+
+**其它已排除的路径**
+- `XIAOTU_GP_ASM_SIDE_STREAM`(旁路流):默认关是因为**必崩**(`cudaErrorIllegalAddress`,异步竞态)✗
+- 跨层预取 `XIAOTU_GP_ASM_PREFETCH`:A/B **不作数**(开关未生效,见 B282);且它需额外 3.35 GiB 显存,
+  当时 free 仅 4.68–5.18 GiB ✓ 边缘可行 ✓
