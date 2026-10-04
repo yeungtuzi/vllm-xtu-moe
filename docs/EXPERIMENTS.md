@@ -10319,3 +10319,63 @@ store 180 行 / retrieve 2915 行 / hit 0 / miss 0
 * 发一个 **≥2560 token** 的提示 ⇒ **主动把 GPU 预填装配路径走起来** ✓ ⇒ 观察是否卡死 ✓
 * 若卡死 ⇒ **现场会被 `[xtu-pf-progress]`(call/ids0/层号)与看门狗同时抓住** ✓✓ ⇒ 即可定位到**具体哪一层、哪一块**
 * ⚠️ 代价:若真卡死,会**打死当前生产**,并影响另一个会话 ✗ ⇒ **需用户同意何时做** ✓
+
+---
+
+### B316(2026-10-05)⭐⭐⭐ **QFN-MXFP4 起不来的根因锁定为 vLLM 的一个【内部自相矛盾】bug(scale 参数命名)**,已 dev-only 修好并**离线对照验证**
+
+**现象(承接 B307/B310)**:修掉白名单后,阻塞点前移到
+`AttributeError: 'MergedColumnParallelLinear' object has no attribute 'data'`
+(发生在 `linear.py:987 → :767`,`param` 竟是【模块】而不是 Parameter)。
+
+**机制(定位到 `MergedColumnParallelLinear.load_weights`)**:
+```python
+param = getattr(self.get_submodule(submodule), attr, self)   # ← 属性找不到 ⇒ 回退成 self(模块)
+param.weight_loader(param, loaded_weight, shard_id)
+    → param_data = param.data                                # ✗ 模块没有 .data
+```
+⇒ 即**某个参数名在模块上不存在**。
+
+**⭐ 根因:同一件事 vLLM 有两种写法,且注释里承认另一个名字"是有意为之"**
+```python
+# ① 简单 fp8 路径(能跑的 QFN-FP8 走这条)
+#    vllm/.../quantization/fp8.py:339
+#    The weight_scale_inv name is intentional for deepseekv3
+     layer.register_parameter("weight_scale_inv", scale)          # 加载期就叫这个 ✓
+
+# ② compressed-tensors 路径(QFN-MXFP4 被迫走这条,因 SM80 无 FP8 GEMM ⇒ 退回 W8A16Fp8)
+     layer.register_parameter("weight_scale", weight_scale)       # 加载期叫这个 ✗
+     def process_weights_after_loading(self, layer):
+         if self.strategy == BLOCK:
+             # Marlin… uses "weight_scale_inv" for block quant, while CT registers "weight_scale"
+             del layer._parameters["weight_scale"]
+             replace_parameter(layer, "weight_scale_inv", ...)     # ← 加载【之后】才改名,太晚 ✗
+```
+⇒ **vLLM 知道 block 量化该用 `weight_scale_inv`,却在加载期用 `weight_scale`** ✗
+
+**检查点实测(1699 个 scale 就是 `weight_scale_inv`)**
+```
+后缀直方图: weight 2711 | **weight_scale_inv 1699** | bias 166 | weight_scale 145 | weight_packed 144 …
+样例: linear_attn.in_proj_qkv.weight_scale_inv [80,20] + in_proj_z.weight_scale_inv [48,20]
+       ⇒ 80+48 = 128 ⇒ 正好等于融合层 weight_scale 的 (128,20) ✓(数据是对的,只是名字不对)
+```
+**判据**:全 vLLM 加载路径里 `weight_scale_inv` **只**出现在那一处"加载后改名"⇒ **加载期无任何映射** ✓
+**旁证**:`hy_v4`/`glm5next` 的模型文件里**都有**专门处理 `weight_scale_inv` 的 loader,**只有 `qwen4_exp` 没有** ✓
+
+**修法(dev-only,零改在服务的树)** —— `sitecustomize` 运行时补丁 #2:
+block 策略时在 `create_weights` 里**按检查点的名字**注册,并把"加载后改名"收敛为**幂等**;
+⚠️ **不能走 `replace_parameter`**(它新建裸 Parameter ⇒ **丢掉 `weight_loader`** ✗),
+必须把**同一个 Parameter 换名注册**才行(这一点是我第一版写错、第二版才修对)✓
+
+**离线对照验证(决定性,无需起服务)**
+```
+构造 in_proj_qkvz 后:params = ['weight', 'weight_scale_inv']  weight(16384,2560) loader=True
+                                                              weight_scale_inv(128,20) loader=True
+  ✅ load_weights('weight')            通过
+  ✅ load_weights('weight_scale_inv')  通过      ← 原先崩的那条路 ⇒ 修好 ✓
+  (对照) load_weights('weight_scale')  失败: AttributeError: … has no attribute 'data'  ← 精确复现原 bug ✓
+```
+⇒ **同一实验里"修好后通过 / 未修时精确复现"**,根因与修法互证 ✓
+
+**⇒ 这是 vLLM 的 bug(内部不一致),不是我们的配置错,也不是检查点不规范**
+⇒ 落点分两步:①本仓 `patches/xtu-series/`(不受限)②**PR 上游需用户逐条批准** ✓
