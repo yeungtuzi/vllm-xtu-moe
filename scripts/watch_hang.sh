@@ -62,9 +62,21 @@ while :; do
   [ "$cur" != "$lastsum" ] && { lastchg=$(date +%s); lastsum="$cur"; }
   stall=$(( $(date +%s) - lastchg ))
   log "running=$R waiting=$W tok=$cur stall=${stall}s | gpu=${U}%/${PW}W cpu=${CORES}cores | $WHO"
-  # ★ A 铁证
-  if [ "${Rn:-0}" -eq 0 ] && [ "${Wn:-0}" -eq 0 ] && [ "${U:-0}" -gt 50 ] && [ "${PW:-0}" -gt 150 ]; then
-    log "★★★ 铁证:零请求 + GPU ${U}%/${PW}W ⇒ 逃逸内核!开始留档"
+  # ★ A′ 【唯一可靠】进度心跳停推(它每 2s 一行、在 step 内部发出 ⇒ 卡死时会停 ✓;
+  #    而 /metrics 的值在长 step 期间是【陈旧的】✗ —— 2026-10-04 我因此误报三次 ✗,见 QA #30/#35)
+  SLOG_A=$(ls -t "$L"/v41_8070.*.log 2>/dev/null | head -1)
+  if [ -n "$SLOG_A" ]; then
+    PFN=$(grep -c "xtu-pf-progress" "$SLOG_A" 2>/dev/null || echo 0)
+    if [ "$PFN" != "${pfprev:-}" ]; then pfchg=$(date +%s); pfprev=$PFN; fi
+    pfstall=$(( $(date +%s) - ${pfchg:-$(date +%s)} ))
+  else pfstall=0; fi
+  if [ "${pfstall:-0}" -gt "${PF_STALL_ALERT:-180}" ] && [ "${U:-0}" -gt 20 ]; then
+    log "★★★ 心跳停推 ${pfstall}s 且 GPU ${U}% ⇒ 真卡死(判据=进度心跳,不是 metrics ✓)"
+    bash "$HERE/diagnose_hang.sh" >>"$OUT" 2>&1 || true
+  fi
+  # ★ A(降级为"参考",不再单独告警 —— 它会因 metrics 陈旧而误报 ✗)
+  if false; then
+    log "（旧判据已停用:会因 metrics 在长 step 期间陈旧而误报 ✗）"
     bash "$HERE/diagnose_hang.sh" >>"$OUT" 2>&1 || true
     log "★★★ 已留档到 $L/hang_*"; alerted=1
   # ☆ B 可疑
