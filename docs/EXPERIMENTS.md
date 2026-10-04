@@ -9920,3 +9920,67 @@ per-layer staging ~5.0 GiB; preflight wants ~8.5 GiB free VRAM
 
 **教训**:报"某个开关打开了但没有效果"之前,必须先找到**该功能自己的判定行**
 (本例 `slack`),而不是只看 `ACTIVE` —— 与 R24#3 完全同源,我这次是**照着那条规则去查的** ✓
+
+---
+
+### B309(2026-10-04)⭐ QFN-FP8:**fp8 KV 把 KV 压到 1/4** ⇒ 256K×2 变得可行;GPU prefill 只差 **0.79 GiB**
+
+**① 用户指出我漏了一个一倍杠杆,而且实际更大**
+我问"QFN 的 KV 为何比 V4.1 重 32×",并**猜**"dtype 取了 bf16 之外的组合"。用户当场反问
+*"等等,这个不应该是 fp8 吗"* ⇒ 查证:**证据站在用户那边** ——
+`kv_cache_dtype=auto`,检查点 `kv_cache_scheme=None`、`text_config.dtype=bfloat16`
+⇒ **vLLM 取的是 bf16,不是 fp8** ✗(我的"组合"是没根据的猜想)。
+
+**② 显式给 fp8 KV 后,效果比"一倍"还好**
+
+| 配置 | KV 预算 | **KV 池** | 折合 |
+|---|---|---|---|
+| bf16(`auto`) | 22.67 GiB | 336,418 tokens | **72,368 B/token** |
+| **fp8** | 19.0 GB | **1,103,626 tokens** | **17,216 B/token** |
+
+⇒ **fp8 比 bf16 轻 4.2×**(不是 2×)⇒ 我先前按 72,368 B/token 做的整张预算表**系统性过于悲观** ✗
+⇒ **256K × numseq 2 = 524,288 tokens** 只需 ≈9 GB ⇒ **放得下** ✓(先前算的 35.3 GiB 作废)
+
+**③ 全开一次(256K×2 + fp8 KV 19.0GB + GPU prefill 384 + `mtp` 投机)**
+READY **200 s**,GPU0 **32.5/40.9 GiB**,生产 8070 全程 200 ✓
+GPU prefill 判定:`slack **-0.79 GiB**`
+```
+per-layer staging ~5.0 GiB; preflight wants ~8.5 GiB free VRAM
+  (staging x1.10 + 3.0 GiB 激活预留), only 7.7 GiB is free
+```
+⇒ **只差 0.79 GiB** ⇒ 把 `KV_CACHE_BYTES` 从 19.0 GB 降到 **~17.3 GB**
+(仍 ≥1.0M tokens,远超 524,288)即可转正 ✓
+
+**④ 三个投机 method 的区别(用户问)**:`mtp` = 模型自带 MTP 草稿层(学习型,**接受率最高**);
+`ngram` = CPU numba n-gram 查表;`ngram_gpu` = **同一套 n-gram 算法的 GPU 异步实现**
+⇒ **`ngram_gpu` 不比 `ngram` 强**,接受率相同,只省 CPU/延迟 ✗(名字有误导性)✓
+⚠️ 实测发现:配 `num_speculative_tokens=2` 时 vLLM 提示会多次运行草稿层;
+且**本次探针没有产出任何结果**(请求可能失败)⇒ 待查 ✓
+
+**⑤ 待办**:①KV 降到 17.3GB 让 GPU prefill 转正;②查 `mtp` 请求为何无输出;
+③量 `mtp` vs `ngram_gpu` 的 `Mean acceptance` 与 tok/s;④修 QFN-MXFP4(见 B310)。
+
+---
+
+### B310(2026-10-04)⭐ QFN-MXFP4 载体重修:**根因是 vLLM 白名单漏一项(一行)**,dev-only 补丁已让阻塞点前移
+
+**根因(实测,非推断)**
+```
+format = 'mxfp4-pack-quantized'
+is_activation_quantization_format('mxfp4-pack-quantized') = False   ← 总闸
+_is_fp8_w8a8 = True / _is_fp8_w8a16 = True                          ← 里面的分支其实能处理
+```
+vLLM 的 `_ACTIVATION_QUANTIZATION_FORMATS` 只有 naive/int/float/nvfp4_pack,
+**漏了 `mxfp4_pack_quantized`**(`compressed_tensors/config/base.py:26` 里确有该枚举)✓
+
+**修法(不碰生产树)**:`sitecustomize.py` 运行时补丁(只在 PYTHONPATH 含该目录时生效),
+把该格式加进白名单;配合 `--hf-overrides` 把融合名 `in_proj_qkvz` 补进 `group_2.targets`。
+
+**效果:阻塞点前移了** ✓
+* 之前:`NotImplementedError: No compressed-tensors compatible scheme …`
+* 现在:`AttributeError: 'MergedColumnParallelLinear' object has no attribute 'data'`
+  (发生在加载/接线 GDN 的 `in_proj_qkvz` 时,**是另一个问题,不是同一个**)
+⇒ 证明**白名单那一行确实是根因之一**,且补丁生效(日志里可见 `[devpatch] ✅ …`)✓
+
+**纪律**:补丁**只进 dev 服务**(`XTU_TREE=/tmp/w4a8/devpatch:<vllm 树>`),
+**生产树零改动**;若最终要进主线,再按"patch 形式"落到 `patches/xtu-series/` 并走用户批准 ✓
