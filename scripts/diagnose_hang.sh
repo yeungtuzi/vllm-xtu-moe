@@ -74,6 +74,20 @@ log "    $(basename "${S:-无}")  mtime=$(stat -c %y "$S" 2>/dev/null | cut -c1-
   | tail -12 | sed 's/^/    /' | tee -a "$OUT/log_tail.txt" >/dev/null
 
 log ""
+log "--- 5b) ⭐ LMCache 现场(它的日志【每次启动被覆盖】⇒ 必须当场抓,否则证据永久丢失 ✗)"
+LML="$L/lmcache_server.log"
+if [ -f "$LML" ]; then
+  log "    大小=$(du -h "$LML" | cut -f1) 最后写入=$(stat -c %y "$LML" | cut -c1-19)"
+  log "    最近动作(去 ANSI):"
+  grep -a "Stored\|Retrieved\|ERROR\|timeout" "$LML" 2>/dev/null | tail -8 \
+    | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-150 | sed 's/^/      /' | tee -a "$OUT/lmcache.txt" >/dev/null
+  log "    Stored 频次分布(多份=同一块反复搬运 ⇒ 传输层可能在重试 ✗):"
+  grep -aoE "Stored [0-9]+ tokens" "$LML" 2>/dev/null | sort | uniq -c | sort -rn | head -5 \
+    | sed 's/^/      /' | tee -a "$OUT/lmcache.txt" >/dev/null
+else
+  log "    ✗ 找不到 $LML"
+fi
+log ""
 log "--- 6) Python 栈(若装了 py-spy 就能直接看到卡在哪一行)---"
 if command -v py-spy >/dev/null 2>&1; then
   for pid in $(ls /proc | grep -E '^[0-9]+$'); do
