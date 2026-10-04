@@ -152,6 +152,8 @@ if [ "$WITH_MONITORING" = "1" ]; then
   # 实测:一天内 10 次 bringup ⇒ 33 个孤儿(`coremap_png.py` / `textfile_exporter.py`,
   # 各 7–19 MB、ppid=1)。根因:这两个 helper 常驻,而 PID 文件每次被**覆盖** ⇒ 旧 PID 丢失 ✗
   bash scripts/proc.sh stop coremap_png  >/dev/null 2>&1 || true
+  # 【规则·用户 2026-10-05】把"进程已消失满 3 天"的陈旧 .pid/日志打包归档 ✓
+  bash scripts/archive_stale_logs.sh >/dev/null 2>&1 || true
   bash scripts/proc.sh stop xtu_exporter >/dev/null 2>&1 || true
   bash scripts/proc.sh spawn xtu_exporter "$PY" "$M/textfile_exporter.py" "$M/textfile/xtu.prom"
   port_up 8787 || bash scripts/proc.sh spawn coremap "$PY" "$M/web/serve.py"
