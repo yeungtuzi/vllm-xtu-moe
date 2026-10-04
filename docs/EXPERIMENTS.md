@@ -9147,3 +9147,59 @@ worker 现状 `RssAnon ≈ 314 GiB/rank` ⇒ 再加一份 = **+134 GiB/rank** �
 **① 每个单元(层/专家/张量)、② 每 rank/world、③ 全模型** ✓
 本次是**用户一眼看出来的**,我连着两轮都在自己算的账上出错(前一次是把每 node 的 3.84 GB 当成每层 ✗)⇒
 **凡是"GiB 级"的数字,交付前必须让单位自己乘一遍**(层 × rank)✓
+
+---
+
+### B290(2026-10-04)⭐⭐⭐ **新目标立项:decode 阶段 CPU/GPU 计算重叠** —— kt 参照已找到,当年 async 慢 8.4× 的根因指向"worker park"
+
+**目标(用户 2026-10-04 明令)**:实现 decode 阶段的**计算重叠**,参照 **ktransformers** 的实现;
+单流上限 ~1.4×(`goal-e5d81755…`)
+
+**① kt 的参照实现(已取到完整源码)**
+- 本机 tar 包被截断 ✗ ⇒ 用 codeload 重下:**完整 61.5 MB / 1792 条目** ✓(`/tmp/kt_src/kt_main.tar.gz`)
+- **核心 API**:`cpu_infer.submit_with_cuda_stream(stream, task)` + `sync_with_cuda_stream(stream)`
+  (实现:`kt-kernel/cpu_backend/cpuinfer.h` ✓;C++ 绑定 `kt-kernel/ext_bindings.cpp:660-662` ✓)
+- **现代版重叠逻辑**:`kt-kernel/python/experts_base.py:636-651` ✓✓ —— 注释原文:
+  > *"`submit_with_cuda_stream` enqueues the CPU-MoE via an **ACL host callback whose firing is not
+  > host-observable (NO_BLOCK)** → a later host-side drain can **race ahead of it**(empty queue →
+  > stale `output_cpu` read by the H2D;**nondeterministic on heavy prefill**)。**Enqueue
+  > synchronously on this host thread instead**(work is guaranteed submitted;**it still runs on the
+  > WorkerPool and overlaps the GPU experts queued after**)"*
+  ⇒ **kt 的重叠三要素**:① 宿主线程**只做同步入队**(极便宜)② 真计算在 **CPU WorkerPool** 上跑 ⇒
+  **天然与随后入队的 GPU 专家工作重叠** ✓ ③ 配 **immediate / deferred 专家拆分 + `output_cpu[next_slot]` 双槽** ✓
+  ⇒ ⚠️ 并且明确:**不要用 host callback 做关键握手**(它会 race ✗)
+- 历史版本也在:`archive/ktransformers/operators/{experts,linear,cpuinfer,dynamic_attention}.py` ✓
+- 另一份文档 `doc/en/kt-kernel/experts-sched-Tutorial.md` 讲的是**专家放置**(哪些专家放 GPU),**不是**计算重叠 ✗(已下载 `/tmp/kt_doc/experts-sched.md` ✓)
+
+**② 我们自己的现状(对照后反倒更有希望)**
+- 我们有 `xiaotu_moe/csrc/scheduler/cpuinfer.h` ✓ —— 但它用 **`cudaLaunchHostFunc`**(host 回调)✗,
+  **正是 kt 放弃的那条路** ✗
+- 而**我们的 async 路径已经把它换成"mapped flag + 流内存操作"** ✓✓(`binding.cpp:109-110`):
+  两个 mapped flag(`hin` GPU 写、`hout` CPU 写,分属不同 cache line ✓),**无 host 回调** ✓
+  —— **协议设计上比 kt 的 host-callback 更干净** ✓
+- ⚠️ 但 `§582` 把**默认改成了 sync**(要 async 得显式 `=1`)✗
+
+**③ 当年 async 慢 8.4× 的直接证据(发布说明 v0.2pre)**
+> *"异步握手路径(`XIAOTU_MOE_ASYNC=1`)在 fork 编排下正常,在**主线下每层多等 ~28 ms**
+> (43 层 × 10 pass ≈ 11 s)⇒ `=0` 后 **11.96 s → 1.42 s(8.4×)**"*
+
+⇒ **每层多等 ~28 ms**,而每层 CPU MoE 本体仅 **~1.2 ms** ⇒ 慢了 ~23× ✗
+⇒ **28 ms 是"调度时延"量级,不是"握手开销"** ⇒ **几乎可以肯定 = worker 线程 park 后被唤醒的代价** ✓✓
+⇒ 且当时的注记精确命中:
+> *"异步/同步这种执行模型开关**必须在真实服务负载下 A/B** —— 分层计时(只反映投递)与**隔离微基准**
+> (单 rank、背靠背调用,**worker 永不 park**)都覆盖不到它"*
+
+**⇒ 结论性假设(下一枪,便宜且同 build 可验)**
+async 协议没错,**坏的是 worker 在层间 park** ✗:异步后 GPU 要等 CPU 结果 ⇒
+**把 park→unpark 的时延每层付一次** ✗;而 `SPIN_IDLE_US=300` 只让 worker 自旋 300 µs,
+层间间隙(attention 段 ~0.3–0.6 ms)**刚好超过它** ⇒ worker 睡着 ⇒ 每层付唤醒费 ✓
+
+**实验设计(同 build,两个 env,直接 A/B)**:
+```
+A(基线): XIAOTU_MOE_ASYNC=0  SPIN_IDLE_US=300     # 现状
+B(待验): XIAOTU_MOE_ASYNC=1  SPIN_IDLE_US=3000    # 异步 + 让 worker 保持热
+C(对照): XIAOTU_MOE_ASYNC=1  SPIN_IDLE_US=300     # 复现当年的慢
+```
+判据:**单流 decode tok/s** 与 **worker CPU 占空比**(现在 47–72% ⇒ 目标 >90%)✓
+若 B 明显快于 A ⇒ 1.4× 到手 ✓;若 B≈C 慢 ⇒ park 不是主因,转查 flag 协议/内存序 ✓
+⚠️ 需停一次生产起测试实例(6 min 加载)⇒ 按约束**先问用户** ✓
