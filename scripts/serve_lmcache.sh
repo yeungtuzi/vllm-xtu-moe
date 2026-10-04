@@ -22,13 +22,18 @@ CHUNK_SIZE="${CHUNK_SIZE:-2176}"                       # 跨模型公共值(见 
 # 与之配对(否则报 "Connector enables transfer_query but server does not",见 EXPERIMENTS B175)
 ENABLE_MODULES="${ENABLE_MODULES:-}"
 PORT="${PORT:-5555}"                        # connector 默认 tcp://localhost:5555
-# ⭐ 2026-10-04【NUMA 修正】:L1 是**一次性大缓冲**,默认策略是"首次触碰的本地节点" ⇒
-#   实测(python 2026-10-04)100 GB L1 里 **92.2 GiB 全落在 node7**、10.5 GiB 在 node5
-#   ⇒ 8 个 NUMA node 严重不均(node7 空闲只剩 13.1 GiB),而引擎 TP=1 会按 8 node 分片权重
-#   ⇒ 起第二个实例时 node7 直接 OOM 风险。
-#   修法:用 `numactl --interleave=all` 让 L1 均摊(100 GB ⇒ ~12.5 GB/node)。
-#   可用 NUMACTL="" 关掉(例如单节点机器)。
-NUMACTL="${NUMACTL-numactl --interleave=all}"
+# ⭐ 2026-10-04【NUMA 修正(背景)】:L1 是**一次性大缓冲**,默认策略是"首次触碰的本地节点" ⇒
+#   曾实测 100 GB L1 里 **92.2 GiB 全落在 node7**、10.5 GiB 在 node5 ⇒ 8 node 严重不均。
+#   ⚠️ 当时担心的后果是"**起第二个实例时** node7 OOM" —— 而按 R28,**第二个完整实例现在是禁止的** ✓
+#   ⇒ 该场景已不存在,单实例下 92 GiB 落一个 node 只是**抢页缓存**,不是 OOM ✓
+#
+# ⭐ 2026-10-05【默认改为不 interleave·用户决定】:
+#   ① 用户:lmcache **对性能要求不高,不必锁死 NUMA local** ✓
+#   ② 实测(⚠️ 正确口径 **MemAvailable**,不是 MemFree ✗ —— 见 QA 台账第 33 条):
+#      整机 **750 GiB 可用** ✓、Cached 685 GiB ✓;每 node 仍有 **77–91 GiB 可回收文件页** ✓
+#      ⇒ 单 node 约可容纳 170 GiB ⇒ L1 落单节点**不会 OOM** ✓(我此前用 MemFree 误判为"仅 89 GiB 可用" ✗)
+#   ③ 若将来单节点再次吃紧:⭐ **优先缩小 L1_GB**,其次才考虑 `NUMACTL="numactl --interleave=all"` ✓
+NUMACTL="${NUMACTL-}"
 mkdir -p "$L2_DIR"
 echo "[lmcache] modules=${ENABLE_MODULES:-none}"
 echo "[lmcache] L1=${L1_GB}GB L2=${L2_DIR}(${L2_GB}GB) port=${PORT} transfer=${TRANSFER_MODE} chunk=${CHUNK_SIZE}"
