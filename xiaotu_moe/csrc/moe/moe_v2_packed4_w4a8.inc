@@ -1185,6 +1185,13 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                     // 数值:累加顺序与通用路径逐字相同(每 (行,列) 按 g 递增、组内固定)。
 #define XIAOTU_TILE_BODY(MRT, NRT) \
     { \
+        /* 【T1.4b 回退路径回归修复】门控**每 tile 只求值一次** ✓                      \
+           原来它出现在下方 `for (g...)` 的**循环条件**里 ⇒ 每个 K 组迭代都要调两次      \
+           门控函数(env 读 + 进程级模式读 + 比较 ✗)。模式在一次 matmul 内**不变** ⇒        \
+           提到循环外是**等价变换**(不改数值 ✓)。实测:门控关时曾比 pristine 慢 16% ✗     \
+           (归因实验见 dev-docs/mywork/LOG.md 2026-10-05 23:4x ✓) */                       \
+        const bool i8_vnni_tile_ =                                                      \
+            xiaotu_int8_vnni_on() && !xiaotu_int8_align_on() && (group_count % 2) == 0;  \
         if (i8_align_ok_) { \
             /* ⭐【方案1】整数内层:每 64 MAC = 1 条 vpdpbusd(FP0/1)+ 3 条整数口 ✓ */ \
             __m512i acci[MRT][NRT]; \
@@ -1240,7 +1247,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
             for (int jj = 0; jj < (NRT); ++jj) acc[r][jj] = _mm512_setzero_ps(); \
         int srt[NRT]; \
         for (int jj = 0; jj < (NRT); ++jj) srt[jj] = ((j0 + jj) / gn) * kb_stride; \
-        if (xiaotu_int8_vnni_on() && !xiaotu_int8_align_on() && (group_count % 2) == 0) { \
+        if (i8_vnni_tile_) { \
             const __m512i ONES_ = _mm512_set1_epi8(1); \
             /* ⭐ A1/A2(专家审计本轮):scale 组装 7 条 -> 5 条,FP 口占用 8 -> 4 ✓ \
                ① 权重侧 blend 向量 wsc_ 提到 r_ 循环外(每 (jj_,g_) 一次,按 MRT 行摊薄)✓ \
@@ -1281,7 +1288,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 } \
             } \
         } \
-        for (int g = 0; !(xiaotu_int8_vnni_on() && !xiaotu_int8_align_on() && (group_count % 2) == 0) && g < group_count; ++g) { \
+        for (int g = 0; !i8_vnni_tile_ && g < group_count; ++g) { \
             const int base = g * 32; \
             __m512 av[MRT][2]; \
             for (int r = 0; r < (MRT); ++r) { \
