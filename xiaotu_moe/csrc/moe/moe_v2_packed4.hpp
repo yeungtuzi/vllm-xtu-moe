@@ -318,29 +318,423 @@ static inline const float* e8m0_table() {
     };
     return table;
 }
+// ═══════════════════════════════════════════════════════════════════════════
+// ⭐【W4A8 / int8-VNNI】自包含辅助(第 336 轮)
+//   实测:引擎等价配置下,预解码 int8 + dpbusd 比当前 fp32 解码+vfma 快
+//   【2.24~2.33x】(4 次复现,/tmp/engine_equiv.c)
+//   ⚠️ 默认关:XIAOTU_MOE_INT8_VNNI=1 才启用;否则与原来逐字相同
+// ═══════════════════════════════════════════════════════════════════════════
+// int8/VNNI 总开关(默认关 ✓);namespace 级 ⇒ 任何函数/宏里都能用 ✓
+// ⭐【第 353 轮】关键:把开关算成【namespace scope 常量】✓
+//   原来放在 inline 函数里的 `static const bool` 会生成【线程安全初始化守卫】
+//   (__cxa_guard_acquire ⇒ 原子读)⇒ 在每个 tile 被调用(百万次)⇒ 跨线程原子争用 ✗✗
+//   与刚找到的 atomic 计数器【同一类 bug】✓
+namespace { const bool g_vnni8_on = [] {
+    const char* e = std::getenv("XIAOTU_MOE_INT8_VNNI");
+    return e && std::atoi(e) != 0;
+}(); }
+static inline bool xiaotu_int8_vnni_on() { return g_vnni8_on; }   // 无 guard ✓
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⭐⭐【W4A8 方案1:整数内层(每 64 MAC 只占 1 个 FP0/1 槽)】(第 393 轮)
+//   旧 int8 内层 = 1 dpbusd + 1 fmadd(cvt(sv),sc,acc) = 2 个 FP0/1 槽/64MAC
+//                ⇒ 与 fp32 FOLD 的 2 条 vfmadd 打平 ⇒ 实测 1.02~1.04x ✓
+//   新内层      = 1 dpbusd + (vpsllvd/psubd/vpaddd 全在整数口)
+//                ⇒ 上限 2.00x ✓
+//
+//   数学(权重侧逐位精确):
+//     w4 = 2·fp4 ∈ {0,±1..±12}(predecode 的 LUT 出来的就是它 ⇒ 精确 s8 ✓)
+//     w  = fp4·2^(b-127) = (w4/2)·2^(b-127) = w4 · 2^(b-128)
+//                  b = e8m0 原始字节;-128 = -127(e8m0 偏置) + (-1)(fp4 = w4/2 ✓)
+//     a  = a8 · 2^c      (逐 32 块 s8;c = ceil(log2(m/127)) 是 2 的幂 ⇒ 只多 ≤1 bit 误差 ✓)
+//     ⇒ 每块 = (Σ a8·w4) · 2^(c + b - 128)
+//   内层(g_ += 2:一次 64 项 = 两个 32 块,zmm 正好 64 字节 ⇒ 无越界读、无需 maskz ✓):
+//     t  = dpbusd(au8, w4)   au8 = a8^0x80(u8,第 1 操作数);w4 必须按【s8】解释(第 2 操作数 ✓)
+//     ws = dpbusd(1, w4)     = Σw4
+//     sg = t - (ws << 7)     去掉 u8 的 128 偏置 ⇒ sg = Σ a8·w4(可负 ✓ 整数精确)
+//     shv= [sh_g ×8, sh_{g+1} ×8]   dpbusd 第 L lane 覆盖字节 4L..4L+3
+//                                   ⇒ lane 0..7 = 第 1 个 32 块,lane 8..15 = 第 2 块 ✓
+//     sg = vpsllvd(sg, shv) ; acc(int32) = vpaddd(acc, sg)     ← 整数口,不占 FP0/1 ✓
+//   收尾:每 (r_,jj_) 一次 vcvtdq2ps + 2 次普通 mul(2^off · global_scale)⇒ 摊薄到 GC/2 次内层后 ✓
+//
+//   移位/公共指数(全部非负 ⇒ 用【两个字节相加 + cvtepu8_epi32】构造成 16 lane):
+//     sh_{r,j,g} = (c_{r,g} - cmin_r) + (b_{j,g} - emin_j)    cmin/emin = 逐行/逐列 min
+//     off_{r,j}  = cmin_r + emin_j - 128                     ⇒ C *= 2^off
+//   ★ 原型里的 β 对齐(w8 = (w4<<β)、指数 b-128-β)是【恒等变换】:
+//       w8·2^(b-128-β) = (w4·2^β)·2^(b-128-β) = w4·2^(b-128) ✓
+//     本实现取 β≡0 ⇒ ① predecode 的权重字节与旧路径【逐字节相同】② 移位跨度【减半】
+//     ③ w4 恒在 ±12 ⇒ **永不溢出 ±127** ⇒ "β≤3" 的兜底自动满足(只需看行内 e8m0 跨度 = wtmax ✓)
+//
+//   守卫(实测定标见 /tmp/eng_align_check.c):
+//     G1 (actmax + wtmax) <= 30 ⇒ 所有 vpsllvd 计数 <31(不会静默清零)、paddb 不回绕 ✓
+//     G2 (cminmin + eminmin - 128) >= -24 ⇒ acc ≈ 真值·2^(-off) 不会溢出 ✓
+//        ⚠️ 病态注入实测:G1 单独【不够】(actmax=23 仍过 G1,off=-37 ⇒ max|lane|=2.13e9 余量 1.0x ⇒ 静默溢出 ✗)
+//   门控:XIAOTU_MOE_INT8_ALIGN=1 才走本分支;旧 XIAOTU_MOE_INT8_VNNI 路径【一字未改】✓
+//         两个 env 都不设 ⇒ 与基线【逐字相同】✓
+// ═══════════════════════════════════════════════════════════════════════════
+namespace { const bool g_align8_on = [] {
+    const char* e = std::getenv("XIAOTU_MOE_INT8_ALIGN");
+    return e && std::atoi(e) != 0;
+}(); }
+static inline bool xiaotu_int8_align_on() { return g_align8_on; }
+
+#define XIAOTU_I8_OFF_MIN  (-24)  /* off = cmin + emin - 128 下限(acc ≈ 真值·2^-off,越负越险 ✓) */
+#define XIAOTU_I8_SHTOT_MAX 30    /* actmax + wtmax 上限(保证移位 <31 且字节相加不回绕 ✓) */
+
+// ⭐【诊断计数器】(第 339 轮):确认"权重解码/激活量化"到底重复了多少次
+struct XiaotuCnt {
+    std::atomic<long> row_call{0}, row_miss{0}, q_call{0}, q_miss{0}, tile{0};
+    ~XiaotuCnt() {
+        fprintf(stderr, "[vnni-cnt] tile=%ld row_call=%ld row_miss=%ld q_call=%ld q_miss=%ld\n",
+                tile.load(), row_call.load(), row_miss.load(), q_call.load(), q_miss.load());
+    }
+};
+static inline XiaotuCnt& xiaotu_cnt() { static XiaotuCnt c; return c; }
+
+static inline const __m512i& xiaotu_lut_i16() {
+    static const __m512i T = _mm512_set_epi16(
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0x00F4,0x00F8,0x00FA,0x00FC,0x00FD,0x00FE,0x00FF,0x0000,
+        0x000C,0x0008,0x0006,0x0004,0x0003,0x0002,0x0001,0x0000);
+    return T;
+}
+// ⭐【整块预解码】(第 350 轮):每次调用把 W 的 [n0,n1) 行一次解码完 ✓
+//   原因:宏内按 (tile, jj) 解码 => 每次调用重复 (M/MR) 次 x
+//        (实测:32 行切片 x K=5120 => 只要 160 KB,一次解码成本是计算的 18% ✓)
+static thread_local const int8_t* g_i8_W = nullptr;
+static thread_local int g_i8_n0 = 0;
+// ⭐【方案1】权重侧移位表:wtsh[j][g] = b - emin_j ≥ 0、逐列 emin、2^(emin-128)、诊断量
+//   ⚠️ 全部是【默认参数】⇒ align 关时旧调用点(不传新参)源码不变、输出字节与改动前【逐位相同】✓
+static thread_local const uint8_t* g_i8_WT = nullptr;    /* [rows][GC] */
+static thread_local const int*     g_i8_EMIN = nullptr;  /* [rows]     */
+static thread_local const float*   g_i8_WSC = nullptr;   /* [rows] 2^(emin-128) */
+// ⚠️【必须 2 槽 · 与 buf[2] 同步】:权重缓存是 2 槽(gate/up 交替命中 ⇒ 命中较老那一槽时,
+//    若 WT/EMIN/WSC 只有 1 份缓冲区,则 g_i8_WT 指向的是【另一个块刚写进去】的移位表 ⇒
+//    权重 s8 与移位表错配 ⇒ 数值静默错 ✗✗(旧代码只有 g_i8_W 一份缓存 ⇒ 从未暴露该坑 ✓)
+//    同理 g_i8_wtmax / g_i8_eminmin(G1/G2 守卫)也必须逐槽保存,否则守卫用错块的诊断量 ✗
+static thread_local std::vector<uint8_t> g_i8_WTb[2];
+// ⭐【B2 第1步】:WT 的"每 32-块对 16 字节"展开(两字节各重复 8 lane ✓)
+//   B2 内层用【预计算的 zmm 移位向量】取代 movzxbd+paddb+shuffle ✓(基准实测 1.582x ✓)
+static thread_local std::vector<uint8_t> g_i8_WT2b[2];
+static thread_local const uint8_t* g_i8_WT2 = nullptr;
+static thread_local std::vector<int>     g_i8_EMINb[2];
+static thread_local std::vector<float>   g_i8_WSCb[2];
+static thread_local int g_i8_gc = 0, g_i8_wtmax = 0, g_i8_eminmin = 255;
+static thread_local int ckwtmax[2] = {0,0}, ckeminmin[2] = {255,255};
+static inline bool xiaotu_predecode_block(const uint8_t* W, int n0, int n1, int rowshift, int K,
+                                          const uint8_t* Sraw = nullptr, int gn = 1,
+                                          int kb_stride = 0, bool with_wt = false) {
+    // ⭐【审计#4 正解】2 槽键缓存:
+    //   分批路径顺序 = gate(chunk0) → up(chunk0) → gate(chunk1) → up(chunk1) …
+    //   ⇒ 两种键【交替】✗ ⇒ 单槽缓存每次被上一句冲掉 ⇒ 命中率 0 ✗(实测 178/244 反而更差 ✓)
+    //   ⇒ 2 槽 ⇒ 交替键都能命中 ⇒ 除每切片首次外全命中 ✓
+    //   ⚠️ 审计#4 A1:键不含"引擎实例身份" ⇒ 同进程"析构→重建同维度引擎"可能复用同一地址 ✗
+    //      ⇒ 加引擎代次键不可行(跨 TU)⇒ 故【只缓存最近 2 个键,且入口校验 rows/K】并在此注明风险:
+    //      【禁止在同一个 worker 进程里"换权重/重建引擎"后继续用 int8 门控】✗
+    static thread_local std::vector<int8_t> buf[2];
+    static thread_local const uint8_t* ckW[2] = { nullptr, nullptr };
+    static thread_local int ckn0[2] = {0,0}, ckn1[2] = {0,0}, ckr[2] = {0,0}, ckK[2] = {0,0};
+    static thread_local const uint8_t* ckS[2] = { nullptr, nullptr };   /* ⭐ scale 入键 ✓ */
+    static thread_local int ckgn[2] = {0,0}, ckgk[2] = {0,0}, ckwt[2] = {0,0};
+    static thread_local int cur = 0;
+    // ⚠️ with_wt / Sraw / gn / kb_stride 必须入键:否则 with_wt=false 的命中会把【没有 wt 表】的槽
+    //    返回给 with_wt=true 的调用者 ⇒ 消费端读空表 OOB ✗(与"空 En"同类的坑 ✓)
+    for (int t = 0; t < 2; ++t) {
+        if (ckW[t] == W && ckS[t] == Sraw && ckn0[t] == n0 && ckn1[t] == n1 && ckr[t] == rowshift
+            && ckK[t] == K && ckgn[t] == gn && ckgk[t] == kb_stride && ckwt[t] == (int)with_wt
+            && !buf[t].empty() && (!with_wt || !g_i8_WTb[t].empty())) {
+            cur = t ^ 1;                    // ⭐ 审计建议:命中后让下一 miss 写【另一槽】(近似 LRU)✓
+            g_i8_W = buf[t].data(); g_i8_n0 = n0;
+            if (with_wt) { g_i8_WT = g_i8_WTb[t].data(); g_i8_WT2 = g_i8_WT2b[t].data();   /* ⭐ 修陈旧指针:命中路径也要设 WT2 ✓ */ g_i8_EMIN = g_i8_EMINb[t].data();
+                           g_i8_WSC = g_i8_WSCb[t].data();
+                           g_i8_wtmax = ckwtmax[t]; g_i8_eminmin = ckeminmin[t]; }   /* ⭐ 逐槽 ✓ */
+            else { g_i8_WT = nullptr; g_i8_WT2 = nullptr; g_i8_EMIN = nullptr; g_i8_WSC = nullptr;
+                   g_i8_wtmax = 0; g_i8_eminmin = 255; }
+            g_i8_gc = K / 32;
+            return true;
+        }
+    }
+    const int rows = n1 - n0;
+    if (rows <= 0 || K <= 0 || (K % 64) != 0 || n0 < rowshift
+        || (with_wt && (Sraw == nullptr || gn <= 0 || kb_stride <= 0))) {
+        g_i8_W = nullptr; g_i8_n0 = 0; g_i8_WT = nullptr; g_i8_WT2 = nullptr; g_i8_EMIN = nullptr; g_i8_WSC = nullptr;
+        g_i8_wtmax = 0; g_i8_eminmin = 255;
+        return false;
+    }
+    const int slot = cur; cur ^= 1;                                 // 轮换写 2 槽 ✓
+    if (buf[slot].size() < (size_t)rows * (size_t)K) buf[slot].resize((size_t)rows * (size_t)K);
+    const __m512i LUT = xiaotu_lut_i16();
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t* brow = W + (size_t)(n0 + r - rowshift) * (size_t)(K / 2);
+        int8_t* out = buf[slot].data() + (size_t)r * (size_t)K;
+        for (int g = 0; g < K / 32; ++g) {
+            const __m128i raw = _mm_loadu_si128((const __m128i*)(brow + (size_t)g * 16));
+            const __m128i lo = _mm_and_si128(raw, _mm_set1_epi8(0x0F));
+            const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), _mm_set1_epi8(0x0F));
+            const __m256i sel = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
+            const __m512i v16 = _mm512_permutexvar_epi16(_mm512_cvtepu8_epi16(sel), LUT);
+            _mm256_storeu_si256((__m256i*)(out + (size_t)g * 32), _mm512_cvtepi16_epi8(v16));
+        }
+    }
+    // ⭐【方案1】权重侧表:逐列 emin = min_g b、wtsh = b - emin ≥ 0、WSC = 2^(emin-128)
+    //    列基址与 row_scale 完全一致 = (n/gn)*kb_stride ✓;权重 s8 字节保持原样(w4 ✓)
+    if (with_wt) {
+        const int gc = K / 32;
+        if ((int)g_i8_WTb[slot].size()   < rows * gc) g_i8_WTb[slot].resize((size_t)rows * (size_t)gc);
+        if ((int)g_i8_EMINb[slot].size() < rows)      g_i8_EMINb[slot].resize((size_t)rows);
+        if ((int)g_i8_WSCb[slot].size()  < rows)      g_i8_WSCb[slot].resize((size_t)rows);
+        int wtmax = 0, eminmin = 255;
+        for (int r = 0; r < rows; ++r) {
+            const uint8_t* sp = Sraw + ((size_t)(n0 + r) / (size_t)gn) * (size_t)kb_stride;
+            int mn = 255;
+            for (int g = 0; g < gc; ++g) if ((int)sp[g] < mn) mn = (int)sp[g];
+            g_i8_EMINb[slot][r] = mn; g_i8_WSCb[slot][r] = std::ldexp(1.0f, mn - 128);
+            if (mn < eminmin) eminmin = mn;
+            uint8_t* wp = g_i8_WTb[slot].data() + (size_t)r * (size_t)gc;
+            int8_t* wrow = buf[slot].data() + (size_t)r * (size_t)K;
+            for (int g = 0; g < gc; ++g) {
+                const int d = (int)sp[g] - mn;   wp[g] = (uint8_t)d;
+                if (d > wtmax) wtmax = d;
+                if (d > 0) {   /* P3-lite: w8' = w8 << d (d<=3 -> |w8'|<=96) */
+                    const __m256i b8 = _mm256_loadu_si256((const __m256i*)(wrow + (size_t)g * 32));
+                    const __m512i w16 = _mm512_cvtepi8_epi16(b8);
+                    const __m512i s16 = _mm512_sllv_epi16(w16, _mm512_set1_epi16((short)d));
+                    _mm256_storeu_si256((__m256i*)(wrow + (size_t)g * 32), _mm512_cvtepi16_epi8(s16));
+                }
+            }
+        }
+        g_i8_WT = g_i8_WTb[slot].data(); g_i8_EMIN = g_i8_EMINb[slot].data();
+        /* ⭐ B2:把 WT(每 32 块 1 字节)展成【每 32-块对 16 字节】⇒ 内层可直接 load 成 zmm ✓ */
+        {
+            const int np_ = (K / 32) / 2;
+            g_i8_WT2b[slot].resize((size_t)rows * (size_t)np_ * 16);
+            for (int r2_ = 0; r2_ < rows; ++r2_) {
+                const uint8_t* src2_ = g_i8_WTb[slot].data() + (size_t)r2_ * (size_t)(K / 32);
+                uint8_t* dst2_ = g_i8_WT2b[slot].data() + (size_t)r2_ * (size_t)np_ * 16;
+                for (int p2_ = 0; p2_ < np_; ++p2_)
+                    for (int q2_ = 0; q2_ < 8; ++q2_) {
+                        dst2_[p2_ * 16 + q2_]      = src2_[p2_ * 2];      /* lane 0..7  = 块 2p ✓ */
+                        dst2_[p2_ * 16 + 8 + q2_]  = src2_[p2_ * 2 + 1];  /* lane 8..15 = 块 2p+1 ✓ */
+                    }
+            }
+            g_i8_WT2 = g_i8_WT2b[slot].data();
+        }
+        g_i8_WSC = g_i8_WSCb[slot].data();
+        g_i8_wtmax = wtmax; g_i8_eminmin = eminmin;
+        ckwtmax[slot] = wtmax; ckeminmin[slot] = eminmin;      /* ⭐ 逐槽保存守卫诊断量 ✓ */
+    } else {
+        g_i8_WT = nullptr; g_i8_EMIN = nullptr; g_i8_WSC = nullptr;
+        g_i8_wtmax = 0; g_i8_eminmin = 255;
+    }
+    g_i8_gc = K / 32;
+    g_i8_W = buf[slot].data(); g_i8_n0 = n0;
+    ckW[slot] = W; ckS[slot] = Sraw; ckn0[slot] = n0; ckn1[slot] = n1; ckr[slot] = rowshift;
+    ckK[slot] = K; ckgn[slot] = gn; ckgk[slot] = kb_stride; ckwt[slot] = (int)with_wt;
+    return true;
+}
+// packed nibble 行(K/2 字节)=> K 个【有符号 int8】(×2 ✓);按 brow 指针缓存(动态预解码 ✓)
+static inline const int8_t* xiaotu_row_int8(const uint8_t* brow, int K) {
+    // ⭐【多槽直映缓存 16】:单槽会被 m0 外层循环穿透 ✗(每个 m0 重解全部 j0 行)
+    //    => 一个 j0 块(NR<=8 行)在整个 m0 扫描里只解一次 ✓✓
+    constexpr int NS = 16;
+    static thread_local const uint8_t* key[NS] = {};
+    static thread_local std::vector<int8_t> buf[NS];
+    
+    const size_t slot = (size_t)(((uintptr_t)brow >> 6) % NS);
+    if (key[slot] == brow && (int)buf[slot].size() == K) return buf[slot].data();
+    
+    key[slot] = brow;
+    buf[slot].resize((size_t)K);
+    int8_t* out = buf[slot].data();
+    const __m512i LUT = xiaotu_lut_i16();
+    for (int g = 0; g < K / 32; ++g) {
+        const __m128i raw = _mm_loadu_si128((const __m128i*)(brow + (size_t)g * 16));
+        const __m128i lo = _mm_and_si128(raw, _mm_set1_epi8(0x0F));
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), _mm_set1_epi8(0x0F));
+        const __m256i sel = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
+        const __m512i v16 = _mm512_permutexvar_epi16(_mm512_cvtepu8_epi16(sel), LUT);
+        _mm256_storeu_si256((__m256i*)(out + (size_t)g * 32), _mm512_cvtepi16_epi8(v16));
+    }
+    return out;
+}
+// fp32 激活行 => 按 32 一组【向量化】量化成 u8(载 128 ✓);scales[g] 回填组 scale
+//   AVX-512:max(1)+ mul(1)+ cvt(1)+ pack(1)+ xor(1) ≈ 5 条 / 16 个元素 ✓
+struct XiaotuQRow { const uint8_t* u8; const float* sc; };
+static inline XiaotuQRow xiaotu_quant_row(const float* a, int K) {
+    // ⭐【多槽缓存 16】:同一激活行在每个 j0 块都被用到 => 单槽会重复量化 n/NR 次 ✗
+    //    => 一个 m0 块(<=4 行)在整轮 j0 扫描里只量化一次 ✓✓
+    constexpr int NS = 16;
+    static thread_local const float* key[NS] = {};
+    static thread_local std::vector<uint8_t> ub[NS];
+    static thread_local std::vector<float>   sb[NS];
+    
+    const size_t slot = (size_t)(((uintptr_t)a >> 6) % NS);
+    if (key[slot] == a && (int)ub[slot].size() == K) return { ub[slot].data(), sb[slot].data() };
+    
+    key[slot] = a;
+    ub[slot].resize((size_t)K);
+    sb[slot].resize((size_t)(K / 32));
+    uint8_t* out = ub[slot].data();
+    float*   osc = sb[slot].data();
+    for (int g = 0; g < K / 32; ++g) {
+        __m512 a0 = _mm512_loadu_ps(a + g * 32);
+        __m512 a1 = _mm512_loadu_ps(a + g * 32 + 16);
+        const __m512 mx = _mm512_max_ps(_mm512_abs_ps(a0), _mm512_abs_ps(a1));
+        const float m = _mm512_reduce_max_ps(mx);
+        const float sc = m > 0.f ? m / 127.0f : 1.0f;
+        osc[g] = sc;   /* 注意:本函数是死代码;×0.5 在 xiaotu_quant_row_into 里 ✓ */
+        const __m512 inv = _mm512_set1_ps(1.0f / sc);
+        const __m512i q0 = _mm512_cvtps_epi32(_mm512_mul_ps(a0, inv));
+        const __m512i q1 = _mm512_cvtps_epi32(_mm512_mul_ps(a1, inv));
+        // ⚠️ 不能用 packs_epi32/16(按 128 位 lane 交错 ✗)=> 直通窄化 ✓
+        const __m128i b0 = _mm512_cvtepi32_epi8(q0);
+        const __m128i b1 = _mm512_cvtepi32_epi8(q1);
+        __m256i b8 = _mm256_set_m128i(b1, b0);
+        b8 = _mm256_xor_si256(b8, _mm256_set1_epi8((char)0x80));
+        _mm256_storeu_si256((__m256i*)(out + g * 32), b8);
+    }
+    return { out, osc };
+}
+
+// ⭐【perf 结论(第 368 轮)】:xiaotu_quant_row 占 64% 时间 ✗
+//   原因:每个 tile 的每行都调用 => 同一行被重复量化 (n1-n0)/NR ≈ 18 次 ✗
+//   修法:提到【m0 层】,每行每 call 只量化一次 ✓
+// ⭐【直接写入版】(第 369 轮,依审计 A9/B3/B6)——
+//   ① 取消 16 槽缓存(B1:槽位算法 ((ptr>>6)%16) 与行距 4K 同余 ⇒ K=5120 时恒撞同一槽 ⇒ 缓存【恒不命中】✗)
+//   ② 直接写调用方缓冲 ⇒ 省掉"写→读→写"三趟 ✓
+// 【方案1 专用】输出仍 u8(= s8 ^ 0x80 ⇒ 内层不必 xor ✓),但 scale 换成【2 的幂】,
+//   并把整数指数 c_g 回填到 cex[g]。注意:权重侧的 -128 已含 fp4=w4/2 的 -1 ⇒ 这里【没有 ×0.5】✗
+static inline void xiaotu_quant_row_align_into(const float* a, int K, uint8_t* out, int16_t* cex) {
+    /* ⭐【P3-full】整行统一指数 ⇒ 内层不再需要 (c_g - A0_r) 那一级移位。
+       代价:远小于行内最大值的 32-块会用更粗的步长(最多 2^ActMax 倍)。 */
+    __m512 vmax_ = _mm512_setzero_ps();
+    for (int k_ = 0; k_ + 16 <= K; k_ += 16)
+        vmax_ = _mm512_max_ps(vmax_, _mm512_abs_ps(_mm512_loadu_ps(a + k_)));
+    const float mrow_ = _mm512_reduce_max_ps(vmax_);
+    int crow_ = 0;
+    if (mrow_ > 0.f) {
+        uint32_t b_; std::memcpy(&b_, &mrow_, sizeof(b_));
+        const int ef_ = (int)((b_ >> 23) & 0xFFu);
+        if (ef_ == 0xFF) crow_ = 120; else if (ef_ == 0) crow_ = -120;
+        else crow_ = (ef_ - 127) - 6 + (((b_ & 0x7FFFFFu) > 8257536u) ? 1 : 0);
+        if (crow_ < -120) crow_ = -120; if (crow_ > 120) crow_ = 120;
+    }
+    float powr_; { uint32_t pb_=(uint32_t)(127-crow_)<<23; std::memcpy(&powr_, &pb_, 4); }
+    const __m512 invrow_ = _mm512_set1_ps(powr_);
+    for (int g = 0; g < K / 32; ++g) {
+        const __m512 a0 = _mm512_loadu_ps(a + g * 32);
+        const __m512 a1 = _mm512_loadu_ps(a + g * 32 + 16);
+        const __m512 mx = _mm512_max_ps(_mm512_abs_ps(a0), _mm512_abs_ps(a1));
+        const float m = _mm512_reduce_max_ps(mx);
+        int c = 0;
+        if (m > 0.f) {
+            /* ⭐ 2026-10-04【quant-opt】用 IEEE 指数域替代 ceilf(log2f(·)),去掉每块一次 libm 调用。
+               数学:  c = ceil(log2(x)), x = m/127.0f
+                      写 x = f·2^e(f∈[1,2) 规格化)⇒ floor(log2 x) = e
+                      ⇒ c = e + (x 不是 2 的幂 ? 1 : 0)      (x 是 2 的幂时 ceil 不加)
+               实现:  指数域 ef = bits>>23 & 0xFF;e = ef-127;尾数非零 ⇒ 不是 2 的幂。
+               边界:  x 次正规 ⇒ ef=0 ⇒ e=-127 ⇒ c=-126 ⇒ 与原实现一样被夹到 -120 ✓
+                      x = inf/NaN ⇒ 防御性取上夹 120 ✓ */
+            const float x = m / 127.0f;                  /* 与原实现同一个除法(不可换成乘法 ✓) */
+            uint32_t b; std::memcpy(&b, &x, sizeof(b));
+            const int ef = (int)((b >> 23) & 0xFFu);
+            if (ef == 0xFF) c = 120;
+            else c = (ef - 127) + (((b & 0x7FFFFFu) != 0) ? 1 : 0);
+            if (c < -120) c = -120;                      /* 防 2^-c 下溢 ⇒ inv=inf ⇒ cvt 成 INT_MIN ✗ */
+            if (c >  120) c =  120;
+        }
+        cex[g] = (int16_t)crow_;   /* P3-full:整行同一个指数 */
+        /* ⭐【quant-opt】2^-c 位构造:c∈[-120,120] ⇒ 指数域 127-c ∈ [7,247] 全为规格化数 ⇒ 与
+           ldexp(1.0f,-c) 逐位相同,但无 libm 调用 ✓ */
+        const uint32_t pb = (uint32_t)(127 - c) << 23;
+        float powv; std::memcpy(&powv, &pb, sizeof(powv));
+        const __m512 inv = invrow_;   /* P3-full:整行同一个 2^-c */
+        const __m512i LO = _mm512_set1_epi32(-127), HI = _mm512_set1_epi32(127);
+        const __m512i q0 = _mm512_min_epi32(_mm512_max_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(a0, inv)), LO), HI);
+        const __m512i q1 = _mm512_min_epi32(_mm512_max_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(a1, inv)), LO), HI);
+        const __m128i b0 = _mm512_cvtepi32_epi8(q0);
+        const __m128i b1 = _mm512_cvtepi32_epi8(q1);
+        __m256i b8 = _mm256_set_m128i(b1, b0);
+        b8 = _mm256_xor_si256(b8, _mm256_set1_epi8((char)0x80));   /* s8 -> u8【唯一一处】✓ */
+        _mm256_storeu_si256((__m256i*)(out + g * 32), b8);
+    }
+}
+static inline void xiaotu_quant_row_into(const float* a, int K, uint8_t* out, float* osc) {
+    for (int g = 0; g < K / 32; ++g) {
+        const __m512 a0 = _mm512_loadu_ps(a + g * 32);
+        const __m512 a1 = _mm512_loadu_ps(a + g * 32 + 16);
+        const __m512 mx = _mm512_max_ps(_mm512_abs_ps(a0), _mm512_abs_ps(a1));
+        const float m = _mm512_reduce_max_ps(mx);
+        const float sc = m > 0.f ? m / 127.0f : 1.0f;
+        osc[g] = sc * 0.5f;   /* ⭐ 修正:×0.5 必须在【生效】的函数里(死函数里的无效 ✓) */
+        const __m512 inv = _mm512_set1_ps(1.0f / sc);
+        const __m128i b0 = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(a0, inv)));
+        const __m128i b1 = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(a1, inv)));
+        __m256i b8 = _mm256_set_m128i(b1, b0);
+        b8 = _mm256_xor_si256(b8, _mm256_set1_epi8((char)0x80));
+        _mm256_storeu_si256((__m256i*)(out + g * 32), b8);
+    }
+}
+static thread_local std::vector<uint8_t> g_i8_A;
+static thread_local std::vector<float>   g_i8_AS;    /* 旧 int8 路的 float scale(align 关时用)✓ */
+// ⭐【方案1】激活侧表:actsh 的 8 字节模式([r][g][8])+ c 暂存 + 逐行 2^A0 + 诊断量
+static thread_local std::vector<uint8_t> g_i8_AC8;
+static thread_local std::vector<int16_t> g_i8_CE;
+static thread_local std::vector<float>   g_i8_ASCv;  /* [MR] 2^(A0_r) ✓ */
+static thread_local int g_i8_actmax = 0, g_i8_cminmin = (1 << 30);
+// 返回 true = 【已按方案1 建好激活表】;false ⇒ 调用方必须回退(旧 int8 / fp32)✓
+static inline bool xiaotu_quant_block_m0(const float* a32, int m0, int MR, int M, int K) {
+    const int rows = (M - m0) < MR ? (M - m0) : MR;
+    const int gc = K / 32;
+    // ⭐【只增不减】(审计 B6):resize 缩小后再涨回会【整块清零】✗ ⇒ 只在小的时候扩 ✓
+    const size_t needA = (size_t)rows * (size_t)K;
+    const size_t needS = (size_t)rows * (size_t)gc;
+    if (g_i8_A.size() < needA) g_i8_A.resize(needA);
+    if (!xiaotu_int8_align_on()) {                    /* ── 旧路径:一字不动 ✓ ── */
+        if (g_i8_AS.size() < needS) g_i8_AS.resize(needS);
+        for (int r = 0; r < rows; ++r)
+            xiaotu_quant_row_into(a32 + (size_t)(m0 + r) * K, K,
+                                  g_i8_A.data() + (size_t)r * K,
+                                  g_i8_AS.data() + (size_t)r * gc);   // 直接写,无 memcpy ✓
+        return false;
+    }
+    /* ── 方案1:逐 32 块 2 的幂 scale ─────────────────────────────────── */
+    if ((int)g_i8_CE.size()   < rows * gc)     g_i8_CE.resize((size_t)rows * (size_t)gc);
+    if ((int)g_i8_AC8.size()  < rows * gc * 8) g_i8_AC8.resize((size_t)rows * (size_t)gc * 8);
+    if ((int)g_i8_ASCv.size() < rows)          g_i8_ASCv.resize((size_t)rows);
+    for (int r = 0; r < rows; ++r)
+        xiaotu_quant_row_align_into(a32 + (size_t)(m0 + r) * K, K,
+                                    g_i8_A.data() + (size_t)r * K,
+                                    g_i8_CE.data() + (size_t)r * gc);
+    // 逐行 A0_r = min_g c;actsh = c - A0_r(≥0)写 8 份;2^A0_r;actmax/cminmin 诊断
+    int actmax = 0, cminmin = (1 << 30);
+    for (int r = 0; r < rows; ++r) {
+        const int16_t* ce = g_i8_CE.data() + (size_t)r * gc;
+        int A0 = (1 << 30);
+        for (int g = 0; g < gc; ++g) if ((int)ce[g] < A0) A0 = (int)ce[g];
+        g_i8_ASCv[r] = std::ldexp(1.0f, A0);
+        if (A0 < cminmin) cminmin = A0;
+        uint8_t* ap = g_i8_AC8.data() + (size_t)r * (size_t)gc * 8;
+        for (int g = 0; g < gc; ++g) {
+            int d = (int)ce[g] - A0;
+            if (d < 0) d = 0;                       /* A0 = min ⇒ d ≥ 0;防御性夹取 ✓ */
+            if (d > 255) d = 255;
+            if (d > actmax) actmax = d;
+            const uint64_t pat = 0x0101010101010101ull * (uint64_t)(uint8_t)d;
+            std::memcpy(ap + (size_t)g * 8, &pat, 8);  /* 16B 载入即 [g ×8, g+1 ×8] ✓ */
+        }
+    }
+    g_i8_actmax = actmax; g_i8_cminmin = cminmin;
+    return true;
+}
+
+
 
 // C[M,N] fp32 = A[M,K]bf16 x W[N,K/2]fp4^T, group scale along N (groupN) and K
 // (groupK), optional global scale. W row major [N][K/2]. S=[N/gn][K/gk].
 // lut: 16-entry float table mapping nibble -> weight value.
 // E8M0: when true, S is a raw uint8 fp8_e8m0 byte buffer (fork MXFP4 feeding),
 // decoded as 2^(byte-127); when false, S is fp32 values (WNA16/NVFP4 feeding).
-// 【2026-10-04 goal-B②】行预取距离(以"输出列行"为单位)。默认 **1 = 原行为**(零回归)。
-// WHY:单行解码路径逐 j(输出列)流式读权重行(W 每行 K/2 字节);原实现只对**下一行**做
-// 前瞻,而 1 个 j 迭代(80 个 group ≈ 400–800 cycle ≈ 130–260 ns)**刚好等于 DRAM 延迟**
-// ⇒ 余量太小,行首/行尾仍在停等。实测每线程只有 ~1.24 GB/s,而单核流式可达 ~36 GB/s。
-// 纯预取、不改任何数值语义 ⇒ 数值门禁天然通过;A/B 靠本 env 在同一 build 内切换 ✓
-// ⚠️ 必须放在下面 `template<...>` **之前** —— 否则会把模板参数与函数拆开(本次已踩一次)✗
-inline int matmul_pf_rows() {
-    static const int v = []() {
-        const char* s = std::getenv("XIAOTU_MOE_PF_ROWS");
-        int n = s ? std::atoi(s) : 1;
-        if (n < 1) n = 1;
-        if (n > 8) n = 8;
-        return n;
-    }();
-    return v;
-}
-
 template <bool E8M0 = false, bool FAST_FP4 = false>
 inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                                  const float* lut, const void* S,
@@ -389,6 +783,14 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
     // (dot = sum_k A[k]*W[k]); semantics identical to the AVX2 path below.
     // ----------------------------------------------------------------------
     if (FAST_FP4 && gk == 32 && (K & 31) == 0 && (size_t)M * (size_t)K <= (size_t)(4 << 20)) {
+    // ⭐【第 335 轮】int8/VNNI 门控探针(默认关 => 无行为影响)
+    //   目的:运行时确认本分支被执行(施工图见 PATCH_INT8_IN_PACKED4.md §2/§4)
+    static const bool vnni8_on = [] { const char* e = std::getenv("XIAOTU_MOE_INT8_VNNI");
+                                         return e && std::atoi(e) != 0; }();
+    if (vnni8_on) {
+        static int probe_n_1 = (fprintf(stderr, "[vnni-p4] BRANCH TAKEN #1\n"), 0);
+        (void)probe_n_1;
+    }
         const bool bp_on = byteprof_on();
         uint64_t bp_t0 = 0;
         if (bp_on) bp_t0 = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -659,7 +1061,9 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 return e2 && std::atoi(e2) != 0;
             }();
             if (_vbmi_on && (group_count % 4) == 0) {
+                if (xiaotu_int8_vnni_on() && !_vbmi_on)   /* 审计必须修#1:VBMI 分支不读这两者 ⇒ 别白做 ✓ */ xiaotu_predecode_block(W, n0, n1, rowshift, K);   // A1:门控 ✓
                 for (int m0 = 0; m0 < M; m0 += MR) {
+                    if (xiaotu_int8_vnni_on() && !_vbmi_on)   /* 审计必须修#1:VBMI 分支不读这两者 ⇒ 别白做 ✓ */ xiaotu_quant_block_m0(a32, m0, MR, M, K);   // A1:门控 ✓
                     const int mr = std::min(MR, M - m0);
                     for (int j0 = n0; j0 < n1; j0 += NR) {
                         const int nj = std::min(NR, n1 - j0);
@@ -702,7 +1106,29 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 return;
             }
 #endif
+            // ⭐【方案1】align 开且 E8M0 ⇒ 预解码时【顺带】建权重侧移位表(wtsh/emin ✓);
+            //   否则走原来的调用(不传新参 ⇒ with_wt=false ⇒ 输出字节与改动前逐位相同 ✓)
+            const bool i8a_pre_ = xiaotu_int8_align_on() && E8M0;
+            if (i8a_pre_) {
+                xiaotu_predecode_block(W, n0, n1, rowshift, K, Sbytes, gn, kb_stride, true);
+            } else if (xiaotu_int8_vnni_on() && !_vbmi_on) {
+                xiaotu_predecode_block(W, n0, n1, rowshift, K);   // A1:门控 ✓
+            }
             for (int m0 = 0; m0 < M; m0 += MR) {
+                bool i8a_q_ = false;
+                if (xiaotu_int8_align_on()) i8a_q_ = xiaotu_quant_block_m0(a32, m0, MR, M, K);
+                else if (xiaotu_int8_vnni_on() && !_vbmi_on) xiaotu_quant_block_m0(a32, m0, MR, M, K);   // A1:门控 ✓
+                // ⭐ 逐 (m0 块 × 该 j0 tile) 的守卫:任一不过 ⇒ 本 tile 走旧 int8 / fp32 FOLD(永远正确 ✓)
+                //    G1 = actmax + wtmax <= 30(移位/字节完整性)· G2 = cmin+emin-128 >= -24(溢出)✓
+                // ⚠️ 必须带 `E8M0 && i8a_pre_`:否则 align 开 + E8M0 关时 predecode 不会以 with_wt
+                //    调用 ⇒ g_i8_W/g_i8_WT 可能是【上一次 E8M0 调用留下的陈旧指针】⇒ 读到错的表 ✗
+                const bool i8_align_ok_ = E8M0 && i8a_pre_ && i8a_q_ && g_i8_WT2 != nullptr && g_i8_WT != nullptr
+                    && g_i8_W != nullptr && g_i8_WT != nullptr
+                    && g_i8_gc == group_count && (group_count % 2) == 0
+                    /* ⭐【修正 G1】B2 是【两级】移位 ⇒ vpsllvd 的限制是【每一级各自】< 31 ✓
+                       (原判据用了 actmax+wtmax 的【和式】✗ ⇒ 过严 ⇒ 真实数据几乎必失败 ⇒ 回退 fp32 ✗) */
+                    && g_i8_actmax <= XIAOTU_I8_SHTOT_MAX && g_i8_wtmax <= 3   /* P3-lite: w8'=w8<<d 需 d<=3 */
+                    && (g_i8_cminmin + g_i8_eminmin - 128) >= XIAOTU_I8_OFF_MIN;
                 const int mr = std::min(MR, M - m0);
                 for (int j0 = n0; j0 < n1; j0 += NR) {
                     const int nj = std::min(NR, n1 - j0);
@@ -716,48 +1142,139 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                     // 里表现为大量等距 512 字节的 `vmovaps`(占 31% 周期)。
                     // 用宏把 MRT/NRT 展开成**字面量** ⇒ 边界编译期常量 ⇒ 有资格进 zmm。
                     // 数值:累加顺序与通用路径逐字相同(每 (行,列) 按 g 递增、组内固定)。
-#define XIAOTU_TILE_BODY(MRT, NRT)                                                        \
-    {                                                                                     \
-        __m512 acc[MRT][NRT];                                                             \
-        for (int r = 0; r < (MRT); ++r)                                                   \
-            for (int jj = 0; jj < (NRT); ++jj) acc[r][jj] = _mm512_setzero_ps();          \
-        int srt[NRT];                                                                     \
-        for (int jj = 0; jj < (NRT); ++jj) srt[jj] = ((j0 + jj) / gn) * kb_stride;        \
-        for (int g = 0; g < group_count; ++g) {                                           \
-            const int base = g * 32;                                                      \
-            __m512 av[MRT][2];                                                            \
-            for (int r = 0; r < (MRT); ++r) {                                             \
-                const float* ap = a32 + (size_t)(m0 + r) * K + base;                      \
-                av[r][0] = _mm512_loadu_ps(ap);                                           \
-                av[r][1] = _mm512_loadu_ps(ap + 16);                                      \
-            }                                                                             \
-            for (int jj = 0; jj < (NRT); ++jj) {                                          \
-                const uint8_t* brow = W + (size_t)(j0 + jj - rowshift) * (K / 2);         \
-                XIAOTU_DECODE_GROUP_AVX512(brow, g);                                      \
-                const __m512 sv = _mm512_set1_ps(row_scale(srt[jj], g));                  \
-                /* 【§637b】折 scale **只在 MRT>=2 时**才划算:`mr=1` 时旧式是 1 mul + 2 fma = 3 个
-                 * FMA 端口,新式是 2 mul + 2 fma = 4 个 ⇒ **反而慢 33%**。通用循环里本来就写着
-                 * `if (mr >= 2)`,但特化 body 漏了这个条件 ⇒ 修掉它同时(a)让 `me=1` 的数值回到
-                 * 历史的 `max_rel=1.873e-02` 逐位不变,(b)去掉纯解码路径上的这个回退。 */       \
-                if constexpr (XIAOTU_MOE_FOLD_SCALE && (MRT) >= 2) {                      \
-                    const __m512 wlos = _mm512_mul_ps(wlo_, sv);                          \
-                    const __m512 whis = _mm512_mul_ps(whi_, sv);                          \
-                    for (int r = 0; r < (MRT); ++r) {                                     \
-                        acc[r][jj] = _mm512_fmadd_ps(wlos, av[r][0], acc[r][jj]);         \
-                        acc[r][jj] = _mm512_fmadd_ps(whis, av[r][1], acc[r][jj]);         \
-                    }                                                                     \
-                } else {                                                                  \
-                    for (int r = 0; r < (MRT); ++r) {                                     \
-                        __m512 d = _mm512_mul_ps(wlo_, av[r][0]);                         \
-                        d = _mm512_fmadd_ps(whi_, av[r][1], d);                           \
-                        acc[r][jj] = _mm512_fmadd_ps(d, sv, acc[r][jj]);                  \
-                    }                                                                     \
-                }                                                                         \
-            }                                                                             \
-        }                                                                                 \
-        for (int r = 0; r < (MRT); ++r)                                                   \
-            for (int jj = 0; jj < (NRT); ++jj)                                            \
-                C[(size_t)(m0 + r) * N + j0 + jj] = hsum512(acc[r][jj]) * global_scale;   \
+#define XIAOTU_TILE_BODY(MRT, NRT) \
+    { \
+        if (i8_align_ok_) { \
+            /* ⭐【方案1】整数内层:每 64 MAC = 1 条 vpdpbusd(FP0/1)+ 3 条整数口 ✓ */ \
+            __m512i acci[MRT][NRT]; \
+            for (int r_ = 0; r_ < (MRT); ++r_) \
+                for (int jj_ = 0; jj_ < (NRT); ++jj_) acci[r_][jj_] = _mm512_setzero_si512(); \
+            const __m512i ONES_ = _mm512_set1_epi8(1); \
+            const __m128i PAIR8_ = _mm_setr_epi8(0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1); \
+            const uint8_t* A8b_ = g_i8_A.data(); \
+            const uint8_t* ACb_ = g_i8_AC8.data(); \
+            const size_t  acst_ = (size_t)g_i8_gc * 8; \
+            float dw_[NRT], av_[MRT]; \
+            for (int jj_ = 0; jj_ < (NRT); ++jj_) \
+                dw_[jj_] = global_scale * g_i8_WSC[(size_t)(j0 + jj_ - g_i8_n0)]; \
+            for (int r_ = 0; r_ < (MRT); ++r_) av_[r_] = g_i8_ASCv[r_]; \
+            /* ⭐【B2】(基准实测 1.582x):jj 内层共享 a8/dpbusd;两级【预计算】移位向量,        \
+               内层无 movzxbd / 无 paddb / 无 shuffle ✓ */                                          \
+            {                                                                                        \
+                const int np2_ = group_count / 2;                                                    \
+                __m512i w64v_[NRT], ws7v_[NRT], wshv_[NRT];                                          \
+                for (int p_ = 0; p_ < np2_; ++p_) {                                                  \
+                    const int g_ = p_ * 2;                                                           \
+                    for (int jj_ = 0; jj_ < (NRT); ++jj_) {                                           \
+                        const size_t ro_ = (size_t)(j0 + jj_ - g_i8_n0);                             \
+                        w64v_[jj_] = _mm512_loadu_si512((const void*)(g_i8_W + ro_ * (size_t)K       \
+                            + (size_t)g_ * 32));                                                     \
+                        ws7v_[jj_] = _mm512_slli_epi32(_mm512_dpbusd_epi32(                          \
+                            _mm512_setzero_si512(), ONES_, w64v_[jj_]), 7);                          \
+                        (void)0;   /* P3-lite: 权重侧移位已折进 w8' */                                  \
+                            ;                                                                                 \
+                    }                                                                                 \
+                    for (int r_ = 0; r_ < (MRT); ++r_) {                                              \
+                        const __m512i a8_ = _mm512_loadu_si512(                                       \
+                            (const void*)(A8b_ + (size_t)r_ * (size_t)K + (size_t)g_ * 32));          \
+                        (void)0;   /* P3-full:无激活侧移位 */                                      \
+                            ;                                                                                 \
+                        for (int jj_ = 0; jj_ < (NRT); ++jj_) {                                       \
+                            const __m512i sg_ = _mm512_sub_epi32(_mm512_dpbusd_epi32(                \
+                                _mm512_setzero_si512(), a8_, w64v_[jj_]), ws7v_[jj_]);               \
+                            acci[r_][jj_] = _mm512_add_epi32(acci[r_][jj_],                           \
+                                sg_);   /* P3-full:内层只剩 add */   /* P3-lite: 只剩激活侧一级移位 */         \
+                        }                                                                             \
+                    }                                                                                 \
+                }                                                                                     \
+            }                                                                                         \
+            for (int r_ = 0; r_ < (MRT); ++r_) \
+                for (int jj_ = 0; jj_ < (NRT); ++jj_) \
+                    C[(size_t)(m0 + r_) * N + j0 + jj_] = \
+                        hsum512(_mm512_cvtepi32_ps(acci[r_][jj_])) * (dw_[jj_] * av_[r_]); \
+            continue; \
+        } \
+        __m512 acc[MRT][NRT]; \
+        for (int r = 0; r < (MRT); ++r) \
+            for (int jj = 0; jj < (NRT); ++jj) acc[r][jj] = _mm512_setzero_ps(); \
+        int srt[NRT]; \
+        for (int jj = 0; jj < (NRT); ++jj) srt[jj] = ((j0 + jj) / gn) * kb_stride; \
+        if (xiaotu_int8_vnni_on() && !xiaotu_int8_align_on() && (group_count % 2) == 0) { \
+            const __m512i ONES_ = _mm512_set1_epi8(1); \
+            /* ⭐ A1/A2(专家审计本轮):scale 组装 7 条 -> 5 条,FP 口占用 8 -> 4 ✓ \
+               ① 权重侧 blend 向量 wsc_ 提到 r_ 循环外(每 (jj_,g_) 一次,按 MRT 行摊薄)✓ \
+               ② 激活侧:loadl(8B = 2 个 scale)+ permutexvar({0x8,1x8})+ mulps ✓ \
+               数值:仍是【每一次 fp32 乘、同一次舍入】=> 逐位不变 ✓ */ \
+            const __m512i AS2IDX_ = _mm512_set_epi32(1,1,1,1,1,1,1,1, 0,0,0,0,0,0,0,0); \
+            const uint8_t* Ap_[MRT]; \
+            const float*   ASp_[MRT]; \
+            { const uint8_t* A8b_ = g_i8_A.data(); const float* ASb_ = g_i8_AS.data(); \
+              for (int r_ = 0; r_ < (MRT); ++r_) { \
+                  Ap_[r_]  = A8b_ + (size_t)r_ * (size_t)K; \
+                  ASp_[r_] = ASb_ + (size_t)r_ * (size_t)(K / 32); } } \
+            for (int jj_ = 0; jj_ < (NRT); ++jj_) { \
+                const int8_t* w8_ = (g_i8_W != nullptr) \
+                    ? (g_i8_W + (size_t)(j0 + jj_ - g_i8_n0) * (size_t)K) \
+                    : xiaotu_row_int8(W + (size_t)(j0 + jj_ - rowshift) * (K / 2), K); \
+                const int sr_ = srt[jj_]; \
+                for (int g_ = 0; g_ < group_count; g_ += 2) { \
+                    const __m512i w64_ = _mm512_loadu_si512((const void*)(w8_ + g_ * 32)); \
+                    const __m512i wsum_ = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ONES_, w64_); \
+                    const __m512i wsum7_ = _mm512_slli_epi32(wsum_, 7); \
+                    /* ① 权重侧 scale 的 lane 结构【只依赖 (jj_,g_)】=> 提到 r_ 循环外 ✓ */ \
+                    const __m512 wsc_ = _mm512_mask_blend_ps((__mmask16)0xFF00, \
+                        _mm512_set1_ps(row_scale(sr_, g_)), \
+                        _mm512_set1_ps(row_scale(sr_, g_ + 1))); \
+                    for (int r_ = 0; r_ < (MRT); ++r_) { \
+                        const __m512i avq_ = _mm512_loadu_si512( \
+                            (const void*)(Ap_[r_] + g_ * 32)); \
+                        const __m512i sv_ = _mm512_sub_epi32( \
+                            _mm512_dpbusd_epi32(_mm512_setzero_si512(), avq_, w64_), wsum7_); \
+                        /* ② 激活侧两个 scale:一次 8B 载入 + 一次 permutexvar => 16 lane ✓ */ \
+                        const __m512 asc_ = _mm512_permutexvar_ps(AS2IDX_, \
+                            _mm512_castsi512_ps(_mm512_zextsi128_si512( \
+                                _mm_loadl_epi64((const __m128i*)(ASp_[r_] + g_))))); \
+                        acc[r_][jj_] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sv_), \
+                            _mm512_mul_ps(wsc_, asc_), acc[r_][jj_]); \
+                    } \
+                } \
+            } \
+        } \
+        for (int g = 0; !(xiaotu_int8_vnni_on() && !xiaotu_int8_align_on() && (group_count % 2) == 0) && g < group_count; ++g) { \
+            const int base = g * 32; \
+            __m512 av[MRT][2]; \
+            for (int r = 0; r < (MRT); ++r) { \
+                const float* ap = a32 + (size_t)(m0 + r) * K + base; \
+                av[r][0] = _mm512_loadu_ps(ap); \
+                av[r][1] = _mm512_loadu_ps(ap + 16); \
+            } \
+            for (int jj = 0; jj < (NRT); ++jj) { \
+                const uint8_t* brow = W + (size_t)(j0 + jj - rowshift) * (K / 2); \
+                XIAOTU_DECODE_GROUP_AVX512(brow, g); \
+                const __m512 sv = _mm512_set1_ps(row_scale(srt[jj], g)); \
+                /* 【§637b】折 scale **只在 MRT>=2 时**才划算:`mr=1` 时旧式是 1 mul + 2 fma = 3 个 \
+                 * FMA 端口,新式是 2 mul + 2 fma = 4 个 ⇒ **反而慢 33%**。通用循环里本来就写着 \
+                 * `if (mr >= 2)`,但特化 body 漏了这个条件 ⇒ 修掉它同时(a)让 `me=1` 的数值回到 \
+                 * 历史的 `max_rel=1.873e-02` 逐位不变,(b)去掉纯解码路径上的这个回退。 */ \
+                if constexpr (XIAOTU_MOE_FOLD_SCALE && (MRT) >= 2) { \
+                    const __m512 wlos = _mm512_mul_ps(wlo_, sv); \
+                    const __m512 whis = _mm512_mul_ps(whi_, sv); \
+                    for (int r = 0; r < (MRT); ++r) { \
+                        acc[r][jj] = _mm512_fmadd_ps(wlos, av[r][0], acc[r][jj]); \
+                        acc[r][jj] = _mm512_fmadd_ps(whis, av[r][1], acc[r][jj]); \
+                    } \
+                } else { \
+                    for (int r = 0; r < (MRT); ++r) { \
+                        __m512 d = _mm512_mul_ps(wlo_, av[r][0]); \
+                        d = _mm512_fmadd_ps(whi_, av[r][1], d); \
+                        acc[r][jj] = _mm512_fmadd_ps(d, sv, acc[r][jj]); \
+                    } \
+                } \
+            } \
+        } \
+        for (int r = 0; r < (MRT); ++r) \
+            for (int jj = 0; jj < (NRT); ++jj) \
+                C[(size_t)(m0 + r) * N + j0 + jj] = hsum512(acc[r][jj]) * global_scale; \
     }
                     // 【§632】把特化从"只有 mr==MR"扩到 **所有 mr**(1/2/3/4)。
                     // 为什么:§625 只特化了满 tile,mr<MR 的**尾巴**仍走下面的通用循环,
@@ -849,11 +1366,10 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
             // 整行预取:下一行有 K/2 字节(4096 维 ⇒ 2048 B = 32 条 cache line),
             // 原实现只预取前 4 条 ⇒ 每行的前 28 条线仍要现取,worker 在行首停等
             // DRAM(实测每核只有 1.2 GB/s,而单核流式能到 36 GB/s)。
-            const int pf_rows = matmul_pf_rows();   // 【goal-B②】默认 1 = 原行为
-            const uint8_t* next_row = (j + pf_rows < n1)
-                ? W + (size_t)(j + pf_rows - rowshift) * (K / 2) : nullptr;
-            for (int pr = 1; pr <= pf_rows && j + pr < n1; ++pr) {
-                const char* nr = (const char*)(W + (size_t)(j + pr - rowshift) * (K / 2));
+            const uint8_t* next_row = (j + 1 < n1)
+                ? W + (size_t)(j + 1 - rowshift) * (K / 2) : nullptr;
+            if (j + 1 < n1) {
+                const char* nr = (const char*)(W + (size_t)(j + 1 - rowshift) * (K / 2));
                 _mm_prefetch(nr, _MM_HINT_T0);
                 _mm_prefetch(nr + 64, _MM_HINT_T0);
                 _mm_prefetch(nr + 128, _MM_HINT_T0);
@@ -1020,6 +1536,14 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
     // xiaotu's (byte = 2 consecutive K elements, low nibble = even k).
     // ----------------------------------------------------------------------
     if (FAST_FP4 && gk == 32 && (K & 31) == 0 && (size_t)M * (size_t)K <= (size_t)(4 << 20)) {
+    // ⭐【第 335 轮】int8/VNNI 门控探针(默认关 => 无行为影响)
+    //   目的:运行时确认本分支被执行(施工图见 PATCH_INT8_IN_PACKED4.md §2/§4)
+    static const bool vnni8_on = [] { const char* e = std::getenv("XIAOTU_MOE_INT8_VNNI");
+                                         return e && std::atoi(e) != 0; }();
+    if (vnni8_on) {
+        static int probe_n_0 = (fprintf(stderr, "[vnni-p4] BRANCH TAKEN #0\n"), 0);
+        (void)probe_n_0;
+    }
         const bool bp_on = byteprof_on();
         uint64_t bp_t0 = 0;
         if (bp_on) bp_t0 = std::chrono::steady_clock::now().time_since_epoch().count();
