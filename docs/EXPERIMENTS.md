@@ -10829,3 +10829,74 @@ return x.to(out_ty)
 
 **⇒ 结论一句话**:FlashInfer 在**帮我们的地方是 attention + sampling** ✓;
 **MoE 的收益在 CPU 侧(VNNI-int8 / per-32 scale / 带宽与 NUMA)** ✓ —— 与 `PLAN_VNNI_SM80.md` 的排序一致 ✓
+
+---
+
+### B325(2026-10-05)🎉 **fp8 KV 在 SM80 上跑通**(devpatch #10+#11)+ 成本账对上了 + 下一个杠杆定位
+
+#### ① 成果:fp8 KV 可用 ✓✓(这是 256K 与 MTP 的共同前置)
+| 判据 | 结果 |
+|---|---|
+| ① 引擎能起(prepare 阶段无 fp8e4nv) | ✅ `#10` 生效 |
+| ② 注意力 kernel 能编译 | ✅ `#11` 生效 |
+| ③ **真实请求 200** | ✅ 短/长 prompt 都通过,**输出连贯**(长 3565 tok / 21.11 s) |
+| ④ KV 成本 | 16 GiB ⇒ **448,921 tokens = 37.4 KiB/token**(bf16 对照 346,931 = 48.4) |
+
+`#11` 的三处改动(全在 `ops/qsa.py`,手法同 `0003`):kernel 加 `FP8_U8` constexpr,两条 `if IS_FP8:` 里先
+`_e4m3_uint8_to_f32(...)` 解码;宿主 `k_cache.dtype == torch.uint8` 也算 fp8;launch 传 `FP8_U8`;
+调用侧(`qsa.py:218-219` 的 `.view(torch.float8_e4m3fn)`)在包装层换回 uint8 ✓
+
+#### ② ⭐ 成本账(实测 + 模型维度,精确对上)
+* 模型:`48 层 = 36 linear_attention(GDN) + 12 full_attention`;主 KV:`head_dim 256 × 2 KV heads × 2(K,V) × 2 B = 2 KiB/token/层`
+* ⇒ 12 层 × 2 KiB = **24 KiB/token(bf16)**;fp8 后 **12 KiB** ⇒ 差值 `48.4−37.4 = 11 KiB` ✓ **吻合**
+* ⇒ 剩余 `37.4 − 12 = **25.4 KiB/token**` 是**侧缓存**,其中:
+  * indexer 的 compressed cache(跟 `indexer_kv_dtype` 旋钮):**实测只省 1.03×**(36.3 vs 37.4)⇒ **不是大头** ✗
+  * 且它走 fp8 时**推理 500**(自己的 logits 内核在 SM80 也要同样处理 ✗)⇒ **性价比极低,已弃** ✗
+  * ⇒ 最可能是 **36 层 GDN 的 state 缓存**:其 dtype 由 `MambaStateDtypeCalculator.gated_delta_net_state_dtype`
+    /`text_config.mamba_ssm_dtype` 决定,**与 `--kv-cache-dtype` 无关** ✗,且它按**序列**而非按 token ✗
+
+#### ③ ⇒ 下一个动作(必须先做"线性度"实验,再动手 ✗)
+⚠️ 现在**分不清**这 25.4 KiB/token 里"固定开销(state,与 token 数无关)"与"每-token 开销"各占多少 ✗
+⇒ **实验设计(2 次启动,已写死判据)**:
+| 臂 | KV_CACHE_BYTES | 判据 |
+|---|---|---|
+| A | 8 GiB | `KV cache size` tokens(与 16 GiB 一起解出斜率与截距)|
+| B | 16 GiB | 已有(448,921)✓ |
+⇒ 若为纯线性 ⇒ 固定开销 ≈ 0,25.4 KiB 是每-token 的 ⇒ 必须降 **GDN state 精度**或减小 state(改代码 ✗);
+若截距显著 ⇒ 它主要是每-序列固定开销 ⇒ 那么 **256K×N 的账要把固定项单独留出**(反而对 ×3 有利 ✓)
+⇒ 之后才决定动哪块代码(#12:GDN state 降精度,同样要 kernel 侧配合 ✗)
+
+#### ④ 结论对目标的影响
+* **256K×2**:fp8 下 KV 18.7 GiB + 非 KV 11.1 + 1 垫 = **30.8 GiB ⇒ 可行 ✓**(保守口径 40.3 仍擦边 ✗)
+* **256K×3**:28.0 GiB ⇒ 40.1 GiB **仍不行** ✗ ⇒ 只有把 25.4 KiB 那一块压下来才可能 ✓
+* 副产品:fp8 KV 下 prefill 实测约 **169 tok/s**(3565 tok / 21.11 s),比 bf16 的 ~497 慢 —— **待复核**
+  (样本只 1 次、且含首次预热;也可能是 fp8 解码开销 ⇒ 下一批顺手测)
+
+---
+
+### B320(2026-10-05)架构核实:**Python 编排 + C++/ISA 内核**;上游 CPU MoE 的主力是 **Intel AMX**(本机 EPYC 走不了 ✗)
+
+**问题(用户)**:① Python 是否只负责编排调度,核心计算在 C++/asm/CUDA?② 上游的 CPU 计算引擎是什么? ✓
+
+**① 分层实况(两边对照)**
+| 层 | 做什么 | 本仓 | 上游 vLLM |
+|---|---|---|---|
+| **Python** | 调度/编排/形状/分块/**专家映射与路由组合**/量化格式选择 ✓ | `mixed_experts.py`(2000+ 行 ✓)| `fused_moe/experts/cpu_moe.py`(**1859 行** ✓)|
+| **CPU 计算内核** | 真正的 GEMM / 激活 / 量化 ✓ | ⭐ **自研 C++ + AVX-512 intrinsics**(`_mm512_*` 见于 5 文件 ✓;⚠️ **源码里没有字面 `vpdpbusd`** ✗ ⇒ VNNI 由**内建函数/`-march` 代码生成**提供 ✓)| ⭐ **`vllm._custom_ops`(C++ 扩展)** 或 **PyTorch ATen** |
+| **GPU 计算** | CUDA ✓ | FlashInfer + 自研 ✓ | CUDA / FlashInfer / CUTLASS ✓ |
+⚠️ **精确一点**:Python 里也含**真算法**(路由/分块/专家映射 ✓),不是纯胶水 ✗
+
+**② ⭐ 上游 CPU MoE 是【两条互不相同的路】**
+| 上游文件 | 底层引擎 | 在 EPYC 9654 上可用? |
+|---|---|---|
+| **`cpu_moe.py`**(dense/bf16/fp8 ✓)| ⭐ **vLLM 自研 C++ 扩展 `_custom_ops` + Intel AMX**(`cpu_has_amx_fp8` ✓;AMD 另有 **ZenDNN** 分支 ✓)| ⭐ **AMX 是 Intel 专属** ✗ ⇒ **本机不可用** ✓(`/proc/cpuinfo` 无 amx 标志 ✓)|
+| **`cpu_int4_moe.py`**(4-bit ✓)| ⭐ **PyTorch 原生 ATen `aten._dyn_quant_matmul_4bit` / `_dyn_quant_pack_4bit_weight`** ✓(带 torch 版本检查 ✓)| ✅ 可用(受 torch 版本约束 ✓)|
+
+**③ 我们的位置(15 个 ISA 变体 ✓)**
+`.so` 变体:`scalar` / `avx2` / `avx512_base` / `avx512_bf16` / **`avx512_vnni`** / 10 个 `avx512_bf16_vbmi_*` 调优变体 ✓
+⇒ ⭐ **⇒ 我们走的是"AMD Zen4 友好"的第三条路** ✓(AVX-512 + VNNI,无 AMX ✓)
+
+**⇒ 结论(与 `PLAN_VNNI_SM80.md` 呼应)**
+1. ⭐ **上游的 CPU MoE 主力(AMX C++)在 AMD 上不可用** ✗ ⇒ **我们的 VNNI 路在本机是必然选择,且是差异化** ✓✓
+2. ⭐ ⇒ **这正是可以提给上游的方向**:一个 **AMD/Zen4 友好的 CPU MoE 后端**(VNNI-int8 / per-32 scale ✓)
+3. ⭐ **值得对标的免费基线**:`aten._dyn_quant_matmul_4bit`(PyTorch 原生 4-bit ✓)—— 我们做 A/B 时应把它算作一条臂 ✓
