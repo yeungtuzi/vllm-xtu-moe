@@ -121,11 +121,23 @@ VARIANTS=(
   "avx512_vnni|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mfma"
   "avx512_bf16|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mfma"
   "avx512_bf16_vbmi|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mfma"
+  # 【W4A8 / int8 激活】bf16 + vbmi + vnni：承载 int8 激活路径（`_mm512_dpbusd_epi32` 需要 `-mavx512vnni`）。
+  # ⚠️ 这一档**故意不进 `loader._LADDER`**：用 `XIAOTU_MOE_VARIANT=avx512_bf16_vbmi_vnni` 显式选，
+  #    以免"合并即改变生产默认路径"（见 dev-docs/mywork/DECISIONS.md **D11**）✓
+  "avx512_bf16_vbmi_vnni|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mavx512vnni -mfma"
 )
+
+# 【dev 便利】`ONLY=<空格分隔的变体名>` ⇒ 只构建列出的变体（默认全建）。
+# 用途：快速迭代单个变体，避免每次都把 6 档全编一遍（每次构建都是几分钟）。
+ONLY="${ONLY:-}"
 
 for entry in "${VARIANTS[@]}"; do
   name="${entry%%|*}"
   flags="${entry#*|}"
+  if [[ -n "$ONLY" && " $ONLY " != *" $name "* ]]; then
+    echo ">> skip variant [$name] (ONLY=$ONLY)"
+    continue
+  fi
   mod="_xiaotu_moe_C_${name}"
   OUT="$OUT_DIR/${mod}${PY_EXT}"
   echo ">> Building variant [$name] -> $OUT"
