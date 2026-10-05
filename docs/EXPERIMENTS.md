@@ -10933,3 +10933,51 @@ aten::_dyn_quant_matmul_4bit(Tensor inp, Tensor packed_weights, int block_size, 
    ② **给上游 PR 的证据**("原生 int4 = X,我们的精确 int8 = Y" ✓)
 3. ⚠️ **未查证(不写结论)**:是否存在**原生 int4 点积**的硬件支持 ⇒ VNNI 是 **int8×int8** ✓;
    `int4` 在我们源码里只出现 6 次 ⇒ **支持很边缘** ✓
+
+---
+
+### B322(2026-10-05)路线图核实:**4-bit 的行业定调是 FP4(MXFP4);int4 仍在,但多在"emulation"里** ⇒ 我们的格式是朝前的 ✓
+
+**用户怀疑**:"我很怀疑有硬件去支持 int4 而不是 fp4" ✓ ⇒ **基本成立** ✓
+
+**① 本地最诚实的证据:vLLM 自己给这些后端起的名字**
+```
+mxfp8_native_moe.py        ← "native"
+int4_emulation_moe.py      ← "emulation" ✗
+nvfp4_emulation_moe.py     ← "emulation" ✗
+mxfp8_emulation_moe.py     ← "emulation" ✗
+ocp_mx_emulation_moe.py    ← "emulation" ✗
+trtllm_mxfp4_moe.py / trtllm_nvfp4_moe.py / trtllm_mxint4_moe.py    ← TRT-LLM 系(Blackwell 级)
+aiter_mxfp4_w4a8_moe.py / aiter_mxfp4_w4a16_moe.py                  ← AMD AITER 系(FP4 权重!)
+```
+⭐ **⇒ `int4` 出现在"emulation"里;而 FP4(MXFP4/NVFP4)有 native/厂商 kernel** ✓
+
+**② 原生 FP4 的算力门槛(vLLM 源码实证)**
+`deep_gemm_moe.py`:**"available on Blackwell (SM100)"** ✓、`is_device_capability_family(100)` ✓、
+注释:**"GPUs (SM100 datacenter or SM120 consumer)"** ✓ ⇒ **原生 FP4 = SM100/SM120** ✓
+
+**③ 本机实测(决定一切)**
+| | 值 |
+|---|---|
+| GPU | **A100-PCIE-40GB,compute cap = 8.0(SM80)** ×3 ✓ ⇒ **无原生 FP4** ✗ |
+| CPU | `avx512_vnni` ✓ `avx512_bf16` ✓ `avx512vbmi` ✓ …;**`amx` 出现 0 次** ✓ ⇒ **无 AMX** ✗ |
+
+**④ 行业侧(带出处,但**未做逐厂商逐代完整表** ⚠️)**
+* ⭐ **OCP Microscaling(MX)标准**把 4-bit 定义为 **MXFP4(E2M1 + E8M0 块 scale)** ✓
+  —— **与我们 ds41f 的 `expert_dtype: fp4` + `scale_fmt: ue8m0` + `block [32,32]` 完全一致** ✓✓
+* **NVIDIA**:FP4 自 Blackwell(SM100)原生 ✓;**INT4 tensor core 是 Turing 时代(T4)的老路径** ✓
+* **AMD**:**MI355X 明确宣传 FP4** ✓
+* **Intel**:AMX-**INT8** / AMX-BF16 / AMX-FP16 在 Xeon 上 ✓(**本机 Zen4 无 AMX** ✗)
+
+**⇒ 结论(三层)**
+1. ⭐ **模型格式之争已定调为 FP4(MXFP4)** ✓ ⇒ **我们的 ds41f 格式是对且朝前的** ✓✓
+2. ⭐ **int4 依然存在**,但主要在:移动/边缘 ✓、TRT-LLM `mxint4` ✓、vLLM 的 **`int4_emulation`** ✓
+   ⇒ ⚠️ **注意"emulation"这个词** —— **它不是硬件原生能力** ✓
+3. ⭐⭐ **我们的硬件(int4 与 fp4)两者皆无原生** ✗ ⇒ **问题对我们不存在** ✓
+   ⇒ **⇒ 必须把 4-bit 映射到别的单元 ⇒ 我们的 `MXFP4 → 精确 int8(×2) + VNNI` 正好两全:**语义不变 + 用上 int8 单元 ✓✓
+4. ⚠️ **未取证、故不写结论**:"未来 Intel CPU / 未来 NVIDIA 消费卡是否上 FP4"等**前瞻** ✗
+
+**出处**:[OCP MX 规范](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)、
+[AMD MI355X](https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html)、
+[NVIDIA T4 数据表(INT4 时代)](https://www.ctc-g.co.jp/solutions/nvidia/nvidiadgx/document/nvidia-t4-datasheet-a4-nvidia-772234-r14-jp.pdf)、
+[Blackwell Ultra INT8 审计(arXiv)](https://arxiv.org/abs/2608.11693)
