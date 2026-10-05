@@ -174,6 +174,12 @@ not published with this repository** (they exist only in the local working copy)
 
 ---
 
+## About the author
+
+Independent researcher. Chief designer and operator of a **10-PFLOP/s (double-precision) supercomputer**, with a background in high-performance computing.
+
+That is where this project's priorities come from: **NUMA topology and memory layout, bandwidth-bound kernels, and host-side data movement** - which is exactly where running giant MoE models on ordinary servers is decided today.
+
 ## Acknowledgements
 
 This project was inspired by **KTransformers** and **Lvllm**. In particular the compute engine
