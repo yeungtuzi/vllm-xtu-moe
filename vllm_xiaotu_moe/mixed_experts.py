@@ -2095,6 +2095,38 @@ class _XiaotuExpertsMixin:
                 and not getattr(self, "_dumped", False):
             self._dumped = True
             self._dump_layer(layer)
+        # ⭐ dev-only (T1.2):把【真实 MoE 输入激活】存档,供离线数值对拍用 ✓
+        #   `XIAOTU_ACT_DUMP=<目录>`(+ 可选 `XIAOTU_ACT_DUMP_LAYER=<layer_name 子串>`)⇒ 每层一次。
+        #   存 {h[M,H] bf16, ids[M,topk] int32, wts[M,topk] fp32, layer} —— 与 dev-docs/mywork/artifacts/ 的旧 dump 同格式 ✓
+        _act_dump_dir = os.environ.get("XIAOTU_ACT_DUMP", "")
+        if _act_dump_dir and not _ACT_DUMP_DONE[0]:
+            _act_dump_layer = os.environ.get("XIAOTU_ACT_DUMP_LAYER", "")
+            if not _act_dump_layer or _act_dump_layer in getattr(layer, "layer_name", ""):
+                try:
+                    import torch as _t
+
+                    os.makedirs(_act_dump_dir, exist_ok=True)
+                    _lname = getattr(layer, "layer_name", "layer").replace("/", "_")
+                    _p = os.path.join(_act_dump_dir, f"act_{_lname}.pt")
+                    _t.save(
+                        {
+                            "h": h_bf16.detach().to("cpu"),
+                            "ids": ids_i32.detach().to("cpu"),
+                            "wts": wts_f32.detach().to("cpu"),
+                            "layer": getattr(layer, "layer_name", "?"),
+                        },
+                        _p,
+                    )
+                    # ⚠️ 标记必须放在【模块级】：`self` 是**逐层**的 MoE 实例 ⇒ 放在 self 上会
+                    #    "每层各存一份"（2026-10-05 实测因此产生 48 个文件 ✗）
+                    _ACT_DUMP_DONE[0] = True
+                    print(
+                        f"[act-dump] saved {_p} layer={getattr(layer, 'layer_name', '?')} "
+                        f"M={int(h_bf16.shape[0])} H={int(h_bf16.shape[1])} topk={int(ids_i32.shape[1])}",
+                        flush=True,
+                    )
+                except Exception as _e:  # 绝不让 dev 钩子影响服务 ✓
+                    print(f"[act-dump] FAILED: {type(_e).__name__}: {_e}", flush=True)
         if _VERIFY_LAYER and getattr(self, "_verified_n", 0) < _VERIFY_MAX:
             # 跳过 profile/warmup 等路由 id 无效的调用(此时 topk_ids 为 -1 哨兵)
             if bool((ids_i32 >= 0).all()):

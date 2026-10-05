@@ -38,6 +38,35 @@
 #include "../kernels/bf16_gemm.hpp"
 
 // ---------------------------------------------------------------------------
+// 【W4A8 集成 · ISA 可移植性】`XIAOTU_DPBUSD`：`vpdpbusd` 的可用性封装 ✓
+//
+// 背景：int8 激活路径的内层用 `_mm512_dpbusd_epi32`（= AVX512-VNNI 的 `vpdpbusd`），
+// 而**该内建只在带 `-mavx512vnni` 编译的 TU 里可内联**。我们**同时**要保留
+// `avx512_bf16_vbmi` 这一档（生产当前跑的就是它，见 dev-docs/mywork/T1.1_*.md），
+// 它**没有** `-mavx512vnni` ⇒ 若不做封装，整个引擎在那一档上**编译失败** ✗
+// （实测：`error: inlining failed in call to 'always_inline' '_mm512_dpbusd_epi32' :
+//   target specific option mismatch`）。
+//
+// 处理：启用 VNNI 时直接用内建；否则退到 `pmaddubsw + pmaddwd` 的**等价实现** ✓
+//   `_mm512_maddubs_epi16(a,b)`：a 按 **无符号** 字节、b 按 **有符号** 字节，成对求和到 int16
+//   `_mm512_madd_epi16(x, 1)`：相邻两个 int16 相加到 int32
+//   ⇒ 与 `dpbusd` 的语义一致（u8×s8 乘积、每 4 个字节累加进一个 int32 通道）✓
+//
+// ⚠️ **等价性前提（必须与门控条件一起成立）**：`maddubs` 会**饱和**到 int16，
+//   只有当"一对乘积之和 ≤ 32767"时才与 dpbusd 完全等价。本文件的门控已保证
+//   `g_i8_wtmax <= 3`（权重侧移位 d ≤ 3 ⇒ |w8'| ≤ 12·2³ = 96）且激活 |a8| ≤ 127
+//   ⇒ 每对 ≤ 2 × 96 × 127 = **24384 < 32767** ✓ 不会饱和 ⇒ **回落路径也是精确的** ✓
+//   （回落只在"没有 VNNI 指令"的 TU + "门控打开"时才可能被走到；门控默认关 ✓）
+// ---------------------------------------------------------------------------
+#if defined(__AVX512VNNI__)
+#  define XIAOTU_DPBUSD(acc, a, b) _mm512_dpbusd_epi32((acc), (a), (b))
+#else
+#  define XIAOTU_DPBUSD(acc, a, b) \
+      _mm512_add_epi32((acc), \
+          _mm512_madd_epi16(_mm512_maddubs_epi16((a), (b)), _mm512_set1_epi16(1)))
+#endif
+
+// ---------------------------------------------------------------------------
 // 【§631】`XIAOTU_MOE_FOLD_SCALE`:把每 (输出列 j, K 组 g) 的 scale **折到权重侧**。
 //
 // 旧式(默认 0,数值与历史逐位一致):
@@ -1169,7 +1198,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                         const size_t ro_ = (size_t)(j0 + jj_ - g_i8_n0);                             \
                         w64v_[jj_] = _mm512_loadu_si512((const void*)(g_i8_W + ro_ * (size_t)K       \
                             + (size_t)g_ * 32));                                                     \
-                        ws7v_[jj_] = _mm512_slli_epi32(_mm512_dpbusd_epi32(                          \
+                        ws7v_[jj_] = _mm512_slli_epi32(XIAOTU_DPBUSD(                          \
                             _mm512_setzero_si512(), ONES_, w64v_[jj_]), 7);                          \
                         (void)0;   /* P3-lite: 权重侧移位已折进 w8' */                                  \
                             ;                                                                                 \
@@ -1180,7 +1209,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                         (void)0;   /* P3-full:无激活侧移位 */                                      \
                             ;                                                                                 \
                         for (int jj_ = 0; jj_ < (NRT); ++jj_) {                                       \
-                            const __m512i sg_ = _mm512_sub_epi32(_mm512_dpbusd_epi32(                \
+                            const __m512i sg_ = _mm512_sub_epi32(XIAOTU_DPBUSD(                \
                                 _mm512_setzero_si512(), a8_, w64v_[jj_]), ws7v_[jj_]);               \
                             acci[r_][jj_] = _mm512_add_epi32(acci[r_][jj_],                           \
                                 sg_);   /* P3-full:内层只剩 add */   /* P3-lite: 只剩激活侧一级移位 */         \
@@ -1219,7 +1248,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 const int sr_ = srt[jj_]; \
                 for (int g_ = 0; g_ < group_count; g_ += 2) { \
                     const __m512i w64_ = _mm512_loadu_si512((const void*)(w8_ + g_ * 32)); \
-                    const __m512i wsum_ = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ONES_, w64_); \
+                    const __m512i wsum_ = XIAOTU_DPBUSD(_mm512_setzero_si512(), ONES_, w64_); \
                     const __m512i wsum7_ = _mm512_slli_epi32(wsum_, 7); \
                     /* ① 权重侧 scale 的 lane 结构【只依赖 (jj_,g_)】=> 提到 r_ 循环外 ✓ */ \
                     const __m512 wsc_ = _mm512_mask_blend_ps((__mmask16)0xFF00, \
@@ -1229,7 +1258,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                         const __m512i avq_ = _mm512_loadu_si512( \
                             (const void*)(Ap_[r_] + g_ * 32)); \
                         const __m512i sv_ = _mm512_sub_epi32( \
-                            _mm512_dpbusd_epi32(_mm512_setzero_si512(), avq_, w64_), wsum7_); \
+                            XIAOTU_DPBUSD(_mm512_setzero_si512(), avq_, w64_), wsum7_); \
                         /* ② 激活侧两个 scale:一次 8B 载入 + 一次 permutexvar => 16 lane ✓ */ \
                         const __m512 asc_ = _mm512_permutexvar_ps(AS2IDX_, \
                             _mm512_castsi512_ps(_mm512_zextsi128_si512( \
