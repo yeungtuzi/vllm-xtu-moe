@@ -448,6 +448,8 @@ fi
     $( [ -n "$HF_OVERRIDES" ] && printf -- '--hf-overrides %s' "${HF_OVERRIDES// /}" ) \
     $( [ -n "$TOOL_PARSER" ] && printf -- '--enable-auto-tool-choice --tool-call-parser %s' "$TOOL_PARSER" ) \
     $( [ -n "$REASONING_PARSER" ] && printf -- '--reasoning-parser %s' "$REASONING_PARSER" ) \
+    $( [ -n "${GENERATION_CONFIG:-}" ] && printf -- '--generation-config %s' "$GENERATION_CONFIG" ) \
+    $( [ -n "${OVERRIDE_GEN_CFG:-}" ] && printf -- '--override-generation-config %s' "${OVERRIDE_GEN_CFG// /}" ) \
     $( [ -n "$DEFAULT_CHAT_KWARGS" ] && printf -- '--default-chat-template-kwargs %s' "${DEFAULT_CHAT_KWARGS// /}" ) \
     $( [ "$KV_DTYPE" != "auto" ] && printf -- '--kv-cache-dtype %s' "$KV_DTYPE" ) \
     $( [ "$LMCACHE" = "1" ] && echo --enable-prefix-caching ) \
