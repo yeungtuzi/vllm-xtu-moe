@@ -103,6 +103,10 @@ def _lt_record(pre_ms: float, eng_ms: float, post_ms: float, name: str = "") -> 
 _VERIFY_LAYER = os.environ.get("XIAOTU_VERIFY_LAYER", "") == "1"
 _VERIFY_MAX = int(os.environ.get("XIAOTU_VERIFY_MAX", "1"))
 _DUMP_LAYER = os.environ.get("XIAOTU_DUMP_LAYER", "")
+# ⭐【T1.4】W4A8（int8 激活）派发总开关：**默认关** ✓
+#   置 1 ⇒ 插件**按权重格式自动派发**（MXFP4 + 块 32 ⇒ int8/ALIGN 路径；FP8/BF16 ⇒ 原路径）✓
+#   默认关的原因：换成 int8 计算必须先过**三项语义验收**（`DECISIONS.md` **D13**）✓
+_W4A8_ENABLE = os.environ.get("XIAOTU_MOE_W4A8", "0") == "1"
 _HID_LAYER = os.environ.get("XIAOTU_HID_LAYER", "")
 
 
@@ -1133,6 +1137,18 @@ class _XiaotuExpertsMixin:
         cfg.use_gpu_prefill = False
         cfg.groupN = int(self._group_n)
         cfg.groupK = int(self._group_k)
+        # ⭐【T1.4 格式感知派发】按**权重格式**决定 W4A8(int8 激活)路径的模式 ✓
+        #   * **MXFP4**（本文件的类文档：groupN=1 / groupK=32 / u8 nibble + **e8m0** ✓）
+        #     ⇒ 候选 **1 = ALIGN int8**：权重侧 fp4×2 是**逐位精确**的整数 ⇒ 语义不变 ✓
+        #   * **FP8 / BF16 / WNA16** ⇒ **0**，各自走原路径 ✗（浮点→int8 是**有损转换** ✓）
+        #   ⚠️ **默认仍然关**（`XIAOTU_MOE_W4A8=1` 才生效）—— 因为"换成 int8 计算"要等
+        #      **三项语义验收**（GSM8K 198~199/200 · Vision 23/23 · 1M 四针一致）通过后才能默认开 ✓
+        #   ⚠️ 仅对带 `-mavx512vnni` 构建的档生效（非 VNNI 档该路径不参与编译 ✓）；
+        #      且 env `XIAOTU_MOE_INT8_ALIGN/_VNNI` 仍可**强制覆盖**，供 dev A/B ✓
+        if _W4A8_ENABLE and self._engine_attr == "MOE_MXFP4" and int(self._group_k) == 32:
+            cfg.int8_activation = 1
+        else:
+            cfg.int8_activation = 0
         engine_cls = getattr(xiaotu_moe, self._engine_attr)
         # 【诊断·NOTES §484】ctor 只拿到 **裸 data_ptr**,而 shard_fill 会在里面按
         # cfg 推出来的几何 memcpy;DSpark 的 draft 层让这个 memcpy 读到了映射尽头

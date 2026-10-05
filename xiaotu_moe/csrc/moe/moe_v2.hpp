@@ -143,6 +143,11 @@ struct MOEConfigV2 {
     float swiglu_limit = 0.f;   // clamp on both gate (max) and up (+-), 0=off
     int   activation_type = 0;  // 0=plain gated SiLU, 1=clamped SwiGLU
     bool  use_gpu_prefill = false;
+    // 【T1.4 格式感知派发】W4A8（int8 激活）路径模式：0=关（**默认，零回归** ✓）、
+    //   1=ALIGN int8、2=旧 VNNI int8。插件按**权重格式**设置（MXFP4+E8M0 ⇒ 1；FP8/BF16 ⇒ 0 ✓）。
+    //   引擎构造时写进 `xiaotu_int8_mode.h` 的进程级变量；env（`XIAOTU_MOE_INT8_*`）仍可强制打开 ✓
+    //   ⚠️ 仅对带 `-mavx512vnni` 的档生效（其它档该路径不被编译进来 ✓）
+    int   int8_activation = 0;
 };
 
 namespace act {

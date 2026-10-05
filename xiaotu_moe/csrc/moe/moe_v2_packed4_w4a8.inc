@@ -37,6 +37,9 @@
 
 #include "../kernels/bf16_gemm.hpp"
 
+// 【T1.4】W4A8 模式存取（进程级）。**自带本 include** ⇒ 该实现文件在任何 TU 里都自洽 ✓
+#include "xiaotu_int8_mode.h"
+
 // ---------------------------------------------------------------------------
 // 【W4A8 集成 · ISA 可移植性】`XIAOTU_DPBUSD`：`vpdpbusd` 的可用性封装 ✓
 //
@@ -358,11 +361,16 @@ static inline const float* e8m0_table() {
 //   原来放在 inline 函数里的 `static const bool` 会生成【线程安全初始化守卫】
 //   (__cxa_guard_acquire ⇒ 原子读)⇒ 在每个 tile 被调用(百万次)⇒ 跨线程原子争用 ✗✗
 //   与刚找到的 atomic 计数器【同一类 bug】✓
-namespace { const bool g_vnni8_on = [] {
+namespace { const bool g_vnni8_env = [] {
     const char* e = std::getenv("XIAOTU_MOE_INT8_VNNI");
     return e && std::atoi(e) != 0;
 }(); }
-static inline bool xiaotu_int8_vnni_on() { return g_vnni8_on; }   // 无 guard ✓
+// 【T1.4 格式感知派发】env **或** cfg 派发（`activation()==2` = 旧 VNNI int8 路径 ✓）
+//   ⚠️ 必须保持"**无函数内 static**"⇒ 不引入线程安全初始化守卫
+//      （本文件第 353–360 行记录过该教训：守卫 = 每次调用一次原子读 ⇒ 百万次 tile 上跨线程争用 ✗）
+static inline bool xiaotu_int8_vnni_on() {
+    return g_vnni8_env || xiaotu_int8::activation() == 2;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ⭐⭐【W4A8 方案1:整数内层(每 64 MAC 只占 1 个 FP0/1 槽)】(第 393 轮)
@@ -401,11 +409,15 @@ static inline bool xiaotu_int8_vnni_on() { return g_vnni8_on; }   // 无 guard �
 //   门控:XIAOTU_MOE_INT8_ALIGN=1 才走本分支;旧 XIAOTU_MOE_INT8_VNNI 路径【一字未改】✓
 //         两个 env 都不设 ⇒ 与基线【逐字相同】✓
 // ═══════════════════════════════════════════════════════════════════════════
-namespace { const bool g_align8_on = [] {
+namespace { const bool g_align8_env = [] {
     const char* e = std::getenv("XIAOTU_MOE_INT8_ALIGN");
     return e && std::atoi(e) != 0;
 }(); }
-static inline bool xiaotu_int8_align_on() { return g_align8_on; }
+// 【T1.4 格式感知派发】env **或** cfg 派发（`activation()==1` = ALIGN int8 路径 ✓）
+//   同样保持无函数内 static（见上一条注释 ✓）
+static inline bool xiaotu_int8_align_on() {
+    return g_align8_env || xiaotu_int8::activation() == 1;
+}
 
 #define XIAOTU_I8_OFF_MIN  (-24)  /* off = cmin + emin - 128 下限(acc ≈ 真值·2^-off,越负越险 ✓) */
 #define XIAOTU_I8_SHTOT_MAX 30    /* actmax + wtmax 上限(保证移位 <31 且字节相加不回绕 ✓) */
