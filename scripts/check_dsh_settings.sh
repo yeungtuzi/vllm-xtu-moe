@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 检查 DSH 设置里"本地端点 + 官方端点都可用"所必需的字段(B160/B214/B224 几个坑)
+# 检查 DSH 设置里"本地端点 + 官方端点都可用"所必需的字段(B160/B214/B24 几个坑)
 # 用法: bash scripts/check_dsh_settings.sh
 #
 # ⚠️ 2026-10-05 起【权威层变了】:dsh 启动时会把旧的 ~/.dsh/settings.yaml
@@ -72,7 +72,7 @@ chk("agent-default-model", bool(ad.get("provider")) and bool(ad.get("model")), "
 print("  --- 官方端点(llm-deepseek)---")
 b=str(ld.get("baseURL") or "")
 chk("baseURL 走 Anthropic 协议", b.rstrip("/").endswith("/anthropic"),
-    "B224: dsh 2.0 的 Messages 路径是 <base>/anthropic/v1/messages;裸域名 ⇒ /v1/messages ⇒ 404 ✗  (当前=%s)"%(b or "<未设置:用内置缺省 PUBLIC_BASE_URL>"))
-print("  ⇒ %s"%("全部通过 ✓" if ok else "有缺失 ✗ ⇒ 按 B160/B214/B224 补齐;patch 层是 watch 的,外部编辑约 2s 热生效 ✓"))
+    "B24: dsh 2.0 的 Messages 路径是 <base>/anthropic/v1/messages;裸域名 ⇒ /v1/messages ⇒ 404 ✗  (当前=%s)"%(b or "<未设置:用内置缺省 PUBLIC_BASE_URL>"))
+print("  ⇒ %s"%("全部通过 ✓" if ok else "有缺失 ✗ ⇒ 按 B160/B214/B24 补齐;patch 层是 watch 的,外部编辑约 2s 热生效 ✓"))
 sys.exit(0 if ok else 1)
 PY

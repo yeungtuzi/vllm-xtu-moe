@@ -10409,3 +10409,29 @@ block 策略时在 `create_weights` 里**按检查点的名字**注册,并把"�
 | 1 | `REASONING_PARSER=deepseek_v41` 跑一臂 | 启动日志里那条警告**是否消失** ✓ |
 | 2 | `--override-generation-config '{"repetition_penalty":1.1}'` | 重复退化**是否减少** ✓ |
 | 3 | (记录)客户端侧:temperature/新会话 | 零成本,用户可自行试 ✓ |
+
+---
+
+### B317(2026-10-05)⭐ **思考强度的档位—代价实测:同一题 low=8.5s vs high=53s(6×);`Off` 确实生效**
+
+**背景**:DSH 的"思考强度"下拉出现 7 档(`Default/Off/Minimal/Low/Medium/High/Xhigh/Max`)✓
+用户问"这对吗" ✓ ⇒ 实测其中 4 档(同一道简单题:17 只羊,只给答案 ✓)
+
+| 发出的 `reasoning_effort` | `reasoning` 长度 | `content` | 用时 |
+|---|---:|---:|---:|
+| **`none`**(UI 的 **Off**)| **1 字符(≈空 ✓)** | 0 | **6.9 s** |
+| `low`(UI 的 Minimal/Low)| 93 字符 | 2 | **8.5 s** |
+| `high`(UI 的 Medium/High)| 79 字符 | 2 | ⚠️ **53.0 s** |
+| `max`(UI 的 Max)| 151 字符 | 2 | **40.8 s** |
+
+**⇒ 三条结论**
+1. ✅ **7 档是对的** ✓:DSH 的 `reasoningEfforts` 映射把 UI 档位翻译成模型**接受**的值 ✓
+   ⇒ `Minimal→low`、`Medium→high` ⇒ **实际只有 5 种效果**(冗余但无害 ✓)
+2. ⭐ **`Off` 确实生效** ✓:`none` 时 `reasoning` 只有 **1 字符** ✓(此前"仍有 70 字符"的读数是小 `max_tokens` 截断所致 ✗)
+3. ⭐⭐ **档位对耗时的杠杆极大**(同题 **8.5s → 53s = 6×** ✗)⇒ ⇒ **长对话若挂在 `High`/`Max`,
+   每轮光思考就几十秒** ✓ ⇒ 用户看到的"吞吐塌陷(0.4 tok/s)"里**有相当一部分就是这个** ✓
+   ⇒ **建议**:长会话/易打转任务用 `Low`/`Medium` ✓,需要深推理时才上 `High`/`Max` ✓
+
+**⚠️ 附:模型只接受 4 档 + 整数**(见 BUG_REGISTRY B23)
+`low / high / xhigh / max` 或 **整数 [1,10]** ✓;`medium`、`minimal` **直接 400** ✗
+⇒ **不要绕过 DSH 的映射直接发** ✓
