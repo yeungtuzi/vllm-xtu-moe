@@ -42,11 +42,6 @@ WITH_MONITORING="${WITH_MONITORING:-1}"
 # ───────── 参数(唯一真源 ✓;改这里就够)─────────
 VLLM_ENV=(
   LMCACHE="${LMCACHE:-1}"   # 【2026-10-05 修】原来硬编码 ⇒ 覆盖外部 env,令 LMCACHE=0 的 A/B 从未生效 ✗
-  # 【2026-10-05】官方 API 自带采样默认,我们一个都没有 ⇒ 退化时无人兜底 ✗
-  # 只覆盖【客户端通常不传】的字段(请求里显式传的值仍优先 ✓):repetition_penalty / min_p
-  # 原因:实测退化时 acceptance=6.00(满格)而吞吐 0.4 tok/s ⇒ 需要惩罚来打断自我强化 ✓
-  GENERATION_CONFIG="${GENERATION_CONFIG:-auto}"
-  OVERRIDE_GEN_CFG="${OVERRIDE_GEN_CFG:-{\"repetition_penalty\":1.1,\"min_p\":0.05}}"
   MM_IMAGES="${MM_IMAGES:-4}"   # 【2026-10-05】用户被 400 挡住(历史里的图被数成超限)⇒ 提到 4 解阻塞;代价:多图一起过编码器 ⇒ 首 token 慢
   MAXLEN=1048576
   MBT=8192
