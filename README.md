@@ -29,6 +29,22 @@
 
 ---
 
+> [!WARNING]
+> ## ⚠️ 请勿开启 LMCache(已知恶性问题)
+>
+> **本项目已默认关闭 LMCache**(`LMCACHE=0`,且不启动 `lmcache_server`)。原因:
+>
+> * 🔴 **长 prompt 会让整个引擎崩掉**:一次大请求即可触发
+>   `KV connector reported block-level load failures (invalid_block_ids)` ⇒ `EngineDeadError`
+>   ⇒ **所有会话一起断**(我们实测:同一 78 万 token 请求,开 LMCache 两次都崩;
+>   关掉后 20 万 token 请求 200 通过、GPU 预填从 0 次恢复到 686 次)。
+> * 🔴 **与输出退化(重复、意图漂移、写错路径)高度相关**,且与上游多条未修完的 issue 吻合。
+> * ✅ **关掉还有额外收益**:GPU 省 **0.85 GiB**、宿主省 **~65 GiB** RSS,且 **GPU 预填恢复工作**。
+>
+> **完整证据、上游 issue 清单、关闭/回滚方法见
+> [`docs/KNOWN_ISSUES_LMCACHE.md`](docs/KNOWN_ISSUES_LMCACHE.md)。**
+> **在上游修复前,请勿在生产启用** —— 下文凡提到 LMCache 的段落均**仅作历史记录**。
+
 ## 项目特色
 
 1. 任意 MoE 模型:不绑死某一代架构。已跑通 DeepSeek-V4 / V4.1 系列、
@@ -98,6 +114,11 @@ GLM / DeepSeek-V4.1 未开投机解码（random 数据集对投机是最坏情�
 
 
 ## 持久化输入缓存(LMCache,SSD)
+
+> 🔴 **【不推荐 / 已知恶性问题】本节仅作历史记录** —— 见上文警示与
+> [`docs/KNOWN_ISSUES_LMCACHE.md`](docs/KNOWN_ISSUES_LMCACHE.md):
+> LMCache 会导致**长 prompt 崩溃**与**输出退化**;本项目已默认 `LMCACHE=0`。
+> 下列数字是**当时**测得的能力,不代表现在推荐这样部署。
 
 服务重启后仍能复用巨大重复前缀(不再重新 prefill):
 

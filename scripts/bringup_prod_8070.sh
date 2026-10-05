@@ -41,19 +41,38 @@ WITH_MONITORING="${WITH_MONITORING:-1}"
 
 # ───────── 参数(唯一真源 ✓;改这里就够)─────────
 VLLM_ENV=(
-  LMCACHE="${LMCACHE:-1}"   # 【2026-10-05 修】原来硬编码 ⇒ 覆盖外部 env,令 LMCACHE=0 的 A/B 从未生效 ✗
+  LMCACHE="${LMCACHE:-0}"   # ⭐ 2026-10-05 目标①:默认关闭 LMCache 连接器
+  #   依据:SPEC=0 两次大请求崩溃栈均为 LMCache(retrieve 失败 ⇒ invalid_block_ids ⇒ scheduler 抛)✗
+  #   ⇒ 先验证"无 LMCache 时 long prefill 是否稳定" ✓   # 【2026-10-05 修】原来硬编码 ⇒ 覆盖外部 env,令 LMCACHE=0 的 A/B 从未生效 ✗
   MM_IMAGES="${MM_IMAGES:-4}"   # 【2026-10-05】用户被 400 挡住(历史里的图被数成超限)⇒ 提到 4 解阻塞;代价:多图一起过编码器 ⇒ 首 token 慢
   MAXLEN=1048576
-  MBT=8192
+  MBT=8192   # ⭐ 2026-10-05 B 臂:恢复满速 chunk(8192);实测 MBT=4096 时
+              #    GPU 预填触发率=0(device=cuda 0 次 ✗)⇒ 丢掉 1.41× 预填优化
+              #    安全改由 ACT_RESERVE 承担(见下)
+              #    原 8192(用户 2026-10-03 指示)⇒ 崩溃回归;详见 BUG_REGISTRY A19/A20/A21/A24
   MAXSEQS=1
   GPUS=1,2        # 【2026-10-03 用户明令】TP=2 一律 GPU1+GPU2(GPU0 只有 PCIe x8)⇒ IRON_RULES R19
   TP=2
   GPU_UTIL=0.90
   COMPILE=1
   EAGER=0
-  SPEC=1
+  SPEC=1   # ⭐ 2026-10-05 用户指示:生产【开启】投机解码(DSpark k=5)
+            #   理由:投机收益太大(实测 mean acceptance ≈3.59 ⇒ decode 约 2–3×)
+            #   ⭐ 保留 LMCACHE=0(已确认它是 long prefill 崩溃的元凶 ✓,见 docs/KNOWN_ISSUES_LMCACHE.md)
+            #   ⇒ 本配置用于明天验证【输出退化】是否仍出现
+            #   若本臂 long prefill 稳定 ⇒ 按目标③把此配置留在生产供明天测退化
+            #   崩溃栈:LMCache retrieve 失败 ⇒ invalid_block_ids ⇒ scheduler 抛 ⇒ EngineCore 死(A34)
+            #   ⇒ 暂回 SPEC=1(已知可用);SPEC=0 需先解决 LMCache 崩才能用于退化验证
+            #   目的①:减每步激活(不再被 draft token 放大)⇒ 放开显存闸门
+            #   目的②:⭐ 验证模型退化是否由投机解码引起(sample #3 的对照臂)
+            #   ⚠️ 代价:decode 吞吐下降(acceptance 均值 3.59 ⇒ 预期 decode 慢 ~2x)
   KV_DTYPE=fp8_ds_mla
-  KV_CACHE_BYTES=2684354560
+  KV_CACHE_BYTES=2684354560   # ⚠️ 2026-10-05:1.5 GiB 导致 EngineCore 初始化失败 ✗ ⇒ 回退已知可用值 ✓(见 A19)
+  # ⭐ 2026-10-05 三方审核定案:原 2.5 GiB ⇒ 可用显存只剩 ~0.14-0.42 GiB
+  #   ⇒ 512 MiB 的 per-forward q_out(MBT=8192 ⇒ 8188x64KiB)分配失败 ⇒ EngineDeadError
+  #   ⇒ 降到 1.5 GiB 永久多出 ~1 GiB 余量 ⇒ 确定性 >=512 MiB ✓
+  #   ⇒ 代价:KV 池 119 万 → ~71 万 token(agent 实际只需 ~31 万 ✓)
+  #   ⇒ 依据:BUG_REGISTRY A17/A18 + EXPERIMENTS B25 + CHANGELOG 2026-09-21
   # 【2026-10-05 改】原 384 是 **ds-v4-flash** 时代的甜点 ✗(该模型已退役)⇒ 归档 ✓
   # 现依据【本仓实测】`dev-docs/PREFILL_CPU_VS_GPU_2026-10-03.md` §3:
   #   TP=1 交叉点 ≈ **5700** token/层;TP=2 每 rank 的 DMA 减半 ⇒ 交叉点 **~2500–2900** ✓
@@ -74,6 +93,11 @@ VLLM_ENV=(
   #   ⇒ 降到 128 MB 后,同样的请求只申请 ≤128 MB,在碎片空间里就能放下 ✓
   #   (框架按此预算在 query 维分块,可优雅退化到 1 token:vllm/v1/attention/backends/mla/indexer.py:1285-1318)
   EXTRA_ENV="XIAOTU_GP_ACT_RESERVE_GIB=1.5 VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128"
+  # ⭐ 2026-10-05 定案(A28):ACT_RESERVE 原为 1.5 GiB,而代码默认 3.0 GiB(gpu_prefill.py:886)✗
+  #   ⇒ 预检过松 ⇒ 显存极紧时仍放行 GPU 预填 ⇒ 随后的几百 MiB 分配失败 ⇒ EngineCore 死 ✗
+  #   ⇒ 恢复 3.0(与"peak activation 2.9 GiB"同量级 ✓)⇒ 保住 MAXLEN=1M ✓
+  #   ⇒ B 臂修正:3.0 过严 ⇒ GPU 预填【完全禁用】(实测 device=cuda 0 次 ✗)
+  #   ⇒ 取 2.5:仍比历史 1.5 严 1 GiB(> 512 MiB 的 q_out + staging ✓),又给 GPU 预填留出空间 ✓
   WARMUP=1
   PORT=8070
   TAG=v41_8070
