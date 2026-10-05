@@ -63,14 +63,14 @@ print("  --- 本地端点(epyc-a100-server)---")
 chk("provider.api", bool(prov.get("api")), "⭐ 协议(丢了会回退到默认端点 ⇒ 404 打死自己)")
 chk("provider.baseURL", bool(prov.get("baseURL")), "⭐ 路由地址(同上,必须与 api 匹配)")
 chk("models[0].reasoningEfforts", bool(m.get("reasoningEfforts")), "各档位映射(思考强度选择器就靠它)")
-# ⭐ 2026-10-05 实测确认的严重默认值 bug:vLLM 的 DeepSeek-V4.1 分词器里
-#   drop_thinking=kwargs.get("drop_thinking", True)   ⇒ 历史轮的 thinking 默认被丢弃 ✗
-#   ⇒ 走本地端口的智能体逐轮失去推理链 ⇒ 表现为"持续忘记工作目录与目标" ✗
-#   修法:模型条目的 compat.chatTemplateKwargs 里加 drop_thinking: false ✓
+# ⭐ 2026-10-05 修正(实测 4 次后):V4.1 编码器【有工具豁免】——
+#   `if any(m.get("tools") for m in full_messages): effective_drop_thinking = False`
+#   实测:无 tools 时 prompt_tokens=43(思考被丢,纯聊天场景,刻意省 token ✓);
+#         带 tools 时 =394(思考【全部保留】✓)⇒ **agent 场景服务端本来就没问题** ✓
+#   ⇒ 故此项**不作为失败项**,只作提示:显式设 false 可让"无 tools 的中间轮"也保留 ✓
 _ctk = (m.get("compat") or {}).get("chatTemplateKwargs") or {}
-chk("compat.chatTemplateKwargs.drop_thinking",
-    _ctk.get("drop_thinking") is False,
-    "⭐ 必须显式 false:vLLM V4.1 默认 drop_thinking=True ⇒ 历史思考被丢弃 ⇒ agent 失忆")
+print("  %s compat.chatTemplateKwargs.drop_thinking = %s(可选;带 tools 时服务端会自动保留思考 ✓)"%(
+    "•", _ctk.get("drop_thinking")))
 chk("models[0].compat", bool(m.get("compat")), "⚠️ schema 里 compat 属【模型级】(放 provider 级可能不生效)")
 chk("compat.thinkingFormat", (m.get("compat") or {}).get("thinkingFormat")=="deepseek", "按 deepseek 格式读写思考(缺失=选不了思考强度 ✗)")
 chk("多模态字段", bool(m.get("input") or m.get("inputModalities")), "图片输入(新 schema 用 input)")
