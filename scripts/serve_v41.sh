@@ -173,7 +173,9 @@ else
   KV_TRANSFER_JSON=""
 fi
 TOOL_PARSER="${TOOL_PARSER:-deepseek_v41}"
-REASONING_PARSER="${REASONING_PARSER:-deepseek_v3}"
+REASONING_PARSER="${REASONING_PARSER:-deepseek_v3}"   # ⚠️ 与第 25 行注释("默认 deepseek_v41")不一致 ✗;
+#    启动日志会出现 "Auto-initialization of reasoning token IDs failed" 警告 ✓
+#    待验:改成 deepseek_v41 是否消除该警告(见台账 B316 的攒批清单 ✓)
 # 【DSH 思考强度】解析器在**服务启动时**初始化,必须显式告诉它"思考是开的",否则不会切分 reasoning_content。
 # 请求侧仍可用顶层 `reasoning_effort`(low/high/xhigh/max/1-100)覆盖;`none` 表示关思考。
 DEFAULT_CHAT_KWARGS="${DEFAULT_CHAT_KWARGS-{\"thinking\":true}}"   # 解析器启动时初始化 ⇒ 必须显式告诉它思考开着;请求侧可用顶层 reasoning_effort 覆盖(low/high/xhigh/max/1-100;none=关)

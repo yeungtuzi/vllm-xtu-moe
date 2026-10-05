@@ -42,6 +42,7 @@ WITH_MONITORING="${WITH_MONITORING:-1}"
 # ───────── 参数(唯一真源 ✓;改这里就够)─────────
 VLLM_ENV=(
   LMCACHE="${LMCACHE:-1}"   # 【2026-10-05 修】原来硬编码 ⇒ 覆盖外部 env,令 LMCACHE=0 的 A/B 从未生效 ✗
+  MM_IMAGES="${MM_IMAGES:-4}"   # 【2026-10-05】用户被 400 挡住(历史里的图被数成超限)⇒ 提到 4 解阻塞;代价:多图一起过编码器 ⇒ 首 token 慢
   MAXLEN=1048576
   MBT=8192
   MAXSEQS=1

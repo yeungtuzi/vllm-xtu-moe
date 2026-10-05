@@ -10379,3 +10379,33 @@ block 策略时在 `create_weights` 里**按检查点的名字**注册,并把"�
 
 **⇒ 这是 vLLM 的 bug(内部不一致),不是我们的配置错,也不是检查点不规范**
 ⇒ 落点分两步:①本仓 `patches/xtu-series/`(不受限)②**PR 上游需用户逐条批准** ✓
+
+---
+
+### B316(2026-10-05)🔍 **"重复退化"的现场数据 + 一处真实的配置不一致(未证明因果)**
+
+**症状(用户)**:另一个会话的 agent 反复吐出占位符式文本(`<find>`, `<check flag>` ✗)——**不是工具循环,是模型层重复退化** ✗
+
+**现场数据(同一次运行,前后对照)**
+| 时段 | Mean acceptance length | gen throughput | accepted throughput |
+|---|---|---|---|
+| 01:19:23–01:20:13(正常) | 5.89–5.98 | **52–54 tok/s** | **44–45 tok/s** |
+| 03:10:53–03:11:03(循环) | **6.00**(满格) | **0.4–0.8 tok/s** ✗ | **0.00–0.50** ✗ |
+| 03:12:23(略恢复) | 2.76 | 9.5 | 0.75 |
+⇒ ⚠️ **接受长度在两段都是 ~6** ⇒ **"满格"是常态,不是病征** ✗(我先前的推断被数据否掉 ✓)
+⇒ ⭐ **真正的信号是吞吐塌陷 ~100×**(53 → 0.4 ✗),而**步骤仍在完成**(引擎统计每 10s 更新 ✓)⇒ **不是卡死** ✓
+
+**⭐ 新发现的一处真实不一致(但【未证明】与循环有关 ✗)**
+* `serve_v41.sh:25` 注释:*"TOOL_PARSER / REASONING_PARSER(默认 **deepseek_v41**)"* ✗
+* `serve_v41.sh:176` 代码:**`REASONING_PARSER="${REASONING_PARSER:-deepseek_v3}"`** ✓
+* 启动日志确有警告:`Auto-initialization of reasoning token IDs failed. Please check whether your reasoning parser has implemented the reasoning_start_str and reasoning_end_str.` ✗
+* ⚠️ 但**检查后 `deepseek_v3` 是实现了这两个属性的** ✓(`deepseek_v3_reasoning_parser.py:40,44` ✓)
+  ⇒ 而 `deepseek_v41` 只有 `.pyc` ⇒ 我 grep 二进制 ⇒ **那次"不满足"的结论无效** ✗(方法错误 ✓)
+⇒ **⇒ 结论:未定位到该警告的成因,也未证明它与重复退化有关** ✗ —— **按 R27(差异≠缺失)与"少推理多实验"处理** ✓
+
+**⇒ 攒批清单(一次重启回答两问)**
+| # | 做什么 | 判据 |
+|---|---|---|
+| 1 | `REASONING_PARSER=deepseek_v41` 跑一臂 | 启动日志里那条警告**是否消失** ✓ |
+| 2 | `--override-generation-config '{"repetition_penalty":1.1}'` | 重复退化**是否减少** ✓ |
+| 3 | (记录)客户端侧:temperature/新会话 | 零成本,用户可自行试 ✓ |
