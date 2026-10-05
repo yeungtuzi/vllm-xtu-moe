@@ -14,7 +14,10 @@
 // ---------------------------------------------------------------------------
 #ifndef XIAOTU_MOE_MOE_V2_PACKED4_HPP_SELECT
 #define XIAOTU_MOE_MOE_V2_PACKED4_HPP_SELECT
-#if defined(__AVX512VNNI__)
+// 【受控实验用】`-DXIAOTU_MOE_FORCE_PACKED4_BASE=1` ⇒ 即使有 VNNI 也强制用 **base 实现** ✓
+//   用途：把"`-mavx512vnni` 旗标对共享 bf16 路径 codegen 的影响"与"W4A8 源码本身的影响"**分开**
+//   （线③② 的归因实验 ✓）。**不用于生产** ✗
+#if defined(__AVX512VNNI__) && !defined(XIAOTU_MOE_FORCE_PACKED4_BASE)
 #  include "moe_v2_packed4_w4a8.inc"
 #else
 #  include "moe_v2_packed4_base.inc"

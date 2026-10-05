@@ -125,6 +125,9 @@ VARIANTS=(
   # ⚠️ 这一档**故意不进 `loader._LADDER`**：用 `XIAOTU_MOE_VARIANT=avx512_bf16_vbmi_vnni` 显式选，
   #    以免"合并即改变生产默认路径"（见 dev-docs/mywork/DECISIONS.md **D11**）✓
   "avx512_bf16_vbmi_vnni|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mavx512vnni -mfma"
+  # 【受控实验用·不用于生产】同样的旗标(含 -mavx512vnni)但**强制 base 实现** ⇒
+  #   把"旗标对共享 bf16 路径 codegen 的影响"与"W4A8 源码的影响"分离 ✓（线③② 归因）
+  "avx512_bf16_vbmi_vnni_base|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mavx512vnni -mfma -DXIAOTU_MOE_FORCE_PACKED4_BASE=1"
 )
 
 # 【dev 便利】`ONLY=<空格分隔的变体名>` ⇒ 只构建列出的变体（默认全建）。
