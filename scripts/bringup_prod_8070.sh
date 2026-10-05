@@ -127,7 +127,12 @@ say "① LMCache 服务端(必须先起 ✓)"
 if port_up 5555; then
   echo "  已在跑 ⇒ 跳过 ✓"
 else
-  bash scripts/proc.sh spawn lmcache_server env "${LMCACHE_ENV[@]}" bash scripts/serve_lmcache.sh
+  # ⭐ 2026-10-05:仅当 LMCACHE=1 时才启动服务端(目标④:不启动也不连接 ✓)
+  if [ "$LMCACHE" = "1" ]; then
+    bash scripts/proc.sh spawn lmcache_server env "${LMCACHE_ENV[@]}" bash scripts/serve_lmcache.sh
+  else
+    echo "  LMCACHE=0 ⇒ 不启动 lmcache_server(端口 5555/8080 预期 DOWN ✓)"
+  fi
   wait_port 5555 24 && echo "  ✅ 5555 就绪 ✓" || { echo "  ✗ LMCache 未起来"; exit 1; }
 fi
 
