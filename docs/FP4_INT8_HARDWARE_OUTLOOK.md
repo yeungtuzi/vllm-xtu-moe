@@ -221,7 +221,9 @@ Microsoft Phi MoE, AI2 OLMoE.
 | Incoming format | Handling |
 |---|---|
 | MXFP4 (E2M1, block-32 E8M0 scales) | used directly |
-| NVFP4 (E2M1, FP8/E4M3 block-16 scales) | elements kept as-is; the E4M3 scales are converted losslessly to fp32 |
+| NVFP4 (E2M1, FP8/E4M3 block-16 scales) | converted offline to the OCP block-32 E8M0 layout, or consumed with a
+  native E4M3 scale path; **not** by expanding scales to fp32, which would add roughly 40% to the
+  bytes moved per weight in a bandwidth-bound kernel |
 | INT4 weight-only (e.g. GPTQ, W4A16) | separate lookup convention, supported |
 | FP8, BF16 | their own paths |
 
