@@ -13,10 +13,11 @@ def chk(name,cond,why):
     global ok
     print("  %s %-22s %s"%("✅" if cond else "❌",name,why))
     if not cond: ok=False
-chk("models[0].reasoning", m.get("reasoning") is True, "思考强度选择器的开关(丢了就选不了思考强度)")
-chk("compat.thinkingFormat", bool(prov.get("compat",{}).get("thinkingFormat")), "告诉客户端按 deepseek 格式读思考")
-chk("reasoningEfforts", bool(m.get("reasoningEfforts")), "各档位映射(注意:官方只认 low/high/max,传 medium 会 400)")
-chk("多模态字段", bool(m.get("input") or m.get("inputModalities")), "图片输入(注意字段名可能是 input 或 inputModalities)")
+chk("models[0].reasoningEfforts", bool(m.get("reasoningEfforts")), "各档位映射(选择器就靠它;官方只认 low/high/xhigh/max)")
+chk("models[0].compat", bool(m.get("compat")), "⚠️ schema 里 compat 属【模型级】(放 provider 级可能不生效)")
+chk("compat.thinkingFormat", bool((m.get("compat") or prov.get("compat") or {}).get("thinkingFormat")), "按 deepseek 格式读写思考")
+chk("多模态字段", bool(m.get("input") or m.get("inputModalities")), "图片输入(新 schema 用 input)")
+chk("无过期字段 reasoning", "reasoning" not in m or m.get("reasoning") is None, "旧 schema 的字段,新版不存在(留着无用)")
 print("  ⇒ %s"%("全部通过 ✓" if ok else "有缺失 ✗ ⇒ 按 B160/B214 补齐,DSH 设置是 watch:true 可热生效 ✓"))
 sys.exit(0 if ok else 1)
 PY
