@@ -10466,3 +10466,366 @@ block 策略时在 `create_weights` 里**按检查点的名字**注册,并把"�
 2. ⭐ **"退化"不能归因于量化** ✓(两边都是量化 ✓)⇒ 与先前撤回"4-bit 说法"一致 ✓
 
 **⚠️ 记录规范(免得再混)**:凡写结论,必须同时写清 **① 在哪个模型上 ② 什么精度 ③ 哪条实验线** ✓
+
+---
+
+### B319(2026-10-05)⭐ **vLLM CT block-FP8 命名 bug:补上【单测 + 端到端】红/绿实测(用户要求"2、3 都要测一遍并反映在 PR 里")**
+
+> 交叉引用:`dev-docs/pr/PR_DRAFT.md` §0/§2(PR 定稿);`USER_QA_LEDGER` 第 42 条;
+> 相关 bug 记录 `BUG_REGISTRY`;上游对象 `vllm-project/vllm`(本仓只备料,提交须用户逐条批准 ✓)
+
+#### ① 机制查清(决定"到底修哪个文件")—— 代码级依据
+```
+compressed_tensors.py:851-868
+  is_fp8_w8a8_supported = self._check_scheme_supported(CompressedTensorsW8A8Fp8.get_min_capability(), error=False)
+  if is_fp8_w8a8_supported: → CompressedTensorsW8A8Fp8(...)
+  else:                     → CompressedTensorsW8A16Fp8(weight_quant=..., is_static_input_scheme=not input_quant.dynamic)
+```
+* 真实检查点(`Qwen3.8-Flash-Next-MXFP4-FP8`)的 8-bit block 组**带动态 input 量化**(配置层面是 W8A8),
+  但 **A100(SM80)没有 FP8 W8A8 内核 ⇒ 回退构造 `CompressedTensorsW8A16Fp8`** ✓
+  ⇒ 这就是"为什么坏在 `compressed_tensors_w8a16_fp8.py` 而不是 `w8a8_fp8.py`" ✓(B316 的"SM80 无 FP8 GEMM 退回 W8A16"在此得到代码级确认)
+* 上游测试用 `RedHatAI/Qwen3-0.6B-FP8-BLOCK`(新卡上走 W8A8)**所以一直没暴露** ✓
+* ⚠️ **纯 W8A16 配置**(`input_activations` 缺失)会算出 `is_static_input_scheme = None`(:872)
+  ⇒ 在 `assert ... is False` 处崩 ✗ —— **那是另一个问题,不在本 PR 范围**(我一度用它做复现,被这一点卡住才查出机制 ✓)
+
+#### ② 单测(已写进 PR 补丁 `tests/quantization/test_compressed_tensors.py`)
+| 树 | 命令 | 结果 |
+|---|---|---|
+| **未修** | `pytest tests/quantization/test_compressed_tensors.py -k w8a16_fp8_block_scale -x -q` | ❌ `1 failed` — **`AttributeError: 'MergedColumnParallelLinear' object has no attribute 'data'`** |
+| **已修** | 同上 | ✅ `1 passed`(1.78 s) |
+
+* 失败帧与**真实故障逐帧一致**:`layers/linear.py:987 load_weights` → `param.weight_loader(...)` → `:767 param_data = param.data` ✓
+  (与 `logs/qmx_fix2.2134324.log:159` 的原始现场同帧 ✓)
+* 单测**直接构造 scheme**(不经配置选路)⇒ **平台无关**,不会在 Hopper 的 CI 上选中 W8A8 而误挂 ✓
+
+#### ③ 端到端(真实引擎;用**本地合成**的忠实检查点)
+* 合成法:`Qwen/Qwen3-0.6B` 的 `model.layers.*` 下每个 `*.weight` 按 **block-128×128 FP8 E4M3** 量化,
+  scale 存成 **`weight_scale_inv`**(与真实 block-FP8 产物同名 ✓),config 采用真实产物的
+  `quantization_config`(weights: 8bit float/block[128,128];inputs: **dynamic group-128**)⇒ 在 SM80 上正好走本 scheme ✓
+* `synth_ct_w8a16_block.py`:量化 196 个 Linear、保留 115 个张量 ✓
+| 树 | 结果 |
+|---|---|
+| **未修** | ❌ `ValueError: There is no module or parameter named 'layers.0.mlp.down_proj.weight_scale_inv' in Qwen3Model. The available parameters … are: {'layers.0.mlp.down_proj.weight_scale', …}`(加载器名字校验这条出口)|
+| **已修** | ✅ `Loading weights took 0.18 seconds` → `KV cache size: 99,360 tokens` → `init engine … 11.60 s` → `OUTPUT>>> ' Paris. The capital of France is also the capital of the French Republic. The'` |
+
+* 两种报错面(`AttributeError` / `ValueError`)**同根因**:缺失的参数名,沿两条加载路径出现 ✓
+* 补丁:112 行 / 2 文件,**对今日 `origin/main`(`0c16eee3f1`)** `git apply --check` **通过** ✓
+
+#### ④ ⭐ 可复用方法:用 `cp -al` 硬链接做"红/绿双树"——**但有致命坑**
+* `cp -al <树> tree_red` / `tree_green`(同文件系统 ⇒ 秒级、几乎不占空间 ✓)
+* ⛔ **绝不能原地改写**:硬链接共享 inode ⇒ 原地写会**连带改到在服务的树** ✗✗
+  ⇒ 必须 **`os.unlink()` 后再创建**新文件(打断该路径的链接 ✓)
+* ⛔ **不要在快照树里跑 `git`**:`.git/` 也是硬链接,`git status/diff` 可能刷新并写 `index` 而影响原树 ✗
+  ⇒ 生成补丁改用 `diff -u` 直接比对文件 ✓
+* ✅ **改前记录、改后校验**:`md5sum` 存基线 → 每次动作后 `md5sum -c` 复核在服务树未被改 ✓(本条目全程 OK ✓)
+
+#### ⑤ 顺带修掉一个**过时的环境说明**
+* 断点 §3.3 阻塞 5 写"`nvidia/cu13/lib` …**我们自己的 env 没有**" —— **已过时** ✗:
+  实测 `/home/user/anaconda3/envs/vllm-xiaotu-moe/lib/python3.12/site-packages/nvidia/cu13/lib/` **存在** ✓
+  ⇒ 跑带 NVRTC 的路径时加 `LD_LIBRARY_PATH=<该目录>:$LD_LIBRARY_PATH`(否则 `RuntimeError: NVRTCCompiler run failed` ✓)
+
+#### ⑥ 回归命令(以后改 CT 量化/加载相关代码时)
+```bash
+# 需要一棵【已打本 PR 补丁】的树(在 /tmp 里建,别在服务树开分支)
+cd <tree> && PYTHONPATH=<tree> pytest tests/quantization/test_compressed_tensors.py \
+  -k w8a16_fp8_block_scale -x -q          # 期望 1 passed
+```
+
+---
+
+### B320(2026-10-05)🎯🎯 **QFN-MXFP4 第一次 READY 且服务了真实请求** —— 第 7 个阻塞的真正根因(CT 的 MXFP4 MoE **根本不查 oracle**)
+
+> 目标(用户 2026-10-04 授权,断点 §1):让 QFN(Qwen3.8-Flash-Next-**MXFP4-FP8**)能 READY 并服务真实请求 ✓ **本条达成** ✓
+> 附件现场:`dev-docs/report/tuning/logs/qmx_cpu3.1778161.log`(685 行)
+
+#### ① 三条判据(起服务前就写死 ✓,一次启动答完 ✓)
+| 判据 | 结果 |
+|---|---|
+| ① 选中 CPU 后端 | ✅ `[devpatch-9] ✅ MXFP4 MoE -> CPU 后端,experts_cls=XiaotuCPUExpertsMxfp4` —— **本插件自己的 CPU 引擎** ✓,且**无** `Using MarlinExperts for MXFP4 MoE` ✗(旧行为) |
+| ② READY | ✅ `Application startup complete.` |
+| ③ 真实请求 | ✅ **HTTP 200 / 5.71 s**(32 tok,TP=1+`--enforce-eager`+CPU 专家)输出:<br>*" Paris, a city that has served as the country's political and cultural center for centuries. Paris is located in the north-central part of France, along the Seine"* ✓ |
+
+#### ② ⭐ 根因(⚠️ **推翻**断点 §3.3 的"决定性发现")
+断点写:*"oracle/mxfp4.py 缺 CPU 后端 ⇒ 总根因"* —— **错** ✗:
+它有 `Mxfp4MoeBackend.CPU = "CPU"`(:146)、`CPUExpertsMxfp4`(:296)、`"cpu": [CPU]` 映射(:356)、
+以及 `if current_platform.is_cpu(): return [Mxfp4MoeBackend.CPU]`(:402)✓(**当初只看了函数头 30 行** ✗)。
+
+真因在**调用方**——`compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py:56-77`:
+```python
+self.mxfp4_backend = Mxfp4MoeBackend.MARLIN                 # 默认就是 Marlin ✗
+if moe.moe_backend == "b12x" or is_flashinfer_moe_ep_backend(...):
+    self.mxfp4_backend, experts_cls = select_mxfp4_moe_backend(moe)   # ← 只有这两条路查 oracle
+elif self.use_cutlass_mxfp4: ...     # SM100
+elif current_platform.is_xpu(): ...  # XPU
+else:                                # ← SM80 + moe_backend="auto" 走这里
+    logger.info_once("Using MarlinExperts for MXFP4 MoE"); self.experts_cls = MarlinExperts
+```
+⇒ ① **oracle 在这条路上不被调用**(所以我先写的补丁 #8「改 oracle 候选表」**实测无效** ✗,已标注保留)
+   ② 这条路上也**没有** `VLLM_EXPERTS_LOAD_DEVICE=cpu` 分支(兄弟 oracle fp8.py:143 / int_wna16 / unquantized 都有)
+   ⇒ 主机驻留的 MXFP4 权重被喂给 Marlin 的 **GPU 重排** ⇒ 崩 ✗ —— **这才是与兄弟们的不对称所在** ✓
+
+#### ③ 修法(dev-only 补丁 #9:`/tmp/w4a8/devpatch/patch_ct_mxfp4_cpu.py`,零改树 ✓)
+包住 `CompressedTensorsW4A4Mxfp4MoEMethod` 的两个方法:
+* `__init__`:专家在主机时把 `mxfp4_backend/experts_cls` 覆盖为 **CPU**,且 `experts_cls` **运行时**取
+  `cpu_moe.CPUExpertsMxfp4`(⇒ 拿到插件 `register_mixed_cpu_backend()` 换过的 `XiaotuCPUExpertsMxfp4` ✓)
+* `process_weights_after_loading`:CPU 路径下临时屏蔽 `prepare_moe_fp4_layer_for_marlin`
+  (CPU 引擎直接消费 raw MXFP4/e8m0 ✓,与 `gpu_prefill.py` 头部的设计说明一致 ✓)
+
+#### ④ 第 8 个阻塞(推理期)与 devpatch #4 的退休
+修完选路后 READY ✓,但首个请求 500:`KeyError: 'language_model.model.layers.3.self_attn'`(`nvidia/qsa.py:468`)✗
+* 机制:该文件 `:433 static_context[self.layer_name] = self` **发生在原 `__init__` 内**(注册键 = `…self_attn.attn` ✓),
+  而 devpatch #4 在 `__init__` **之后**才把 `layer_name` 的后缀删掉 ⇒ **注册键 ≠ 查找键** ✗
+* ⇒ **#4 停用**(它当初只是为了绕加载期那 36 个名字,而**补丁 #6 已经覆盖**:
+  `[skip-attn] ✅ 已跳过 36 个无处安放的名字,例 ['model.layers.11.self_attn.attn.{k,q,v}_scale']` ✓)
+* 停用 #4 后:READY ✓ + 请求 200 ✓(同一启动内)
+
+#### ⑤ 可复现命令(以后回归)
+```bash
+cd <repo>; bash scripts/proc.sh spawn <tag> env CKPT=<qfn ckpt> GPUS=0 TP=1 PORT=8140 MAXLEN=8192 \
+  MBT=2048 SEQS=1 THREADS=60 GPU_PREFILL_MIN=0 EAGER=1 TAG=<tag> VLLM_PLE_FP8_GLOBAL_SCALE=1 \
+  XTU_TREE="/tmp/w4a8/devpatch:<vllm tree>" HF_OVERRIDES="$(cat /tmp/w4a8/qfn_mxfp4_hf_overrides.json)" \
+  LD_LIBRARY_PATH="<env>/lib/python3.12/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH" \
+  bash scripts/serve_qwen38.sh
+# 判据(三条都要):
+grep -E "devpatch-9|Using MarlinExperts for MXFP4" <log>   # 有 devpatch-9、无 Marlin ✗
+grep -c "Application startup complete" <log>               # ≥1
+curl -sS http://127.0.0.1:8140/v1/completions -H 'content-type: application/json' \
+  -d '{"model":"Qwen3.8-Flash-Next","prompt":"The capital of France is","max_tokens":32,"temperature":0}'   # ⇒ 200 + 连贯文本
+```
+
+#### ⑥ 当前 devpatch 一览(7 个在用 / 2 个退役 / 1 个无效)
+| # | 作用 | 状态 |
+|---|---|---|
+| 1 | CT 白名单加 `mxfp4-pack-quantized` | 用 ✓ |
+| 2 | CT FP8-block scale 命名(→**已有上游 PR #60015** ✓) | 用 ✓ |
+| 3 | FP8 PLE 全局 scale | 用 ✓ |
+| ~~4~~ | ~~去掉 `layer_name` 的 `.attn`~~ | **停用** ✗(见 ④) |
+| 5 | 跳过 `self_attn.attn.*` 的 KV scale | 用 ✓ |
+| 6 | 过滤 36 个无处安放的名字 | 用 ✓(承载了 #4 的职责 ✓) |
+| ~~7~~ | ~~跳过 CPU 专家的 Marlin 重排~~ | 已撤回(设计上要走 GPU 内核)✗ |
+| 8 | 改 oracle 候选表 → CPU | **实测无效** ✗(CT 不查 oracle) |
+| **9** | **CT MXFP4 MoE → CPU 后端** | ⭐ **本次阻塞的解** ✓ |
+
+#### ⑦ 下一步(断点 §6)
+1. ✅ 目标"能 READY 且服务真实请求" —— **达成** ✓
+2. devpatch 退场路径:#2 走上游 PR #60015(已提交 ✓);#9 属"上游缺口"(可另开 PR:让 CT MXFP4 认 `VLLM_EXPERTS_LOAD_DEVICE=cpu`)——**待用户决定** ✗
+3. 走 §6③:QFN(+FP8)上量 **GPU prefill / 投机** 收益(下一批:按 R23 攒批,先写判据)
+4. §6④回退路径回归、§6⑤语义验收(通过线**先问用户**)
+
+---
+
+### B321(2026-10-05)🔬 QFN-MXFP4 的"CPU/GPU prefill 分界点 + 合理 MBT"扫描 —— **结论:该配置下没有 GPU 预填路径** ✗(并打假上一轮的 6–10×)
+
+> 目标(用户):"像 ds41f 一样设定一个 cpu/gpu_prefill 的分界点和合理的 MBT,这个需要**扫描式测试**才能回答" ✓
+> 现场:`logs/qmx_s32048.<pid>.log`、`logs/qmx_s38192.<pid>.log`;数据表:`/tmp/qfn_port/sweep_gp3.tsv`
+
+#### ① 方法(把三个坑都堵上了)
+* 阈值**运行时切换**:`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS_FILE` 每次调用都重读
+  (`gpu_prefill.py:60-90`)⇒ **一个实例内**即可切 `0`(禁用) / `1`(总是 GPU)✓,不必为每个阈值重启 ✓
+* 触发条件读原文(`hybrid_model.py:1230-1236`):`_gp_min > 0 and qlen >= _gp_min and not capturing`
+  ⇒ `qlen` 是**本层这次 forward 的 chunk 大小**(受 MBT 限制)⇒ **阈值与 MBT 天然耦合** ✓
+* ⭐ **每请求唯一 nonce + 机械断言 `cached_tokens == 0`**(vLLM 默认开前缀缓存 ⇒ 同 prompt 复测必假 ✗)
+* 生效判据:`[xtu-pf-progress] … device=cuda|cpu` 心跳计数(按行号切片,只算本请求区间)✓
+
+#### ② 结果(全部行 `cached_tokens=0` ✓)
+| MBT | L 实际 | CPU prefill | GPU prefill | 心跳 cuda |
+|---|---|---|---|---|
+| 2048 | 234 / 917 / 1826 / 6329 | **345 / 481 / 503 / 508** tok/s | 427 / 483 / 503 / 510 tok/s | **0** |
+| 8192 | 235 / 916 / 1828 / 6329 | 337 / 468 / 488 / 505 tok/s | 432 / 471 / 487 / 506 tok/s | **0** |
+
+⇒ ① 两模式差 **<1%**(噪声内)② `device=cuda` **恒为 0** ⇒ "gpu" 臂走的还是 CPU 路径 ✗
+⇒ ③ **MBT 2048 vs 8192 无差异**(<0.5%);④ 真数字:**CPU prefill ≈ 505–510 tok/s(L≥2048)、decode ≈ 12 tok/s**
+
+#### ③ ⭐ 为什么没有 GPU 路径(结论要连着 #9 一起读)
+补丁 #9 把 CT 的 MXFP4 MoE 选到 **CPU 后端** ⇒ 计算由本插件的 `XiaotuCPUExpertsMxfp4`(CPU 引擎)承担;
+而 GPU 预填/staging 的触发点在**插件自己的 FusedMoE 路径**里(`hybrid_model.py:1230`)⇒ **不在活跃路径上** ✗
+⇒ 两种设计是**互斥**的:
+* **(A) CT MoE 方法 + CPU 引擎**(#9 达成):prefill 全 CPU(≈505 tok/s)✓ 能服务,但没有 GPU 加速位 ✗
+* **(B) 插件自己的 mixed 路径 + 按层 GPU staging**(`gpu_prefill.py`):**计算在 GPU**,需要在 GPU 上 repack/staging
+  ⇒ 正是断点 §3.3 原先那条(word:marin 重排必须发生,只是要在 GPU 上发生)——**尚未打通** ✗
+⇒ 所以"分界点"这个问题**在 (A) 下无意义**;要回答它,要么打通 (B),要么到**插件路径活跃的那条线(qfn官方 FP8)**上量 ✓
+
+#### ④ ⚠️ 打假:上一轮(同 prompt、无 nonce)的"GPU 快 6–10×"是**前缀缓存**假象 ✗
+那一轮 `TTFT 0.30 s vs 2.89 s` 看起来极漂亮,**但探测显示 `device=cuda` 心跳为 0** ✗
+⇒ 复核后发现:serve 脚本未显式设置 ⇒ **vLLM 默认开前缀缓存**,第二次同 prompt 直接命中 ⇒ 无 prefill ✗
+⇒ 这正是 `R25#10`("一次只跑一个 bench 循环;预热 + 每请求唯一 nonce,否则前缀缓存把结论毁掉")的原型事故 ✓
+⇒ **教训:漂亮的数字要先问"它是不是在做同一件事"**;本次靠"心跳探针 + cached_tokens 断言"两条硬判据才发现 ✗
+
+#### ⑤ ⚠️ 我自己的操作事故(记下来,免得再犯)
+我用 `pkill -f sweep_gp.sh` 去停扫描脚本 ⇒ **我自己的命令行里就含这个字符串** ⇒ **把自己 SIGTERM 了** ✗✗
+(会话被自杀、当轮后续命令全部丢失)。这正是 `AGENTS.md` 第 0 条 1 明令禁止的("历史上已发生 40+ 次")✗
+⇒ **机械改法**:长任务启动时**把 PID 写文件**(本次 `/tmp/qfn_port/sweep_gp3.pid`),停一律 `kill $(cat <pidfile>)`;
+**任何 `pkill -f` / `pgrep -f | xargs kill` 一律视为事故** ✓
+
+#### ⑥ 下一步(二选一,待用户定)
+1. **去 qfn官方(FP8)线上量分界点**:那条线插件路径活跃(断点 §3.3 说 FP8 已由插件的 shim 接管)⇒ 分界点有定义 ✓
+2. **打通设计 (B)**:让 MXFP4 的 Marlin repack/staging 在 **GPU 上**发生(断点 §3.3 的"正解")⇒ 才有 GPU 加速位可比 ✓
+
+---
+
+### B322(2026-10-05)📐 GPU prefill 定论(单卡禁用) + **256K×4 的显存账** + ⚠️ 对 B321 的订正
+
+#### ① ⚠️ 先订正 B321 的结论
+B321 写"该配置下**没有** GPU 预填路径" —— **不准确** ✗。真因有两层:
+1. **策略层早已按用户裁决禁用**:`vram_policy.py:240-247`(§592)*"TP=1 **不支持** GPU 预填充;staging 不随 TP 摊薄
+   (TP=1 staging 翻倍到 13.4 GiB、preflight 要 16.8)…用户明确'没指望 TP=1 跑起来'"* ⇒ `_tp_eff <= 1 ⇒ pref_ok = False` ✓
+2. **运行期 preflight 按 slack 卡**:B321 的 ACTIVE 行原文
+   `staging ~2.65 GiB, required >= 5.91 GiB free, had 2.73 GiB (slack -3.18 GiB)` ⇒ **逐层被拒 ⇒ staying on CPU** ✓
+
+#### ② ✅ 显式开 GPU 预填并给它留显存后,才量到真数字(B321 的 v5 扫描)
+做法:阈值文件 `=8`(运行时切换 ✓)+ **`KV_CACHE_BYTES=17179869184`(16 GiB,必须给字节数 ✗ 不接受 `16GiB`)**
+⇒ slack 转正、`device=cuda` 心跳出现(3/6/15 条)✓
+
+| MBT=2048 | L=512 | L=2048 | L=7112 |
+|---|---|---|---|
+| CPU prefill | **470 tok/s**(0.98 s) | **491**(3.72 s) | **497**(12.76 s) |
+| GPU prefill | 82(5.60 s) | 159(11.46 s) | 216(29.25 s) |
+⇒ **GPU 预填慢 2–6×** ✗ 根因:该路径要**逐层把 raw MXFP4 权重 H2D 流式搬运**,而**实验卡 GPU0 只有 PCIe x8(≈12.5 GB/s)** ✓
+⇒ 与用户结论一致:"**本测试实例 gpu prefill 没有意义**(pcie link 速度太低)" ✓
+
+#### ③ ⭐ 关键副产品:QFN 的 KV 每-token 成本(实测,两实例一致)
+`16 GiB / 346,931 tok = 48.4 KiB/token`(另一次 25.64 GiB/555,827 ⇒ 同一值 ✓)
+⇒ **是 ds41f 的 ~10×**(策略常量 `KV_GIB_PER_MTOKEN = 5.04` 是 V4.1 标定,**对 QFN 失真** ✗)
+⇒ 用 QFN 线跑 `vram_policy` 前,**必须**改这个常量或显式给 `KV_CACHE_BYTES` ✓
+
+#### ④ 📐 256K×4 的账(卡 39.49 GiB 可用;权重≈11.6;reserve=4.0+workspace(min(6.0, 5.0×maxlen/32K)))
+| 配置 | KV bf16 | KV **fp8** | 合计 bf16 / fp8 | 可行性 |
+|---|---|---|---|---|
+| **256K×4**(1.05M tok) | 48.4 | 24.2 | 70.0 / **45.8** | ✗ / ✗(**fp8 也差 5.8 GiB**)|
+| 256K×2 | 24.2 | 12.1 | 45.8 / 33.7 | ✗ / **✓ 余 6.3** |
+| 128K×4 | 24.2 | 12.1 | 45.8 / 33.7 | ✗ / **✓ 余 6.3** |
+| 256K×1 | 12.1 | 6.0 | 33.7 / 27.6 | ✓ / ✓ |
+⇒ **"256K×4" 单卡不可行**;可行的是 **256K×2 / 128K×4**,且**都要 fp8 KV** ✓
+⇒ 若一定要 256K×4:需 **TP=2(GPU1+2,80 GB,且 x16)** —— 但那要暂停生产 ⇒ **须用户许可** ✗
+
+#### ⑤ 因此下一步的前置工作被"选定"了
+* **关掉 GPU prefill 链路**:在策略层已自动(TP=1 ⇒ 不预留 staging ⇒ `held` 不含它 ✓,见 `vram_policy.py:290`),
+  ⇒ serve 脚本保持 `GPU_PREFILL_MIN=0` 即可 ✓;**不需要改代码**,但**要写进 QFN 线的运行手册** ✓(否则后人会再开 ✗)
+* ⭐ **fp8 KV 是本轮目标的共同前置**:256K×2 / 128K×4 都要它;而 SM80 上 `--kv-cache-dtype fp8` 会崩在
+  `fp8e4nv not supported`(B311)⇒ 必须走**社区补丁 0002(FP8 E4M3 KV reader for QSA + 静态 scale sidecar)**
+  的移植(断点 §4/§6.1)✓ —— 它**从"可选"回到"关键路径"** ✓
+* MTP 解码:排在 fp8 KV 之后(它同样吃显存:`draft_gib` 在策略里是优先级 3)✓
+
+---
+
+### B323(2026-10-05)🎯 **fp8 KV 在 SM80 上的解锁路径判明:不必搬社区 16 个 hunk,只需照 0003 改一处** ✓
+
+> 背景:用户目标改为 **256K×N 上下文(需 fp8 KV 才放得下)+ MTP**(见 B322④)⇒ fp8 KV 从"可选"回到**关键路径** ✓
+
+#### ① 先按 R27 查"上游是不是已经修了"(结论:**大半已有** ✓)
+* `vllm/models/qwen4_exp/nvidia/qsa.py:66-95` 上游**已声明 fp8 KV 支持**:
+  ```python
+  # fp8/fp8_e4m3: e4m3 bytes in a uint8 cache, written by reshape_and_cache
+  # with the layer's per-tensor scales and dequantized on load inside the QSA Triton kernel.
+  supported_kv_cache_dtypes = ["auto", "bfloat16", "fp8", "fp8_e4m3"]
+  ```
+  ⇒ **社区补丁 0002 的核心特性上游已经有了** ✓ ⇒ 移植整条内核**大概率是白干** ✗
+  (⇒ 这也解释了为什么三方合并有 16 个冲突:两边在**同一块**代码上各自发展 ✗)
+
+#### ② B311 崩点的真实性质(**一处**)
+`vllm/models/qwen4_exp/nvidia/ops/qsa_prepare.py:88`:
+```python
+out_ty = dst.dtype.element_ty
+if out_ty == tl.float8e4nv:      # ← SM80:Triton 【只要源码里出现这个名字就拒绝编译】✗
+    x = x.to(tl.float32) / scale
+return x.to(out_ty)
+```
+* 全 QSA 目录只有**这一处** fp8 Triton 类型用法(实测 grep:1 处 ✓)
+* 错误原文(`fp8e4nv not supported in this architecture. The supported fp8 dtypes are
+  ('fp4e2m1fn','fp8e4b15','fp8e5')`)⇒ 属**编译期**拒绝(与分支是否执行无关)✓
+* ⇒ 仅"跳过那个 if"**不够**:后面 `x.to(out_ty)` 也依赖该类型 ✗ ⇒ 必须**换结构**
+
+#### ③ 修法(照我们**已验证**的 0003 手法 ✓)
+* `patches/xtu-series/0003-fix-DSv4.1-SM80-remove-Triton-fp8e4nv-dependenc.patch` 的做法:
+  `_f32_to_e4m3_uint8` / `_e4m3_uint8_to_f32`(定义**已在树里**:`fp8_utils.py:1524` ✓),
+  注释原话 *"Ampere (SM80) has no fp8e4nv type; encode e4m3 bytes directly"* ✓
+* ⇒ QSA 侧同样处理:把"目标是 fp8-e4m3-uint8 缓存"作为 **constexpr** 传进 `_to_dst_dtype`,
+  走 `_f32_to_e4m3_uint8(x_fp32 / scale)`;**源码里不再出现 `tl.float8e4nv`** ✓
+  (Triton 对 `tl.constexpr` 分支做编译期剪枝,0003 已验证这条可行 ✓)
+* 落点:`ops/qsa_prepare.py::_to_dst_dtype` + 其调用链(`_store_rotated` → launch 处)+ 必要时的
+  `qsa.py` 缓存 dtype 选择;预估**十几~几十行**,远小于搬社区内核 ✓
+
+#### ④ 下一步(顺序已排好)
+1. **devpatch #10**:上述 constexpr + `_f32_to_e4m3_uint8` 改造 ⇒ 起一次实例带 `KV_DTYPE=fp8` 验证
+   判据:① 引擎能起(无 fp8e4nv 编译错)② `KV cache size` 每-token 成本**降到 ~一半**(实测反推,
+   这正是 256K 预算的分母!)③ 发一个长 prompt 请求 200 ✓
+2. 用实测的 fp8 每-token 成本**重算** 256K×2/×3/×4 的账(B322④ 的两个口径据此收敛)✓
+3. 再上 **MTP 解码** ✓
+4. 稳定后把 devpatch 变成 `patches/xtu-series/` 里的正式补丁(树治理 ✓)
+
+---
+
+### B324(2026-10-05)🔓 fp8 KV on SM80 第一半打通(prepare ✓)+ **账目修正:fp8 只省 1.29×,不是 2×**
+
+> 承接 B323;目标:让 `KV_DTYPE=fp8` 在 SM80 上可用(256K×N 与 MTP 的共同前置)✓
+
+#### ① devpatch #10(两处)与实测进展
+| 子补丁 | 内容 | 结果 |
+|---|---|---|
+| a) 源码变换 | `ops/qsa_prepare.py`:`_to_dst_dtype` 去掉 `tl.float8e4nv` 字面量,改 constexpr `E4M3_U8` + `_f32_to_e4m3_uint8(x/scale)`(目标为 uint8 时编 e4m3 字节 ✓) | ✅ 生效 |
+| b) 调用侧包装 | `indexer_qsa.qsa_prepare`:把 `main_kv_cache.view(torch.float8_e4m3fn)` 换成 **uint8 视图** | ✅ 生效 |
+
+* 判据 ①②:实例 **READY ✓**、`not supported in this architecture` **0 次**(prepare 阶段)、补丁横幅两条都在 ✓
+* ⛔ 判据 ③(请求 200)**仍失败** —— 但**错误位置前移了** ✓:
+  ```
+  qsa.py:234 forward_qsa → ops/qsa.py:694 qsa_sparse_paged_attention →
+  _qsa_sparse_paged_gqa_splitk_kernel → ValueError("type fp8e4nv not supported …")
+  ```
+  ⇒ prepare 已过,现在是**注意力 kernel** 撞同一问题 ✗
+  ⇒ 同源:`ops/qsa.py:771-773` 注释写着 *"An fp8 cache is allocated as uint8 and viewed as e4m3 at
+    attention time."* ⇒ 它把 uint8 view 成 `float8_e4m3fn` 再交给 Triton ⇒ 实参类型 = fp8e4nv ✗
+  ⇒ **下一半**:同样改成"交 uint8 + kernel 内 `_e4m3_uint8_to_f32` 解码"(树里已有该 helper ✓,0003 的手法 ✓)
+
+#### ② ⚠️ 我这一轮踩的两个坑(都是"看起来对"的错 ✗)
+1. **exec 假文件名**:`exec(compile(src, "<假名>"))` ⇒ Triton `@triton.jit` 需要 `inspect.getsource` ⇒
+   `ValueError: @jit functions should be defined in a Python file` ✗
+   ⇒ 正解:**补丁后源码落盘成真文件**(`/tmp/w4a8/devpatch/_gen_qsa_prepare_sm80.py`)再 import + 换符号 ✓
+   (devpatch #2 能用 exec 是因为它没有 jit 函数 ⇒ **不能类推** ✓)
+2. **只看源码文本不够**:删掉字面量后仍报 fp8e4nv ✗ —— 因为 Triton 还按**实参张量的 dtype** 推断类型 ✓
+   ⇒ 判据要加一条:**"源码里 0 处 fp8e4nv" ≠ "编译不会失败"** ✓(必须看实参 dtype / 真跑一次)
+
+#### ③ ⭐ 账目修正:**fp8 KV 只省 1.29×**
+| | 实测 |
+|---|---|
+| KV/bf16 | 16 GiB / 346,931 tok = **48.4 KiB/token** |
+| KV/fp8 | 16 GiB / 448,921 tok = **37.4 KiB/token** ⇒ **1.29×**(不是 2×)✗ |
+根因:`kv cache group sizes [1600,1600,1600,1600,4,1600]` ⇒ 6 个组里**只有一部分**随 `--kv-cache-dtype fp8` 变 fp8,
+其余仍 bf16 ⇒ 省不出 2× ✓(**要再挤,须查清这 6 组各是什么、哪些能降精度** ✓)
+
+⇒ 用实测分母重算(卡 39.49 GiB;非 KV 实测 11.1;策略保守口径 +21.6):
+| | KV | 乐观合计 | 保守合计 |
+|---|---|---|---|
+| 256K×1 | 9.3 | 21.4 ✓ | 30.9 ✓ |
+| **256K×2** | 18.7 | 30.8 ✓ | 40.3 ✗(擦边) |
+| 256K×3 | 28.0 | 40.1 ✗ | 49.6 ✗ |
+| 256K×4 | 37.4 | 49.5 ✗ | 59.0 ✗ |
+⇒ **256K×2 是上限**;×3/×4 需要**额外的省显存杠杆**(其余缓存组降精度 / 更紧的 reserve)✗
+
+#### ④ 下一步(顺序)
+1. **下半程**:`ops/qsa.py` 的注意力路径改 uint8 + kernel 内解码 ⇒ 请求 200 ⇒ fp8 KV 真正可用 ✓
+2. 查清 6 个 KV 缓存组,找出还能降精度的部分(目标:把 37.4 压到 ~25 KiB/token ⇒ 256K×3 才可能)✓
+3. 然后 MTP;最后把 #10 落成 `patches/xtu-series/` 正式补丁 ✓
+
+---
+
+### B319(2026-10-05)依赖与选型核实:**我们依赖 FlashInfer(attention+sampling)与 Triton(SM80 sparse-MLA);但 MoE 用不上 FlashInfer**
+
+**问题(用户)**:① 我们整条执行路径依赖 triton / flashinfer 吗?② 对 MoE,用 flashinfer 能否提性能? ✓
+
+**① 依赖实况(读进程与已装包,非印象 ✓)**
+| 组件 | 依赖 | 用在哪 |
+|---|---|---|
+| **FlashInfer** | ⭐ **是**(`flashinfer-python 0.7.0` ✓)| ⭐ **attention backend = `FLASHINFER`** + `FLASHINFER_PCIE_IPC` + **`FLASHINFER_SAMPLER`**(日志实证 ✓)|
+| **Triton** | ⭐ **是**(`triton 3.7.1` + `tokenspeed-triton` ✓)| ⭐ **我们自己的 SM80 可移植 sparse-MLA**(patch 0004/0005/0007 ✓);上游那份是 `flashinfer_mla_sparse_sm90` ✗ **SM90 专用** ⇒ 这正是我们写 Triton 回退的原因 ✓ |
+| **CPU MoE 引擎** | ❌ **都不依赖** ✓ | 自研 C++/AVX-512(`xiaotu_moe/csrc` ✓);生产 `VLLM_EXPERTS_LOAD_DEVICE=cpu` ✓、`XIAOTU_MOE_THREADS=60` ✓ |
+
+**② MoE 能否靠 FlashInfer 提速:对我们的场景 ⇒ 不能** ✗,两个**独立**理由:
+1. ⭐⭐ **架构(决定性)**:我们的专家**在 CPU 上** ✓ ⇒ **GPU 侧 MoE kernel 根本碰不到主要计算** ✗
+2. ⚠️ **算力**:FlashInfer 的 `fused_moe` 代码里算力字样以 **`sm90`(39)/`SM100`(36)/`SM107`/`SM120`** 为主 ✓,
+   `8.0` 仅 12 处 ⇒ ⚠️ **不能断言 SM80 完全不可用** ✗,但**它不是目标平台** ✓;我们 **A100 = SM80** ✗
+
+**⭐ 真正值得对标的(比 flashinfer 更相关)**:上游已有 **`cpu_moe.py` / `cpu_int4_moe.py`** ✓ ⇒ **CPU MoE 的同类对象** ✓;
+若将来想把**部分热专家放 GPU**,SM80 上更可能走 **`triton_moe.py`**(Triton 后端不挑算力 ✓)而不是 FlashInfer ✓
+
+**⇒ 结论一句话**:FlashInfer 在**帮我们的地方是 attention + sampling** ✓;
+**MoE 的收益在 CPU 侧(VNNI-int8 / per-32 scale / 带宽与 NUMA)** ✓ —— 与 `PLAN_VNNI_SM80.md` 的排序一致 ✓
