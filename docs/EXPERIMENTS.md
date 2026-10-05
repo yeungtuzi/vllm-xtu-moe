@@ -10900,3 +10900,36 @@ return x.to(out_ty)
 1. ⭐ **上游的 CPU MoE 主力(AMX C++)在 AMD 上不可用** ✗ ⇒ **我们的 VNNI 路在本机是必然选择,且是差异化** ✓✓
 2. ⭐ ⇒ **这正是可以提给上游的方向**:一个 **AMD/Zen4 友好的 CPU MoE 后端**(VNNI-int8 / per-32 scale ✓)
 3. ⭐ **值得对标的免费基线**:`aten._dyn_quant_matmul_4bit`(PyTorch 原生 4-bit ✓)—— 我们做 A/B 时应把它算作一条臂 ✓
+
+---
+
+### B321(2026-10-05)核实:**PyTorch 原生 4-bit 是【int4(仿射)】,不是 MXFP4/NVFP4;而"换 int4"对我们【没有价值】**
+
+**问题(用户)**:那个原生 4bit 是 int4 还是 mxfp4/nvfp4?int4 有实际价值吗? ✓
+
+**① 它是 int4(而且带零点 ⇒ 仿射均匀量化)** —— 证据是 **op 的 schema**(权威 ✓):
+```
+aten::_dyn_quant_pack_4bit_weight(Tensor weights, Tensor scales_zeros, Tensor? bias,
+                                  int block_size, int in_features, int out_features) -> Tensor
+aten::_dyn_quant_matmul_4bit(Tensor inp, Tensor packed_weights, int block_size, ...) -> Tensor
+```
+⭐ 关键在 **`scales_zeros`** ✓ ⇒ **有 scale 又有 zero-point** = **均匀仿射 int4** ✓
+⇒ **不是 MXFP4**(E2M1 + **ue8m0 2 的幂** scale,**无零点** ✗)✓,**也不是 NVFP4**(E2M1 + FP8 scale ✗)✓
+
+**② 我们的格式(实测,不猜)** —— ds41f `config.json`:
+`expert_dtype: fp4` ✓、`weight_block_size: [32,32]` ✓、**`scale_fmt: ue8m0`** ✓
+⇒ ⭐ **⇒ 就是 MXFP4(E2M1 + 块 32 的 2 的幂 scale)** ✓;源码里 `e8m0` 309 处 / `int8` 306 处 / `int4` 仅 **6** 处 ✓
+
+**③ "int4 有实际价值吗" ⇒ 要拆成两个问法(这是关键)**
+| 问法 | 答案 |
+|---|---|
+| **整数【类型】有价值吗** | ⭐ **有,而且是关键** ✓ —— 只有整数量化才能用 **VNNI 整数点积** ✓ ⇒ **这正是 W4A8 收益的全部来源**(实测 **2.24~2.33×** ✓)|
+| **把权重【换成 int4】有价值吗** | ❌ **没有** ✗:① **不再省内存** —— 我们**已经是 4-bit**(MXFP4)✓;② **精度更差** —— E2M1 的**块浮点动态范围**优于均匀 int4 的等距格点 ✗;③ **不必要** —— ⭐ **MXFP4 → int8 是【精确】的(×2 ✓,见 `AB_W4A8_ACCEPTANCE.md`)** ⇒ **语义不变** ✓ |
+
+**⇒ 结论(直接改变 A/B 设计)**
+1. ⭐ **正确对照是** `A: MXFP4→bf16 + fp32 FMA` vs `B: MXFP4→int8(×2, 精确) + VNNI int32` ✓
+   —— **不是** "MXFP4 vs int4" ✗(换格式只会白担精度风险 ✓)
+2. ⭐ **PyTorch 原生 int4 路的价值在别处**:① **下界参照**("不写 kernel、用原生库"能到多少 ✓);
+   ② **给上游 PR 的证据**("原生 int4 = X,我们的精确 int8 = Y" ✓)
+3. ⚠️ **未查证(不写结论)**:是否存在**原生 int4 点积**的硬件支持 ⇒ VNNI 是 **int8×int8** ✓;
+   `int4` 在我们源码里只出现 6 次 ⇒ **支持很边缘** ✓
