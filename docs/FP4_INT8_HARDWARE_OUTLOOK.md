@@ -14,7 +14,8 @@
 1. **The 4-bit format question is settled, and the answer is floating-point, not integer.**
    The industry's 4-bit format is **FP4 in the microscaling (MX) style**: E2M1 elements with a
    shared block scale. **INT4** (uniform integer with per-group scale/zero-point) is a previous
-   generation of the same idea and has receded from the server roadmaps.
+   generation of the same idea: it has receded from the server hardware roadmaps, but it remains
+   in wide use for *post-hoc weight-only* quantisation (section 6.2).
 2. **No announced CPU provides native 4-bit matrix multiplication.** CPU matrix extensions
    either stop at 8-bit or accept 4-bit input only for *conversion* — so the practical pattern is
    **4-bit storage, 8-bit compute**.
@@ -153,5 +154,84 @@ MXFP4.
   material.
 * The cache-bandwidth ratio quoted in §3.4 is our own single-thread measurement, not an
   official figure. No vendor publishes per-CCD L3 bandwidth.
-* Claims about *how many models are shipped in FP4* are **not** made here; that would require a
-  survey we have not run.
+* For *how many models ship in FP4*, see section 6, which reports a survey of 35+ open-weight
+  MoE releases distinguishing official from community checkpoints and FP4 from INT4.
+
+---
+
+## 6. What the current model landscape actually ships
+
+A survey of 35+ open-weight MoE releases (2024 through 2026-10), reporting the **publisher's own
+checkpoint** only — community re-quantisations are listed separately below. Two categories are
+kept strictly apart, because they are different formats: **FP4** (E2M1 elements with block
+scales) and **INT4** (uniform affine integer with per-group scale/zero-point).
+
+### 6.1 Official FP4
+
+| Publisher | Model | Date | Official format |
+|---|---|---|---|
+| DeepSeek | V4-Flash / V4-Pro / V4.1-Flash | 2026-04 … 2026-09 | **Experts FP4, rest FP8** — E2M1 with block-32 E8M0 scales; card text: *"MoE expert parameters use FP4 precision; most other parameters use FP8"* |
+| OpenAI | gpt-oss-120b / 20b | 2025-08 | **MXFP4 on MoE expert weights**, BF16 elsewhere |
+| NVIDIA | Nemotron 3 Super / Ultra | 2026-03 … 2026-06 | **NVFP4** (Super was *pretrained* in NVFP4); attention/embeddings/MTP stay BF16/MXFP8 |
+| Mistral | Small 4, Large 3 | 2026-03 / 2025-12 | **NVFP4** |
+| IBM | Granite 4.2 | 2026-08 | **NVFP4 + MXFP4** |
+| StepFun | Step-3.7-Flash | 2026-05 | **NVFP4** |
+| Moonshot | Kimi K3 | 2026-06 | **MXFP4 weights + MXFP8 activations** (QAT) |
+| Arcee | Trinity series | 2025-12 … 2026-04 | BF16 + FP8 + W4A16 (INT4) + **NVFP4** |
+
+### 6.2 Official INT4 — still very much alive
+
+| Publisher | Model | Date | Format |
+|---|---|---|---|
+| Moonshot | Kimi K2 Thinking | 2025-11 | **INT4 weight-only QAT** on MoE experts |
+| Google | Gemma 4 26B-A4B | 2026-03 | **QAT INT4 affine** (`q4_0`/`w4a16`), explicitly not FP4 |
+| Tencent | Hunyuan-A13B | 2025-06 | BF16 + FP8 + **GPTQ-Int4** |
+| Baichuan | M3-235B | 2026-01 | FP8 + **GPTQ-INT4** |
+| Baidu | ERNIE-4.5-300B-A47B | 2025-06 | FP8 + W4A8C8 + **WINT2 (2-bit)** — integer-style, no FP4 |
+| Qwen | Qwen2/1.5 MoE, Qwen3, Qwen3.5 | 2024 … 2026 | BF16 + FP8 primary; **GPTQ-Int4 / MLX-4bit** as publisher-published 4-bit |
+
+### 6.3 Still FP8 / BF16 as the primary checkpoint
+
+DeepSeek V3 → V3.2 (FP8 only, no BF16 release), Qwen3-Next and every Qwen MoE (BF16 + FP8),
+Zhipu GLM-4.5/5.3, MiniMax M1–M3, Tencent Hy3, Xiaomi MiMo, Ant Ling, Meta Llama 4 (BF16 + FP8),
+Microsoft Phi MoE, AI2 OLMoE.
+
+### 6.4 The pattern that matters
+
+1. **4-bit lands on the experts first.** Where a publisher ships 4-bit, it is the MoE expert
+   weights (the bulk of the bytes) — dense, attention and embedding layers stay FP8 or BF16.
+   This is exactly the split a CPU-expert/GPU-attention serving engine wants.
+2. **When 4-bit is the *native or training* precision it is FP4; when it is *post-hoc weight-only*
+   quantisation it is often INT4.** NVIDIA pretrained Nemotron 3 Super in NVFP4 and Moonshot
+   quantisation-aware-trained K3 to MXFP4, whereas Kimi K2 Thinking, Hunyuan, Baichuan, Gemma and
+   the Qwen GPTQ releases chose INT4-style schemes. The direction of travel is from the latter
+   towards the former.
+3. **The same lab can move:** Moonshot shipped INT4 (K2 Thinking, 2025-11) and then MXFP4
+   (K3, 2026-06).
+4. **Published format ≠ served format.** NVIDIA, Red Hat and AMD publish NVFP4 or MXFP4
+   re-quantisations of models whose authors ship FP8 or BF16 — for example of GLM, Kimi, MiniMax,
+   Qwen, and DeepSeek. Neither the Qwen nor the DeepSeek organisation publishes any FP4-named
+   repository; their FP4-formatted serving weights come from third parties.
+5. **Accuracy of the compute step is not the limiting factor.** The FP4 weights themselves carry
+   a few percent of quantisation error, whereas an integer compute path over FP4 weights can be
+   made exact on the weight side and well under one percent on the activation side.
+
+### 6.5 What this engine consumes
+
+| Incoming format | Handling |
+|---|---|
+| MXFP4 (E2M1, block-32 E8M0 scales) | used directly |
+| NVFP4 (E2M1, FP8/E4M3 block-16 scales) | elements kept as-is; the E4M3 scales are converted losslessly to fp32 |
+| INT4 weight-only (e.g. GPTQ, W4A16) | separate lookup convention, supported |
+| FP8, BF16 | their own paths |
+
+Because published and served formats can differ, the engine is built to consume **both** halves of
+the landscape rather than assuming either one.
+
+### 6.6 Non-claims
+
+This survey covers model cards and repositories that could be read directly; ModelScope and
+other non-Hugging-Face distributions were not exhaustively checked, and a variant published only
+there cannot be ruled out. Formats attributed by inference from `config.json` fields plus
+safetensors headers are marked as such. Dates are publisher upload months. Where a third party
+re-quantised a model, that is stated rather than attributed to the model's author.
