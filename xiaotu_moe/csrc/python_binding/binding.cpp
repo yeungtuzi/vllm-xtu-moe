@@ -16,6 +16,9 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
+// 【T1.4 格式感知派发】进程级 W4A8 模式存取（见该头文件顶部的设计说明 ✓）
+#include "../moe/xiaotu_int8_mode.h"
+
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -588,6 +591,10 @@ static void bind_moe_class(py::module& m, const char* name) {
             MOE* p = new MOE(cfg, as_ptr(w13), as_ptr(w2), as_ptr(w13_g), as_ptr(w2_g),
                              static_cast<const float*>(as_ptr(w13_global)),
                              static_cast<const float*>(as_ptr(w2_global)));
+            // 【T1.4 格式感知派发】把 cfg 的 W4A8 模式写进进程级存储 ✓
+            //   必须在**第一次 matmul 之前**（构造函数里 ⇒ 天然满足 ✓）。
+            //   非 VNNI 档只是把值存下来、无人读取 ⇒ 零影响 ✓
+            xiaotu_int8::set_activation(cfg.int8_activation);
             // lk 链只给 num_processes/process_id:引擎自建跨 rank 归约(见 auto_ep_setup)
             auto_ep_setup((const void*)p, cfg);
             // 必须在任何 CUDA graph 捕获之前把解码 pinned 缓冲开好(R103)。
@@ -1058,7 +1065,9 @@ PYBIND11_MODULE(XIAOTU_MOE_MODULE_NAME, m) {
         .def_readwrite("swiglu_beta", &MOEConfigV2::swiglu_beta)
         .def_readwrite("swiglu_limit", &MOEConfigV2::swiglu_limit)
         .def_readwrite("activation_type", &MOEConfigV2::activation_type)
-        .def_readwrite("use_gpu_prefill", &MOEConfigV2::use_gpu_prefill);
+        .def_readwrite("use_gpu_prefill", &MOEConfigV2::use_gpu_prefill)
+        // 【T1.4】W4A8(int8 激活)模式：0=关(默认 ✓) / 1=ALIGN / 2=旧 VNNI
+        .def_readwrite("int8_activation", &MOEConfigV2::int8_activation);
 
     bind_moe_class<BF16WeightTraits, BF16Activation>(m, "MOE_BF16");
     bind_moe_class<BF16WeightTraits, FP16Activation>(m, "MOE_FP16");

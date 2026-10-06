@@ -103,6 +103,10 @@ def _lt_record(pre_ms: float, eng_ms: float, post_ms: float, name: str = "") -> 
 _VERIFY_LAYER = os.environ.get("XIAOTU_VERIFY_LAYER", "") == "1"
 _VERIFY_MAX = int(os.environ.get("XIAOTU_VERIFY_MAX", "1"))
 _DUMP_LAYER = os.environ.get("XIAOTU_DUMP_LAYER", "")
+# ⭐【T1.4】W4A8（int8 激活）派发总开关：**默认关** ✓
+#   置 1 ⇒ 插件**按权重格式自动派发**（MXFP4 + 块 32 ⇒ int8/ALIGN 路径；FP8/BF16 ⇒ 原路径）✓
+#   默认关的原因：换成 int8 计算必须先过**三项语义验收**（`DECISIONS.md` **D13**）✓
+_W4A8_ENABLE = os.environ.get("XIAOTU_MOE_W4A8", "0") == "1"
 _HID_LAYER = os.environ.get("XIAOTU_HID_LAYER", "")
 
 
@@ -1133,7 +1137,24 @@ class _XiaotuExpertsMixin:
         cfg.use_gpu_prefill = False
         cfg.groupN = int(self._group_n)
         cfg.groupK = int(self._group_k)
+        # ⭐【T1.4 格式感知派发】按**权重格式**决定 W4A8(int8 激活)路径的模式 ✓
+        #   * **MXFP4**（本文件的类文档：groupN=1 / groupK=32 / u8 nibble + **e8m0** ✓）
+        #     ⇒ 候选 **1 = ALIGN int8**：权重侧 fp4×2 是**逐位精确**的整数 ⇒ 语义不变 ✓
+        #   * **FP8 / BF16 / WNA16** ⇒ **0**，各自走原路径 ✗（浮点→int8 是**有损转换** ✓）
+        #   ⚠️ **默认仍然关**（`XIAOTU_MOE_W4A8=1` 才生效）—— 因为"换成 int8 计算"要等
+        #      **三项语义验收**（GSM8K 198~199/200 · Vision 23/23 · 1M 四针一致）通过后才能默认开 ✓
+        #   ⚠️ 仅对带 `-mavx512vnni` 构建的档生效（非 VNNI 档该路径不参与编译 ✓）；
+        #      且 env `XIAOTU_MOE_INT8_ALIGN/_VNNI` 仍可**强制覆盖**，供 dev A/B ✓
+        if _W4A8_ENABLE and self._engine_attr == "MOE_MXFP4" and int(self._group_k) == 32:
+            cfg.int8_activation = 1
+        else:
+            cfg.int8_activation = 0
         engine_cls = getattr(xiaotu_moe, self._engine_attr)
+        # ⭐【T1.4 可观测性】派发生效时必须**在日志里留痕**（否则验收跑无法证明走的是 int8 路径 ✗）。
+        #   只在非 0 时打印 ⇒ **生产日志保持不变** ✓
+        if int(getattr(cfg, "int8_activation", 0)) != 0:
+            print(f"[vllm-xtu-moe] ⭐ W4A8 dispatch: {self._engine_attr} "
+                  f"int8_activation={int(cfg.int8_activation)} (1=ALIGN int8 path)", flush=True)
         # 【诊断·NOTES §484】ctor 只拿到 **裸 data_ptr**,而 shard_fill 会在里面按
         # cfg 推出来的几何 memcpy;DSpark 的 draft 层让这个 memcpy 读到了映射尽头
         # (SIGSEGV in MOE_V2<MXFP4>::MOE_V2)。这里把"cfg 期望的字节数"与
@@ -2095,6 +2116,38 @@ class _XiaotuExpertsMixin:
                 and not getattr(self, "_dumped", False):
             self._dumped = True
             self._dump_layer(layer)
+        # ⭐ dev-only (T1.2):把【真实 MoE 输入激活】存档,供离线数值对拍用 ✓
+        #   `XIAOTU_ACT_DUMP=<目录>`(+ 可选 `XIAOTU_ACT_DUMP_LAYER=<layer_name 子串>`)⇒ 每层一次。
+        #   存 {h[M,H] bf16, ids[M,topk] int32, wts[M,topk] fp32, layer} —— 与 dev-docs/mywork/artifacts/ 的旧 dump 同格式 ✓
+        _act_dump_dir = os.environ.get("XIAOTU_ACT_DUMP", "")
+        if _act_dump_dir and not _ACT_DUMP_DONE[0]:
+            _act_dump_layer = os.environ.get("XIAOTU_ACT_DUMP_LAYER", "")
+            if not _act_dump_layer or _act_dump_layer in getattr(layer, "layer_name", ""):
+                try:
+                    import torch as _t
+
+                    os.makedirs(_act_dump_dir, exist_ok=True)
+                    _lname = getattr(layer, "layer_name", "layer").replace("/", "_")
+                    _p = os.path.join(_act_dump_dir, f"act_{_lname}.pt")
+                    _t.save(
+                        {
+                            "h": h_bf16.detach().to("cpu"),
+                            "ids": ids_i32.detach().to("cpu"),
+                            "wts": wts_f32.detach().to("cpu"),
+                            "layer": getattr(layer, "layer_name", "?"),
+                        },
+                        _p,
+                    )
+                    # ⚠️ 标记必须放在【模块级】：`self` 是**逐层**的 MoE 实例 ⇒ 放在 self 上会
+                    #    "每层各存一份"（2026-10-05 实测因此产生 48 个文件 ✗）
+                    _ACT_DUMP_DONE[0] = True
+                    print(
+                        f"[act-dump] saved {_p} layer={getattr(layer, 'layer_name', '?')} "
+                        f"M={int(h_bf16.shape[0])} H={int(h_bf16.shape[1])} topk={int(ids_i32.shape[1])}",
+                        flush=True,
+                    )
+                except Exception as _e:  # 绝不让 dev 钩子影响服务 ✓
+                    print(f"[act-dump] FAILED: {type(_e).__name__}: {_e}", flush=True)
         if _VERIFY_LAYER and getattr(self, "_verified_n", 0) < _VERIFY_MAX:
             # 跳过 profile/warmup 等路由 id 无效的调用(此时 topk_ids 为 -1 哨兵)
             if bool((ids_i32 >= 0).all()):

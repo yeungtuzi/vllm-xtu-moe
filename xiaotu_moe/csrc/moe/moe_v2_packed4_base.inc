@@ -1,0 +1,1566 @@
+// xiaotu-moe: packed 4-bit WeightTraits (MXFP4 / WNA16) for MOE_V2.
+// Self-contained CPU kernels.
+//
+// Weight layout (mirrors what vLLM feeds the real lk_moe MOE_MXFP4 / MOE_WNA16
+// engines after _process_mxfp4/_process_wna16):
+//   w13  : [expert_num][2*inter][hidden/2]  uint8, 4-bit nibble-packed along K.
+//          gate = rows [0, inter), up = rows [inter, 2*inter).
+//   w2   : [expert_num][hidden][inter/2]    uint8, nibble-packed along K.
+//   Each byte = 2 consecutive K elements: low nibble = even k, high nibble = odd k.
+//   Scales (w13_g / w2_g):
+//          [expert_num][N/groupN][K/groupK] fp32 per-group block scale.
+//          N = 2*inter for w13_g, hidden for w2_g; K = hidden/inter respectively.
+//   Dequant: W[n,k] = lut[nibble(W,n,k)] * scale[n/groupN, k/groupK]
+//     - MXFP4 : lut = FP4 E2M1 table (no zero point).
+//     - WNA16 : lut = int4 centered at 8  ((nibble - 8)), ktransformers GPTQ
+//               convention. Exact vLLM-Marlin matching needs a real-model A/B.
+//
+// GEMM uses the deferred-hsum pattern: inside a K-group only unscaled values
+// accumulate, at each group boundary one broadcast-FMA folds the group scale,
+// one hsum per row, then an optional global scale is applied.
+//
+// Copyright: Apache-2.0. Dequantization approach and FP4 E2M1 table follow
+// KVCache.AI ktransformers (/kt-kernel/operators/avx2/mxfp4-moe.hpp).
+
+#ifndef XIAOTU_MOE_MOE_V2_PACKED4_HPP
+#define XIAOTU_MOE_MOE_V2_PACKED4_HPP
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "../kernels/bf16_gemm.hpp"
+
+// ---------------------------------------------------------------------------
+// 【§631】`XIAOTU_MOE_FOLD_SCALE`:把每 (输出列 j, K 组 g) 的 scale **折到权重侧**。
+//
+// 旧式(默认 0,数值与历史逐位一致):
+//     d  = wlo * avlo                 (mul)
+//     d  = fma(whi, avhi, d)          (fma)   -> d = 该 32-K 组的点积(16 lane 部分和)
+//     acc= fma(d, sv, acc)            (fma)   -> 折 scale + 水平归约累加
+//   ⇒ **每个 (行,列,组) 占 3 个 FMA 端口**;32 个真 MAC 用掉 48 个 lane-op
+//     ⇒ FMA 端口利用率 **64/96 = 67%**。
+//
+// 新式(=1):
+//     wlos = wlo * sv;  whis = whi * sv        (2 个 mul,**每 (列,组) 只做一次**,被 MR 行摊薄)
+//     acc  = fma(wlos, avlo, acc)              (fma)
+//     acc  = fma(whis, avhi, acc)              (fma)
+//   ⇒ MR=4 时每个 (行,列,组) 只占 **2.5 个 FMA 端口**(2 + 2/4)⇒ 理论 **1.2×**。
+//   机理:新式的两次 fma 同时完成"乘加"和"水平归约累加",不再有第 3 条只为折 scale、
+//   白白多花 16 个 lane 乘法的指令。(lk_moe 之所以不吃这个亏:它的 16 个 lane 就是
+//   16 个**输出列**,压根不需要水平归约 —— 见 NOTES §630 的反汇编对比。)
+//
+// **数值**:E8M0/fp32 的 block scale 都是 **2 的整数次幂**(E8M0 = 2^(b-127)),
+// 故 `w*sv` 是**精确**的(只动指数,不舍入);两种写法都只有 2 次舍入,但**分组不同**
+// ⇒ 低位可能差 1-2 ulp。因此本开关**只作用于 MR>=2 的 tile 路径**(预处理大 M),
+// **单行解码路径与 block_23 保持逐位不变** —— 数值门的 `me=1 max_rel=1.873e-02`
+// 与 `me=2/3` 用例不受影响。
+//
+// 【2026-09-18 实测:默认改为 1】
+//   * 数值门 `test_block23_equiv.py`:**OK=7 BAD=1,BAD 仍是 `me=1 max_rel=1.873e-02`(逐位不变)**;
+//     me>=2 的 7 项全部 <7e-4(门限 2e-3),其中 me=6 还从 6.602e-04 改善到 6.002e-04。
+//   * `test_wna16_repack.py` / `test_swiglu_clamp.py`:与 FOLD=0 **逐位相同**。
+//   * 确定性门 `test_engine_determinism.py 11`:**10/10 bit-identical**。
+//   * 性能(g++-16,THREADS=60,DEDUP=226,同一 session 的 lk 参照):
+//     BS=227 36.49→**35.24**(−3.4%)、BS=1893 253.40→**232.21**(−8.4%)、
+//     BS=8192 1053.72→**967.86**(−8.2%)、解码 0.41→0.42。
+//     ⇒ 我们/lk 从 1.201/1.164/1.130 降到 **1.160/1.066/1.038**(后两档**达标 ≤1.111**)。
+// ---------------------------------------------------------------------------
+#ifndef XIAOTU_MOE_FOLD_SCALE
+#define XIAOTU_MOE_FOLD_SCALE 1
+#endif
+
+// 【§632】`XIAOTU_MOE_TILE_ALLMR`:tile 特化覆盖的 `mr` 档位。
+//   0 = 只特化满 tile `mr==MR`;**3(默认)= 满 tile + `mr=3/2/1`**;1 = 全部 mr;2 = 满 tile + mr=2。
+// 开关只影响**码生成**(循环边界是字面量还是运行时值),不改变任何一次浮点运算的顺序
+// ⇒ 各档之间**逐位一致**。
+// 【§632 实测(MR=4 时代)**:** 扩到全部 mr 反而更差(BS=1893 +3.1%、BS=8192 +2.7%),
+// 因为多出来的 13 个 tile body 让热点函数变大、挤 I-cache ⇒ 当时默认保持 0。
+// 【§635 实测(MR=6 之后)**:** 必须补小 M 尾巴 —— 通用回退路径声明 `acc[MR][8]`
+// (= acc[6][8] = 48 个 zmm)会**剧烈溢出**,门禁形状 DEDUP=12(BS=6 ⇒ 每专家 M=3)
+// 从 0.65-0.69 退化到 **0.79 ms/层**(同日 lk 比值 1.46×,门限 1.30 ⇒ **FAIL**)。
+// 补 `mr=3/2/1` 三档(=3)后:
+//   | 形状 | ALLMR=0 | **ALLMR=3** | ALLMR=1 | lk |
+//   |---|---|---|---|---|
+//   | 门禁 DEDUP=12 | 0.79(1.46×)❌ | **0.51(0.944×)✅** | 0.52(0.945×) | 0.54 |
+//   | 门禁 DEDUP=23 | 0.71(1.22×) | **0.68(1.133×)✅** | 0.63(1.016×) | 0.60 |
+//   | BS=227 (na≈226) | 29.44 | **30.01(0.986×)✅** | 33.34(1.095×) | 30.44 |
+//   | BS=1893 | 224.23 | **227.29(1.044×)✅** | 242.10(1.112×) | 217.65 |
+// ⇒ **=3** 在真实形状上最好且门禁全过;=1 门禁更漂亮但真实形状差 5-6%。
+#ifndef XIAOTU_MOE_TILE_ALLMR
+// 【§637 实测:默认改为 1】**必须**给所有 `mr` 发 body。`=3` 时 `mr=4/5` 掉进通用回退路径,
+// M=4/5 实测 1.02/1.09 ms/层;`=1` 后 0.63/0.70(**−38%/−36%**),且 M=1..12 全档最优。
+// (M=1..12 的完整曲线见 report/tuning/AB_LVLLM_VS_XIAOTU.md 轮 7。)
+#define XIAOTU_MOE_TILE_ALLMR 1
+#endif
+
+// 【§634】(MR, NR) 的寄存器预算。
+// 每个 (g, tile) 需要的**常驻 zmm** ≈ `acc[MR][NR] + av[MR][2] + wlo/whi + wlos/whis + sv`
+//                              = MR*NR + 2*MR + 5,再叠加解码用的 ~7 个短命临时 ⇒ 上限 ~32。
+//   MR=4, NR=4 : 16 + 8  + 5 = 29  (当前)
+//   MR=6, NR=2 : 12 + 12 + 5 = 29  (同一个预算,但 **每个权重字节只读一遍**)
+// 为什么 MR 对**真实负载**比对 NR 更要紧:`na≈226` 使每专家 M≈6,
+//   * MR=4 ⇒ M=6 被切成 `mr=4` + `mr=2` **两遍**,权重字节被读 **2 次**;
+//     lk_moe 的内循环一次吃 8 行 ⇒ **只读 1 次**。这就是 perf 里我们
+//     `L1-dcache-loads = 2.0×`、`L1-dcache-load-misses = 5.0×` lk 的直接来源。
+//   * MR=6 ⇒ M=6 **一遍过**,权重只读 1 次;代价是 NR 从 4 降到 2
+//     (指令模型 0.25 → 0.156 instr/MAC,M=6;M=50 时 0.176 → 0.161)。
+//
+// 【§634 实测:默认改为 MR=6 / NR=2】同一 session、THREADS=60、DEDUP=226:
+//   | 形状 | lk_moe | MR=4/NR=4 | **MR=6/NR=2** | 比值 |
+//   |---|---|---|---|---|
+//   | BS=227 | 30.43 | 35.27 | **29.46** | **0.968×**(比 lk 还快 3%) |
+//   | BS=1893 | 217.56 | 234.30 | **223.34** | **1.027×** |
+//   | 解码 BS=1/DD=6 | 0.44 | 0.39 | 0.41 | 0.932× |
+//   BS=227 一步 **−16.5%**。数值门 `OK=7 BAD=1`(BAD 仍 `me=1 max_rel=1.873e-02`,逐位不变)、
+//   确定性 10/10 全部通过。
+#ifndef XIAOTU_MOE_GEMM_MR
+#define XIAOTU_MOE_GEMM_MR 6
+#endif
+#ifndef XIAOTU_MOE_GEMM_NR_DEFAULT
+#define XIAOTU_MOE_GEMM_NR_DEFAULT 2
+#endif
+// 【§637】`XIAOTU_MOE_GEMM_NR_CT`:**编译期** NR(>0 时生效,并禁用 `XIAOTU_MOE_GEMM_NR` 覆盖)。
+// 为什么必须有它 —— 修 §635 留下的"洞":
+//   通用回退路径(未被 tile 特化覆盖的 `mr`)声明 `__m512 acc[MR][8]`。NR 是**运行时**值时
+//   编译器无法收紧,于是 `MR=6` 时它是 `acc[6][8]` = **48 个 zmm** ⇒ 剧烈溢出。
+//   实测代价:`mr=3`(M=3)从 0.51 → **0.79 ms/层(+55%)**。
+//   而 `TILE_ALLMR=3` 只发 `mr∈{6,3,2,1}` ⇒ **`mr=4/5` 永远掉进这条路径**。
+//   M=4/5 落在哪些 batch?`M≈B·k/E`:V4.1(E=384,k=6)在 **B∈[256,320]**;V4(E=256)在 **[171,214]**;
+//   解码侧 B=8..10 也可能 —— 都是很常见的 chunk 尺寸。
+// 有了 NR_CT,数组变成 `acc[6][2]` = 12 个 zmm ⇒ **通用路径本身不再溢出**,
+// `mr=4/5` 无需专门 body,`mr` 的覆盖不再需要"猜哪些档会出现",对**所有模型/所有 batch**都安全。
+#ifndef XIAOTU_MOE_GEMM_NR_CT
+// 【§637 实测:默认改为 2】出货构建(= 实测用的 nct2_a1 那套 .so):
+//   THREADS=60 / DEDUP=226 / 同 session lk 参照
+//   | 形状 | 旧出货(MR=6,NR 运行时,ALLMR=3) | **NR_CT=2 + ALLMR=1** | lk_moe | 比值 |
+//   |---|---|---|---|---|
+//   | BS=227  | 30.20 | **29.75** | 30.23 | **0.984×** |
+//   | BS=1893 | 224.45 | **210.86** | 217.80 | **0.968×** |
+//   | BS=8192 | 964.96 | **876.22** | 932.85 | **0.939×** |
+//   | 解码 BS=1/DD=6 | 0.42 | **0.41** | 0.46 | **0.891×** |
+//   ⇒ **引擎级四个形状全部比 lk_moe 快**(0.89-0.98×)。
+//   M 曲线(DEDUP=6 ⇒ M=BS)也证明它填平了 mr=4/5 的悬崖:
+//   M=4 1.24→**0.63**(−49%)、M=5 1.30→**0.70**(−46%),且 M=1..12 每档最优。
+#define XIAOTU_MOE_GEMM_NR_CT 2   // 0 = 关闭(保持历史"运行时 NR"行为)
+#endif
+#if XIAOTU_MOE_GEMM_NR_CT > 0
+#define XIAOTU_TILE_NMAX XIAOTU_MOE_GEMM_NR_CT
+#else
+#define XIAOTU_TILE_NMAX 8
+#endif
+
+namespace xiaotu_moe {
+
+namespace packed4 {
+
+// Standard FP4 E2M1 dequant table (nibble -> value). Shared by MXFP4 & NVFP4.
+// e2m1: 1 sign, 2 exponent (bias 1), 1 mantissa.
+static constexpr float E2M1[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    0.0f /* -0 */, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
+// WNA16 int4 table, centered at 8 (ktransformers GPTQ convention: (nibble-8)).
+static constexpr float INT4_CENTER8[16] = {
+    -8.0f, -7.0f, -6.0f, -5.0f, -4.0f, -3.0f, -2.0f, -1.0f,
+    0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f,
+};
+
+// nibble value of packed element (W packed [N][K/2], low nibble = even k).
+static inline int nibble_of(const uint8_t* Wrow, int k) {
+    const uint8_t b = Wrow[k / 2];
+    return (k & 1) ? (b >> 4) : (b & 0x0F);
+}
+
+// horizontal sum of a 256-bit vector into a scalar.
+static inline float hsum256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+#if defined(__AVX512F__)
+// horizontal sum of a 512-bit vector into a scalar (fnm/blend-free).
+static inline float hsum512(__m512 v) {
+    __m256 lo = _mm512_castps512_ps256(v);
+    __m256 hi = _mm512_extractf32x8_ps(v, 1);
+    __m256 s = _mm256_add_ps(lo, hi);
+    return hsum256(s);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Fast-path memory profiler (DISABLED unless XIAOTU_MOE_BYTEPROF is set).
+// Counts raw weight bytes read per fast-path call + wall time to measure the
+// engine's real streaming bandwidth (MB/s) for the packed4 gate/up/down GEMMs.
+// ---------------------------------------------------------------------------
+static std::atomic<uint64_t> g_bp_bytes{0}, g_bp_ns{0}, g_bp_calls{0};
+static std::atomic<uint64_t> g_bp_Lbytes{0}, g_bp_Lns{0}, g_bp_Lcalls{0}; // large (>=512KB)
+static inline bool byteprof_on() {
+    static const bool on = (std::getenv("XIAOTU_MOE_BYTEPROF") != nullptr);
+    return on;
+}
+static inline void byteprof_accum(size_t bytes, uint64_t ns) {
+    g_bp_bytes += bytes; g_bp_ns += ns; g_bp_calls += 1;
+    if (bytes >= (size_t)(512 << 10)) { g_bp_Lbytes += bytes; g_bp_Lns += ns; g_bp_Lcalls += 1; }
+    uint64_t c = g_bp_calls.load(std::memory_order_relaxed);
+    if ((c % 200) == 0) {
+        double agg = (double)g_bp_bytes.load() / 1e6 / std::max((double)g_bp_ns.load()/1e9, 1e-12);
+        double Lag = (double)g_bp_Lbytes.load() / 1e6 / std::max((double)g_bp_Lns.load()/1e9, 1e-12);
+        fprintf(stderr, "[BYTEPROF] calls=%llu agg=%.0f MB/s  LARGE(>=512KB) calls=%llu bytes=%.1fMB ns=%.0f agg=%.0f MB/s\n",
+                (unsigned long long)c, agg,
+                (unsigned long long)g_bp_Lcalls.load(), (double)g_bp_Lbytes.load()/1e6, (double)g_bp_Lns.load(), Lag);
+    }
+}
+// fp8_e8m0fnu ("ue8m0") decode: scale = 2^(byte - 127). This is how the fork's
+// Mxfp4MoEMethod feeds DeepSeek-V4-Flash MXFP4 scales (raw uint8 bytes, verified
+// against real lk_moe MOE_MXFP4: median ratio 1.0001 vs torch truth). Lazy
+// 256-entry table so indexing costs one load, no per-group powf.
+inline float e8m0_scale_table_gen(int i) { return std::pow(2.0f, i - 127); }
+static inline const float* e8m0_table() {
+    static const float table[256] = {
+        e8m0_scale_table_gen(0), e8m0_scale_table_gen(1), e8m0_scale_table_gen(2),
+        e8m0_scale_table_gen(3), e8m0_scale_table_gen(4), e8m0_scale_table_gen(5),
+        e8m0_scale_table_gen(6), e8m0_scale_table_gen(7), e8m0_scale_table_gen(8),
+        e8m0_scale_table_gen(9), e8m0_scale_table_gen(10), e8m0_scale_table_gen(11),
+        e8m0_scale_table_gen(12), e8m0_scale_table_gen(13), e8m0_scale_table_gen(14),
+        e8m0_scale_table_gen(15), e8m0_scale_table_gen(16), e8m0_scale_table_gen(17),
+        e8m0_scale_table_gen(18), e8m0_scale_table_gen(19), e8m0_scale_table_gen(20),
+        e8m0_scale_table_gen(21), e8m0_scale_table_gen(22), e8m0_scale_table_gen(23),
+        e8m0_scale_table_gen(24), e8m0_scale_table_gen(25), e8m0_scale_table_gen(26),
+        e8m0_scale_table_gen(27), e8m0_scale_table_gen(28), e8m0_scale_table_gen(29),
+        e8m0_scale_table_gen(30), e8m0_scale_table_gen(31), e8m0_scale_table_gen(32),
+        e8m0_scale_table_gen(33), e8m0_scale_table_gen(34), e8m0_scale_table_gen(35),
+        e8m0_scale_table_gen(36), e8m0_scale_table_gen(37), e8m0_scale_table_gen(38),
+        e8m0_scale_table_gen(39), e8m0_scale_table_gen(40), e8m0_scale_table_gen(41),
+        e8m0_scale_table_gen(42), e8m0_scale_table_gen(43), e8m0_scale_table_gen(44),
+        e8m0_scale_table_gen(45), e8m0_scale_table_gen(46), e8m0_scale_table_gen(47),
+        e8m0_scale_table_gen(48), e8m0_scale_table_gen(49), e8m0_scale_table_gen(50),
+        e8m0_scale_table_gen(51), e8m0_scale_table_gen(52), e8m0_scale_table_gen(53),
+        e8m0_scale_table_gen(54), e8m0_scale_table_gen(55), e8m0_scale_table_gen(56),
+        e8m0_scale_table_gen(57), e8m0_scale_table_gen(58), e8m0_scale_table_gen(59),
+        e8m0_scale_table_gen(60), e8m0_scale_table_gen(61), e8m0_scale_table_gen(62),
+        e8m0_scale_table_gen(63), e8m0_scale_table_gen(64), e8m0_scale_table_gen(65),
+        e8m0_scale_table_gen(66), e8m0_scale_table_gen(67), e8m0_scale_table_gen(68),
+        e8m0_scale_table_gen(69), e8m0_scale_table_gen(70), e8m0_scale_table_gen(71),
+        e8m0_scale_table_gen(72), e8m0_scale_table_gen(73), e8m0_scale_table_gen(74),
+        e8m0_scale_table_gen(75), e8m0_scale_table_gen(76), e8m0_scale_table_gen(77),
+        e8m0_scale_table_gen(78), e8m0_scale_table_gen(79), e8m0_scale_table_gen(80),
+        e8m0_scale_table_gen(81), e8m0_scale_table_gen(82), e8m0_scale_table_gen(83),
+        e8m0_scale_table_gen(84), e8m0_scale_table_gen(85), e8m0_scale_table_gen(86),
+        e8m0_scale_table_gen(87), e8m0_scale_table_gen(88), e8m0_scale_table_gen(89),
+        e8m0_scale_table_gen(90), e8m0_scale_table_gen(91), e8m0_scale_table_gen(92),
+        e8m0_scale_table_gen(93), e8m0_scale_table_gen(94), e8m0_scale_table_gen(95),
+        e8m0_scale_table_gen(96), e8m0_scale_table_gen(97), e8m0_scale_table_gen(98),
+        e8m0_scale_table_gen(99), e8m0_scale_table_gen(100), e8m0_scale_table_gen(101),
+        e8m0_scale_table_gen(102), e8m0_scale_table_gen(103), e8m0_scale_table_gen(104),
+        e8m0_scale_table_gen(105), e8m0_scale_table_gen(106), e8m0_scale_table_gen(107),
+        e8m0_scale_table_gen(108), e8m0_scale_table_gen(109), e8m0_scale_table_gen(110),
+        e8m0_scale_table_gen(111), e8m0_scale_table_gen(112), e8m0_scale_table_gen(113),
+        e8m0_scale_table_gen(114), e8m0_scale_table_gen(115), e8m0_scale_table_gen(116),
+        e8m0_scale_table_gen(117), e8m0_scale_table_gen(118), e8m0_scale_table_gen(119),
+        e8m0_scale_table_gen(120), e8m0_scale_table_gen(121), e8m0_scale_table_gen(122),
+        e8m0_scale_table_gen(123), e8m0_scale_table_gen(124), e8m0_scale_table_gen(125),
+        e8m0_scale_table_gen(126), e8m0_scale_table_gen(127), e8m0_scale_table_gen(128),
+        e8m0_scale_table_gen(129), e8m0_scale_table_gen(130), e8m0_scale_table_gen(131),
+        e8m0_scale_table_gen(132), e8m0_scale_table_gen(133), e8m0_scale_table_gen(134),
+        e8m0_scale_table_gen(135), e8m0_scale_table_gen(136), e8m0_scale_table_gen(137),
+        e8m0_scale_table_gen(138), e8m0_scale_table_gen(139), e8m0_scale_table_gen(140),
+        e8m0_scale_table_gen(141), e8m0_scale_table_gen(142), e8m0_scale_table_gen(143),
+        e8m0_scale_table_gen(144), e8m0_scale_table_gen(145), e8m0_scale_table_gen(146),
+        e8m0_scale_table_gen(147), e8m0_scale_table_gen(148), e8m0_scale_table_gen(149),
+        e8m0_scale_table_gen(150), e8m0_scale_table_gen(151), e8m0_scale_table_gen(152),
+        e8m0_scale_table_gen(153), e8m0_scale_table_gen(154), e8m0_scale_table_gen(155),
+        e8m0_scale_table_gen(156), e8m0_scale_table_gen(157), e8m0_scale_table_gen(158),
+        e8m0_scale_table_gen(159), e8m0_scale_table_gen(160), e8m0_scale_table_gen(161),
+        e8m0_scale_table_gen(162), e8m0_scale_table_gen(163), e8m0_scale_table_gen(164),
+        e8m0_scale_table_gen(165), e8m0_scale_table_gen(166), e8m0_scale_table_gen(167),
+        e8m0_scale_table_gen(168), e8m0_scale_table_gen(169), e8m0_scale_table_gen(170),
+        e8m0_scale_table_gen(171), e8m0_scale_table_gen(172), e8m0_scale_table_gen(173),
+        e8m0_scale_table_gen(174), e8m0_scale_table_gen(175), e8m0_scale_table_gen(176),
+        e8m0_scale_table_gen(177), e8m0_scale_table_gen(178), e8m0_scale_table_gen(179),
+        e8m0_scale_table_gen(180), e8m0_scale_table_gen(181), e8m0_scale_table_gen(182),
+        e8m0_scale_table_gen(183), e8m0_scale_table_gen(184), e8m0_scale_table_gen(185),
+        e8m0_scale_table_gen(186), e8m0_scale_table_gen(187), e8m0_scale_table_gen(188),
+        e8m0_scale_table_gen(189), e8m0_scale_table_gen(190), e8m0_scale_table_gen(191),
+        e8m0_scale_table_gen(192), e8m0_scale_table_gen(193), e8m0_scale_table_gen(194),
+        e8m0_scale_table_gen(195), e8m0_scale_table_gen(196), e8m0_scale_table_gen(197),
+        e8m0_scale_table_gen(198), e8m0_scale_table_gen(199), e8m0_scale_table_gen(200),
+        e8m0_scale_table_gen(201), e8m0_scale_table_gen(202), e8m0_scale_table_gen(203),
+        e8m0_scale_table_gen(204), e8m0_scale_table_gen(205), e8m0_scale_table_gen(206),
+        e8m0_scale_table_gen(207), e8m0_scale_table_gen(208), e8m0_scale_table_gen(209),
+        e8m0_scale_table_gen(210), e8m0_scale_table_gen(211), e8m0_scale_table_gen(212),
+        e8m0_scale_table_gen(213), e8m0_scale_table_gen(214), e8m0_scale_table_gen(215),
+        e8m0_scale_table_gen(216), e8m0_scale_table_gen(217), e8m0_scale_table_gen(218),
+        e8m0_scale_table_gen(219), e8m0_scale_table_gen(220), e8m0_scale_table_gen(221),
+        e8m0_scale_table_gen(222), e8m0_scale_table_gen(223), e8m0_scale_table_gen(224),
+        e8m0_scale_table_gen(225), e8m0_scale_table_gen(226), e8m0_scale_table_gen(227),
+        e8m0_scale_table_gen(228), e8m0_scale_table_gen(229), e8m0_scale_table_gen(230),
+        e8m0_scale_table_gen(231), e8m0_scale_table_gen(232), e8m0_scale_table_gen(233),
+        e8m0_scale_table_gen(234), e8m0_scale_table_gen(235), e8m0_scale_table_gen(236),
+        e8m0_scale_table_gen(237), e8m0_scale_table_gen(238), e8m0_scale_table_gen(239),
+        e8m0_scale_table_gen(240), e8m0_scale_table_gen(241), e8m0_scale_table_gen(242),
+        e8m0_scale_table_gen(243), e8m0_scale_table_gen(244), e8m0_scale_table_gen(245),
+        e8m0_scale_table_gen(246), e8m0_scale_table_gen(247), e8m0_scale_table_gen(248),
+        e8m0_scale_table_gen(249), e8m0_scale_table_gen(250), e8m0_scale_table_gen(251),
+        e8m0_scale_table_gen(252), e8m0_scale_table_gen(253), e8m0_scale_table_gen(254),
+        e8m0_scale_table_gen(255),
+    };
+    return table;
+}
+
+// C[M,N] fp32 = A[M,K]bf16 x W[N,K/2]fp4^T, group scale along N (groupN) and K
+// (groupK), optional global scale. W row major [N][K/2]. S=[N/gn][K/gk].
+// lut: 16-entry float table mapping nibble -> weight value.
+// E8M0: when true, S is a raw uint8 fp8_e8m0 byte buffer (fork MXFP4 feeding),
+// decoded as 2^(byte-127); when false, S is fp32 values (WNA16/NVFP4 feeding).
+// 【2026-10-04 goal-B②】行预取距离(以"输出列行"为单位)。默认 **1 = 原行为**(零回归)。
+// WHY:单行解码路径逐 j(输出列)流式读权重行(W 每行 K/2 字节);原实现只对**下一行**做
+// 前瞻,而 1 个 j 迭代(80 个 group ≈ 400–800 cycle ≈ 130–260 ns)**刚好等于 DRAM 延迟**
+// ⇒ 余量太小,行首/行尾仍在停等。实测每线程只有 ~1.24 GB/s,而单核流式可达 ~36 GB/s。
+// 纯预取、不改任何数值语义 ⇒ 数值门禁天然通过;A/B 靠本 env 在同一 build 内切换 ✓
+// ⚠️ 必须放在下面 `template<...>` **之前** —— 否则会把模板参数与函数拆开(本次已踩一次)✗
+inline int matmul_pf_rows() {
+    static const int v = []() {
+        const char* s = std::getenv("XIAOTU_MOE_PF_ROWS");
+        int n = s ? std::atoi(s) : 1;
+        if (n < 1) n = 1;
+        if (n > 8) n = 8;
+        return n;
+    }();
+    return v;
+}
+
+template <bool E8M0 = false, bool FAST_FP4 = false>
+inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
+                                 const float* lut, const void* S,
+                                 float global_scale, float* C,
+                                 int M, int N, int K,
+                                 int groupN, int groupK,
+                                 int n0 = 0, int n1 = -1,
+                                 int rowshift = 0,
+                                 // 【轮 73】rowmap != nullptr 时,激活的第 i 行取自
+                                 // A + rowmap[i]*K(而不是 A + i*K)。有了它,gate/up 可以直接
+                                 // 读"按 token 去重"的输入缓冲,不必先把每个专家的激活行
+                                 // gather 成连续的 xg —— 省掉一整段 memcpy **和一个完整的并行区**。
+                                 // 下游全部走 a32(由下面的转换点一次性建成),所以只需改行基址。
+                                 const uint32_t* rowmap = nullptr,
+                                 // 【轮 85】a32_in != nullptr 时直接复用已转好的 fp32 激活(跳过转换),
+                                 // a32_out 非空则回传本次所用缓冲的指针。gate 与 up 两次 matmul 读的是
+                                 // **同一块激活**,原来各转一遍 ⇒ 转换次数减半(§131 处方第 1 步)。
+                                 // 不做"跨 job 缓存":rowmap 内容每层都会被重写,按指针做键会陈旧。
+                                 const float* a32_in = nullptr, float** a32_out = nullptr) {
+        { static const bool _pc=[&](){ if(std::getenv("XIAOTU_MOE_TRACE")) fprintf(stderr,"[trace] MPG COND FAST_FP4=%d groupK=%d K=%d M=%d N=%d\n",(int)FAST_FP4,groupK,K,M,N); return true;}(); (void)_pc; }
+    auto arow_at = [&](int i) -> const uint16_t* {
+        return A + (size_t)(rowmap ? rowmap[i] : (uint32_t)i) * (size_t)K;
+    };
+    if (K <= 0 || (K & 1)) return;  // packed layout requires even K
+    if (n1 < 0 || n1 > N) n1 = N;
+    if (n1 <= n0) return;
+    // rowshift > 0 means W is a shard holding global rows [rowshift, rowshift+N):
+    // local row j (global output row j) reads weight slice row j - rowshift.
+    const int gn = groupN > 0 ? groupN : 1;
+    const int gk = groupK > 0 ? groupK : 1;
+    const float* Srow = static_cast<const float*>(S);
+    auto scale_at = [&](int n, int kbase) -> float {
+        const int idx = (n / gn) * ((K + gk - 1) / gk) + (kbase / gk);
+        if constexpr (E8M0) return e8m0_table()[static_cast<const uint8_t*>(S)[idx]];
+        return Srow[idx];
+    };
+#if defined(__AVX512F__)
+    // ----------------------------------------------------------------------
+    // FAST FP4 (E2M1) gather-free AVX512 path, matching the approach used by
+    // the reference engine's AVX-512 path (PSHUFB nibble decode -> vpmovzx
+    // zero-extend -> vcvtdq2ps -> vfmadd231ps, FP32 accumulate on the 512-bit
+    // datapath -- no BF16 materialization, no int8). Keeps weights FP4 (packed
+    // 2 values/byte) and dequantizes to FP32 in-kernel; on Zen4 the 512-bit
+    // `_mm512_fmadd_ps` runs ~2x the FMA rate of the old 256-bit mul+add path.
+    // Decoded into NATURAL column order so activations need no permutation
+    // (dot = sum_k A[k]*W[k]); semantics identical to the AVX2 path below.
+    // ----------------------------------------------------------------------
+    if (FAST_FP4 && gk == 32 && (K & 31) == 0 && (size_t)M * (size_t)K <= (size_t)(4 << 20)) {
+        const bool bp_on = byteprof_on();
+        uint64_t bp_t0 = 0;
+        if (bp_on) bp_t0 = std::chrono::steady_clock::now().time_since_epoch().count();
+#if defined(__AVX512BF16__)
+        // =====================================================================
+        // vdpbf16ps 路径(2026-09-11)。动机:在"每 CCD 4-5 核"前提下瓶颈是**每字节
+        // 的指令数**而不是带宽(实测内核只吃到机器流式带宽的 13-20%)。本路径:
+        //   * 权重解码一次喂 M 行,解码结果**以 bf16 留在寄存器**(不再 cvtepu16+slli
+        //     展成 32 个 fp32)⇒ 省 4 条/组、寄存器减半;
+        //   * 激活本来就是 bf16(模型 hidden state),**不再转 fp32** ⇒ 每行每组的激活
+        //     载入从 2×zmm(128B fp32)降到 1×zmm(64B bf16),L1 流量减半;
+        //   * 每 (行,组) 从"2 载入 + mul + 2 fma"变成"1 载入 + 1 vdpbf16ps(32 MAC)
+        //     + 1 fma(叠 e8m0 组 scale)"。
+        // 数值:bf16×bf16 乘积在 fp32 内精确,累加仍是 fp32 ⇒ 与 fp32 路径等价
+        // (仅结合顺序不同),由 scripts/test_block23_equiv.py 对拍。
+        // 默认**关**(2026-09-11):实测只快 1.10×(TOTAL 1780→1616 µs,DEDUP=18 真实形状),
+        // 而且在受控对拍的 me=2 用例上 max_rel 8.4e-3 > 项目门限 2e-3(fp32 路径同档
+        // 只有 3.9e-4)⇒ 收益不足以为精度买单,保留代码+开关待后续再评估
+        // (可能的精度来源:Zen4 vdpbf16ps 的成对乘积求和舍入)。置 1 可开启做实验。
+        static const bool dotp16 = [] {
+            const char* e = std::getenv("XIAOTU_MOE_DPBF16");
+            return e && std::atoi(e) != 0;
+        }();
+        if (dotp16) {
+            static bool once_ = [](){ fprintf(stderr, "[dotp16] BRANCH TAKEN (bf16 dot path)\n"); return true; }();
+            (void)once_;
+            alignas(16) static constexpr uint8_t d_lo[16] = {
+                0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+                0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};
+            alignas(16) static constexpr uint8_t d_hi[16] = {
+                0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
+                0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
+            const __m256i llo16 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)d_lo));
+            const __m256i lhi16 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)d_hi));
+            const __m128i nm16 = _mm_set1_epi8(0x0F);
+            const int kb_stride16 = (K + gk - 1) / gk;
+            const uint8_t* Sbytes16 = static_cast<const uint8_t*>(S);
+            const float* Sflt16 = static_cast<const float*>(S);
+            const int gcount = K / 32;
+            // 【轮 94】加 NR 列分块。原结构是 GEMV(列在最外层):每个 (列, k 组) 只有 mr 条
+            // 独立累加链,无法掩盖 vdpbf16ps 的延迟(Zen4 上该指令延迟约 4-5 周期)——
+            // 这才是 R65"bf16 点积更慢"的真正原因,不是 bf16 本身。
+            // 改成 acc[MR][NR] 后独立链变成 MR×NR 条。寄存器预算:
+            // acc[4][4]=16 + av[4]=4 + wz/sv/t=3 ⇒ 23 zmm ✓(MR=4/NR=8 会到 39,溢出)。
+            static constexpr int MRb = 4, NRb = 4;
+            for (int j0 = n0; j0 < n1; j0 += NRb) {
+                const int nj = std::min(NRb, n1 - j0);
+                for (int m0 = 0; m0 < M; m0 += MRb) {
+                    const int mr = std::min(MRb, M - m0);
+                    __m512 acc[MRb][NRb];
+                    for (int r = 0; r < mr; ++r)
+                        for (int jj = 0; jj < nj; ++jj) acc[r][jj] = _mm512_setzero_ps();
+                    for (int g = 0; g < gcount; ++g) {
+                        __m512i av[MRb];          // 激活每 (组) 只载一次,被 NR 列复用
+                        for (int r = 0; r < mr; ++r)
+                            av[r] = _mm512_loadu_si512(
+                                (const void*)(arow_at(m0 + r) + (size_t)g * 32));
+                        for (int jj = 0; jj < nj; ++jj) {
+                            const int j = j0 + jj;
+                            const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
+                            const int srow16 = (j / gn) * kb_stride16;
+                            const __m128i raw = _mm_loadu_si128((const __m128i*)(b_row + (size_t)g * 16));
+                            const __m128i lo = _mm_and_si128(raw, nm16);
+                            const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), nm16);
+                            const __m128i sl = _mm_unpacklo_epi8(lo, hi);
+                            const __m128i sh = _mm_unpackhi_epi8(lo, hi);
+                            const __m256i sel = _mm256_inserti128_si256(
+                                _mm256_castsi128_si256(sl), sh, 1);
+                            const __m256i bl = _mm256_shuffle_epi8(llo16, sel);
+                            const __m256i bh = _mm256_shuffle_epi8(lhi16, sel);
+                            const __m256i ul = _mm256_unpacklo_epi8(bl, bh);
+                            const __m256i uh = _mm256_unpackhi_epi8(bl, bh);
+                            const __m256i wa = _mm256_inserti128_si256(
+                                _mm256_castsi128_si256(_mm256_extracti128_si256(ul, 0)),
+                                _mm256_extracti128_si256(uh, 0), 1);
+                            const __m256i wb = _mm256_inserti128_si256(
+                                _mm256_castsi128_si256(_mm256_extracti128_si256(ul, 1)),
+                                _mm256_extracti128_si256(uh, 1), 1);
+                            const __m512i wz = _mm512_inserti64x4(
+                                _mm512_castsi256_si512(wa), wb, 1);
+                            const float sc = E8M0 ? e8m0_table()[Sbytes16[srow16 + g]]
+                                                  : Sflt16[srow16 + g];
+                            const __m512 sv = _mm512_set1_ps(sc);
+                            for (int r = 0; r < mr; ++r) {
+                                const __m512 t = _mm512_dpbf16_ps(
+                                    _mm512_setzero_ps(), (__m512bh)wz, (__m512bh)av[r]);
+                                acc[r][jj] = _mm512_fmadd_ps(t, sv, acc[r][jj]);
+                            }
+                        }
+                    }
+                    for (int r = 0; r < mr; ++r)
+                        for (int jj = 0; jj < nj; ++jj)
+                            C[(size_t)(m0 + r) * N + j0 + jj] = hsum512(acc[r][jj]) * global_scale;
+                }
+            }
+            if (bp_on) {
+                auto bp_t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+                byteprof_accum((size_t)(n1 - n0) * (size_t)(K / 2), (uint64_t)(bp_t1 - bp_t0));
+            }
+            return;
+        }
+#endif  // __AVX512BF16__
+
+        // Activations -> FP32 in NATURAL (non-permuted) order once, so the inner
+        // loop pairs plain zmm loads with the decoded natural-order weights.
+        thread_local std::vector<float> a32_storage;
+        if (a32_storage.size() < (size_t)M * (size_t)K) a32_storage.resize((size_t)M * (size_t)K);
+        float* a32 = a32_storage.data();
+        // 【轮 80】诊断:量 a32 转换(bf16->fp32)到底吃掉多少 CPU 时间。
+        // 动机:该转换**每个 (expert, 列切片, matmul) 调用都重转整个 M x K 块**(与列切片无关),
+        // 同一块被重复转 2*subA+subB ~= 32 次;总工作量 ∝ NASS*subA*K = **与 na 无关**,
+        // 正好匹配 §126 拟合出的"固定项 0.383 ms"。XIAOTU_MOE_A32_PROF=1 打开。
+        static const bool _a32p = std::getenv("XIAOTU_MOE_A32_PROF") != nullptr;
+        if (a32_in) {                       // 【轮 85】复用同一 job 上一次的转换结果
+            a32 = const_cast<float*>(a32_in);
+            if (a32_out) *a32_out = a32;
+        } else {
+        const auto _a32_t0 = _a32p ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+        for (int mi = 0; mi < M; mi++) {
+            const uint16_t* a_row = arow_at(mi);
+            float* p_row = a32 + (size_t)mi * K;
+            for (int k = 0; k < K; k++) p_row[k] = bf16::bf16_to_fp32(a_row[k]);
+        }
+        if (a32_out) *a32_out = a32;
+        if (_a32p) {
+            static thread_local uint64_t l_ns = 0, l_n = 0;
+            l_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - _a32_t0).count();
+            static const uint64_t _every = [] {
+                const char* e = std::getenv("XIAOTU_MOE_A32_EVERY");
+                const long v = e ? std::atol(e) : 0;
+                return (uint64_t)(v > 0 ? v : 400);
+            }();
+            if (++l_n % _every == 0) {
+                static uint64_t g_ns = 0;
+                const uint64_t tot = __atomic_fetch_add(&g_ns, l_ns, __ATOMIC_RELAXED) + l_ns;
+                fprintf(stderr, "[a32-prof] thread avg=%.2f us/call  global_total=%.2f core-ms\n",
+                        (double)l_ns / (double)l_n / 1e3, (double)tot / 1e6);
+            }
+        }
+        }   // end else (a32_in == nullptr)
+        // E2M1 -> BF16 byte LUTs (same values as packed4::E2M1, APACHE-2.0 ktransformers).
+        alignas(16) static constexpr uint8_t fp4_bf16_lo[16] = {
+            0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+            0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};
+        alignas(16) static constexpr uint8_t fp4_bf16_hi[16] = {
+            0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
+            0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
+        // ---- 行级 scale 索引(去掉内层每 group 的整数除法)-------------------
+        // 本分支已保证 gk == 32 ⇒ kbase/gk 恒等于 g(kbase = g*32)、(K+gk-1)/gk
+        // 恒等于 K/32,两者都与 g 无关;只有 (n/gn) 是每行一个。原来的 scale_at()
+        // 在**每行每个 group** 都做两次整数除法(Zen4 上 div ~20-40 cycle),
+        // 而内层是 128 group/行 ⇒ 单次调用上万次除法,纯浪费。
+        const int kb_stride = (K + gk - 1) / gk;              // == group_count
+        const uint8_t* Sbytes = static_cast<const uint8_t*>(S);
+        const float* Sflt = static_cast<const float*>(S);
+        // 【§623】把 `e8m0_table()` 的指针**提到 lambda 外**。它是一个函数内 `static const
+        // float[256]`,每次调用都要读一次 **guard variable**(线程安全静态初始化的守卫);
+        // `perf annotate` 实测这条 `movzbl ...guard variable...` 单独占热点内核 **4.28%** 的周期,
+        // 而它只是取一个常量地址。取不到 E8M0 时给 nullptr,走 Sflt 分支。
+        const float* const e8tbl = [] {
+            if constexpr (E8M0) return e8m0_table();
+            return static_cast<const float*>(nullptr);
+        }();
+        auto row_scale = [&](int srow, int gi) -> float {
+            if constexpr (E8M0) return e8tbl[Sbytes[srow + gi]];
+            return Sflt[srow + gi];
+        };
+        // 【§623】每组 scale 的行基址 `(j/gn)*kb_stride` 与 g 无关 ⇒ 每个 j0 块**只算一次**,
+        // 内层 g 循环里不再做整数除法(`perf annotate` 里那条 `cltd` 就是它)。
+        int srow_of[XIAOTU_TILE_NMAX];
+        // PERMV 解码用的 fp32 LUT(16 项,恰好一个 zmm);见 XIAOTU_DECODE_GROUP_AVX512
+        const __m512 permv_tbl_ = _mm512_loadu_ps(lut);
+        const __m256i lut_lo256_ = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_lo));
+        const __m256i lut_hi256_ = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_hi));
+        const __m128i nib_mask = _mm_set1_epi8(0x0F);
+        // Decode one 32-value K-group (16 packed bytes at b_row+g*16) into
+        // 32 bf16(u16) in NATURAL column order [W0..W31] (nibble c%2 of byte c/2).
+#if defined(__AVX512VBMI__)
+// 【§548】VBMI 一次解 4 组(64 字节)。映射经 /tmp/vbmi_idx4.cpp 逐位验证(§547):
+//   multishift(control,data);控制 = 4*(i%8) 与 32+4*(i%8)(所有 qword 相同);
+//   输出字节位置决定读哪个 qword;每 lane(=1 组)自然列序 = [n1_lo8, n2_lo8, n1_hi8, n2_hi8]。
+// 【§629c】**必须手动展开成 4 条**,不能用 `for (int _s...)`:
+// `_mm512_extracti32x4_epi32(v, imm)` 的 imm 必须是**常量**,GCC 会把常量上界的小循环折掉,
+// 但 **Clang 不折** ⇒ `error: argument to '__builtin_ia32_extracti32x4_mask' must be a
+// constant integer`。手动展开后 GCC/Clang 都能编,且语义逐字不变。
+#define XIAOTU_QUAD_ONE(S, WLO, WHI)                                                        \
+    {                                                                                       \
+        const __m128i _l = _mm512_extracti32x4_epi32(_n1, (S));                             \
+        const __m128i _r = _mm512_extracti32x4_epi32(_n2, (S));                             \
+        (WLO)[S] = _mm512_permutexvar_ps(                                                   \
+            _mm512_cvtepu8_epi32(_mm_unpacklo_epi64(_l, _r)), permv_tbl_);                  \
+        (WHI)[S] = _mm512_permutexvar_ps(                                                   \
+            _mm512_cvtepu8_epi32(_mm_unpackhi_epi64(_l, _r)), permv_tbl_);                  \
+    }
+#define XIAOTU_DECODE_QUAD_VBMI(b_row, g0, WLO, WHI)                                        \
+    do {                                                                                    \
+        const __m512i _raw = _mm512_loadu_si512((const void*)((b_row) + (size_t)(g0) * 16)); \
+        const __m512i _m   = _mm512_set1_epi8(0x0F);                                        \
+        const __m512i _n1  = _mm512_and_si512(_mm512_multishift_epi64_epi8(                  \
+                                 _mm512_set1_epi64((long long)0x1C1814100C080400ULL), _raw), _m); \
+        const __m512i _n2  = _mm512_and_si512(_mm512_multishift_epi64_epi8(                  \
+                                 _mm512_set1_epi64((long long)0x3C3834302C282420ULL), _raw), _m); \
+        XIAOTU_QUAD_ONE(0, WLO, WHI) XIAOTU_QUAD_ONE(1, WLO, WHI)                          \
+        XIAOTU_QUAD_ONE(2, WLO, WHI) XIAOTU_QUAD_ONE(3, WLO, WHI)                          \
+    } while (0)
+#endif
+
+#define XIAOTU_DECODE_GROUP_AVX512(b_row, g_in)                                        \
+        /* 【第 215 轮·PERMV 解码】把 4bit 码经 fp32 LUT 直接 permute 成 fp32 权重:        \
+           load(1)+and(1)+srli(1)+and(1)+unpack(2)+cvt(2)+permutexvar(2) = 10 条/32 权重,   \
+           替代原来 19 条的 bf16-LUT+shuffle+extract/insert+移位链。                          \
+           数值:直接用 fp32 LUT 值 ⇒ **比原来的 bf16 截断更精确**(不再丢 bf16 的低位)。 */   \
+        const __m128i raw_ = _mm_loadu_si128((const __m128i*)((b_row) + (size_t)(g_in) * 16)); \
+        const __m128i lo_ = _mm_and_si128(raw_, nib_mask);                            \
+        const __m128i hi_ = _mm_and_si128(_mm_srli_epi16(raw_, 4), nib_mask);         \
+        const __m128i sello_ = _mm_unpacklo_epi8(lo_, hi_);  /* cols 0..15 自然序 */  \
+        const __m128i selhi_ = _mm_unpackhi_epi8(lo_, hi_);  /* cols 16..31 */        \
+        const __m512i idxlo_ = _mm512_cvtepu8_epi32(sello_);                          \
+        const __m512i idxhi_ = _mm512_cvtepu8_epi32(selhi_);                          \
+        const __m512 wlo_ = _mm512_permutexvar_ps(idxlo_, permv_tbl_);                \
+        const __m512 whi_ = _mm512_permutexvar_ps(idxhi_, permv_tbl_);
+
+        const int group_count = K / 32;
+        // =====================================================================
+        // GEMM 分块路径(2026-09-11,预填充用):把 j(输出行)循环放到**内层**,
+        // 让每个 K 组的激活**一次载入、被 NR 个输出行复用**。
+        // 原结构是 GEMV:j 在最外层 = 每行输出都把整条激活重读一遍 ⇒ 激活:权重
+        // 流量 = 64:1,大批量(预填充)时被激活带宽压死(实测每层只到 19 GB/s)。
+        // 分块后激活流量降为 1/NR,权重仍只解码一次/行。
+        // 寄存器预算:acc[MR][NR] + av[MR][2] + wlo/whi/sv/d ⇒ MR=4,NR=4 时 28 个 zmm。
+        // 数值:每个 (行, token) 仍是"每 K 组 mul+2×fma 后累加",与单行路径同序。
+        // 【§629】默认 **NR=4**(原为 8):见下方注释里的 back-to-back 实测(真实形状下全面更好)。
+        // `XIAOTU_MOE_GEMM_NR` 仍可覆盖;=0 回退旧 GEMV 路径。
+        // 【§634】(MR, NR) 改成**可编译期配置**:`XIAOTU_MOE_GEMM_MR` /
+        // `XIAOTU_MOE_GEMM_NR_DEFAULT`。理由见下方 (MR,NR) 寄存器预算的推导。
+        static const int gemm_nr = [] {
+            const char* e = std::getenv("XIAOTU_MOE_GEMM_NR");
+            return e ? std::atoi(e) : XIAOTU_MOE_GEMM_NR_DEFAULT;
+        }();
+        if (gemm_nr > 0) {
+            constexpr int MR = XIAOTU_MOE_GEMM_MR;
+            // 【§629】NR=4(原为 8)。**在真实形状(DEDUP=226,na≈226)上 back-to-back 实测**,
+            // NR 从 8 降到 4 在三个档位全面更好:
+            //   BS=227  40.00 → 38.57 (−3.6%)
+            //   BS=1893 291.77 → 266.84 (−8.5%)
+            //   BS=8192 1253.90 → 1136.23 (−9.4%)
+            // 机制:NR 决定激活复用(越大越好)与累加器阵列 `acc[4][NR]` 的溢出(越大越糟);
+            // 真实负载 `na≈226` 使每个专家的 M 很小(BS=1893 时每专家仅 ~50 行),
+            // 小 NR 的溢出优势占上风。**数值安全**:NR 只决定"一次处理几列",
+            // 每个输出列的累加顺序(按 g 递增)完全不变 ⇒ 对拍逐位一致。
+            // ⚠️ 另注:试过"按 M 自适应(大 M 用 4、小 M 用 8)"反而更差(311.27/1301.47),
+            //    因为内核里的 M 是**每专家行数**(BS=1893 时 ~50),阈值根本触发不到,
+            //    而多出来的两支 static 查询/分支影响了 codegen。**用固定 4**。
+            // 解码档(M<=2)用 NR=8:实测 M=1 时 NR=4 的激活载入次数翻倍 ⇒ 0.59 vs 0.54 ms/层。
+#if XIAOTU_MOE_GEMM_NR_CT > 0
+            // 【§637】编译期 NR:所有 `acc[MR][N]` 数组随之收紧 ⇒ 通用回退路径不再溢出。
+            constexpr int NR = XIAOTU_MOE_GEMM_NR_CT;
+#else
+            const int NR = (M <= 2) ? 8 : std::min(gemm_nr, 8);
+#endif
+#if defined(__AVX512VBMI__)
+            // 【§548】XIAOTU_MOE_VBMI_DECODE=1 时用 VBMI 版解码路径(4 组一次);
+            // 累加顺序与下方完全一致(每 (行,token) 按 g 递增、组内 s 递增)⇒ 数值应逐位相同。
+            static const bool _vbmi_on = [] {
+                const char* e2 = std::getenv("XIAOTU_MOE_VBMI_DECODE");
+                return e2 && std::atoi(e2) != 0;
+            }();
+            if (_vbmi_on && (group_count % 4) == 0) {
+                for (int m0 = 0; m0 < M; m0 += MR) {
+                    const int mr = std::min(MR, M - m0);
+                    for (int j0 = n0; j0 < n1; j0 += NR) {
+                        const int nj = std::min(NR, n1 - j0);
+                        __m512 acc[MR][XIAOTU_TILE_NMAX];
+                        for (int r = 0; r < mr; ++r)
+                            for (int jj = 0; jj < nj; ++jj) acc[r][jj] = _mm512_setzero_ps();
+                        for (int g0 = 0; g0 < group_count; g0 += 4) {
+                            __m512 av[MR][2][4];
+                            for (int r = 0; r < mr; ++r)
+                                for (int s = 0; s < 4; ++s) {
+                                    const float* ap = a32 + (size_t)(m0 + r) * K + (g0 + s) * 32;
+                                    av[r][0][s] = _mm512_loadu_ps(ap);
+                                    av[r][1][s] = _mm512_loadu_ps(ap + 16);
+                                }
+                            for (int jj = 0; jj < nj; ++jj) {
+                                const int j = j0 + jj;
+                                const uint8_t* brow = W + (size_t)(j - rowshift) * (K / 2);
+                                __m512 wlo[4], whi[4];
+                                XIAOTU_DECODE_QUAD_VBMI(brow, g0, wlo, whi);
+                                for (int s = 0; s < 4; ++s) {
+                                    const __m512 sv =
+                                        _mm512_set1_ps(row_scale((j / gn) * kb_stride, g0 + s));
+                                    for (int r = 0; r < mr; ++r) {
+                                        __m512 d = _mm512_mul_ps(wlo[s], av[r][0][s]);
+                                        d = _mm512_fmadd_ps(whi[s], av[r][1][s], d);
+                                        acc[r][jj] = _mm512_fmadd_ps(d, sv, acc[r][jj]);
+                                    }
+                                }
+                            }
+                        }
+                        for (int r = 0; r < mr; ++r)
+                            for (int jj = 0; jj < nj; ++jj)
+                                C[(size_t)(m0 + r) * N + j0 + jj] = hsum512(acc[r][jj]) * global_scale;
+                    }
+                }
+                if (bp_on) {
+                    auto bp_t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+                    byteprof_accum((size_t)(n1 - n0) * (size_t)(K / 2), (uint64_t)(bp_t1 - bp_t0));
+                }
+                return;
+            }
+#endif
+            for (int m0 = 0; m0 < M; m0 += MR) {
+                const int mr = std::min(MR, M - m0);
+                for (int j0 = n0; j0 < n1; j0 += NR) {
+                    const int nj = std::min(NR, n1 - j0);
+                    __m512 acc[MR][XIAOTU_TILE_NMAX];
+                    for (int r = 0; r < mr; ++r)
+                        for (int jj = 0; jj < nj; ++jj) acc[r][jj] = _mm512_setzero_ps();
+                    // 【§623】scale 行基址每行只算一次(原来是每组 g 都做一次整数除法)
+                    for (int jj = 0; jj < nj; ++jj) srow_of[jj] = ((j0 + jj) / gn) * kb_stride;
+                    // 【§625/§629】满 tile 特化。`av[MRT][2]` / `acc[MRT][NRT]` 原来用**运行时**
+                    // 边界 `mr`/`nj` 索引 ⇒ 编译器只能把它们放进可寻址内存,`perf annotate`
+                    // 里表现为大量等距 512 字节的 `vmovaps`(占 31% 周期)。
+                    // 用宏把 MRT/NRT 展开成**字面量** ⇒ 边界编译期常量 ⇒ 有资格进 zmm。
+                    // 数值:累加顺序与通用路径逐字相同(每 (行,列) 按 g 递增、组内固定)。
+#define XIAOTU_TILE_BODY(MRT, NRT)                                                        \
+    {                                                                                     \
+        __m512 acc[MRT][NRT];                                                             \
+        for (int r = 0; r < (MRT); ++r)                                                   \
+            for (int jj = 0; jj < (NRT); ++jj) acc[r][jj] = _mm512_setzero_ps();          \
+        int srt[NRT];                                                                     \
+        for (int jj = 0; jj < (NRT); ++jj) srt[jj] = ((j0 + jj) / gn) * kb_stride;        \
+        for (int g = 0; g < group_count; ++g) {                                           \
+            const int base = g * 32;                                                      \
+            __m512 av[MRT][2];                                                            \
+            for (int r = 0; r < (MRT); ++r) {                                             \
+                const float* ap = a32 + (size_t)(m0 + r) * K + base;                      \
+                av[r][0] = _mm512_loadu_ps(ap);                                           \
+                av[r][1] = _mm512_loadu_ps(ap + 16);                                      \
+            }                                                                             \
+            for (int jj = 0; jj < (NRT); ++jj) {                                          \
+                const uint8_t* brow = W + (size_t)(j0 + jj - rowshift) * (K / 2);         \
+                XIAOTU_DECODE_GROUP_AVX512(brow, g);                                      \
+                const __m512 sv = _mm512_set1_ps(row_scale(srt[jj], g));                  \
+                /* 【§637b】折 scale **只在 MRT>=2 时**才划算:`mr=1` 时旧式是 1 mul + 2 fma = 3 个
+                 * FMA 端口,新式是 2 mul + 2 fma = 4 个 ⇒ **反而慢 33%**。通用循环里本来就写着
+                 * `if (mr >= 2)`,但特化 body 漏了这个条件 ⇒ 修掉它同时(a)让 `me=1` 的数值回到
+                 * 历史的 `max_rel=1.873e-02` 逐位不变,(b)去掉纯解码路径上的这个回退。 */       \
+                if constexpr (XIAOTU_MOE_FOLD_SCALE && (MRT) >= 2) {                      \
+                    const __m512 wlos = _mm512_mul_ps(wlo_, sv);                          \
+                    const __m512 whis = _mm512_mul_ps(whi_, sv);                          \
+                    for (int r = 0; r < (MRT); ++r) {                                     \
+                        acc[r][jj] = _mm512_fmadd_ps(wlos, av[r][0], acc[r][jj]);         \
+                        acc[r][jj] = _mm512_fmadd_ps(whis, av[r][1], acc[r][jj]);         \
+                    }                                                                     \
+                } else {                                                                  \
+                    for (int r = 0; r < (MRT); ++r) {                                     \
+                        __m512 d = _mm512_mul_ps(wlo_, av[r][0]);                         \
+                        d = _mm512_fmadd_ps(whi_, av[r][1], d);                           \
+                        acc[r][jj] = _mm512_fmadd_ps(d, sv, acc[r][jj]);                  \
+                    }                                                                     \
+                }                                                                         \
+            }                                                                             \
+        }                                                                                 \
+        for (int r = 0; r < (MRT); ++r)                                                   \
+            for (int jj = 0; jj < (NRT); ++jj)                                            \
+                C[(size_t)(m0 + r) * N + j0 + jj] = hsum512(acc[r][jj]) * global_scale;   \
+    }
+                    // 【§632】把特化从"只有 mr==MR"扩到 **所有 mr**(1/2/3/4)。
+                    // 为什么:§625 只特化了满 tile,mr<MR 的**尾巴**仍走下面的通用循环,
+                    // 那里 `av[MR][2]`/`acc[MR][8]` 又被**运行时** `mr`/`nj` 索引 ⇒ 只能放内存。
+                    // 而真实负载 `na≈226` 下每专家 M 很小(BS=227 时 M≈6)⇒ `M=6` 被切成
+                    // `mr=4` + `mr=2` 两块,**一半的工作量都在尾巴上**。
+                    // 数值:展开后每条 (行,列) 的 g 递增顺序与通用循环**逐字相同** ⇒ 逐位一致。
+#define XIAOTU_TILE_DISPATCH_R(MRT)                                                   \
+                    if (mr == (MRT)) {                                            \
+                        if (nj == 8) { XIAOTU_TILE_BODY(MRT, 8) continue; }        \
+                        if (nj == 6) { XIAOTU_TILE_BODY(MRT, 6) continue; }        \
+                        if (nj == 4) { XIAOTU_TILE_BODY(MRT, 4) continue; }        \
+                        if (nj == 2) { XIAOTU_TILE_BODY(MRT, 2) continue; }        \
+                    }
+#if XIAOTU_MOE_TILE_ALLMR == 1
+                    XIAOTU_TILE_DISPATCH_R(6)
+                    XIAOTU_TILE_DISPATCH_R(5)
+                    XIAOTU_TILE_DISPATCH_R(4)
+                    XIAOTU_TILE_DISPATCH_R(3)
+                    XIAOTU_TILE_DISPATCH_R(2)
+                    XIAOTU_TILE_DISPATCH_R(1)
+#elif XIAOTU_MOE_TILE_ALLMR == 3
+                    // 【§635】MR=6 之后**必须**覆盖小 M 的尾巴,否则通用回退路径会声明
+                    // `acc[MR][8]`(= acc[6][8] = 48 个 zmm)而**剧烈溢出** ——
+                    // 门禁形状 DEDUP=12(BS=6 ⇒ 每专家 M=3)因此从 0.65-0.69 退化到 **0.78 ms/层**,
+                    // 同日 lk 比值 1.44×(门限 1.30)**FAIL**。
+                    // 只补真实会出现的尾巴档:`mr=3`(M=3,门禁/解码)与 `mr=2`/`mr=1`
+                    // (M≈50 的 8×6+2、M≈217 的 36×6+1)。
+                    XIAOTU_TILE_DISPATCH_R(MR)
+                    XIAOTU_TILE_DISPATCH_R(3)
+                    XIAOTU_TILE_DISPATCH_R(2)
+                    XIAOTU_TILE_DISPATCH_R(1)
+#elif XIAOTU_MOE_TILE_ALLMR == 2
+                    XIAOTU_TILE_DISPATCH_R(MR)
+                    XIAOTU_TILE_DISPATCH_R(2)
+#else
+                    XIAOTU_TILE_DISPATCH_R(MR)
+#endif
+#undef XIAOTU_TILE_DISPATCH_R
+#undef XIAOTU_TILE_BODY
+                    for (int g = 0; g < group_count; ++g) {
+                        const int base = g * 32;
+                        __m512 av[MR][2];
+                        for (int r = 0; r < mr; ++r) {
+                            const float* ap = a32 + (size_t)(m0 + r) * K + base;
+                            av[r][0] = _mm512_loadu_ps(ap);
+                            av[r][1] = _mm512_loadu_ps(ap + 16);
+                        }
+                        for (int jj = 0; jj < nj; ++jj) {
+                            const int j = j0 + jj;
+                            const uint8_t* brow = W + (size_t)(j - rowshift) * (K / 2);
+                            XIAOTU_DECODE_GROUP_AVX512(brow, g);
+                            const __m512 sv = _mm512_set1_ps(row_scale(srow_of[jj], g));
+                            if constexpr (XIAOTU_MOE_FOLD_SCALE) {
+                                // 【§631】scale 折到权重侧(见文件头注释)。这里 mr 可能 < MR,
+                                // 摊薄比 MR 差一些;`mr==1` 的极端尾巴由下方 `mr>=2` 判定退回旧式。
+                                if (mr >= 2) {
+                                    const __m512 wlos = _mm512_mul_ps(wlo_, sv);
+                                    const __m512 whis = _mm512_mul_ps(whi_, sv);
+                                    for (int r = 0; r < mr; ++r) {
+                                        acc[r][jj] = _mm512_fmadd_ps(wlos, av[r][0], acc[r][jj]);
+                                        acc[r][jj] = _mm512_fmadd_ps(whis, av[r][1], acc[r][jj]);
+                                    }
+                                    continue;
+                                }
+                            }
+                            for (int r = 0; r < mr; ++r) {
+                                __m512 d = _mm512_mul_ps(wlo_, av[r][0]);
+                                d = _mm512_fmadd_ps(whi_, av[r][1], d);
+                                acc[r][jj] = _mm512_fmadd_ps(d, sv, acc[r][jj]);
+                            }
+                        }
+                    }
+                    for (int r = 0; r < mr; ++r)
+                        for (int jj = 0; jj < nj; ++jj)
+                            C[(size_t)(m0 + r) * N + j0 + jj] =
+                                hsum512(acc[r][jj]) * global_scale;
+                }
+            }
+            if (bp_on) {
+                auto bp_t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+                byteprof_accum((size_t)(n1 - n0) * (size_t)(K / 2), (uint64_t)(bp_t1 - bp_t0));
+            }
+            return;
+        }
+        for (int j = n0; j < n1; ++j) {
+            const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
+            const int srow = (j / gn) * kb_stride;            // 每行一次除法
+            // 整行预取:下一行有 K/2 字节(4096 维 ⇒ 2048 B = 32 条 cache line),
+            // 原实现只预取前 4 条 ⇒ 每行的前 28 条线仍要现取,worker 在行首停等
+            // DRAM(实测每核只有 1.2 GB/s,而单核流式能到 36 GB/s)。
+            const int pf_rows = matmul_pf_rows();   // 【goal-B②】默认 1 = 原行为
+            const uint8_t* next_row = (j + pf_rows < n1)
+                ? W + (size_t)(j + pf_rows - rowshift) * (K / 2) : nullptr;
+            for (int pr = 1; pr <= pf_rows && j + pr < n1; ++pr) {
+                const char* nr = (const char*)(W + (size_t)(j + pr - rowshift) * (K / 2));
+                _mm_prefetch(nr, _MM_HINT_T0);
+                _mm_prefetch(nr + 64, _MM_HINT_T0);
+                _mm_prefetch(nr + 128, _MM_HINT_T0);
+                _mm_prefetch(nr + 192, _MM_HINT_T0);
+            }
+            // 4-token blocked path: decode each group once, feed 4x zmm accumulators.
+            int mi = 0;
+            for (; mi + 4 <= M; mi += 4) {
+                const float* p0 = a32 + (size_t)(mi + 0) * K;
+                const float* p1 = a32 + (size_t)(mi + 1) * K;
+                const float* p2 = a32 + (size_t)(mi + 2) * K;
+                const float* p3 = a32 + (size_t)(mi + 3) * K;
+                __m512 a0[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+                __m512 a1[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+                __m512 a2[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+                __m512 a3[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+                for (int g = 0; g < group_count; g++) {
+                    const int base = g * 32;
+                    XIAOTU_DECODE_GROUP_AVX512(b_row, g);
+                    if (next_row && ((g) & 3) == 0)
+                        _mm_prefetch((const char*)next_row + ((size_t)((g) >> 2) << 6),
+                                     _MM_HINT_T0);
+                    const float scale = row_scale(srow, g);
+                    const __m512 sv = _mm512_set1_ps(scale);
+                    // ILP-16: round-robin over 4 independent partial chains per
+                    // token (4 tokens x 4 partials = 16 in-flight vfmadd231ps),
+                    // mirroring lk's 8x64 tile of 16 independent zmm accumulators.
+                    // Breaks the serial FMA dependency chain so EPYC's ~4-cycle
+                    // FMA latency is hidden; reassociates fp32 (fine for inference).
+                    const int p = g & 3;
+                    // 【§631】4 行共享一次"scale 折到权重":2 mul + 8 fma,
+                    // 替代旧的 4×(1 mul + 2 fma) = 12 ⇒ FMA 端口 1.2×。
+                    if constexpr (XIAOTU_MOE_FOLD_SCALE) {
+                        const __m512 wlos = _mm512_mul_ps(wlo_, sv);
+                        const __m512 whis = _mm512_mul_ps(whi_, sv);
+                        a0[p] = _mm512_fmadd_ps(wlos, _mm512_loadu_ps(p0 + base), a0[p]);
+                        a0[p] = _mm512_fmadd_ps(whis, _mm512_loadu_ps(p0 + base + 16), a0[p]);
+                        a1[p] = _mm512_fmadd_ps(wlos, _mm512_loadu_ps(p1 + base), a1[p]);
+                        a1[p] = _mm512_fmadd_ps(whis, _mm512_loadu_ps(p1 + base + 16), a1[p]);
+                        a2[p] = _mm512_fmadd_ps(wlos, _mm512_loadu_ps(p2 + base), a2[p]);
+                        a2[p] = _mm512_fmadd_ps(whis, _mm512_loadu_ps(p2 + base + 16), a2[p]);
+                        a3[p] = _mm512_fmadd_ps(wlos, _mm512_loadu_ps(p3 + base), a3[p]);
+                        a3[p] = _mm512_fmadd_ps(whis, _mm512_loadu_ps(p3 + base + 16), a3[p]);
+                    } else {
+                    __m512 d0 = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p0 + base));
+                    d0 = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p0 + base + 16), d0);
+                    a0[p] = _mm512_fmadd_ps(d0, sv, a0[p]);
+                    __m512 d1 = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p1 + base));
+                    d1 = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p1 + base + 16), d1);
+                    a1[p] = _mm512_fmadd_ps(d1, sv, a1[p]);
+                    __m512 d2 = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p2 + base));
+                    d2 = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p2 + base + 16), d2);
+                    a2[p] = _mm512_fmadd_ps(d2, sv, a2[p]);
+                    __m512 d3 = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p3 + base));
+                    d3 = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p3 + base + 16), d3);
+                    a3[p] = _mm512_fmadd_ps(d3, sv, a3[p]);
+                    }
+                }
+                const __m512 s0 = _mm512_add_ps(_mm512_add_ps(a0[0], a0[1]), _mm512_add_ps(a0[2], a0[3]));
+                const __m512 s1 = _mm512_add_ps(_mm512_add_ps(a1[0], a1[1]), _mm512_add_ps(a1[2], a1[3]));
+                const __m512 s2 = _mm512_add_ps(_mm512_add_ps(a2[0], a2[1]), _mm512_add_ps(a2[2], a2[3]));
+                const __m512 s3 = _mm512_add_ps(_mm512_add_ps(a3[0], a3[1]), _mm512_add_ps(a3[2], a3[3]));
+                C[(size_t)(mi + 0) * N + j] = hsum512(s0) * global_scale;
+                C[(size_t)(mi + 1) * N + j] = hsum512(s1) * global_scale;
+                C[(size_t)(mi + 2) * N + j] = hsum512(s2) * global_scale;
+                C[(size_t)(mi + 3) * N + j] = hsum512(s3) * global_scale;
+            }
+            // ---- 2/3-row blocked path (decode-critical) --------------------
+            // WHY: `gate_up_slice_batch_impl`/`down_slice_batch_impl` call this
+            // kernel with M = me = (instances routed to ONE expert). In a decode
+            // step the 6 tokens of a sequence land on ~12 distinct experts, i.e.
+            // **me ≈ 3** — so the 4-row block above is never taken and every row
+            // went through the single-row remainder below, which re-runs the
+            // whole FP4 nibble decode for each instance.
+            // Measured (scripts/bench_cpu_engine.py, same 12 experts = same
+            // weight bytes): me=4 (blocked) = 31.2 us/assignment vs me=3
+            // (unblocked) = 55.6 us/assignment => 1.78x wasted decode work.
+            // This block shares ONE decode across 2-3 rows, with the same
+            // 4-partial accumulation structure as the 4-row block (identical
+            // association/numerics per row).
+            auto block_23 = [&](auto Rc) {
+                constexpr int R = decltype(Rc)::value;
+                const float* pr[R];
+                for (int r = 0; r < R; ++r) pr[r] = a32 + (size_t)(mi + r) * K;
+                __m512 acc[R][4];
+                for (int r = 0; r < R; ++r)
+                    for (int q = 0; q < 4; ++q) acc[r][q] = _mm512_setzero_ps();
+                for (int g = 0; g < group_count; g++) {
+                    const int base = g * 32;
+                    XIAOTU_DECODE_GROUP_AVX512(b_row, g);
+                    if (next_row && ((g) & 3) == 0)
+                        _mm_prefetch((const char*)next_row + ((size_t)((g) >> 2) << 6),
+                                     _MM_HINT_T0);
+                    const __m512 sv = _mm512_set1_ps(row_scale(srow, g));
+                    const int p = g & 3;
+                    for (int r = 0; r < R; ++r) {
+                        __m512 d = _mm512_mul_ps(wlo_, _mm512_loadu_ps(pr[r] + base));
+                        d = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(pr[r] + base + 16), d);
+                        acc[r][p] = _mm512_fmadd_ps(d, sv, acc[r][p]);
+                    }
+                }
+                for (int r = 0; r < R; ++r) {
+                    const __m512 s = _mm512_add_ps(_mm512_add_ps(acc[r][0], acc[r][1]),
+                                                   _mm512_add_ps(acc[r][2], acc[r][3]));
+                    C[(size_t)(mi + r) * N + j] = hsum512(s) * global_scale;
+                }
+            };
+            if (M - mi == 3) {
+                block_23(std::integral_constant<int, 3>{});
+                mi += 3;
+            } else if (M - mi == 2) {
+                block_23(std::integral_constant<int, 2>{});
+                mi += 2;
+            }
+            // Single-row remainder (also the whole path when M == 1).
+            //
+            // ILP: 4 INDEPENDENT partial accumulators instead of one serial
+            // chain. The old loop did `total0 = fmadd(d, sv, total0)` 128 times
+            // per row = a 128-long dependency chain at ~4-cycle FMA latency
+            // (~512 cycles/row) that out-of-order execution cannot hide. Real
+            // routing is dominated by M==1 (in-server measurement: 36
+            // assignments land on ~32 DISTINCT experts => me≈1.1), so this path
+            // IS the decode hot loop. Accumulation structure now matches the
+            // 4-row blocked path: ((t0+t1)+(t2+t3)). Numerics validated by
+            // scripts/test_block23_equiv.py + scripts/test_swiglu_clamp_mxfp4.py.
+            for (; mi < M; mi++) {
+                const float* p0 = a32 + (size_t)mi * K;
+                __m512 t[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(),
+                               _mm512_setzero_ps(), _mm512_setzero_ps()};
+                for (int g = 0; g < group_count; g++) {
+                    const int base = g * 32;
+                    XIAOTU_DECODE_GROUP_AVX512(b_row, g);
+                    if (next_row && ((g) & 3) == 0)
+                        _mm_prefetch((const char*)next_row + ((size_t)((g) >> 2) << 6),
+                                     _MM_HINT_T0);
+                    __m512 d = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p0 + base));
+                    d = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p0 + base + 16), d);
+                    const float scale = row_scale(srow, g);
+                    const int p = g & 3;
+                    t[p] = _mm512_fmadd_ps(d, _mm512_set1_ps(scale), t[p]);
+                }
+                const __m512 s = _mm512_add_ps(_mm512_add_ps(t[0], t[1]),
+                                               _mm512_add_ps(t[2], t[3]));
+                C[(size_t)mi * N + j] = hsum512(s) * global_scale;
+            }
+        }
+        if (bp_on) {
+            auto bp_t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+            byteprof_accum((size_t)(n1 - n0) * (size_t)(K / 2), (uint64_t)(bp_t1 - bp_t0));
+        }
+        return;
+    }
+#endif  // __AVX512F__
+
+#if defined(__AVX2__)
+    // ----------------------------------------------------------------------
+    // FAST FP4 (E2M1) gather-free path, ported from KVCache.AI ktransformers
+    // /kt-kernel/operators/avx2/mxfp4-moe.hpp (Apache-2.0), KT_MXFP4_DECODE_GROUP.
+    // The old per-8-elements _mm256_i32gather_ps from the 16-entry LUT is
+    // latency-bound (~1GB/s vs ~48GB/s memory bandwidth) and was the decode
+    // bottleneck (73ms/layer at M=1). This decode expands a whole 32-value
+    // K-group (16 packed bytes) with one 256-bit PSHUFB into 4 ymm, then folds
+    // with plain FMAs — no gather, bandwidth-bound. Layout is identical to
+    // xiaotu's (byte = 2 consecutive K elements, low nibble = even k).
+    // ----------------------------------------------------------------------
+    if (FAST_FP4 && gk == 32 && (K & 31) == 0 && (size_t)M * (size_t)K <= (size_t)(4 << 20)) {
+        const bool bp_on = byteprof_on();
+        uint64_t bp_t0 = 0;
+        if (bp_on) bp_t0 = std::chrono::steady_clock::now().time_since_epoch().count();
+        // Decode emission order within each 32-value group (see macro below).
+        static constexpr int kPerm[32] = {0,  2,  4,  6,  1,  3,  5,  7,  8,  10, 12, 14, 9,  11, 13, 15,
+                                          16, 18, 20, 22, 17, 19, 21, 23, 24, 26, 28, 30, 25, 27, 29, 31};
+        // Pre-permute each activation row to FP32 in decode order once, so the
+        // inner loops pair plain loads with the decoded weights.
+        thread_local std::vector<float> a_perm_storage;
+        if (a_perm_storage.size() < (size_t)M * (size_t)K) a_perm_storage.resize((size_t)M * (size_t)K);
+        float* a_perm = a_perm_storage.data();
+        const int group_count = K / 32;
+        for (int mi = 0; mi < M; mi++) {
+            const uint16_t* a_row = arow_at(mi);
+            float* p_row = a_perm + (size_t)mi * K;
+            for (int g = 0; g < group_count; g++) {
+                const int base = g * 32;
+                for (int j = 0; j < 32; j++) p_row[base + j] = bf16::bf16_to_fp32(a_row[base + kPerm[j]]);
+            }
+        }
+        // E2M1 -> BF16 byte LUTs (same values as packed4::E2M1, APACHE-2.0 ktransformers).
+        alignas(16) static constexpr uint8_t fp4_bf16_lo[16] = {
+            0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+            0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};
+        alignas(16) static constexpr uint8_t fp4_bf16_hi[16] = {
+            0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
+            0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
+        const __m256i lut_lo256 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_lo));
+        const __m256i lut_hi256 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_hi));
+        const __m256i zero256 = _mm256_setzero_si256();
+        const __m128i nib_mask = _mm_set1_epi8(0x0F);
+        // Decode one 32-value K-group at b_row + g*16 bytes into w0..w3.
+        // w0: cols {0,2,4,6|1,3,5,7}; w1: {8,10,12,14|9,11,13,15};
+        // w2: {16,...,22|17,...,23};    w3: {24,...,30|25,...,31}.
+#define XIAOTU_DECODE_GROUP(b_row, g_in)                                                \
+        const __m128i raw_ = _mm_loadu_si128((const __m128i*)((b_row) + (size_t)(g_in) * 16)); \
+        const __m128i lo_ = _mm_and_si128(raw_, nib_mask);                             \
+        const __m128i hi_ = _mm_and_si128(_mm_srli_epi16(raw_, 4), nib_mask);          \
+        const __m256i v_ = _mm256_set_m128i(hi_, lo_);                                 \
+        const __m256i bl_ = _mm256_shuffle_epi8(lut_lo256, v_);                        \
+        const __m256i bh_ = _mm256_shuffle_epi8(lut_hi256, v_);                        \
+        const __m256i u16a_ = _mm256_unpacklo_epi8(bl_, bh_);                          \
+        const __m256i u16b_ = _mm256_unpackhi_epi8(bl_, bh_);                          \
+        const __m256 w0_ = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero256, u16a_)); \
+        const __m256 w1_ = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero256, u16a_)); \
+        const __m256 w2_ = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero256, u16b_)); \
+        const __m256 w3_ = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero256, u16b_))
+
+        for (int j = n0; j < n1; ++j) {
+            const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
+            // ktransformers alignment: prefetch the next weight row ahead of the
+            // FMA stream (bandwidth-bound; hides DRAM latency for the next row).
+            if (j + 1 < n1) {
+                const char* nr = (const char*)(W + (size_t)(j + 1 - rowshift) * (K / 2));
+                _mm_prefetch(nr, _MM_HINT_T0);
+                _mm_prefetch(nr + 64, _MM_HINT_T0);
+                _mm_prefetch(nr + 128, _MM_HINT_T0);
+                _mm_prefetch(nr + 192, _MM_HINT_T0);
+            }
+            // 4-token blocked path: decode each group once, feed 4 accumulators.
+            int mi = 0;
+            for (; mi + 4 <= M; mi += 4) {
+                const float* p0 = a_perm + (size_t)(mi + 0) * K;
+                const float* p1 = a_perm + (size_t)(mi + 1) * K;
+                const float* p2 = a_perm + (size_t)(mi + 2) * K;
+                const float* p3 = a_perm + (size_t)(mi + 3) * K;
+                __m256 tot0 = _mm256_setzero_ps(), tot1 = _mm256_setzero_ps();
+                __m256 tot2 = _mm256_setzero_ps(), tot3 = _mm256_setzero_ps();
+                for (int g = 0; g < group_count; g++) {
+                    const int base = g * 32;
+                    XIAOTU_DECODE_GROUP(b_row, g);
+                    const float scale = scale_at(j, g * 32);
+                    const __m256 sv = _mm256_set1_ps(scale);
+                    __m256 g0 = _mm256_mul_ps(_mm256_loadu_ps(p0 + base), w0_);
+                    g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 8), w1_, g0);
+                    g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 16), w2_, g0);
+                    g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 24), w3_, g0);
+                    __m256 g1 = _mm256_mul_ps(_mm256_loadu_ps(p1 + base), w0_);
+                    g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 8), w1_, g1);
+                    g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 16), w2_, g1);
+                    g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 24), w3_, g1);
+                    __m256 g2 = _mm256_mul_ps(_mm256_loadu_ps(p2 + base), w0_);
+                    g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 8), w1_, g2);
+                    g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 16), w2_, g2);
+                    g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 24), w3_, g2);
+                    __m256 g3 = _mm256_mul_ps(_mm256_loadu_ps(p3 + base), w0_);
+                    g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 8), w1_, g3);
+                    g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 16), w2_, g3);
+                    g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 24), w3_, g3);
+                    tot0 = _mm256_fmadd_ps(g0, sv, tot0);
+                    tot1 = _mm256_fmadd_ps(g1, sv, tot1);
+                    tot2 = _mm256_fmadd_ps(g2, sv, tot2);
+                    tot3 = _mm256_fmadd_ps(g3, sv, tot3);
+                }
+                C[(size_t)(mi + 0) * N + j] = hsum256(tot0) * global_scale;
+                C[(size_t)(mi + 1) * N + j] = hsum256(tot1) * global_scale;
+                C[(size_t)(mi + 2) * N + j] = hsum256(tot2) * global_scale;
+                C[(size_t)(mi + 3) * N + j] = hsum256(tot3) * global_scale;
+            }
+            // Single-row remainder (also the whole decode path when M == 1).
+            for (; mi < M; mi++) {
+                const float* p0 = a_perm + (size_t)mi * K;
+                __m256 total0 = _mm256_setzero_ps();
+                __m256 total1 = _mm256_setzero_ps();
+                for (int g = 0; g < group_count; g++) {
+                    const int base = g * 32;
+                    XIAOTU_DECODE_GROUP(b_row, g);
+                    __m256 gacc = _mm256_mul_ps(_mm256_loadu_ps(p0 + base), w0_);
+                    gacc = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 8), w1_, gacc);
+                    gacc = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 16), w2_, gacc);
+                    gacc = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 24), w3_, gacc);
+                    const float scale = scale_at(j, g * 32);
+                    const __m256 sv = _mm256_set1_ps(scale);
+                    if (g & 1)
+                        total1 = _mm256_fmadd_ps(gacc, sv, total1);
+                    else
+                        total0 = _mm256_fmadd_ps(gacc, sv, total0);
+                }
+                C[(size_t)mi * N + j] = hsum256(_mm256_add_ps(total0, total1)) * global_scale;
+            }
+        }
+        if (bp_on) {
+            auto bp_t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+            byteprof_accum((size_t)(n1 - n0) * (size_t)(K / 2), (uint64_t)(bp_t1 - bp_t0));
+        }
+        return;
+    }
+    // FAST_FP4 cross-parity fallback (gk != 32 or K%32 != 0): FP4 E2M1 dequant
+    // without a per-8-elements gather. The values are mag[nib & 7] * sign, with
+    // mag in {0,.5,1,1.5,2,3,4,6} and sign = +/-1 from bit 3. A gather from the
+    // 16-entry LUT is latency-bound and was ~70x slower than memory bandwidth in
+    // the M=1 GEMV hot loop; two permutevar8x32 lookups + one mul replace it.
+    static constexpr float kMag8[8] = {0.0f, 0.5f, 1.0f, 1.5f,
+                                      2.0f, 3.0f, 4.0f, 6.0f};
+    const __m256 mag_tab = _mm256_loadu_ps(kMag8);
+    const __m256 sign_tab = _mm256_setr_ps(1.0f, -1.0f, 0, 0, 0, 0, 0, 0);
+    for (int i = 0; i < M; ++i) {
+        const uint16_t* Arow = arow_at(i);
+        float* Crow = C + (size_t)i * N;
+        for (int j = n0; j < n1; ++j) {
+            const uint8_t* Wrow = W + (size_t)(j - rowshift) * (K / 2);
+            __m256 total = _mm256_setzero_ps();
+            int kbase = 0;
+            for (; kbase < K; kbase += gk) {
+                __m256 gacc = _mm256_setzero_ps();
+                int k = kbase;
+                int kend = (kbase + gk < K) ? (kbase + gk) : K;
+                if constexpr (FAST_FP4) {
+                    __m256 pre = _mm256_setzero_ps();
+                    for (; k + 8 <= kend; k += 8) {
+                        __m128i a16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Arow + k));
+                        __m256 av = _mm256_castsi256_ps(
+                            _mm256_slli_epi32(_mm256_cvtepu16_epi32(a16), 16));
+                        uint32_t raw;
+                        std::memcpy(&raw, Wrow + (k / 2), 4);
+                        __m128i b = _mm_cvtsi32_si128((int)raw);
+                        __m128i lo = _mm_and_si128(b, _mm_set1_epi8(0x0F));
+                        __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), _mm_set1_epi8(0x0F));
+                        __m128i nib = _mm_unpacklo_epi8(lo, hi);  // 8 nibbles
+                        __m256i magidx = _mm256_cvtepu8_epi32(
+                            _mm_and_si128(nib, _mm_set1_epi8(7)));
+                        __m256 mag = _mm256_permutevar8x32_ps(mag_tab, magidx);
+                        // sign bit = bit 3 -> shift each 16-bit lane right 3,
+                        // mask the low byte's bit0 (which was nib bit 3).
+                        __m128i s3 = _mm_srli_epi16(nib, 3);
+                        __m256i signidx = _mm256_cvtepu8_epi32(
+                            _mm_and_si128(s3, _mm_set1_epi8(1)));
+                        __m256 sign = _mm256_permutevar8x32_ps(sign_tab, signidx);
+                        __m256 wv = _mm256_mul_ps(mag, sign);
+                        // scale deferred: fold at group end
+                        pre = _mm256_fmadd_ps(av, wv, pre);
+                    }
+                    float pre_scalar = 0.f;
+                    for (; k < kend; ++k) {
+                        int nib = (Wrow[k / 2] >> (k & 1 ? 4 : 0)) & 0x0F;
+                        float v = kMag8[nib & 7] * ((nib & 8) ? -1.0f : 1.0f);
+                        pre_scalar += bf16::bf16_to_fp32(Arow[k]) * v;
+                    }
+                    float scale = scale_at(j, kbase);
+                    total = _mm256_fmadd_ps(pre, _mm256_set1_ps(scale), total);
+                    if (pre_scalar != 0.f) {
+                        float t[8]; _mm256_storeu_ps(t, total);
+                        t[0] += pre_scalar * scale;
+                        total = _mm256_loadu_ps(t);
+                    }
+                } else {
+                    __m256 gacc = _mm256_setzero_ps();
+                    for (; k + 8 <= kend; k += 8) {
+                        __m128i a16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Arow + k));
+                        __m256 av = _mm256_castsi256_ps(
+                            _mm256_slli_epi32(_mm256_cvtepu16_epi32(a16), 16));
+                        // 8 elements = 4 packed bytes starting at byte k/2.
+                        uint32_t raw;
+                        std::memcpy(&raw, Wrow + (k / 2), 4);
+                        __m128i b = _mm_cvtsi32_si128((int)raw);
+                        __m128i lo = _mm_and_si128(b, _mm_set1_epi8(0x0F));
+                        __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), _mm_set1_epi8(0x0F));
+                        __m128i nib = _mm_unpacklo_epi8(lo, hi);  // 8 nibble indices
+                        __m256i idx = _mm256_cvtepu8_epi32(nib);
+                        __m256 wv = _mm256_i32gather_ps(lut, idx, 4);
+                        gacc = _mm256_fmadd_ps(av, wv, gacc);
+                    }
+                    float gscalar = 0.f;
+                    for (; k < kend; ++k)
+                        gscalar += bf16::bf16_to_fp32(Arow[k]) * lut[nibble_of(Wrow, k)];
+                    float scale = scale_at(j, kbase);
+                    total = _mm256_fmadd_ps(gacc, _mm256_set1_ps(scale), total);
+                    if (gscalar != 0.f) {
+                        float t[8]; _mm256_storeu_ps(t, total);
+                        t[0] += gscalar * scale;
+                        total = _mm256_loadu_ps(t);
+                    }
+                }
+            }
+            float tmp[8]; _mm256_storeu_ps(tmp, total);
+            float acc = 0.f;
+            for (int t = 0; t < 8; ++t) acc += tmp[t];
+            Crow[j] = acc * global_scale;
+        }
+    }
+#else
+    (void)lut;
+    for (int i = 0; i < M; ++i) {
+        const uint16_t* Arow = arow_at(i);
+        float* Crow = C + (size_t)i * N;
+        for (int j = n0; j < n1; ++j) {
+            const uint8_t* Wrow = W + (size_t)(j - rowshift) * (K / 2);
+            float acc = 0.f;
+            for (int k = 0; k < K; ++k)
+                acc += bf16::bf16_to_fp32(Arow[k]) *
+                       lut[nibble_of(Wrow, k)] * scale_at(j, k - (k % gk));
+            Crow[j] = acc * global_scale;
+        }
+    }
+#endif
+}
+
+}  // namespace packed4
+
+// Generic CRTP base for a packed-4bit quant type given a dequant LUT.
+// The LM `w13_g`/`w2_g` are block-scale arrays and `w13_gs`/`w2_gs` are optional
+// per-expert global scales (NVFP4). dequant = lut[nibble] * block_scale * global.
+// `Tag` type parameter gives each *configuration* a distinct C++ type so that
+// pybind11 can register MXFP4 and NVFP4 (which share the E2M1 LUT) as separate
+// classes (pybind11 keys registered classes by C++ typeid).
+struct MXFP4Tag;  // forward decl so the base can detect the fast FP4 path
+template <const float (&LUT)[16], typename Tag = void, bool E8M0 = false,
+          bool FastFP4 = true, bool NeedsGS = false>
+struct Packed4WeightTraitsBase
+    : WeightTraitsBase<Packed4WeightTraitsBase<LUT, Tag, E8M0, FastFP4, NeedsGS>> {
+    static constexpr bool kE8M0 = E8M0;   // scale stored as 1-byte e8m0 vs fp32
+    // NVFP4 需要 per-expert global(tensor) scale;MXFP4/WNA16 不需要。
+    static constexpr bool kNeedsGlobalScale = NeedsGS;
+    // FAST path only for the FP4 E2M1 LUT (MXFP4/NVFP4), where dequant reduces to
+    // mag[nib&7]*sign and avoids the slow gather. WNA16's INT4_CENTER8 table does
+    // not decompose that way and keeps the general gather path -- it MUST pass
+    // FastFP4=false, otherwise the cross-parity fallback decodes its nibbles with
+    // the E2M1 table and silently produces wrong weights.
+    static constexpr bool kFastFP4 = FastFP4;
+    // This trait can split the N (row) dimension of each GEMV across worker
+    // threads (ktransformers `split_range_n`). Requires the *_slice_impl below.
+    static constexpr bool kNParallel = true;
+    static constexpr size_t w13_bytes_impl(size_t E, size_t n2, size_t H) {
+        return E * n2 * (H / 2);          // [E][2I][H/2] packed (2 elem/byte)
+    }
+    static constexpr size_t w2_bytes_impl(size_t E, size_t H, size_t I) {
+        return E * H * (I / 2);           // [E][H][I/2] packed (2 elem/byte)
+    }
+    static void gate_up_impl(const uint16_t* x, const void* w13, const void* w13_g,
+                            const float* w13_gs, float* gate, float* up,
+                            int inter, int hidden, size_t eid,
+                            int groupN, int groupK) {
+        // w13 : [E][2I][H/2] packed; scales [E][2I/gn][H/gk] (fp32 or e8m0 bytes).
+        const int n2 = 2 * inter;
+        const uint8_t* base = static_cast<const uint8_t*>(w13) + eid * (size_t)n2 * (hidden / 2);
+        std::vector<float> both(n2);
+        const int gn = groupN > 0 ? groupN : 1;
+        const int gk = groupK > 0 ? groupK : 1;
+        const size_t nb = (size_t)(n2 + gn - 1) / gn;
+        const size_t kb = (size_t)(hidden + gk - 1) / gk;
+        const void* sbase = nullptr;
+        if (w13_g) {
+            // scale element is 1 byte (e8m0) or 4 bytes (fp32) -> byte offset
+            const size_t byte_off = eid * (nb * kb) * (E8M0 ? 1u : sizeof(float));
+            sbase = static_cast<const char*>(w13_g) + byte_off;
+        } else if constexpr (E8M0) {
+            static const uint8_t ones[1] = {127};  // 2^(127-127)=1
+            sbase = ones;
+        } else {
+            static const float ones[1] = {1.0f};
+            sbase = ones;
+        }
+        const float gs = w13_gs ? w13_gs[eid] : 1.0f;
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(x, base, LUT, sbase, gs, both.data(),
+                                            1, n2, hidden, groupN, groupK);
+        std::copy(both.begin(), both.begin() + inter, gate);
+        std::copy(both.begin() + inter, both.end(), up);
+    }
+
+    static void down_impl(const uint16_t* act, const void* w2, const void* w2_g,
+                          const float* w2_gs, float* down, int hidden, int inter,
+                          size_t eid, int groupN, int groupK) {
+        // w2 : [E][H][I/2] packed; scales [E][H/gn][I/gk] (fp32 or e8m0 bytes).
+        const uint8_t* base = static_cast<const uint8_t*>(w2) + eid * (size_t)hidden * (inter / 2);
+        const int gn = groupN > 0 ? groupN : 1;
+        const int gk = groupK > 0 ? groupK : 1;
+        const size_t nb = (size_t)(hidden + gn - 1) / gn;
+        const size_t kb = (size_t)(inter + gk - 1) / gk;
+        const void* sbase = nullptr;
+        if (w2_g) {
+            const size_t byte_off = eid * (nb * kb) * (E8M0 ? 1u : sizeof(float));
+            sbase = static_cast<const char*>(w2_g) + byte_off;
+        } else if constexpr (E8M0) {
+            static const uint8_t ones[1] = {127};
+            sbase = ones;
+        } else {
+            static const float ones[1] = {1.0f};
+            sbase = ones;
+        }
+        const float gs = w2_gs ? w2_gs[eid] : 1.0f;
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(act, base, LUT, sbase, gs, down,
+                                            1, hidden, inter, groupN, groupK);
+    }
+
+    // ---- N-sliced variants (kNParallel) ------------------------------------
+    // Compute gate/up only for rows i in [n0, n1) of `inter`. `both` is [2*inter]:
+    //   gate in [0, inter), up in [inter, 2*inter).
+    static void gate_up_slice_impl(const uint16_t* x, const void* w13, const void* w13_g,
+                                   const float* w13_gs, float* both, int inter, int hidden,
+                                   size_t eid, int groupN, int groupK, int n0, int n1) {
+        if (n1 < 0 || n1 > inter) n1 = inter;
+        if (n1 <= n0) return;
+        const int n2 = 2 * inter;
+        const uint8_t* base = static_cast<const uint8_t*>(w13) + eid * (size_t)n2 * (hidden / 2);
+        const int gn = groupN > 0 ? groupN : 1;
+        const int gk = groupK > 0 ? groupK : 1;
+        const size_t nb = (size_t)(n2 + gn - 1) / gn;
+        const size_t kb = (size_t)(hidden + gk - 1) / gk;
+        const void* sbase = nullptr;
+        if (w13_g) {
+            const size_t byte_off = eid * (nb * kb) * (E8M0 ? 1u : sizeof(float));
+            sbase = static_cast<const char*>(w13_g) + byte_off;
+        } else if constexpr (E8M0) {
+            static const uint8_t ones[1] = {127};
+            sbase = ones;
+        } else {
+            static const float ones[1] = {1.0f};
+            sbase = ones;
+        }
+        const float gs = w13_gs ? w13_gs[eid] : 1.0f;
+        // w13 rows [0, inter) = gate, [inter, 2*inter) = up. gate slice first;
+        // the up call indexes rows [inter+n0, inter+n1) of the same n2 block into
+        // C=both (so both[inter+n0..inter+n1) holds up[n0..n1)).
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(x, base, LUT, sbase, gs, both,
+                                            1, n2, hidden, groupN, groupK, n0, n1);
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(x, base, LUT, sbase, gs, both,
+                                            1, n2, hidden, groupN, groupK, inter + n0, inter + n1);
+    }
+
+    static void down_slice_impl(const uint16_t* act, const void* w2, const void* w2_g,
+                                const float* w2_gs, float* down, int hidden, int inter,
+                                size_t eid, int groupN, int groupK, int n0, int n1) {
+        if (n1 < 0 || n1 > hidden) n1 = hidden;
+        if (n1 <= n0) return;
+        const uint8_t* base = static_cast<const uint8_t*>(w2) + eid * (size_t)hidden * (inter / 2);
+        const int gn = groupN > 0 ? groupN : 1;
+        const int gk = groupK > 0 ? groupK : 1;
+        const size_t nb = (size_t)(hidden + gn - 1) / gn;
+        const size_t kb = (size_t)(inter + gk - 1) / gk;
+        const void* sbase = nullptr;
+        if (w2_g) {
+            const size_t byte_off = eid * (nb * kb) * (E8M0 ? 1u : sizeof(float));
+            sbase = static_cast<const char*>(w2_g) + byte_off;
+        } else if constexpr (E8M0) {
+            static const uint8_t ones[1] = {127};
+            sbase = ones;
+        } else {
+            static const float ones[1] = {1.0f};
+            sbase = ones;
+        }
+        const float gs = w2_gs ? w2_gs[eid] : 1.0f;
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(act, base, LUT, sbase, gs, down,
+                                            1, hidden, inter, groupN, groupK, n0, n1);
+    }
+
+    // ---- Batched N-sliced variants (kNParallel). ----------------------------
+    // `matmul_packed4_group`'s FAST_FP4 kernel is gated on `M*K <= 4<<20`
+    // (moe_v2_packed4.hpp:254). At gate/up K == hidden (5120), so that silently
+    // caps `me` at 819: any expert with MORE tokens than that drops to the generic
+    // fallback. Measured as a 2.11x cliff (840 -> 368 ms/layer vs 763 -> 174
+    // ms/layer, NOTES §437) -- i.e. exactly the prefill case, where a single
+    // expert legitimately owns thousands of tokens.
+    //
+    // Fix: chunk the M dimension so any `me` keeps the fast kernel. Each row's dot
+    // product is accumulated independently, so chunking changes no arithmetic --
+    // results are identical. And because the chunk is exactly the old guard value,
+    // `me <= 819` (the entire previously-working domain) still issues ONE call with
+    // mc == me, i.e. it is byte-for-byte the old behaviour. The chunk also caps the
+    // per-thread `a32_storage` at the same 16 MB it was capped at before, which is
+    // why the guard cannot simply be raised.
+    static constexpr size_t kFastMKElems = (size_t)4 << 20;
+    // Default chunk 64: measured optimum over 16..819 (NOTES §439). It keeps the
+    // per-thread fp32 activation buffer at 64*K*4 bytes (1.31 MB at K=5120, i.e.
+    // about one Zen4 L2) while still decoding each weight row once per chunk. At
+    // me=1400 it is 142.6 ms/layer vs 184.6 at chunk=819 and 434.2 on the old slow
+    // path. Values 16..819 give BIT-IDENTICAL results, so this is purely a cache
+    // choice. Capped by the guard so the fast kernel is always the one selected.
+    static size_t fast_m_chunk(int K) {
+        static const long ov = [] {
+            const char* e = std::getenv("XIAOTU_MOE_FAST_CHUNK");
+            return e ? std::atol(e) : 0L;
+        }();
+        const size_t guard = kFastMKElems / (size_t)(K > 0 ? K : 1);
+        if (ov > 0) {
+            const size_t v = (size_t)ov;
+            return (guard && v > guard) ? guard : v;
+        }
+        const size_t want = 64;
+        return (guard && want > guard) ? guard : (guard ? want : 1);
+    }
+    // Same as the single-instance *_slice_impl but with `me` token-rows of the
+    // SAME expert run in one GEMM call, so the packed kernel (matmul_packed4_group
+    // FAST path) decodes each weight row once and shares it across me rows and
+    // gets M-way FMA ILP via its 4-token blocked loop (ktransformers pattern).
+    static void gate_up_slice_batch_impl(int me, const uint16_t* xg, const void* w13, const void* w13_g,
+                                         const float* w13_gs, float* both_buf, int inter, int hidden,
+                                         size_t eid, int groupN, int groupK, int n0, int n1,
+                                         const uint32_t* rowmap = nullptr,
+                                         size_t cstride = 0, long row0 = 0, size_t up_off = 0) {
+        if (me <= 0) return;
+        if (n1 < 0 || n1 > inter) n1 = inter;
+        if (n1 <= n0) return;
+        const int n2 = 2 * inter;
+        // Compact single-copy NUMA shard geometry (see forward_many): each expert
+        // block in the shard is [gate cbytes][up cbytes]; `row0` is the global row
+        // stored at offset 0 and `cstride` the byte distance between experts.
+        // Dense callers pass cstride=0/row0=0/up_off=0 and keep the old layout.
+        const size_t rb = (size_t)hidden / 2;                    // bytes per weight row
+        const size_t S = cstride ? cstride : (size_t)n2 * rb;    // per-expert stride
+        const size_t r0 = (size_t)(row0 < 0 ? 0 : row0);
+        const size_t uoff = up_off ? up_off : (size_t)inter * rb;  // gate -> up gap
+        const uint8_t* gbase = static_cast<const uint8_t*>(w13) + eid * S;
+        const int gn = groupN > 0 ? groupN : 1;
+        const int gk = groupK > 0 ? groupK : 1;
+        const size_t nb = (size_t)(n2 + gn - 1) / gn;
+        const size_t kb = (size_t)(hidden + gk - 1) / gk;
+        const void* sbase = nullptr;
+        if (w13_g) {
+            const size_t byte_off = eid * (nb * kb) * (E8M0 ? 1u : sizeof(float));
+            sbase = static_cast<const char*>(w13_g) + byte_off;
+        } else if constexpr (E8M0) {
+            static const uint8_t ones[1] = {127};
+            sbase = ones;
+        } else {
+            static const float ones[1] = {1.0f};
+            sbase = ones;
+        }
+        const float gs = w13_gs ? w13_gs[eid] : 1.0f;
+        // both_buf rows are strided by n2; indices [n0,n1) = gate chunk and
+        // [inter+n0, inter+n1) = up chunk, both over ALL me rows at once.
+        // rowshift=r0 maps global row j to shard-local row j-r0 (dense: r0==0).
+        // Chunked over M so the FAST_FP4 kernel is reachable for any `me`
+        // (me <= 819 -> exactly one iteration, i.e. bit-identical to before).
+        const size_t mch = fast_m_chunk(hidden);
+        for (size_t m0 = 0; m0 < (size_t)me; m0 += mch) {
+            const int mc = (int)std::min<size_t>(mch, (size_t)me - m0);
+            // The kernel reads the activation row as A + rowmap[i]*K, so a chunk
+            // must advance either A itself (no gather) or rowmap (gather) -- never
+            // both, or the row index is applied twice.
+            const uint16_t* ac = rowmap ? xg : (xg + m0 * (size_t)hidden);
+            const uint32_t* rm = rowmap ? (rowmap + m0) : nullptr;
+            float* bc = both_buf + m0 * (size_t)n2;
+            float* a32_reuse = nullptr;   // 【轮 85】up 复用 gate 转好的激活(每个 chunk 内)
+            packed4::matmul_packed4_group<E8M0, kFastFP4>(ac, gbase, LUT, sbase, gs, bc,
+                                                mc, n2, hidden, groupN, groupK, n0, n1, (int)r0, rm,
+                                                nullptr, &a32_reuse);
+            packed4::matmul_packed4_group<E8M0, kFastFP4>(ac, gbase + uoff, LUT, sbase, gs, bc,
+                                                mc, n2, hidden, groupN, groupK, inter + n0, inter + n1,
+                                                (int)(r0 + (size_t)inter), rm,
+                                                a32_reuse, nullptr);
+        }
+    }
+
+    static void down_slice_batch_impl(int me, const uint16_t* actg, const void* w2, const void* w2_g,
+                                      const float* w2_gs, float* down_buf, int hidden, int inter,
+                                      size_t eid, int groupN, int groupK, int n0, int n1,
+                                      size_t cstride = 0, long row0 = 0) {
+        if (me <= 0) return;
+        if (n1 < 0 || n1 > hidden) n1 = hidden;
+        if (n1 <= n0) return;
+        const size_t rb = (size_t)inter / 2;                       // bytes per weight row
+        const size_t S = cstride ? cstride : (size_t)hidden * rb;  // per-expert stride
+        const size_t r0 = (size_t)(row0 < 0 ? 0 : row0);
+        const uint8_t* base = static_cast<const uint8_t*>(w2) + eid * S;
+        const int gn = groupN > 0 ? groupN : 1;
+        const int gk = groupK > 0 ? groupK : 1;
+        const size_t nb = (size_t)(hidden + gn - 1) / gn;
+        const size_t kb = (size_t)(inter + gk - 1) / gk;
+        const void* sbase = nullptr;
+        if (w2_g) {
+            const size_t byte_off = eid * (nb * kb) * (E8M0 ? 1u : sizeof(float));
+            sbase = static_cast<const char*>(w2_g) + byte_off;
+        } else if constexpr (E8M0) {
+            static const uint8_t ones[1] = {127};
+            sbase = ones;
+        } else {
+            static const float ones[1] = {1.0f};
+            sbase = ones;
+        }
+        const float gs = w2_gs ? w2_gs[eid] : 1.0f;
+        // down_buf rows strided by hidden; write slice [n0,n1) for all me rows.
+        // rowshift=r0 maps global row j to shard-local row j-r0 (dense: r0==0).
+        // Chunked over M for the same reason as gate_up_slice_batch_impl (§437);
+        // down has no rowmap, so the activation base advances with the chunk.
+        const size_t mch = fast_m_chunk(inter);
+        for (size_t m0 = 0; m0 < (size_t)me; m0 += mch) {
+            const int mc = (int)std::min<size_t>(mch, (size_t)me - m0);
+            packed4::matmul_packed4_group<E8M0, kFastFP4>(actg + m0 * (size_t)inter, base, LUT,
+                                                sbase, gs, down_buf + m0 * (size_t)hidden,
+                                                mc, hidden, inter, groupN, groupK, n0, n1, (int)r0);
+        }
+    }
+};
+
+// MXFP4: FP4 E2M1 weights, raw fp8_e8m0 uint8 per-block scales (fork feeding),
+// no global scale. groupK=32 when fed by the fork.
+struct MXFP4Tag {};
+using MXFP4WeightTraits = Packed4WeightTraitsBase<packed4::E2M1, MXFP4Tag, true>;
+
+// WNA16: int4 weights (LUT centered at 8), fp32 per-group scales, no global scale.
+// FastFP4=false: the E2M1 fast decode does not apply to the center-8 table.
+struct WNA16Tag {};
+using WNA16WeightTraits =
+    Packed4WeightTraitsBase<packed4::INT4_CENTER8, WNA16Tag, false, false>;
+
+// NVFP4: FP4 E2M1 weights (same nibble layout as MXFP4), fp32 per-group scales
+// PLUS a per-expert global scale. groupK is 32 when fed by vLLM.
+struct NVFP4Tag {};
+using NVFP4WeightTraits =
+    Packed4WeightTraitsBase<packed4::E2M1, NVFP4Tag, false, true, /*NeedsGS=*/true>;
+
+}  // namespace xiaotu_moe
+
+#endif  // XIAOTU_MOE_MOE_V2_PACKED4_HPP
