@@ -21,15 +21,22 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 当前版本：v0.2.5**（2026-10-03）—— **优化 GPU prefill 内存机制**：
-> **为 GPU 算子增加对 NUMA 切片权重的处理路径，节省了一层权重空间** —— 对 **DeepSeek-V4.1-Flash 节约 6.33 GiB**，**2 个 GPU（TP=2）时每卡节约 3.16 GiB**（单层 staging 10.73 → **7.56 GiB/rank**，离线同层 364.91 → **341.31 ms**，数值逐字节相同）；
-> **支持 1M 上下文 + GPU 预填充**（CED 让每 token KV 从 ~5437 B 降到 ~2106 B ⇒ 1M 只需 KV ~2.2 GiB）；**Engram pinned 浪费修复（宿主内存 −75 GiB）**；
-> rebase 到上游后 **CED 恢复生效**（V4.1 16k prefill **527.8 → 982.4 tok/s**）；**TP=2 一律用 GPU1+GPU2**（GPU0 只有 PCIe x8）；服务日志按 **PID** 命名。
-> 发行说明：[`RELEASE_NOTES_v0.2.5.md`](RELEASE_NOTES_v0.2.5.md)
+> **📌 当前版本：v0.2.6**（2026-10-06）—— **自举开发：全程用自己开发的引擎作推理后端，打通 FP4 专家权重的 INT8 激活计算路径**：
+> **为 MXFP4 专家权重增加 INT8 激活的计算路径**（fp4 码值 `{0, ±1…±12}` 完全含于 int8 ⇒ **权重侧零代价**，全部数值代价只来自激活量化）—— 内核级 **24.9 → 15.1–15.7 ms/层（1.54–1.62×）**，`max_abs ≈ 3.163e-03`；
+> 端到端（qfn · MXFP4-FP8）：GSM8K 全量 200 题 **base 193/200 · int8 193/200**、逐题一致 **194/200（净变化 0）**，256K 四针 **两臂 4/4 + `finish_reason=stop`**，Vision 23 逐项一致 18/23；
+> 同时修复**回退路径回归**（原本慢 16–22% ⇒ **+1.49% 指令**）、打通 **qfn 的 MTP**（解码 **2.44×**）、qfn 服务默认线程数改为 **120（= 5 核/CCD）**；该路径**默认关**，`XIAOTU_MOE_W4A8=1` 启用。
+> 发行说明：[`RELEASE_NOTES_v0.2.6.md`](RELEASE_NOTES_v0.2.6.md)
 
 ---
 
 > [!WARNING]
+> ⚠️ **关掉它的代价（必须一起知道）**：LMCache 的原始价值是
+> **让服务重启变得可接受**（跨重启复用前缀）✓。
+> 关掉后每次重启都要**全量重预填**：实测一个长会话的开发 agent
+> 重新 prefill 了 **21 分钟**才能开始工作（原来的 10K 前缀对比：冷 26.7 s
+> ⇒ 重启后 1.27 s）✗。⇒ 所以“关 LMCache”与“不能重启”是一对互相强化的约束 ✓
+>
+
 > ## ⚠️ 请勿开启 LMCache(已知恶性问题)
 >
 > **本项目已默认关闭 LMCache**(`LMCACHE=0`,且不启动 `lmcache_server`)。原因:
@@ -132,6 +139,14 @@ LMCACHE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False bash scripts/serve_v
 
 ## 性能观测:通过 DeepSeek Harness 进行本项目开发的典型性能统计
 
+> ⭐ **本项目的开发方式是"自举(bootstrapping)"的**:agent 自身充当开发者,而**被开发的这个引擎
+> 正是它的推理后端** —— 即每一次推进、每一次回归、每一轮 A/B 测量,都由**被改造的引擎自己服务**。
+> 这同时验证了引擎在**真实在线负载**下的稳定性:**v0.2.6 会话期间,该服务连续运行 16 小时以上无故障** ✓
+>
+> agent 侧性能统计(该次会话;后端 = **DeepSeek-V4.1-Flash**,TP=2):
+> **18 轮 / 718 步** · Token **232,529,485**(agent 侧缓存命中 **99.7%**)· 输出 **474,129** tok
+> **模型用时 282 分 30 秒** · **工具调用用时 506 分 52 秒**(合计 ≈ 13.2 h)· TTFT **6.6 s** · **39 tok/s**
+
 ![通过 DeepSeek Harness 进行本项目开发的一个典型性能统计](docs/assets/dsh-dev-performance.webp)
 
 > 上图是本项目**自建监控栈**在一次典型开发会话中的读数(面板来自 vLLM + LMCache 业务指标与主机
@@ -168,6 +183,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 
 | 版本 | 主题 |
 |---|---|
+| **v0.2.6** | **自举开发：INT8 激活 × FP4 专家权重 的计算路径** —— 为 **MXFP4** 专家权重增加 **INT8 激活**路径（fp4 码值全含于 int8 ⇒ **权重侧零代价**）：内核级 **24.9 → 15.1–15.7 ms/层（1.54–1.62×）**；端到端（qfn·MXFP4-FP8）GSM8K **两臂 193/200**、逐题一致 194/200（净 0）、256K 四针两臂 4/4 + `stop`、Vision 23 逐项一致 18/23；修复**回退路径回归**（慢 16–22% ⇒ +1.49% 指令）；打通 **qfn 的 MTP**（**2.44×**）；qfn 默认线程数 **120（5 核/CCD）**；路径默认关（`XIAOTU_MOE_W4A8=1`）|
 | **v0.2.5** | **优化 GPU prefill 内存机制** —— **为 GPU 算子增加对 NUMA 切片权重的处理路径,节省了一层权重空间**(对 DeepSeek-V4.1-Flash **节约 6.33 GiB**;2 个 GPU 时**每卡节约 3.16 GiB**):单层 staging 10.73→**7.56 GiB/rank**、离线同层 364.91→**341.31 ms**、数值逐字节相同;**支持 1M 上下文 + GPU 预填充**(CED 让每 token KV 5437→2106 B,1M 只需 KV ~2.2 GiB);**Engram pinned 浪费修复**(宿主内存 **−75 GiB**);rebase 到上游后 **CED 恢复生效**(16k prefill 527.8→**982.4** tok/s);**TP=2 一律用 GPU1+GPU2**(GPU0 只有 x8);服务日志按 **PID** 命名 |
 | **v0.2.4** | **支持 MiMo-V2.6-Flash-RL + 性能优化** —— 新模型接入（MXFP4/TP=2/1M/多模态/MTP k=1，**层内数值门禁 94/94 层通过**、312K 针测试命中、多模态真图通过）；**GPU 预填充「0=关闭」陷阱修复**（长 prefill 313→**811** tok/s）；**`--max-num-seqs` 默认统一为 4**（短 C=2 prefill 236→**367**）；**decode 口径改为 median ITL**（真实争用 1.13–1.77×）；修好 MXFP4 上的层内数值门禁 |
 | **v0.2.3** | **跟进上游 + GLM/MiMo 的 MTP** —— 补丁栈 rebase 到上游 `133b71e0b`(11 补丁/40 文件);**GLM-5.3-Flash 的 MTP 落地**(draft 层识别 + GPU 常驻,`SPEC_K=1..4`);**MiMo-V2.5(310B/15B)单卡端到端支持**,MTP k=1 decode +10%;显存契约重标定(GLM `GPU_UTIL` 0.85 → **0.82**) |
@@ -177,7 +193,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 | v0.1.0 | 首个公开版:混合模式(CPU 专家 + GPU 其余)、AVX2 / AVX-512 多 ISA、DeepSeek-V4 系列 |
 
 改动清单、性能对照与运行参数变更:
-[**v0.2.5**](RELEASE_NOTES_v0.2.5.md) · [**v0.2.4**](RELEASE_NOTES_v0.2.4.md) · [**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
+[**v0.2.6**](RELEASE_NOTES_v0.2.6.md) · [**v0.2.5**](RELEASE_NOTES_v0.2.5.md) · [**v0.2.4**](RELEASE_NOTES_v0.2.4.md) · [**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
 (归档:[v0.2pre](RELEASE_NOTES_v0.2pre.md))
 
 ---
@@ -194,6 +210,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 | [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) | 已知限制与不支持的组合 |
 | [`docs/INSTALL_MAINLINE.md`](docs/INSTALL_MAINLINE.md) | 主线 vLLM 环境准备 |
 | [`docs/FP4_INT8_HARDWARE_OUTLOOK.md`](docs/FP4_INT8_HARDWARE_OUTLOOK.md) | **4-bit 推理格式的公开硬件路线图**(FP4 vs INT4;含出处与"已宣告/传闻"标注)与 **CPU 优先 MoE 服务的设计依据** |
+| [`docs/INT8_ACTIVATION_FOR_MXFP4_EXPERTS.md`](docs/INT8_ACTIVATION_FOR_MXFP4_EXPERTS.md) | **INT8 激活 × MXFP4 专家权重** —— 这条计算路径解决什么问题、内核级收益、端到端语义验收口径、启用方法与已知限制 |
 
 **面向开发者** —— 架构与主线集成、GPU 预填充实现、上游漂移、调优记录与全部内部报告,
 **属于内部开发文档,不随本仓库发布**(只保留在本地工作副本里)。

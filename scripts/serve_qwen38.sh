@@ -35,7 +35,7 @@ MAXLEN="${MAXLEN:-8192}"    # 【纪律】上下文尽量短
 MBT="${MBT:-2048}"
 SEQS="${SEQS:-1}"
 GPU_UTIL="${GPU_UTIL:-0.90}"
-THREADS="${THREADS:-60}"
+THREADS="${THREADS:-120}"   # ⭐ qfn 服务默认 = n_ccd×5(本机 24 CCD ⇒ 120);见下方资源纪律段 ✓
 LOAD="${LOAD:-auto}"        # auto=读真权重;dummy=不读盘,只验架构与显存
 EAGER="${EAGER:-1}"         # 单卡调试先从全 eager 起,稳了再上图
 PLE_CPU="${XIAOTU_PLE_CPU:-1}"   # 必须有:PLE 47.8GiB 走主机内存(UVA)
@@ -113,11 +113,20 @@ export CUDA_VISIBLE_DEVICES="$GPUS"
 
 # ⭐ 2026-10-04【同机多实例纪律,AGENTS.md §4】起第二个实例前的四项自查:
 #   ① 结构相似的替代模型(QFN ✓,不是巨模型)  ② MemAvailable 够
-#   ③ oom_score_adj=+800(让内核【先杀自己】,别去挑生产)  ④ ≤64 核 + taskset 避开生产核
+#   ③ oom_score_adj=+800(让内核【先杀自己】,别去挑生产)  ④ THREADS=n_ccd×5(=120)+ taskset(见下方 2026-10-06 段 ✓)
 OOM_SCORE_ADJ="${OOM_SCORE_ADJ:-800}"
-# 核数上限:生产(8070 的 4 个进程)自己占 ~120 核 ⇒ 调试实例 ≤64,建议 48/72(=2-3 核/CCD)
-THREADS="$(awk -v t="$THREADS" 'BEGIN{print (t+0>64)?64:(t+0)}')"
-TASKSET="${TASKSET:-48-95}"          # 生产重载线程实测绑在 0-23 / 96-119 ⇒ 本区间零重叠
+# ⭐ 2026-10-06【qfn 服务默认值,用户授权】线程数默认改为 **n_ccd × 5**(本机 24 CCD ⇒ 120)。
+#   依据(实测):
+#     · 引擎自身默认就是 n_ccd×5 = 120(`serve_v41.sh` 注释:*"未设时插件按 n_ccd×5 自动调优"*);
+#       本脚本此前钉成 60 是"先跑通"的保守值,`serve_v41.sh` 明确写着 **60 两头都亏**:
+#       60 → 386.8 ms/层,120 → 219.2,192 → 170.9 ⇒ 120 比 60 快 **1.76×**。
+#     · 本任务 qfn 端到端实测(全量 200 题):`THREADS=120` 比 60 快 **1.62×**。
+#   ⚠️ 代价(用户已知并接受):生产 8070 自身也吃 CPU;用户说明**当前引擎实现的核心利用率
+#      本就吃不满**,故按 120 设定。若生产转为满载,应把 THREADS_MAX 调回 64 ✗。
+#   ⚠️ 本项与 GPU 预填无关 —— 本次任务不关注 GPU 预填性能,只要求行为正确 ✓。
+THREADS_MAX="${THREADS_MAX:-192}"
+THREADS="$(awk -v t="$THREADS" -v m="$THREADS_MAX" 'BEGIN{print (t+0>m)?m:(t+0)}')"
+TASKSET="${TASKSET:-0-191}"          # 与 120 线程(=5 core/CCD,铺满 8 NUMA node)配套
 MEM_GATE_GIB="${MEM_GATE_GIB:-250}"  # QFN 实测宿主 ~163 GiB(FP8)/~107 GiB(MXFP4)
 _avail="$(awk '/MemAvailable/{printf "%d", $2/1048576}' /proc/meminfo)"
 echo "[qwen38] 资源纪律: THREADS=$THREADS taskset=$TASKSET nice=19 oom_score_adj=$OOM_SCORE_ADJ MemAvailable=${_avail}GiB"

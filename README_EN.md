@@ -22,15 +22,16 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.2.5** (2026-10-03) — **GPU prefill memory rework**:
-> **The GPU operator now consumes NUMA-sharded experts directly, dropping one layer of weight staging** —
-> for **DeepSeek-V4.1-Flash that is 6.33 GiB saved, or 3.16 GiB per card with 2 GPUs** (per-layer staging
-> 10.73 -> **7.56 GiB/rank**; offline single layer 364.91 -> **341.31 ms**; weights byte-identical).
-> **1M context with GPU prefill is now supported** (CED cuts KV from ~5437 B to ~2106 B per token, so 1M
-> needs only ~2.2 GiB of KV), the **Engram pinned over-allocation is fixed (-75 GiB of host memory)**, and
-> after rebasing onto upstream **CED works again** (V4.1 16k prefill 527.8 -> **982.4** tok/s). TP=2 now
-> always uses GPU1+GPU2 (GPU0 is PCIe x8 only), and service logs are named by PID.
-> Release notes: [`RELEASE_NOTES_v0.2.5.md`](RELEASE_NOTES_v0.2.5.md)
+> **📌 Current release: v0.2.6** (2026-10-06) — **bootstrapped development: the whole session ran on the engine it was building, and FP4 expert weights gained an INT8 activation compute path**:
+> **MXFP4 expert weights now have an INT8 activation path** (the fp4 code set `{0, ±1…±12}` fits int8 exactly,
+> so the **weight side is free**; the entire numerical cost comes from quantising the activations) —
+> kernel level **24.9 -> 15.1-15.7 ms/layer (1.54-1.62x)**, `max_abs ≈ 3.163e-03`;
+> end to end (qfn, MXFP4-FP8): GSM8K 200 questions **193/200 on both arms**, 194/200 per-question agreement
+> (net change 0), 256K four-pin **4/4 with `finish_reason=stop` on both arms**, Vision 23 agrees 18/23;
+> also fixed the **fallback-path regression** (was 16-22% slower -> **+1.49% instructions**),
+> brought up **MTP on qfn** (**2.44x** decode) and set the qfn service default thread count to
+> **120 (= 5 cores/CCD)**. The path is **off by default**; enable with `XIAOTU_MOE_W4A8=1`.
+> Release notes: [`RELEASE_NOTES_v0.2.6.md`](RELEASE_NOTES_v0.2.6.md)
 
 ---
 
@@ -74,6 +75,11 @@
 4. One copy of the weights even across the multiple NUMA nodes of a single server:
    each NUMA node only reads and writes its local memory, maximising performance while
    saving memory.
+5. **Bootstrapped development.** The 2026-10-06 session was developed and tested entirely inside the
+   local "self-service" environment: the agent acted as the developer while the engine under
+   development **was its own inference backend**. Every step, regression and A/B measurement was
+   served by the very engine being changed -- which also exercised its stability under real live load
+   (that service ran **16+ hours without a fault** during the session).
 
 ---
 ## Measurement host
@@ -161,6 +167,7 @@ Per-model recipes, memory budgeting, self-checks and troubleshooting →
 
 | Version | Theme |
 |---|---|
+| **v0.2.6** | **Bootstrapped development: INT8 activation x FP4 expert weights** — MXFP4 experts gain an **INT8 activation** path (the fp4 code set fits int8 exactly, so the **weight side is free**): kernel level **24.9 -> 15.1-15.7 ms/layer (1.54-1.62x)**; end to end (qfn, MXFP4-FP8) GSM8K **193/200 on both arms**, 194/200 per-question (net 0), 256K four-pin 4/4 + `stop` on both arms, Vision 23 agrees 18/23; **fallback-path regression fixed** (16-22% slower -> +1.49% instructions); **MTP on qfn (2.44x)**; qfn default threads **120 (5 cores/CCD)**; path off by default (`XIAOTU_MOE_W4A8=1`) |
 | **v0.2.5** | **GPU prefill memory rework** — the GPU operator consumes NUMA-sharded experts directly, dropping one layer of weight staging (**6.33 GiB saved for DeepSeek-V4.1-Flash, 3.16 GiB per card at TP=2**; per-layer staging 10.73 → **7.56 GiB/rank**; byte-identical results); **1M context + GPU prefill** (CED: KV 5437 → 2106 B/token, so 1M needs ~2.2 GiB); **Engram pinned over-allocation fixed (−75 GiB host)**; rebasing onto upstream restores **CED** (16k prefill 527.8 → **982.4** tok/s); **TP=2 uses GPU1+GPU2**; service logs named by PID |
 | **v0.2.4** | **MiMo-V2.6-Flash-RL support + performance work** — MXFP4 experts over V4.1's engine path (TP=2 / 1M context / multimodal / MTP k=1 all measured); the **GPU prefill "zero means off" trap fixed** (long prefill 313 → **811** tok/s); **`--max-num-seqs` now defaults to 4**; decode metric switched to median ITL |
 | **v0.2.3** | **Upstream tracking + GLM/MiMo MTP** — patch stack rebased onto upstream `133b71e0b` (11 patches / 40 files); **GLM-5.3-Flash MTP wired up, ON by default** (`SPEC_K=1`, decode 21.9 → 22.6 tok/s at the cost of a 27% smaller KV pool); **MiMo-V2.5 (310B/15B) runs end-to-end on one A100-40GB** with MTP k=1 at +10% decode; GLM memory contract re-calibrated (`GPU_UTIL` 0.85 → **0.82**) |
@@ -170,7 +177,7 @@ Per-model recipes, memory budgeting, self-checks and troubleshooting →
 | v0.1.0 | First public release: hybrid mode (CPU experts + GPU rest), AVX2 / AVX-512 multi-ISA, DeepSeek-V4 family |
 
 Details, performance comparisons and parameter changes:
-[**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
+[**v0.2.6**](RELEASE_NOTES_v0.2.6.md) · [**v0.2.5**](RELEASE_NOTES_v0.2.5.md) · [**v0.2.4**](RELEASE_NOTES_v0.2.4.md) · [**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
 (archived: [v0.2pre](RELEASE_NOTES_v0.2pre.md))
 
 ---
@@ -187,6 +194,7 @@ Details, performance comparisons and parameter changes:
 | [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) | Known limitations and unsupported combinations |
 | [`docs/INSTALL_MAINLINE.md`](docs/INSTALL_MAINLINE.md) | Preparing an upstream vLLM environment |
 | [`docs/FP4_INT8_HARDWARE_OUTLOOK.md`](docs/FP4_INT8_HARDWARE_OUTLOOK.md) | **Public hardware outlook on 4-bit inference formats** (FP4 vs INT4, with sources) and what it implies for **CPU-first MoE serving** |
+| [`docs/INT8_ACTIVATION_FOR_MXFP4_EXPERTS.md`](docs/INT8_ACTIVATION_FOR_MXFP4_EXPERTS.md) | **INT8 activation x MXFP4 expert weights** — what the path solves, kernel-level gains, the end-to-end semantic acceptance protocol, how to enable it, and known limitations |
 
 **For developers** — architecture and upstream integration, the GPU-prefill implementation,
 upstream drift, tuning logs and all internal reports are **internal development documents and are
