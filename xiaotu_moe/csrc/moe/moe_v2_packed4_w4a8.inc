@@ -769,6 +769,147 @@ static inline bool xiaotu_quant_block_m0(const float* a32, int m0, int MR, int M
     return true;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 【T1.4b】W4A8 的两个 int8 tile 体 —— **移出热宏 + `noinline`**
+//
+// 为什么:这两段体原本**写死在**热宏 `XIAOTU_TILE_BODY(MRT,NRT)` 里,而该宏被
+// `XIAOTU_TILE_DISPATCH_R` 对**(MRT × NRT) 多组**实例化(ALLMR=1 ⇒ 最多 6×4 = 24 份)⇒
+// int8 代码在每一份特化里各来一遍 ⇒ **代码体积 / I-cache / 寄存器压力**全部压在
+// **门控关(= 回退 fp32 FMA)的那条路径**上 ✗。
+// 实测(见 dev-docs/mywork/LOG.md 2026-10-05 23:4x 的 4 臂归因):门控关比 pristine 慢 **16%**,
+// 且已排除 `-mavx512vnni` 旗标与数值原因 ⇒ 元凶就是"源码本身在热宏里膨胀" ✓
+//
+// ⇒ 把两个体做成 **`__attribute__((noinline))` 模板函数**,热宏里只剩 **两个调用点** ✓
+//   * 热宏里剩下的 fp32 路径 ⇒ 代码体积回到 baseline ⇒ 判据:门控关 **1.00× ±2%** ✓
+//   * int8 代码仍然存在(只是出线 out-of-line)⇒ 门控开时**照旧执行** ✓
+//
+// ⭐ 数值纪律:两段体是**逐语句搬运**,累加顺序 / 舍入点 / 写出时机**一字不改**
+//   (仅去掉了原本的空语句 `(void)0;` / 孤立 `;`,它们不产生任何代码)⇒
+//   **门控开的输出必须与搬运前逐字节一致** ✓
+//   * `acc` 不再以指针传入:两段体都**直接写 C**(ALIGN 原本就写 C ✓;旧 VNNI 原本是
+//     "累到 acc ⇒ 跳过 fp32 循环 ⇒ 再写 C"三明治,拆开等价 ✓ —— 门控开时那条 fp32
+//     循环本来就被 `!i8_vnni_tile_` 短路,永不执行 ✓)
+// ⚠️ 只被 w4a8 变体(`avx512_bf16_vbmi_vnni`)编译到;base 变体不含本文件 ✓
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── ① ALIGN 整数内层(方案1):每个 64 MAC = 1 条 vpdpbusd + 整数口运算 ──────
+//    前置条件(调用方已用守卫判过 ✓):E8M0 · `i8a_pre_`(权重+激活侧移位表已建)·
+//    `i8_align_ok_`(G1/G2 与几何全过)⇒ 本函数内**不再重复判条件** ✓
+template <int MRT, int NRT>
+__attribute__((noinline))
+void xiaotu_i8_align_tile(int m0, int j0, int K, int N, int group_count,
+                          float global_scale, float* C) {
+    __m512i acci[MRT][NRT];
+    for (int r_ = 0; r_ < MRT; ++r_)
+        for (int jj_ = 0; jj_ < NRT; ++jj_) acci[r_][jj_] = _mm512_setzero_si512();
+    const __m512i ONES_ = _mm512_set1_epi8(1);
+    const __m128i PAIR8_ = _mm_setr_epi8(0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1);
+    const uint8_t* A8b_ = g_i8_A.data();
+    const uint8_t* ACb_ = g_i8_AC8.data();
+    const size_t  acst_ = (size_t)g_i8_gc * 8;
+    float dw_[NRT], av_[MRT];
+    for (int jj_ = 0; jj_ < NRT; ++jj_)
+        dw_[jj_] = global_scale * g_i8_WSC[(size_t)(j0 + jj_ - g_i8_n0)];
+    for (int r_ = 0; r_ < MRT; ++r_) av_[r_] = g_i8_ASCv[r_];
+    /* ⭐【B2】(基准实测 1.582x):jj 内层共享 a8/dpbusd;两级【预计算】移位向量,
+       内层无 movzxbd / 无 paddb / 无 shuffle ✓ */
+    {
+        const int np2_ = group_count / 2;
+        __m512i w64v_[NRT], ws7v_[NRT], wshv_[NRT];
+        for (int p_ = 0; p_ < np2_; ++p_) {
+            const int g_ = p_ * 2;
+            for (int jj_ = 0; jj_ < NRT; ++jj_) {
+                const size_t ro_ = (size_t)(j0 + jj_ - g_i8_n0);
+                w64v_[jj_] = _mm512_loadu_si512((const void*)(g_i8_W + ro_ * (size_t)K
+                    + (size_t)g_ * 32));
+                ws7v_[jj_] = _mm512_slli_epi32(XIAOTU_DPBUSD(
+                    _mm512_setzero_si512(), ONES_, w64v_[jj_]), 7);
+                /* P3-lite: 权重侧移位已折进 w8' */
+            }
+            for (int r_ = 0; r_ < MRT; ++r_) {
+                const __m512i a8_ = _mm512_loadu_si512(
+                    (const void*)(A8b_ + (size_t)r_ * (size_t)K + (size_t)g_ * 32));
+                /* P3-full:无激活侧移位 */
+                for (int jj_ = 0; jj_ < NRT; ++jj_) {
+                    const __m512i sg_ = _mm512_sub_epi32(XIAOTU_DPBUSD(
+                        _mm512_setzero_si512(), a8_, w64v_[jj_]), ws7v_[jj_]);
+                    acci[r_][jj_] = _mm512_add_epi32(acci[r_][jj_],
+                        sg_);   /* P3-full:内层只剩 add · P3-lite: 只剩激活侧一级移位 */
+                }
+            }
+        }
+    }
+    for (int r_ = 0; r_ < MRT; ++r_)
+        for (int jj_ = 0; jj_ < NRT; ++jj_)
+            C[(size_t)(m0 + r_) * N + j0 + jj_] =
+                hsum512(_mm512_cvtepi32_ps(acci[r_][jj_])) * (dw_[jj_] * av_[r_]);
+}
+
+// ── ② 旧 VNNI int8 体(align 关时的那条:1 dpbusd + 1 fmadd/64MAC)────────────
+//    逐行 scale(`row_scale`)语义与主函数里的 lambda **完全一致** ⇒ 用同一套
+//    `E8M0 ? e8tbl[Sbytes[i]] : Sflt[i]` 写法 ✓
+template <bool E8M0, int MRT, int NRT>
+__attribute__((noinline))
+void xiaotu_i8_vnni_tile(const uint8_t* W, const void* S, int rowshift,
+                         int m0, int j0, int K, int N, int group_count,
+                         int gn, int kb_stride, float global_scale, float* C) {
+    const uint8_t* Sbytes = static_cast<const uint8_t*>(S);
+    const float*   Sflt   = static_cast<const float*>(S);
+    const float*   e8tbl  = nullptr;
+    if constexpr (E8M0) e8tbl = e8m0_table();
+    auto row_scale = [&](int srow, int gi) -> float {
+        if constexpr (E8M0) return e8tbl[Sbytes[srow + gi]];
+        return Sflt[srow + gi];
+    };
+    __m512 acc[MRT][NRT];
+    for (int r = 0; r < MRT; ++r)
+        for (int jj = 0; jj < NRT; ++jj) acc[r][jj] = _mm512_setzero_ps();
+    int srt[NRT];
+    for (int jj = 0; jj < NRT; ++jj) srt[jj] = ((j0 + jj) / gn) * kb_stride;
+    const __m512i ONES_ = _mm512_set1_epi8(1);
+    /* ⭐ A1/A2(专家审计本轮):scale 组装 7 条 -> 5 条,FP 口占用 8 -> 4 ✓
+       ① 权重侧 blend 向量 wsc_ 提到 r_ 循环外(每 (jj_,g_) 一次,按 MRT 行摊薄)✓
+       ② 激活侧:loadl(8B = 2 个 scale)+ permutexvar({0x8,1x8})+ mulps ✓
+       数值:仍是【每一次 fp32 乘、同一次舍入】=> 逐位不变 ✓ */
+    const __m512i AS2IDX_ = _mm512_set_epi32(1,1,1,1,1,1,1,1, 0,0,0,0,0,0,0,0);
+    const uint8_t* Ap_[MRT];
+    const float*   ASp_[MRT];
+    { const uint8_t* A8b_ = g_i8_A.data(); const float* ASb_ = g_i8_AS.data();
+      for (int r_ = 0; r_ < MRT; ++r_) {
+          Ap_[r_]  = A8b_ + (size_t)r_ * (size_t)K;
+          ASp_[r_] = ASb_ + (size_t)r_ * (size_t)(K / 32); } }
+    for (int jj_ = 0; jj_ < NRT; ++jj_) {
+        const int8_t* w8_ = (g_i8_W != nullptr)
+            ? (g_i8_W + (size_t)(j0 + jj_ - g_i8_n0) * (size_t)K)
+            : xiaotu_row_int8(W + (size_t)(j0 + jj_ - rowshift) * (K / 2), K);
+        const int sr_ = srt[jj_];
+        for (int g_ = 0; g_ < group_count; g_ += 2) {
+            const __m512i w64_ = _mm512_loadu_si512((const void*)(w8_ + g_ * 32));
+            const __m512i wsum_ = XIAOTU_DPBUSD(_mm512_setzero_si512(), ONES_, w64_);
+            const __m512i wsum7_ = _mm512_slli_epi32(wsum_, 7);
+            /* ① 权重侧 scale 的 lane 结构【只依赖 (jj_,g_)】=> 提到 r_ 循环外 ✓ */
+            const __m512 wsc_ = _mm512_mask_blend_ps((__mmask16)0xFF00,
+                _mm512_set1_ps(row_scale(sr_, g_)),
+                _mm512_set1_ps(row_scale(sr_, g_ + 1)));
+            for (int r_ = 0; r_ < MRT; ++r_) {
+                const __m512i avq_ = _mm512_loadu_si512(
+                    (const void*)(Ap_[r_] + g_ * 32));
+                const __m512i sv_ = _mm512_sub_epi32(
+                    XIAOTU_DPBUSD(_mm512_setzero_si512(), avq_, w64_), wsum7_);
+                /* ② 激活侧两个 scale:一次 8B 载入 + 一次 permutexvar => 16 lane ✓ */
+                const __m512 asc_ = _mm512_permutexvar_ps(AS2IDX_,
+                    _mm512_castsi512_ps(_mm512_zextsi128_si512(
+                        _mm_loadl_epi64((const __m128i*)(ASp_[r_] + g_)))));
+                acc[r_][jj_] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sv_),
+                    _mm512_mul_ps(wsc_, asc_), acc[r_][jj_]);
+            }
+        }
+    }
+    for (int r_ = 0; r_ < MRT; ++r_)
+        for (int jj_ = 0; jj_ < NRT; ++jj_)
+            C[(size_t)(m0 + r_) * N + j0 + jj_] = hsum512(acc[r_][jj_]) * global_scale;
+}
+
 
 
 // C[M,N] fp32 = A[M,K]bf16 x W[N,K/2]fp4^T, group scale along N (groupN) and K
@@ -1057,6 +1198,27 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         const __m512 whi_ = _mm512_permutexvar_ps(idxhi_, permv_tbl_);
 
         const int group_count = K / 32;
+        // ═════════════════════════════════════════════════════════════════════
+        // 【T1.4c】W4A8 门控**提升到每次 matmul 一次**(本函数内共 8 个调用点 ✓)
+        //
+        // 为什么(dump 出来的铁证,见 dev-docs/mywork/LOG.md 2026-10-06):
+        //   `xiaotu_int8_align_on/vnni_on()` 读 `xiaotu_int8::g_activation`(**可变的
+        //   进程级全局**),而热循环里**存在到 int8 tile 函数的调用**(PLT 调用)⇒ 编译器
+        //   **无法证明两者不别名** ⇒ 既不能把门控提到循环外,也不能把它留在寄存器里
+        //   ✗ ⇒ 每个 tile 都要:① 重读 `g_align8_env` ② 从**栈槽**重载门控结果
+        //   ③ 重跑 `test/cmp/je`。实测 dump:28 处 `cmpb g_align8_env` + 53 处
+        //   `test %r14b,%r14b` + `mov -0x1300(%rbp),%ecx`(栈槽重载)✓
+        //
+        // ⇒ 在**函数序言**里读一次(此时尚未发生任何 PLT 调用 ⇒ 编译器可放心把它留在
+        //   寄存器里 ✓)。**语义安全性**:`set_activation` 只在
+        //   `binding.cpp:597`(构造 MOE 时、**任何 matmul 之前**)被调用一次,且同一
+        //   checkpoint 的权重格式全进程一致(见 `xiaotu_int8_mode.h` 的设计说明 ✓)
+        //   ⇒ 一次 matmul 内模式恒定 ⇒ 提升是**等价变换** ✓(数值:不改任何累加/舍入 ✓)
+        // ⚠️ 唯一语义差异(可接受且是既有契约):env 在**进程内**改值仍不生效 ——
+        //    与 `g_vnni8_env`/`g_align8_env` 本就是 namespace-scope 常量一致 ✓
+        const bool i8_align_on_ = xiaotu_int8_align_on();
+        const bool i8_vnni_on_  = xiaotu_int8_vnni_on();
+        const bool i8_vnni_tile_gate_ = i8_vnni_on_ && !i8_align_on_ && (group_count % 2) == 0;
         // =====================================================================
         // GEMM 分块路径(2026-09-11,预填充用):把 j(输出行)循环放到**内层**,
         // 让每个 K 组的激活**一次载入、被 NR 个输出行复用**。
@@ -1102,9 +1264,9 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 return e2 && std::atoi(e2) != 0;
             }();
             if (_vbmi_on && (group_count % 4) == 0) {
-                if (xiaotu_int8_vnni_on() && !_vbmi_on)   /* 审计必须修#1:VBMI 分支不读这两者 ⇒ 别白做 ✓ */ xiaotu_predecode_block(W, n0, n1, rowshift, K);   // A1:门控 ✓
+                if (i8_vnni_on_ && !_vbmi_on)   /* 审计必须修#1:VBMI 分支不读这两者 ⇒ 别白做 ✓ */ xiaotu_predecode_block(W, n0, n1, rowshift, K);   // A1:门控 ✓
                 for (int m0 = 0; m0 < M; m0 += MR) {
-                    if (xiaotu_int8_vnni_on() && !_vbmi_on)   /* 审计必须修#1:VBMI 分支不读这两者 ⇒ 别白做 ✓ */ xiaotu_quant_block_m0(a32, m0, MR, M, K);   // A1:门控 ✓
+                    if (i8_vnni_on_ && !_vbmi_on)   /* 审计必须修#1:VBMI 分支不读这两者 ⇒ 别白做 ✓ */ xiaotu_quant_block_m0(a32, m0, MR, M, K);   // A1:门控 ✓
                     const int mr = std::min(MR, M - m0);
                     for (int j0 = n0; j0 < n1; j0 += NR) {
                         const int nj = std::min(NR, n1 - j0);
@@ -1149,16 +1311,16 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
 #endif
             // ⭐【方案1】align 开且 E8M0 ⇒ 预解码时【顺带】建权重侧移位表(wtsh/emin ✓);
             //   否则走原来的调用(不传新参 ⇒ with_wt=false ⇒ 输出字节与改动前逐位相同 ✓)
-            const bool i8a_pre_ = xiaotu_int8_align_on() && E8M0;
+            const bool i8a_pre_ = i8_align_on_ && E8M0;
             if (i8a_pre_) {
                 xiaotu_predecode_block(W, n0, n1, rowshift, K, Sbytes, gn, kb_stride, true);
-            } else if (xiaotu_int8_vnni_on() && !_vbmi_on) {
+            } else if (i8_vnni_on_ && !_vbmi_on) {
                 xiaotu_predecode_block(W, n0, n1, rowshift, K);   // A1:门控 ✓
             }
             for (int m0 = 0; m0 < M; m0 += MR) {
                 bool i8a_q_ = false;
-                if (xiaotu_int8_align_on()) i8a_q_ = xiaotu_quant_block_m0(a32, m0, MR, M, K);
-                else if (xiaotu_int8_vnni_on() && !_vbmi_on) xiaotu_quant_block_m0(a32, m0, MR, M, K);   // A1:门控 ✓
+                if (i8_align_on_) i8a_q_ = xiaotu_quant_block_m0(a32, m0, MR, M, K);
+                else if (i8_vnni_on_ && !_vbmi_on) xiaotu_quant_block_m0(a32, m0, MR, M, K);   // A1:门控 ✓
                 // ⭐ 逐 (m0 块 × 该 j0 tile) 的守卫:任一不过 ⇒ 本 tile 走旧 int8 / fp32 FOLD(永远正确 ✓)
                 //    G1 = actmax + wtmax <= 30(移位/字节完整性)· G2 = cmin+emin-128 >= -24(溢出)✓
                 // ⚠️ 必须带 `E8M0 && i8a_pre_`:否则 align 开 + E8M0 关时 predecode 不会以 with_wt
@@ -1189,57 +1351,22 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
            原来它出现在下方 `for (g...)` 的**循环条件**里 ⇒ 每个 K 组迭代都要调两次      \
            门控函数(env 读 + 进程级模式读 + 比较 ✗)。模式在一次 matmul 内**不变** ⇒        \
            提到循环外是**等价变换**(不改数值 ✓)。实测:门控关时曾比 pristine 慢 16% ✗     \
-           (归因实验见 dev-docs/mywork/LOG.md 2026-10-05 23:4x ✓) */                       \
-        const bool i8_vnni_tile_ =                                                      \
-            xiaotu_int8_vnni_on() && !xiaotu_int8_align_on() && (group_count % 2) == 0;  \
+           (归因实验见 dev-docs/mywork/LOG.md 2026-10-05 23:4x ✓)                        \
+           【T1.4c】再进一步:本值**连"每 tile 求值"也不必** ⇒ 已在函数序言里             \
+           算成 `i8_vnni_tile_gate_`(那里没有 PLT 调用 ⇒ 能留在寄存器 ✓)                  \
+           ⇒ 热宏里只剩一次**寄存器 test** ✓(原为 2 次函数调用 + 栈槽重载 ✗)            */ \
+        const bool i8_vnni_tile_ = i8_vnni_tile_gate_;                                   \
         if (i8_align_ok_) { \
-            /* ⭐【方案1】整数内层:每 64 MAC = 1 条 vpdpbusd(FP0/1)+ 3 条整数口 ✓ */ \
-            __m512i acci[MRT][NRT]; \
-            for (int r_ = 0; r_ < (MRT); ++r_) \
-                for (int jj_ = 0; jj_ < (NRT); ++jj_) acci[r_][jj_] = _mm512_setzero_si512(); \
-            const __m512i ONES_ = _mm512_set1_epi8(1); \
-            const __m128i PAIR8_ = _mm_setr_epi8(0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1); \
-            const uint8_t* A8b_ = g_i8_A.data(); \
-            const uint8_t* ACb_ = g_i8_AC8.data(); \
-            const size_t  acst_ = (size_t)g_i8_gc * 8; \
-            float dw_[NRT], av_[MRT]; \
-            for (int jj_ = 0; jj_ < (NRT); ++jj_) \
-                dw_[jj_] = global_scale * g_i8_WSC[(size_t)(j0 + jj_ - g_i8_n0)]; \
-            for (int r_ = 0; r_ < (MRT); ++r_) av_[r_] = g_i8_ASCv[r_]; \
-            /* ⭐【B2】(基准实测 1.582x):jj 内层共享 a8/dpbusd;两级【预计算】移位向量,        \
-               内层无 movzxbd / 无 paddb / 无 shuffle ✓ */                                          \
-            {                                                                                        \
-                const int np2_ = group_count / 2;                                                    \
-                __m512i w64v_[NRT], ws7v_[NRT], wshv_[NRT];                                          \
-                for (int p_ = 0; p_ < np2_; ++p_) {                                                  \
-                    const int g_ = p_ * 2;                                                           \
-                    for (int jj_ = 0; jj_ < (NRT); ++jj_) {                                           \
-                        const size_t ro_ = (size_t)(j0 + jj_ - g_i8_n0);                             \
-                        w64v_[jj_] = _mm512_loadu_si512((const void*)(g_i8_W + ro_ * (size_t)K       \
-                            + (size_t)g_ * 32));                                                     \
-                        ws7v_[jj_] = _mm512_slli_epi32(XIAOTU_DPBUSD(                          \
-                            _mm512_setzero_si512(), ONES_, w64v_[jj_]), 7);                          \
-                        (void)0;   /* P3-lite: 权重侧移位已折进 w8' */                                  \
-                            ;                                                                                 \
-                    }                                                                                 \
-                    for (int r_ = 0; r_ < (MRT); ++r_) {                                              \
-                        const __m512i a8_ = _mm512_loadu_si512(                                       \
-                            (const void*)(A8b_ + (size_t)r_ * (size_t)K + (size_t)g_ * 32));          \
-                        (void)0;   /* P3-full:无激活侧移位 */                                      \
-                            ;                                                                                 \
-                        for (int jj_ = 0; jj_ < (NRT); ++jj_) {                                       \
-                            const __m512i sg_ = _mm512_sub_epi32(XIAOTU_DPBUSD(                \
-                                _mm512_setzero_si512(), a8_, w64v_[jj_]), ws7v_[jj_]);               \
-                            acci[r_][jj_] = _mm512_add_epi32(acci[r_][jj_],                           \
-                                sg_);   /* P3-full:内层只剩 add */   /* P3-lite: 只剩激活侧一级移位 */         \
-                        }                                                                             \
-                    }                                                                                 \
-                }                                                                                     \
-            }                                                                                         \
-            for (int r_ = 0; r_ < (MRT); ++r_) \
-                for (int jj_ = 0; jj_ < (NRT); ++jj_) \
-                    C[(size_t)(m0 + r_) * N + j0 + jj_] = \
-                        hsum512(_mm512_cvtepi32_ps(acci[r_][jj_])) * (dw_[jj_] * av_[r_]); \
+            /* 【T1.4b】ALIGN 整数内层体已**移出宏**(定义见 `xiaotu_i8_align_tile`)⇒ \
+               热宏里只剩一个调用点 ✓ 目的:门控关(回退 fp32)时不再承担 int8 代码体积 ✓ */ \
+            xiaotu_i8_align_tile<MRT, NRT>(m0, j0, K, N, group_count, global_scale, C); \
+            continue; \
+        } \
+        if (i8_vnni_tile_) { \
+            /* 【T1.4b】旧 VNNI int8 体同样移出宏(`xiaotu_i8_vnni_tile`)✓ \
+               它自己写 C ⇒ 这里直接 continue,不再需要宏里的 `acc` 三明治 ✓ */ \
+            xiaotu_i8_vnni_tile<E8M0, MRT, NRT>(W, S, rowshift, m0, j0, K, N, \
+                                                group_count, gn, kb_stride, global_scale, C); \
             continue; \
         } \
         __m512 acc[MRT][NRT]; \
@@ -1247,48 +1374,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
             for (int jj = 0; jj < (NRT); ++jj) acc[r][jj] = _mm512_setzero_ps(); \
         int srt[NRT]; \
         for (int jj = 0; jj < (NRT); ++jj) srt[jj] = ((j0 + jj) / gn) * kb_stride; \
-        if (i8_vnni_tile_) { \
-            const __m512i ONES_ = _mm512_set1_epi8(1); \
-            /* ⭐ A1/A2(专家审计本轮):scale 组装 7 条 -> 5 条,FP 口占用 8 -> 4 ✓ \
-               ① 权重侧 blend 向量 wsc_ 提到 r_ 循环外(每 (jj_,g_) 一次,按 MRT 行摊薄)✓ \
-               ② 激活侧:loadl(8B = 2 个 scale)+ permutexvar({0x8,1x8})+ mulps ✓ \
-               数值:仍是【每一次 fp32 乘、同一次舍入】=> 逐位不变 ✓ */ \
-            const __m512i AS2IDX_ = _mm512_set_epi32(1,1,1,1,1,1,1,1, 0,0,0,0,0,0,0,0); \
-            const uint8_t* Ap_[MRT]; \
-            const float*   ASp_[MRT]; \
-            { const uint8_t* A8b_ = g_i8_A.data(); const float* ASb_ = g_i8_AS.data(); \
-              for (int r_ = 0; r_ < (MRT); ++r_) { \
-                  Ap_[r_]  = A8b_ + (size_t)r_ * (size_t)K; \
-                  ASp_[r_] = ASb_ + (size_t)r_ * (size_t)(K / 32); } } \
-            for (int jj_ = 0; jj_ < (NRT); ++jj_) { \
-                const int8_t* w8_ = (g_i8_W != nullptr) \
-                    ? (g_i8_W + (size_t)(j0 + jj_ - g_i8_n0) * (size_t)K) \
-                    : xiaotu_row_int8(W + (size_t)(j0 + jj_ - rowshift) * (K / 2), K); \
-                const int sr_ = srt[jj_]; \
-                for (int g_ = 0; g_ < group_count; g_ += 2) { \
-                    const __m512i w64_ = _mm512_loadu_si512((const void*)(w8_ + g_ * 32)); \
-                    const __m512i wsum_ = XIAOTU_DPBUSD(_mm512_setzero_si512(), ONES_, w64_); \
-                    const __m512i wsum7_ = _mm512_slli_epi32(wsum_, 7); \
-                    /* ① 权重侧 scale 的 lane 结构【只依赖 (jj_,g_)】=> 提到 r_ 循环外 ✓ */ \
-                    const __m512 wsc_ = _mm512_mask_blend_ps((__mmask16)0xFF00, \
-                        _mm512_set1_ps(row_scale(sr_, g_)), \
-                        _mm512_set1_ps(row_scale(sr_, g_ + 1))); \
-                    for (int r_ = 0; r_ < (MRT); ++r_) { \
-                        const __m512i avq_ = _mm512_loadu_si512( \
-                            (const void*)(Ap_[r_] + g_ * 32)); \
-                        const __m512i sv_ = _mm512_sub_epi32( \
-                            XIAOTU_DPBUSD(_mm512_setzero_si512(), avq_, w64_), wsum7_); \
-                        /* ② 激活侧两个 scale:一次 8B 载入 + 一次 permutexvar => 16 lane ✓ */ \
-                        const __m512 asc_ = _mm512_permutexvar_ps(AS2IDX_, \
-                            _mm512_castsi512_ps(_mm512_zextsi128_si512( \
-                                _mm_loadl_epi64((const __m128i*)(ASp_[r_] + g_))))); \
-                        acc[r_][jj_] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sv_), \
-                            _mm512_mul_ps(wsc_, asc_), acc[r_][jj_]); \
-                    } \
-                } \
-            } \
-        } \
-        for (int g = 0; !i8_vnni_tile_ && g < group_count; ++g) { \
+        for (int g = 0; g < group_count; ++g) { \
             const int base = g * 32; \
             __m512 av[MRT][2]; \
             for (int r = 0; r < (MRT); ++r) { \

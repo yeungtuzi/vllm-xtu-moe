@@ -1150,6 +1150,11 @@ class _XiaotuExpertsMixin:
         else:
             cfg.int8_activation = 0
         engine_cls = getattr(xiaotu_moe, self._engine_attr)
+        # ⭐【T1.4 可观测性】派发生效时必须**在日志里留痕**（否则验收跑无法证明走的是 int8 路径 ✗）。
+        #   只在非 0 时打印 ⇒ **生产日志保持不变** ✓
+        if int(getattr(cfg, "int8_activation", 0)) != 0:
+            print(f"[vllm-xtu-moe] ⭐ W4A8 dispatch: {self._engine_attr} "
+                  f"int8_activation={int(cfg.int8_activation)} (1=ALIGN int8 path)", flush=True)
         # 【诊断·NOTES §484】ctor 只拿到 **裸 data_ptr**,而 shard_fill 会在里面按
         # cfg 推出来的几何 memcpy;DSpark 的 draft 层让这个 memcpy 读到了映射尽头
         # (SIGSEGV in MOE_V2<MXFP4>::MOE_V2)。这里把"cfg 期望的字节数"与
