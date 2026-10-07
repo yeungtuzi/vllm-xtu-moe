@@ -37,6 +37,9 @@
 # ============================================================================
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# ⭐ 2026-10-07 审计补强:归属证据 / PID 派生一律走【唯一真源】✓
+# shellcheck source=lib_proc_identity.sh
+. "$ROOT/scripts/lib_proc_identity.sh"
 
 ENV="${ENV:-/home/user/anaconda3/envs/lvllm}"
 PY="$ENV/bin/python"
@@ -167,13 +170,39 @@ _kill_tree() {   # 先子后父;pid 不存在时静默返回
 stop_arm() {
   local pidf="$OUTDIR/abmx_$1.pid"
   [ -f "$pidf" ] || return 0
-  local pid; pid="$(cat "$pidf")"
+  local pid; pid="$(cat "$pidf" 2>/dev/null || true)"
+  # ⭐ 2026-10-07 审计修(major):PID 文件内容先过 pi_valid_pid(`0`=杀自己进程组 / `-1`=广播)✗
+  if ! pi_valid_pid "$pid"; then
+    warn "arm $1 的 PID 文件内容非法('${pid:-空}')⇒ 不猜目标、不杀任何进程 ✗"
+    return 1
+  fi
+  # ⭐ 2026-10-07 审计补强:杀之前对【每个目标 pid(含 pi_descendants 得到的后代)】做归属校验;
+  #   命中生产证据 ⇒ 打印原因 + **不杀任何进程** + return 1(fail-closed)✓
+  #   为什么必须加:本 A/B 的 arm 起在 GPUS=0,1 上,若 pidfile 陈旧 + pid 被复用,
+  #   "PID 文件派生"可能恰好指向生产(8070 / CV=1,2)⇒ 必须先由证据拦下 ✗
+  local desc why p
+  desc="$(pi_descendants "$pid")"
+  for p in $pid $desc; do
+    if why="$(pi_prod_hit "$p")"; then
+      warn "!! ⛔ arm $1 拒绝停止:pid=$p 命中生产证据:$why ⇒ 不杀任何进程 ✗"
+      return 1
+    fi
+  done
   kill "$pid" 2>/dev/null
   for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; kill -CHLD 1 2>/dev/null; sleep 3; done
   _kill_tree "$pid"
-  # 兜底:按命令行特征清掉可能被 reparent 到 init 的 vLLM 子进程(只在本脚本串行执行 arm 时安全)。
-  pkill -9 -f "VLLM::EngineCore" 2>/dev/null || true
-  pkill -9 -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
+  # ⛔ 2026-10-07 审计修:删除原来两行"兜底"——
+  #     `pkill -9 -f "VLLM::EngineCore"` / `pkill -9 -f "vllm.entrypoints.openai.api_server"`
+  #   它们按【命令行模式】选目标:本脚本自己的 cmdline、以及**生产 8070** 都会被命中 ✗✗
+  #   (2026-10-07 一天四次事故的根因就是这种写法)。
+  #   ⇒ 改为对【PID 文件派生出来的 pid】做 kill -0 验尸;若仍存活只报错,**不再按模式补杀** ✓
+  #     (真正"被 reparent 到 init 的 vLLM 子进程"本脚本看不到,只能靠人;下面的显存
+  #      等待循环会再兜一层:显存没释放会打出 warning ✓)
+  if kill -0 "$pid" 2>/dev/null; then
+    warn "!! ⛔⛔ arm $1 停止后 pid=$pid 仍存活!"
+    warn "   ⛔ 可能有【被 reparent 到 init 的 vLLM 子进程】在占显存;本脚本不再按模式补杀"
+    warn "      (按模式杀会误杀生产 8070 / 杀掉自己)✗ ⇒ 请用【PID 文件 + 端口】人工确认后再处置 ✓"
+  fi
   rm -f "$pidf"
   local waited=0
   for _ in $(seq 1 48); do
@@ -242,7 +271,10 @@ for arm in $ARMS; do
     launch_arm "$arm" || { stop_arm "$arm"; exit 1; }
   fi
   measure_arm "$arm"
-  if [ "$SKIP_LAUNCH" = "1" ]; then note "SKIP_LAUNCH=1:不停止 arm $arm"; else stop_arm "$arm"; fi
+  # ⭐ 2026-10-07 审计补强:归属门拒绝/停不干净 ⇒ 终止(否则下一个 arm 会与残留撞车)✓
+  if [ "$SKIP_LAUNCH" = "1" ]; then note "SKIP_LAUNCH=1:不停止 arm $arm"; else
+    stop_arm "$arm" || { warn "arm $arm 未停止(见上:归属门拒绝或仍有存活)⇒ 终止,避免与残留撞车 ✗"; exit 1; }
+  fi
 done
 
 echo

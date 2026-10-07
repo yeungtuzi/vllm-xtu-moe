@@ -33,6 +33,44 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# ⭐ 2026-10-07 审计修:归属证据一律走【唯一真源】(pi_prod_hit / pi_alive …)✓
+# shellcheck source=lib_proc_identity.sh
+. "$ROOT/scripts/lib_proc_identity.sh"
+
+# ⭐ 2026-10-07 审计修(blocker B):就绪与"起服务"都必须由【端口属主】确认 ——
+#   裸 curl 成功会被"别人的服务(生产!)"满足 ⇒ 对生产发压测并把结果记成本阶段的数据 ✗
+_port_owned_by() {   # $1=port $2=期望 pid(本阶段 pidfile 里的 pid);rc=0 ⇒ 属主就是他 ✓
+  local port="$1" want="$2" p
+  pi_valid_pid "$want" || return 1
+  pi_port_listeners "$port"
+  for p in $PI_PORT_PIDS; do [ "$p" = "$want" ] && return 0; done
+  return 1
+}
+
+# 起服务【之前】断言:该端口没有【陌生属主】(属主是本阶段自己的旧 pid ⇒ 最多等 10s 释放)✓
+_assert_port_no_foreign_owner() {   # $1=port $2=pidfile $3=tag
+  local port="$1" pidf="$2" tag="$3" p sp="" i=0
+  pi_port_listeners "$port"
+  [ -z "$PI_PORT_PIDS" ] && return 0
+  [ -f "$pidf" ] && sp="$(cat "$pidf" 2>/dev/null || true)"
+  if [ -n "$sp" ]; then
+    while [ $i -lt 10 ]; do
+      _port_owned_by "$port" "$sp" || break      # 已不再由"我们的旧 pid"占用 ⇒ 退出等待
+      sleep 1; i=$((i+1))
+    done
+    pi_port_listeners "$port"
+    [ -z "$PI_PORT_PIDS" ] && return 0
+  fi
+  for p in $PI_PORT_PIDS; do
+    if [ -n "$sp" ] && [ "$p" = "$sp" ]; then
+      echo "  ⛔ $tag: :$port 仍被【本 tag 的旧实例 pid=$sp】占用 ⇒ 拒绝再起(先停它)✗"
+      return 1
+    fi
+    echo "  ⛔ $tag: :$port 有【陌生属主】pid=$p ⇒ 拒绝起服务(可能是生产/别的实例)✗"
+    return 1
+  done
+  return 0
+}
 
 ENVDIR="${BENCH_ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}"
 PY="$ENVDIR/bin/python"
@@ -108,13 +146,22 @@ resolve_kv_cap() {
 # 判据三合一:① curl 就绪;② 服务 pidfile 里的进程消失;③ 日志里出现致命初始化错误。
 wait_ready() { # port pidfile log timeout_s
   local port=$1 pidf=$2 logf=$3 tmo=${4:-1800} i=0
+  local sp=""
   while [ $i -lt $(( tmo / 5 )) ]; do
     if curl -sf --max-time 3 "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1; then
-      echo "  ready=$((i*5))s"; return 0
+      # ⭐ 2026-10-07 审计修(blocker B):curl 成功【必须】同时确认端口属主 == 本阶段 pidfile 的 pid;
+      #   否则可能是生产/别的实例在应答(实测路径:压测打到生产并记成 glm53_rnd)✗
+      sp=$(cat "$pidf" 2>/dev/null || true)
+      if _port_owned_by "$port" "$sp"; then
+        echo "  ready=$((i*5))s(端口属主 pid=$sp ✓)"; return 0
+      fi
+      echo "  ⚠️ :$port 有服务应答,但属主不是本阶段 pidfile(pid='${sp:-空}' 属主='$(printf '%s ' $PI_PORT_PIDS)')⇒ 不认就绪,继续等"
     fi
     if [ -f "$pidf" ]; then
-      local sp; sp=$(cat "$pidf" 2>/dev/null || true)
-      if [ -n "$sp" ] && ! kill -0 "$sp" 2>/dev/null; then
+      # ⭐ 2026-10-07 审计修(major):pidfile 内容先过 pi_valid_pid(拒绝空/非数字/`0*`)
+      #   ⇒ 非法内容一律【不判死、不猜目标】(fail-safe;超时自然退出)✓
+      sp=$(cat "$pidf" 2>/dev/null || true)
+      if pi_valid_pid "$sp" && ! pi_alive "$sp"; then
         echo "  ✗ 服务进程($sp)已退出;日志尾部:"; tail -12 "$logf" 2>/dev/null | sed 's/^/    /'
         return 2
       fi
@@ -134,7 +181,7 @@ wait_ready() { # port pidfile log timeout_s
 }
 
 freegpu() { # 只在"加载之前"调用 —— 绝不在 cell 运行/判定期间调用
-  local f p
+  local f p why
   # 【2026-09-21 修孤儿】先按 pidfile 杀掉已知阶段的残留。只靠 nvidia-smi 会漏掉
   # **"已启动但还在加载、尚未占显存"** 的服务:上一个阶段失败退出时它正在加载,
   # 于是下一阶段的 freegpu 看不见它;等它加载完就变成占着 GPU 的孤儿。
@@ -143,19 +190,38 @@ freegpu() { # 只在"加载之前"调用 —— 绝不在 cell 运行/判定期�
   for f in "$LOGD"/glm53_rnd.pid "$LOGD"/mimo_rnd.pid "$LOGD"/v41_rnd.pid; do
     [ -f "$f" ] || continue
     p=$(cat "$f" 2>/dev/null)
-    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
-      kill -9 -"$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')" 2>/dev/null
+    # ⭐ 2026-10-07 审计修(major):PID 文件内容先过 pi_valid_pid ——
+    #   `kill -9 0` = 对本进程组发 SIGKILL(自杀);`kill -9 -1` = 广播级误杀 ⇒ 一律拒绝 ✗
+    if ! pi_valid_pid "$p"; then
+      echo "  ⛔ freegpu 拒绝:PID 文件 $f 内容非法('${p:-空}')⇒ 不可杀,中止本轮 ✗"
+      return 1
+    fi
+    # ⭐ 2026-10-07 审计修:杀【本脚本 PID 文件派生】的 pid 之前先做归属校验;
+    #   命中生产证据 ⇒ 打印原因 + 整轮中止(fail-closed:宁可不跑,也不误杀生产)✓
+    if why="$(pi_prod_hit "$p")"; then
+      echo "  ⛔ freegpu 拒绝:pid=$p(来自 $f)命中生产证据:$why ⇒ 中止本轮,不杀任何进程 ✗"
+      return 1
+    fi
+    if pi_alive "$p"; then
+      # ⭐ 2026-10-07 审计修(major):进程组号也过数值守卫(`kill -9 -0` = 打自己的进程组 ⇒ 自杀)✗
+      # ⛔ 2026-10-07 独立审计(blocker):不再 `kill -9 -PGID` —— 进程组成员 ≠ 我们的后代,
+      #   生产 API 的 pgid!=pid 且组长可能已 DEAD ⇒ 组里会混进别人的进程 ✗
+      #   ⇒ 只 kill 本实例 pid 文件里的那个 pid;残留下游由"等显存"超时如实报错 ✓
+      if pi_valid_pid "$p"; then kill -9 "$p" 2>/dev/null; fi
       kill -9 "$p" 2>/dev/null
     fi
   done
-  for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do
-    kill -9 "$p" 2>/dev/null
-  done
+  # ⛔ 2026-10-07 审计修:删除 `for p in $(nvidia-smi --query-compute-apps=pid …); do kill -9 "$p"; done`
+  #   —— 它把【全机所有 GPU 进程】当目标,会杀掉同机共存的其它服务
+  #      (LMCache 服务自身也用 CUDA,已被误杀两次)✗✗
+  #   ⇒ 改为【只等待显存释放】;超时 ⇒ 醒目报错 + 中止,而不是去杀别的进程 ✓
   local i=0
   while [ $i -lt 60 ]; do
     nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q . || return 0
     sleep 5; i=$((i+1))
   done
+  echo "  ⛔ freegpu 超时:GPU 上仍有【不是本脚本 PID 文件派生】的进程占卡 ⇒ 中止本轮,不再按模式补杀 ✗"
+  return 1
 }
 
 bench_cell() { # port ckpt served L C tag backend extra...
@@ -195,10 +261,16 @@ cells_for() { # port ckpt served tag backend [extra...]
 srv_log() { echo "$LOGD/$1.log"; }
 
 run_glm() {
-  local tag=glm53_rnd port=8070 cap
+  # ⭐ 2026-10-07 审计修(blocker B):GLM 阶段原来用 **生产端口 8070** ⇒ 生产在跑时会对生产发
+  #   16K 压测并把结果记成 glm53_rnd ✗ ⇒ 改用非保留端口 **8072**(mimo=8073 / v41=8077 不动;
+  #   8071 已被 probe_after_build/serve_mainline 占用,8095-8098 有历史 cellA-D 痕迹 ⇒ 8072 零引用)✓
+  local tag=glm53_rnd port=8072 cap
   cap=$(resolve_kv_cap GLM $RULER_GLM $MAXLEN_G $MAXSEQS "$LONG" $FLOOR_GLM) || return 1
   [ "${DRY_RUN:-0}" = 1 ] && return 0
-  freegpu
+  # ⭐ 2026-10-07 审计修:清场失败(命中生产证据/显存等待超时)⇒ 中止本阶段,不继续起服务 ✓
+  freegpu || return 1
+  # ⭐ 2026-10-07 审计修(blocker B-3):起服务前断言 :$port 没有陌生属主 ✓
+  _assert_port_no_foreign_owner "$port" "$LOGD/$tag.pid" "$tag" || return 1
   # 【必须】先删陈旧 pidfile:serve 脚本要等加载/预热完才写它,而 TAG 可能沿用上一次
   # 运行(同名),于是加载期读到的还是**上一次**的 pid ⇒ 被误判为"服务进程已退出"。
   # 2026-09-21 实测踩到:GLM 阶段因此被误判失败并跳过。
@@ -214,7 +286,8 @@ run_mimo() {
   local tag=mimo_rnd port=8073 cap
   cap=$(resolve_kv_cap MiMo $RULER_MIMO $MAXLEN_M $MAXSEQS "$LONG" $FLOOR_MIMO) || return 1
   [ "${DRY_RUN:-0}" = 1 ] && return 0
-  freegpu
+  freegpu || return 1     # ⭐ 2026-10-07 审计修:清场失败 ⇒ 中止本阶段(见 run_glm 说明)
+  _assert_port_no_foreign_owner "$port" "$LOGD/$tag.pid" "$tag" || return 1   # blocker B-3
   rm -f "$LOGD/$tag.pid"        # 见 run_glm 里的说明:陈旧 pidfile 会误判早退
   setsid env CUDA_VISIBLE_DEVICES=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     PYTHONPATH="$XTU_TREE" VLLM_EXPERTS_LOAD_DEVICE=cpu XIAOTU_MOE_THREADS=60 \
@@ -235,7 +308,8 @@ run_v41() {
   local tag=v41_rnd port=8077 cap
   cap=$(resolve_kv_cap V4.1 $RULER_V41 $MAXLEN_V $MAXSEQS "$LONG" $FLOOR_V41) || return 1
   [ "${DRY_RUN:-0}" = 1 ] && return 0
-  freegpu
+  freegpu || return 1     # ⭐ 2026-10-07 审计修:清场失败 ⇒ 中止本阶段(见 run_glm 说明)
+  _assert_port_no_foreign_owner "$port" "$LOGD/$tag.pid" "$tag" || return 1   # blocker B-3
   rm -f "$LOGD/$tag.pid"        # 见 run_glm 里的说明:陈旧 pidfile 会误判早退
   setsid env PYTHONPATH="$XTU_TREE" TAG="$tag" PORT="$port" GPUS=0,1 TP=2 \
     MAXLEN=$MAXLEN_V MAXSEQS=$MAXSEQS MBT=16384 GPU_UTIL=0.85 \

@@ -17,7 +17,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 LOGS="$ROOT/dev-docs/report/tuning/logs"
-PORT="${PORT:-8070}"
+PORT="${PORT:-8094}"
 K_LIST="${K_LIST:-2 3 5}"
 MODEL_DIR="${MODEL_DIR:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master}"
 DRAFT="${DRAFT:-probabilistic}"

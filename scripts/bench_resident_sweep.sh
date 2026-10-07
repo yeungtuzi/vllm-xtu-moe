@@ -27,6 +27,9 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# ⭐ 2026-10-07 审计修:归属证据一律走【唯一真源】(pi_prod_hit / pi_alive …)✓
+# shellcheck source=lib_proc_identity.sh
+. "$ROOT/scripts/lib_proc_identity.sh"
 
 ENVDIR="${BENCH_ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}"
 PY="$ENVDIR/bin/python"
@@ -58,18 +61,38 @@ print(int(need / ruler * 1024**3 * 1.25))" "$RULER_GLM" "$MAXLEN" "$SEQS" "$PROM
 srv_log() { echo "$LOGD/$1.log"; }
 
 freegpu() { # 只在加载之前调用
-  local f p
+  local f p why
   for f in "$LOGD"/${TAG_PREFIX}*.pid; do
     [ -f "$f" ] || continue
     p=$(cat "$f" 2>/dev/null)
-    [ -n "$p" ] && { kill -9 -"$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')" 2>/dev/null; kill -9 "$p" 2>/dev/null; }
+    # ⭐ 2026-10-07 审计修(major):PID 文件内容先过 pi_valid_pid——`0`/`-1`/非数字一律拒绝 ✗
+    if ! pi_valid_pid "$p"; then
+      echo "⛔ freegpu 拒绝:PID 文件 $f 内容非法('${p:-空}')⇒ 不可杀,中止本轮 ✗"
+      return 1
+    fi
+    # ⭐ 2026-10-07 审计修:杀【本脚本 PID 文件派生】的 pid 之前先做归属校验;
+    #   命中生产证据 ⇒ 打印原因 + 整轮中止(fail-closed:宁可不跑,也不误杀生产)✗→✓
+    if why="$(pi_prod_hit "$p")"; then
+      echo "⛔ freegpu 拒绝:pid=$p(来自 $f)命中生产证据:$why ⇒ 中止本轮,不杀任何进程 ✗"
+      return 1
+    fi
+    # ⭐ 2026-10-07 审计修(major):进程组号也过数值守卫(`kill -9 -0` = 打自己的进程组 ⇒ 自杀)✗
+    # ⛔ 2026-10-07 独立审计(blocker):不再 `kill -9 -PGID` —— 进程组成员 ≠ 我们的后代,
+    #   生产 API 的 pgid!=pid 且组长可能已 DEAD ⇒ 组里会混进别人的进程 ✗
+    #   ⇒ 只 kill 本实例 pid 文件里的那个 pid;残留下游由"等显存"超时如实报错 ✓
+    if pi_valid_pid "$p"; then kill -9 "$p" 2>/dev/null; fi
+    kill -9 "$p" 2>/dev/null
   done
-  for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
+  # ⛔ 2026-10-07 审计修:删除 `for p in $(nvidia-smi --query-compute-apps=pid …); do kill -9` 整行
+  #   —— 会把【全机所有 GPU 进程】当目标(LMCache 自身也用 CUDA,已被误杀两次)✗✗
+  #   ⇒ 改为【只等待显存释放】;超时 ⇒ 醒目报错 + 中止,而不是去杀别的进程 ✓
   local i=0
   while [ $i -lt 60 ]; do
     nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q . || return 0
     sleep 5; i=$((i+1))
   done
+  echo "⛔ freegpu 超时:GPU 上仍有【不是本脚本 PID 文件派生】的进程占卡 ⇒ 中止本轮,不再按模式补杀 ✗"
+  return 1
 }
 
 wait_ready() { # port pidfile log timeout_s
@@ -103,7 +126,8 @@ for k in $KS; do
   tag="${TAG_PREFIX}k${k}"; port=$((8100 + k))
   spec=""
   if [ "$k" -gt 0 ]; then spec="0-$((k-1))"; fi
-  freegpu
+  # ⭐ 2026-10-07 审计修:清场失败(命中生产证据/显存等待超时)⇒ 中止整轮扫描,不继续起服务 ✓
+  freegpu || { echo "⛔ 清场未完成/命中生产证据 ⇒ 中止扫描(不杀别的进程)✗"; exit 1; }
   rm -f "$LOGD/$tag.pid"
   setsid env PYTHONPATH="$XTU_TREE" TAG="$tag" PORT="$port" \
     GPU_UTIL=0.80 SPEC_K=0 SEQS=$SEQS MAXLEN=$MAXLEN MBT=4096 \
@@ -139,7 +163,8 @@ except Exception as e: print(f'C=$C FAILED')" 2>/dev/null)
     printf "%-4s %-8s %-9s %-22s %s\n" "$k" "$actual" "${vram}MiB" "${res%% ok=*}" "${res##*ok=}"
   done
 done
-freegpu
+# ⭐ 2026-10-07 审计修:收尾清场按 PID 文件派生;失败只报错(已有结果不受影响)✓
+freegpu || echo "⛔ 收尾清场未完成(见上;已有结果不受影响)"
 echo "══ 完成 $(date -Is) ══"
 echo "结果 JSON/日志在 $OUT/"
 echo "RESIDENT_SWEEP_DONE"

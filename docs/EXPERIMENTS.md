@@ -10981,3 +10981,407 @@ aiter_mxfp4_w4a8_moe.py / aiter_mxfp4_w4a16_moe.py                  ← AMD AITE
 [AMD MI355X](https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html)、
 [NVIDIA T4 数据表(INT4 时代)](https://www.ctc-g.co.jp/solutions/nvidia/nvidiadgx/document/nvidia-t4-datasheet-a4-nvidia-772234-r14-jp.pdf)、
 [Blackwell Ultra INT8 审计(arXiv)](https://arxiv.org/abs/2608.11693)
+
+---
+
+### B326(2026-10-07)⛔ **【结论】CPU decode 在 base 路径上已无延迟优化空间**
+
+**背景**：早期(ds41f 时代)有一条 5 步计划,目标"decode 时 CPU 吃不满 ⇒ 在等 ⇒ 等的是延迟":
+① 核预算表+affinity ② cpuset 独占 ③ isolcpus+nohz_full+rcu_nocbs ④ MWAITX-park ∥ 软件侧:相融合 / 把 decode 循环收进引擎。
+用户 2026-10-07 明确:此线**与 prefill 无关、与 GPU-CPU 重叠无关**,且"**本架构不适合多流服务,一般最多 4 条**" ✓
+
+**受控测量**(qfn · GPU0 · 每格记下实际加载的 `.so`;样本只取 prefill 完成后的 **`qlen=4` 稳态行**):
+
+| arm | 线程 | `period` | `compute` | `rest` | compute % |
+|---|---|---|---|---|---|
+| base | 48 | **1.84 ms** | 1.14 | 0.70 | 61% |
+| base | 64 | 1.94 ms | 1.09 | 0.83 | 56% |
+| base | 120 | **1.80 ms** | **0.32** | 1.48 | 18% |
+| int8 | 48 | 2.90 ms | 2.22 | 0.67 | 76% |
+| int8 | 64 | 2.66 ms | 2.01 | 0.66 | 75% |
+
+另:SPIN `300→1000→2000` 时 `period` = **1.81 / 1.78 / 1.77 ms(平)**;机器级微基准:派发+屏障+拷贝 ≈ **67 µs/层 = 3.7%**。
+
+**⇒ 结论(三层)**
+1. ⭐⭐ **存在"链底":base 的 `period` ≈ 1.8 ms/层,与线程数无关** —— `compute` 被压 **3.6×**(1.14→0.32)而 `period` 只动 0.04 ms
+   ⇒ ⭐ **多出来的并行度只是把时间从 `compute` 挪进 `rest`** ⇒ **base 臂上 CPU 从不是关键路径** ✗
+2. ⭐⭐ **"CPU 在等"的原因不是唤醒/同步,而是链本身**:SPIN 扫不动 ✓、**2.5× 并行度**扫不动 ✓、派发+屏障仅 3.7% ✓
+   ⇒ 与 **B298(严格串行链)** 一致,并在 **48/64 线程口径上再次验证** ✓
+3. ⭐⭐ ⇒ **那 5 步对 base 路径全部无效**:①②③④ 都是"让每次唤醒更便宜" ⇒ 而 `period` 对唤醒**完全不敏感** ✗;
+   软件侧"相融合/收进引擎"上限 = **派发+屏障那 2.5–3.7%** ✗
+   ⚠️ **唯一例外:int8/ALIGN 臂确实在链底之上**(2.90 > 1.8)⇒ **"削 CPU"只对 int8 有意义** ✓ —— 而 int8 的定位是 prefill ✓
+
+**⇒ 判定(用户 2026-10-07 追认)**:**CPU decode 在 base 路径上已无延迟优化空间** ⇒ ①②③④ 与软件侧融合 **不再投入** ✗
+**仍然只有一条有意义的路**:改变"**链上有什么**"(更大的 M / 多请求批) —— ⚠️ 后者被"最多 4 条"封顶 ✓
+
+**出处**:详细口径与局限见本仓内部实验记录(未发布);相关前序条目 **B293 / B294 / B298 / B299** ✓
+
+---
+
+### B327(2026-10-07)⭐ **生产(ds41f 8070)前缀缓存体检:命中 97.63%,容量 125 万 token;反复重填的是【新内容】而非缓存丢失**
+
+**缘起**:用户观察到"开发 agent 上下文占用变 0% + 生产又从头 prefill ~20 分钟",提出"是 vLLM 丢了 prefix-cache 还是 DSH 清了上下文?"
+
+**方法与口径**:只读 `/metrics`(监控栈本来每 15s 抓一次 ✓)+ 启动配置转储 + 日志时间线 ✓
+
+| 指标 | 值 |
+|---|---|
+| `prefix_cache_queries_total` | 62,710,000 |
+| `prefix_cache_hits_total` | 61,224,960 ⇒ ⭐ **命中率 97.63%** |
+| `prompt_tokens_total` | 60,455,794 |
+| ├ `source=local_cache_hit` | 60,217,216 |
+| └ `source=local_compute`(真正新算) | ⭐⭐ **238,578** |
+| `kv_cache_size_tokens` | **1,253,042**(fp8_ds_mla,`kv_cache_memory_bytes`=2.5 GiB)|
+| `kv_cache_usage_perc` | 23.7% |
+| `kv_cache_max_concurrency` | ⭐ **1.195** |
+
+**⇒ 结论(三层)**
+1. ⭐⭐ **缓存健康且容量充裕**:97.63% 命中、125 万 token 容量、仅用 23.7% ⇒ **"缓存被挤掉/丢失"排除** ✗
+   (⭐ 2.5 GiB 看着小,但 `fp8_ds_mla` 下等于 **125 万 token** ⇒ 不能凭"GiB 小"就断定容量不足 ✗)
+2. ⭐⭐ **反复重填的是【真新内容】**:全程 `local_compute` 仅 **23.9 万 token**(对照 6045 万 prompt token)⇒
+   那 20 分钟 ≈ **一次完整的 agent 上下文(10–18 万 token)**被当作**全新 prompt**重发 ✓ —— 与"上下文占用归 0%"同源 ✓
+3. ⚠️ **教训**:`[xtu-pf-progress]` 的 `qlen` **不能**当 token 量用
+   (我据此累出"237 万/336 万 token" ✗,权威计数器说全程仅 **23.9 万** ✗)⇒ ⭐ **字段含义未核实前不得用它做量的推断** ✓
+
+**仍然无法在服务端断定的**:前缀为何变化 —— 候选:(a) 同一批消息被**重新序列化**(UI 看不出变化却 token 不同 ✓,**最符合"压缩不该导致"的直觉**)
+(b) 会话 resume 重渲染 (c) 前部注入动态字段(**平时命中 97.6% ⇒ 排除"一直变"** ✗) (d) 压缩改写开头 ✓
+⇒ ⭐ **定论办法**:客户端侧把事件前后两次请求的 **prompt 原文 diff**(内容等价而序列化不同 ⇒ 客户端问题 ✓;完全相同却仍 miss ⇒ 才是引擎/vLLM 的 bug ✓)
+
+**顺带(架构量化)**:`kv_cache_max_concurrency = 1.195` ⇒ ⭐ 常说的"本架构最多 4 条",**实测只有 ~1.2 条** ✓
+
+---
+
+### B328(2026-10-07)⚠️ **纠正 B327 的相邻结论:"预填只有 100 多 tok/s"是错的 —— 那个指标不是预填速率**
+
+**缘起**:用户问"最终 prefill 总速度(合计 prompt 长度 ÷ 耗时)是多少?是 MBT=4096 时的数据吗?为什么只有 100 多?"
+
+**先答配置**:⭐ 生产当前 **`max_num_batched_tokens = 6144`**(配置转储 + `[xtu-pf-progress]` 的 `qlen=6140/6144`)—— **不是 4096** ✓
+
+**"总量÷耗时"确实能算**(日志每 10s 一行 ✓):
+
+| 窗口 | 行数(≈秒) | 非零窗 | Σ(速率×10s) | 平均 | 峰值 |
+|---|---|---|---|---|---|
+| 08:04–08:23 | 40(≈400 s) | ⭐ **仅 5** | 62,100 token | 155 tok/s | 5560.7 |
+| 05:45–06:00 | 47(≈470 s) | 11 | 71,319 token | 152 tok/s | 5666.0 |
+
+**⇒ 但"100 多 tok/s"是假数,两层原因**
+1. ⭐ **窗口里 87% 的时间引擎没在预填**:08:04–08:23 的 40 格中 **35 格 = `0.0 tok/s`** ✓ ⇒ 拿总量÷400s 当然低 ✗
+2. ⭐⭐ **`Avg prompt throughput` 把【缓存命中】的 token 也算进去** ⇒ **它不是预填计算速率** ✗
+   证据:全程 `prompt_tokens_total`=6045 万,而 **`local_compute` 仅 238,578**(99.6% 是命中 ✓);
+   且日志里有一格 **18,785.9 tok/s**(08:28 ✓)—— 按 PCIe 上限**根本不可能真算这么快** ✓ ⇒ 那格几乎全是命中 ✓
+
+**⇒ 判定**:⭐ **"预填持续 100 多 tok/s"撤回** ✗;权威数字是
+⭐ **整个 14 小时运行,真正新计算的 token 共 238,578 个** ✓ ⇒ 每次事件的实际重算量是**几万级** ✓,
+**从来不是"持续十几分钟 100 tok/s"** ✗ ⇒ ⭐ 那 20 分钟的主体是**等待**(客户端周期),不是服务端在慢速预填 ✓
+
+**泛化判据**:⭐⭐ **用一个"总量/耗时"的速率前,必须先确认分母是不是"在同一活动上"**
+(本次分母含 87% 空闲 ✗);② ⭐⭐ **vLLM 的 `Avg prompt throughput` 含缓存命中 ⇒ 不能当"预填计算速率"** ✓,
+要新算量就看 **`prompt_tokens_by_source{source="local_compute"}`** ✓;③ ⭐ **一个速率若超过物理上限(如 PCIe 决定的上限),那它一定在统计别的量** ✓
+
+---
+
+### B329(2026-10-07)⭐ **ds41f prefill 的物理上限:速率 ≈ MBT ÷ 一次全专家扫描**;三张新卡的收益排序
+
+**受控实测**(qfn 已停,生产闲置,随机 24 万 token,唯一首块 ⇒ 零命中):
+* 提示 **237,919 token** · 墙钟 **362 s(6.0 分钟)** · `local_compute` 增量 **+237,919**(一个不漏 ✓)
+* ⭐ **端到端 657 tok/s** · GPU1/2 **全程 92–100%** · CPU **仅 2–5/192 核忙** · KV 14.6%→29.0% 稳增
+
+**⭐ 物理模型(与实测吻合 6%)**
+```
+主机侧专家 ≈ 475 GiB(模型) − 7.5 GiB(GPU 常驻) ≈ 460 GiB
+GPU1/2 各 ~25 GB/s ⇒ 合计 ~50 GB/s
+一次全专家扫描 ≈ 494 GB ÷ 50 GB/s ≈ 9.9 s
+每个 chunk(≤MBT)都要扫一遍 ⇒ 速率 ≈ MBT / 9.9s
+    MBT=6144  ⇒ 预测 620 tok/s  ← 实测 657 ✓
+    MBT=8192  ⇒ 828 · MBT=24576 ⇒ 2480
+```
+
+**⇒ 结论(用户 2026-10-07 判定)**:⭐ **"显存限制 MBT,MBT 又让 prefill 很慢"这条链成立** ✓
+⭐ 在新卡(更大显存 / 原生 FP4 / PCIe 5.0 x16)之前,**~650 tok/s 就是上限** ✓
+
+**⭐ 三张卡的收益排序(据本仓实测)**
+
+| 升级 | 收益 | 依据 |
+|---|---|---|
+| ⭐⭐ **更大显存** | ⭐ **唯一乘数**(tokens/扫描 ↑)| MBT 直接受显存限制 ✓(且 MBT=8192 曾 OOM+agent 发疯 ⇒ 已下调 ✓)|
+| ⭐⭐ **PCIe 5.0 x16** | ⭐ **~2×**(扫描时间减半)| 引擎自测 **26.85 GB/s**(Gen4 x16 的 84%)⇒ Gen5 ⇒ ~53 ✓ |
+| ⚠️ **原生 FP4** | ⚠️ **小得多,甚至可能为零** | ⭐ **我们的专家本来就是 MXFP4(4-bit)** ⇒ **PCIe 字节不会减半** ✗;只省 GPU 侧反量化 ✓ |
+
+**⚠️ 未证之处(不得当成结论)**
+* GPU 报 95–100%,但 `utilization.gpu` **分不出"计算"还是"拷贝引擎"** ⇒ ⭐ **"纯 PCIe 受限"只证到 6% 数值吻合,未证因果** ✗
+* ⭐ 若 GPU 侧计算占相当份额,则"原生 FP4"的收益会回升 —— **需实测**(当前无数据 ✓)
+
+**附:结构化观察** ⭐ 大块(6140)走 GPU ✓,小块(128,低于 2560 阈值)走 CPU ✓(本次 78 个 ✓);
+CPU 承担的 token 量很小(≈1 万 ✓)⇒ **CPU 不是 prefill 的瓶颈** ✓(与"CPU 仅 2–5 核忙"一致 ✓)
+
+---
+
+### B330(2026-10-07)⭐ **收口 B327:20 分钟 prefill 的机制 = 客户端【压缩把摘要写在开头】⇒ 前缀整段作废**
+
+**结论来源**:子会话自述 —— "**生产全程未重启;上下文被 compaction 了**(逐轮原文→结构化摘要,计量条归零重算);
+**压缩后下一次请求必须从 position 0 重新 prefill 整段 prompt**,故约 20 分钟,**一次性开销,不是崩溃**" ✓
+
+**⭐ 机制(为什么"压缩"会导致全量重填)**
+```
+策略:把最早的逐轮消息【替换】成摘要 ⇒ prompt 的 position 0 变成摘要 ✗
+vLLM 的 APC 按【块对齐】匹配 ⇒ 第 0 块就不同 ⇒ 之后所有块全部 miss ✗✗
+⇒ 整段(仍然很长的) prompt 从 0 重算
+```
+⭐ 关键不在"压缩"本身,而在**摘要被放在【开头】**:若只动中后段,前面的 KV 仍然命中 ✓
+
+**⭐ 计数器指纹(可复现判定"前缀被完全作废")**
+> `prefix_cache_queries_total` 增加 ≈ **整段长度**,而 `prefix_cache_hits_total` 增加 **0** ✓
+
+本仓受控实验(随机首块,24 万 token)实测到同型指纹:
+```
+queries:  65,890,260 → 66,128,179  (+237,919 = 提示全长)
+hits:     64,389,632 → 64,389,632  (+0,一个都没命中)
+local_compute: +237,919
+```
+
+**量化推断(⚠️ 推断,非实测)**:按 **657 tok/s**(B329)⇒ **20 分钟 ≈ 79 万 token**
+⇒ 该次压缩后摘要本身仍约 **79 万 token** ⇒ **只削减约 20%**(1M 窗口 → ~790k);
+⚠️ 客户端轮次开销也计入 20 分钟 ⇒ **79 万为上界**,精确值用 `local_compute` 前后差读 ✓
+
+**⇒ 修法(客户端侧,很小)**:⭐ **只要保证 prompt 的【前 N 个 token 逐字不变】** ✓
+* 摘要**追加在末尾**(而非替换开头)✓;或保留原文前缀、只对**尾部**截断/摘要 ✓
+⇒ 压缩后只 prefill 新增的一小段(秒级),不再从 0 重来 ✓
+
+---
+
+### B331(2026-10-07)⭐⭐ **收口 B330:那 20 分钟的主体是【摘要请求自身】的 prefill,不是"压缩后重填"**
+
+**背景**:DSH 的上下文压缩由插件实现 —— `@deepseek-ai/dsh-compaction`(**Service Definition**,`ctx.compaction`)+
+`dsh-compaction-basic`(**Provider**:`ctx.tokenMeter` 压力 + token 预算保留 + **`llm.stream()` 摘要**)+ `dsh-command-compact`(`/compact`)✓
+
+**关键证据:本机 profile 只配了一个 provider,且指向生产**
+`~/.dsh/profiles/tui/cordis.patch.yml`:
+```yaml
+- id: dsh-tui
+  config:
+    default: { provider: local, model: DeepSeek-V4-Flash-0731 }
+    providers:
+      local: { api: openai, baseURL: http://localhost:8070/v1, apiKey: dummy }
+```
+⇒ ⭐ **摘要请求走的就是 8070(生产)** ✓
+
+**⭐ 算术对账(决定性)**
+```
+768,000 token(用户设定的可用上限) ÷ 657 tok/s(B329 实测 prefill 速率) = 1169 s = 19.5 分钟
+                                                  ⇔ 观测"约 20 分钟" ✓✓
+```
+⇒ ⭐⭐ **20 分钟 ≈ 摘要器读入 768K 的那一次 prefill** ✓ —— **不是**"压缩完成后再整段重填" ✓
+(后者确实也会发生,但量级由**压缩后的** prompt 长度决定,通常小得多 ✓)
+
+**⇒ 推论**
+1. ⭐ **"压缩率太低"是错觉**:成本取决于**输入长度**,与压得多狠无关 ⇒ ⭐ **用模型压 768K,这台机器上必然 ~20 分钟** ✓
+2. ⭐ **两条改进路径(均在客户端,不动生产)**
+   * **配置级**:加第二个 provider(本地小模型),把摘要/会话指过去 ⇒ 20 分钟 → 秒级 ✓(`cordis.patch.yml` 覆盖机制已在用 ✓)
+   * **插件级**:`ctx.compaction` 明写"**各角色可独立替换**" ✓,摘要调用"**可在 `llm/stream` 处拦截**" ✓
+     ⇒ 写启发式压缩器(保留头部 + 机械摘要,**不调模型**)⇒ ~0 ✓
+3. ⚠️ **落地前的未确认项**:本机只装了 `dsh-compaction`(Definition),**未装 `dsh-compaction-basic`** ✗
+   ⇒ 实际 provider 来自某个 **bundle**(查 `package.json` 的 `dsh.profile.bundles` ✓);
+   ⚠️ 且**未找到**"为 compaction 指定 provider"的确切**配置键** ✗ ⇒ 需再确认 ✓
+
+---
+
+### B332(2026-10-07)⚠️ **更正 B331:"20 分钟 = 摘要器 prefill 768K"是错的 —— 大头是【摘要的生成】,不是 prefill**
+
+**我怎么错的(B331)**:我算了 `768,000 ÷ 657 tok/s = 19.5 分钟 ≈ 观测 20 分钟`,就断定 20 分钟是摘要请求的 prefill ✗
+⚠️ **却忘了和我【已经读过的】计数器对账** ✗
+
+**对账即否**
+```
+local_compute 全 14 小时累计 = 679,949 token(截至那次 24 万请求之后)
+⇒ ⭐ 任何【单次】事件都不可能算过 768K ✗
+⇒ 08:04 事件真实新算量 ≤ 442,030 − 238,578 = 203,452 token
+⇒ 按 657 tok/s ⇒ ⭐ ≤ 310 s = 5.2 分钟
+```
+
+**⇒ 更正后的账(20 分钟窗口)**
+| 成分 | 量级 | 依据 |
+|---|---|---|
+| ⭐ 重填(改开头导致前缀作废)| ⭐ **≤5 分钟** | 计数器上界 ✓ |
+| ⭐⭐ **摘要的【生成】**(decode)| ⭐ **~15 分钟** | decode 实测 ~40 tok/s ⇒ 15 min ≈ **3.6 万 token 输出** ⚠️(**推断** ✓)|
+| 客户端自身轮次开销 | 其余 | ✓ |
+
+**⇒ 两笔浪费可分开修(均在客户端)**
+1. ⭐ **(a) 改开头 ⇒ 前缀作废**:保证前 N 个 token 逐字不变(摘要追加末尾/只截尾部)⇒ 省 ≤5 分钟 ✓(B330 ✓)
+2. ⭐⭐ **(b) 摘要输出太长**:限制摘要长度(如 ≤2k token ⇒ ~1 分钟 ✓)或换快模型 ⇒ ⭐ **省 ~15 分钟(收益最大)** ✓
+
+**⚠️ 待直接测量**:摘要长度是**推断**(40 tok/s × 15 min ✓),未实测 ✗
+⇒ 下次压缩前后各读一次 `/metrics`:⭐ **`generation_tokens_total` 的增量 = 摘要输出真实长度** ✓
+
+**⭐ 本轮教训(第三次同型)**:⭐⭐ **凡"从速率倒推的量级",必须先用已有的累计计数器做上界校验** ✓
+(B331 只需问一句"台账里 `local_compute` 够不够 768K 就有答案" ✗)
+
+---
+
+### B333(2026-10-07)⭐ **设计结论:辅助模型工作不该走混合架构 —— 压缩/摘要应由【GPU0 上的常驻小模型】承担**
+
+**用户判定**:⭐ "这种混合推理架构 decode 慢,让巨大模型干摘要很蠢;应该开一个专业小模型,**完全跑在 GPU0 里,只干摘要和压缩**" ✓
+
+**实测支撑**
+| 判断 | 支撑 |
+|---|---|
+| "decode 慢" | ⭐ ds41f decode ≈ **40 tok/s**(`generation_tokens_total` + 日志一致 ✓)—— CPU 专家 + PCIe 流式的必然结果 ✓ |
+| "让大模型干摘要很蠢" | ⭐ ~3.6 万 token 摘要 ÷ 40 tok/s = ⭐ **~15 分钟**(占那次 20 分钟窗口的 3/4 ✓,见 B332 ✓)|
+| "小模型常驻 GPU0" | ⭐ 常驻显存 ⇒ **无 PCIe 流式、无 CPU 专家** ⇒ decode 上到 ~150 tok/s 量级 ⇒ ⭐ **摘要生成 15 min → ~4 min** ✓;768K prefill 由"几分钟"降到几十秒(乃至靠前缀缓存≈0 ✓)|
+
+**⭐ 为什么 GPU0 恰好合适**:该卡是 **PCIe x8**(对流式架构是硬伤 ✗),⭐ 但**常驻显存的小模型不走 PCIe** ⇒ **最弱的那张空卡正好干这件事** ✓
+⭐ 收益是双份:摘要不再与 agent 自身推理抢那 40 tok/s ✓
+
+**⚠️ 不会因此消失的两项(须一并处理)**
+1. ⭐ **摘要长度仍是主导**:小模型 ~150 tok/s 下,3.6 万 token 摘要仍要 ~4 分钟 ⇒ **必须同时限制摘要长度**(如 ≤2k token ⇒ ~15 s ✓)
+2. ⭐ **改开头 ⇒ 会话前缀缓存作废 ⇒ 下一轮仍要重填(≤5 分钟)**:与谁来摘要无关 ⇒ B330 那条"前 N token 逐字不变"仍要做 ✓
+
+**⚠️ 待确认**
+* ⭐ DSH 能否让**压缩**使用与主会话**不同**的 provider ✗(未找到该配置键);若不能 ⇒ 走文档所述 **`llm/stream` 拦截**(插件级 ✓)
+* ⭐ **摘要质量**:小模型要承担"agent 的全部记忆" ⇒ **需抽查一次**,这是唯一的真实风险 ✓
+
+**⭐ 可外推原则**:本架构是为"把大模型 MoE 放 CPU"优化的 ⇒ ⭐ **任何辅助性模型工作都不该走它**
+(摘要/压缩 ✓,以及 embedding / rerank / 工具路由等 ✓)⇒ **GPU0 宜固定为"小模型专用位"** ✓
+
+---
+
+### B334(2026-10-07)⭐ **调研:压缩/摘要该用哪个小稠密模型**(外部资源 + 两条架构结论 + 量化取舍)
+
+**需求(用户)**:稠密、参数小、能塞进 GPU0(40GB,**PCIe x8**)、⭐ **"只要精度达标,越小越好"**(越小=越低显存=越快)
+
+**⭐⭐ 硬事实(决定架构):小稠密模型基本没有长窗口** —— [Qwen3 官方博客](https://qwenlm.github.io/blog/qwen3/)规格表
+| 模型 | 层 | **原生上下文** |
+|---|---|---|
+| Qwen3-0.6B / 1.7B / 4B | 28/28/36 | ⭐ **32K** |
+| Qwen3-8B / 14B / 32B | 36/40/64 | **128K** |
+⇒ ⭐⭐ **要压 768K 必须【分块 map-reduce】** ✓;⭐ 而这对我们**有利**:map 之间完全并行 ✓
+(⭐ [openclaw #110564](https://github.com/openclaw/openclaw/issues/110564) 讲的就是"窗口够则单趟、否则 map-reduce"这条分界 ✓)
+
+**⭐⭐ 社区权威同结论** —— [docker-agent `compaction_model.yaml`](https://github.com/docker/docker-agent/blob/main/examples/compaction_model.yaml)
+> "整个会话被喂给模型做摘要 —— **那是一次会话里最慢最贵的调用** …… **没必要为它花一个重量级推理模型**" ✓
+⚠️ 该文件同时给出:**若压缩模型窗口 < 主模型,触发阈值会被压到小窗口** ⇒ ⭐ 用 map-reduce 可把阈值留在主模型窗口上 ✓
+
+**候选清单(按"越小越好"排)**
+| 模型 | 参数 | 稠密 | 上下文 | int4 显存 | 备注 |
+|---|---|---|---|---|---|
+| Qwen3-0.6B | 0.6B | ✓ | 32K | ~0.5 GB | 最小,值得先试 |
+| Hunyuan-1.8B-Instruct | 1.8B | ✓ | ⚠️待核 | ~1.2 GB | 腾讯;HF 卡官方给 vLLM 起法 ✓ |
+| Qwen3-1.7B | 1.7B | ✓ | 32K | ~1.1 GB | Qwen 家族,中文/vLLM 稳 ✓ |
+| ⭐ **Qwen3-4B-Instruct-2507** | 4B | ✓ | 32K(2507 或更长 ⚠️待核) | ~2.3 GB | ⭐ 主力;官方称"4B 可媲美 Qwen2.5-72B-Instruct" ✓;有 AWQ ✓ |
+| Qwen3-8B | 8B | ✓ | ⭐ **128K** | ~4.5 GB | 128K 里最小 ⇒ 分块最少 |
+
+⭐ 许可:**Qwen3 全系 Apache-2.0** ✓;⚠️ Gemma 3 为 Gemma 自家条款 ✓
+⭐ 经验([Summarization LLM Leaderboard 2026](https://awesomeagents.ai/leaderboards/summarization-llm-leaderboard/)):
+⭐ **推理型(thinking)模型在摘要上更差**(over-explain ✓)⇒ 用 **非 thinking** 模式(`enable_thinking=False`/`/no_think` ✓)
+
+**⭐⭐ 量化取舍(用户 2026-10-07 指出:fp16 基线选错了)**
+| 阶段 | 瓶颈 | 量化收益 |
+|---|---|---|
+| ⭐ **生成**(几万 token 摘要)| ⭐ **显存带宽** | ⭐⭐ **大**:int4 ⇒ 每 token 只读 1/4 字节 ✓ |
+| ⚠️ **预填**(768K 输入)| ⚠️ **算力** | ⚠️ **基本无,甚至变慢** ✗ —— **A100=SM80 无原生 FP4/FP8** ⇒ 反量化是额外开销 ✓ |
+⇒ ⭐ 选型:**int4 AWQ/GPTQ weight-only + fp16 计算** ✓;⭐ **预填侧靠【并行】而非量化**(权重仅 2–4 GB ⇒ KV 可极大 ⇒ map 一次并发几十上百 ✓)
+⚠️ **必须验的副作用**:4B+int4 可能损伤摘要质量(该摘要要当 agent 全部记忆)⇒ ⭐ A/B 加"量化档"一维
+(1.7B-int4 / 4B-int4 / **4B-fp16** / 8B-int4 ✓)
+
+**⚠️ 未验证处(不得当结论)**
+* ⭐ 无权威结论指定"最适合 agent 会话压缩"的具体 checkpoint ✗(最接近的权威只给原则:小+快 ✓)
+* ⚠️ Gemma 3 / Phi-4-mini / Hunyuan-1.8B 的上下文窗口**未取得权威来源** ✗ ⇒ 用前核 model card ✓
+* ⚠️ **吞吐/延迟未实测** ✗ ⇒ "小模型更快"原理对,必须实测 ✓
+
+---
+
+### B335(2026-10-07)⭐ **DSH 0.2 配置:`does not support reasoning effort "high"` —— 迁移 patch 层时漏了【模型级 `reasoningEfforts`】**
+
+**症状(用户报告)** ✓:重启生产之后,DSH 报
+`本轮运行失败 provider "epyc-a100-server" model "DeepSeek-V4.1-Flash" does not support reasoning effort "high"` ✗
+
+**根因(逐行读 0.2 源码,不是猜)** ✓:
+| 事实 | 出处 |
+|---|---|
+| 自定义 route 在 pi-ai 目录里不存在 ⇒ 能力只能是 `base?.reasoning ?? false` | `dsh-llm-pi-ai/lib/index.js` `resolveModelReasoning` 568-570 |
+| 档位的 profile 字段是【**模型级** `reasoningEfforts`】;省略 ⇒ `{ reasoning: base?.reasoning ?? false }` = **无能力** | 同上 567-590;`modelFields` 1003-1011 |
+| 能力为"无"时,**任何显式档位**在**发请求之前**就抛 `UNSUPPORTED_REASONING_EFFORT` | `dsh-llm/lib/index.js` `resolveCallWithInfo` 2174-2192 |
+
+⇒ 也就是说:**旧配置里 `reasoning: true` / `thinkingLevelMap` 是 pi-ai 的内部名,会被 llm-pi-ai 的
+schema 静默丢弃**(RUNBOOK §3.5 已踩过一次);本次是**迁移到 `cordis.patch.yml` 时整条
+`reasoningEfforts` 被漏掉**,于是 `high` 连校验都过不去 ✗
+
+**修法(`~/.dsh/profiles/web/cordis.patch.yml` 的 `llm-pi-ai` 条目)** ✓:
+```yaml
+      reasoning: high            # route 级:Default 档(缺它 ⇒ Default 落成 off 的拼写 none)
+      models:
+        - id: DeepSeek-V4.1-Flash
+          contextWindow: 524288  # = 生产 /v1/models 的 max_model_len(512K)
+          input: [text, image]
+          compat:
+            thinkingFormat: openai          # vLLM 只认【顶层 reasoning_effort】
+            supportsReasoningEffort: true   # 缺它 ⇒ 选了档位也不改变请求
+            supportsDeveloperRole: false    # 缺它 ⇒ system 被改成 developer ⇒ system prompt 被丢
+          reasoningEfforts: { "off": none, minimal: low, low: low, medium: high,
+                              high: high, xhigh: xhigh, max: max }
+```
+
+**三条"为什么必须这样写"(每条都有源码/实测依据)** ✓:
+1. ⭐ **`thinkingFormat` 选 `openai` 而不是 `deepseek`**:`deepseek` 分支(`openai-completions.js:664-676`)
+   会发 `thinking:{type:…}`,且**off 档只发 `thinking`、不发 `reasoning_effort`** ✗;
+   而 vLLM 没有顶层 `thinking` 字段(其 `OpenAIBaseModel` 是 `extra="allow"` ⇒ **静默忽略**)
+   ⇒ **Off 档会静默失效** ✗。`openai` 落到通用分支(`:713-720`)⇒ **只发顶层 `reasoning_effort`**
+   ⇒ 正是 vLLM 认的那条(`chat_completion/protocol.py:586-587` `effort != "none" ⇒ enable_thinking=True`)✓
+2. ⭐ **`supportsDeveloperRole: false` 不是可选**:`openai-completions.js:896`
+   `instructionRole = model.reasoning && compat.supportsDeveloperRole ? "developer" : "system"`
+   ⇒ 开了 reasoning 之后 system 会变 `developer`,而 DeepSeek 模板无该分支 ⇒ **system prompt 被静默丢弃** ✗
+3. ⭐ **route 级 `reasoning` 决定 "Default" 档**:`dsh-llm-pi-ai/lib/index.js:1851`
+   `resolveReasoningLevel(model, options.reasoningEffort ?? profile.reasoning)`
+   ⇒ 不写它时,Default 走 pi-ai 的"未指定档位"分支 ⇒ 发 `off` 的拼写(= `none`)= **悄悄关掉思考** ✗
+
+**验证(两步,都留了产物 ✓)**:
+1. `bash scripts/check_dsh_settings.sh` ⇒ **全部通过 ✓**
+   (已把本次判据**机械固化**进那个脚本:档位键合法/值非空/含 high、模型级 compat、
+   `supportsReasoningEffort=true`、`supportsDeveloperRole=false`、`thinkingFormat=openai`、route 级默认档)
+2. ⭐ **离线探针** `node dev-docs/dsh_wire_probe_v41.mjs`(起假 endpoint,**零生产流量** ✓):
+   * UI 可选档位(不含 Default)= `["off","minimal","low","medium","high","xhigh","max"]` ✓
+   * 每档实际送出的顶层 `reasoning_effort` = `none/low/low/high/high/xhigh/max` ✓
+   * **system 消息保持 `system`,且 `SYS-PROMPT-MARKER` 完整** ✓
+   * 反例:不代入 route 默认档 ⇒ `reasoning_effort="none"`(证明 `reasoning: high` 不是可选项)✓
+3. 另用包内 schema 跑了 11 例负矩阵,确认 **0.2 schema 确实在生效**
+   (非法键 `bogus`、非法 `thinkingFormat`、非布尔 `supportsReasoningEffort` 都被拒 ✓)
+
+**代价/边界** ✓:⛔ **没有重启 8070**(那是本 agent 自己的推理后端,一次 ≈40 分钟);
+本次只改配置 + 离线验证;`dsh web` 若仍是旧能力,前端刷新一次模型目录即可 ✓
+
+**教训(可泛化)** ✓:
+* ⭐ **"升级后配置字段名变了"这类事故,必须把判据写进【可执行脚本】**(本次扩了
+  `check_dsh_settings.sh`),否则下次迁移仍会静默漏字段 ✓
+* ⭐ **"字段在 schema 里合法"≠"字段起了作用"**:`reasoningEfforts` 的省略、`supportsReasoningEffort`
+  的缺失、`thinkingFormat` 选错,三者都**不报错**却让功能静默失效 ⇒ 必须验到**上线行为**
+  (即"请求体里到底有没有 `reasoning_effort`")✓
+* ⭐ **用户的提醒"之前多次修正过,历史记录中可能就有"是对的**:我起初打算从包源码重新推导,
+  而 `docs/PRODUCTION_8070.md` §7 / RUNBOOK §3.5 / B160 / B214 / B215 里**已有全部结论** ✓
+  ⇒ **先查本仓历史,再读源码** ✓
+
+---
+
+### B336(2026-10-07)⭐ **两条工作线的收口:qfn-INT8/W4A8 线 与 辅助小模型线 —— 均【不采用】;`dev-docs/mywork/` 目录按用户指示取消**
+
+**用户指示**:"**mywork 这个目录就不该存在,更不该存在于 dev-docs 这样的文档目录下面**" ✓
+
+**背景(为什么会存在)**:`dev-docs/mywork/` 立于 **2026-10-05**,是当时一条**收窄范围的工作线**的台账
+(`LOG.md` 操作日志 / `PROGRESS.md` 任务状态 / `DECISIONS.md` 定案)——
+**它从来不是"开发树"**:真正的 dev 树是 `/home/user/lvllm/xtu-dev-qfn` @ `dev/qfn-hybrid-i8-m`(符合"新开 dev 树 → 开发测试验收 → 合并 main")✓
+问题在于:台账目录里**混进了脚本**(12 个 `.sh`)和**第二份 patch 系列**(`patches-qfn-series/`,8 条,未入库),
+而规定真源是 `patches/xtu-series/` ⇒ 又犯"同一事实两处表示" ✗
+
+**收口结论** ✓:
+* **qfn-INT8 / W4A8(INT8 activation for MXFP4 experts)线**:结论 = **不采用**(见原 `MERGE_NOTES.md` / `PERF_RECOMMENDATION.md`);
+  v0.2.6 发布里保留的是**已并入 `patches/xtu-series/` 的那部分**,未入库的 `patches-qfn-series/` 随本目录归档 ✓
+* **辅助小模型线(4B/1.7B/8B 长上下文)**:结论 = **不采用**(原 `results/*.md` 52 个);其 runner 已于同日先行归档 ✓
+
+**归档位置(完整保留,可原路恢复)** ✓:
+```
+/home/user/lvllm/archive/vllm-xiaotu-moe/2026-10-07-dev-docs-mywork/   (原 dev-docs/mywork 全量)
+  └─ NOTICE.md   ← 本索引与恢复方法
+```
+
+**遗留(不动源码,仅登记)** ⚠️:
+* `vllm_xiaotu_moe/mixed_experts.py:2121` 的注释引用了 `dev-docs/mywork/artifacts/` 的**旧 dump 格式**
+  ⇒ 纯注释、非运行期路径;**未改源码**(避免为一条注释去动生产树 editable 安装的源码)✓
+* `scripts/build_engine_variants.sh:126` 注释引用 `DECISIONS.md D11` ⇒ 已改为指向归档路径 ✓

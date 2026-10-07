@@ -62,19 +62,50 @@ print("  --- 本地端点(epyc-a100-server)---")
 #    ⇒ POST https://api.deepseek.com/v1/messages ⇒ 404 ⇒ 【把我自己的会话打死】✗
 chk("provider.api", bool(prov.get("api")), "⭐ 协议(丢了会回退到默认端点 ⇒ 404 打死自己)")
 chk("provider.baseURL", bool(prov.get("baseURL")), "⭐ 路由地址(同上,必须与 api 匹配)")
-chk("models[0].reasoningEfforts", bool(m.get("reasoningEfforts")), "各档位映射(思考强度选择器就靠它)")
+# ⭐⭐ 2026-10-07 【0.2 配置格式 · 思考强度】====================================
+# 症状:`本轮运行失败 provider "epyc-a100-server" model "DeepSeek-V4.1-Flash"
+#       does not support reasoning effort "high"`(重启生产后暴露)
+# 根因:0.2 的档位字段是【模型级】`reasoningEfforts`;迁移到 patch 层时该字段漏掉
+#   而自定义 route 在 pi-ai 目录里不存在 ⇒ 能力只能是 `base?.reasoning ?? false` = 无
+#   ⇒ dsh-llm `resolveCallWithInfo()` 对任何【显式】档位在发请求前就抛
+#     UNSUPPORTED_REASONING_EFFORT ✗
+#   (逐行依据:dsh-llm/lib/index.js resolveCallWithInfo 2174-2192 +
+#              dsh-llm-pi-ai/lib/index.js resolveModelReasoning 567-590)
+# 离线证据:dev-docs/dsh_wire_probe_v41.mjs(假 endpoint,零生产流量)✓
+LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+re_map = m.get("reasoningEfforts")
+chk("models[0].reasoningEfforts 是 dict", isinstance(re_map, dict) and len(re_map) > 0,
+    "⭐ 0.2 的档位字段(键=档位,值=上线拼写);缺失 ⇒ 任何显式档位直接 UNSUPPORTED_REASONING_EFFORT ✗")
+if isinstance(re_map, dict) and re_map:
+    bad_keys = [k for k in re_map if k not in LEVELS]
+    chk("档位键合法", not bad_keys,
+        "键只能是 off/minimal/low/medium/high/xhigh/max(实测:非法键会被 schema 拒)" + ("  命中=%s" % bad_keys if bad_keys else ""))
+    bad_vals = [k for k, v in re_map.items() if not (v is None or (isinstance(v, str) and v))]
+    chk("档位值非空(off 可为 null)", not bad_vals,
+        "空串/错值会被 resolveModelReasoning 拒" + ("  命中=%s" % bad_vals if bad_vals else ""))
+    chk("含 high 档", "high" in re_map, "⭐ 报错原文就是它:high 必须显式声明(键集合 = UI 可选档)")
+mc = m.get("compat") or {}
+chk("models[0].compat 在【模型级】", bool(mc), "0.2 里 compat 属模型级(modelFields.compat)")
+chk("compat.supportsReasoningEffort=true", mc.get("supportsReasoningEffort") is True,
+    "⭐ 0.2 里【是否真的发 reasoning_effort】的开关:false/缺失 ⇒ 选了档位也不改变请求 ✗")
+chk("compat.supportsDeveloperRole=false", mc.get("supportsDeveloperRole") is False,
+    "⭐ 必须 false:否则 reasoning 模型把 system 改成 developer ⇒ system prompt 被模板静默丢弃 ✗")
+chk("compat.thinkingFormat=openai", mc.get("thinkingFormat") == "openai",
+    "⭐ vLLM 只认【顶层 reasoning_effort】;deepseek 格式会塞 thinking 对象且不发 off 的 effort ⇒ Off 静默失效 ✗")
+_dflt = prov.get("reasoning")
+chk("route 级 reasoning 已设", isinstance(_dflt, str) and _dflt in (re_map or {}),
+    "⭐ 'Default' 档用哪一档;缺失 ⇒ Default 退化成 off 的拼写(none)= 悄悄关掉思考 ✗ (当前=%s)" % (_dflt,))
 # ⭐ 2026-10-05 修正(实测 4 次后):V4.1 编码器【有工具豁免】——
 #   `if any(m.get("tools") for m in full_messages): effective_drop_thinking = False`
 #   实测:无 tools 时 prompt_tokens=43(思考被丢,纯聊天场景,刻意省 token ✓);
 #         带 tools 时 =394(思考【全部保留】✓)⇒ **agent 场景服务端本来就没问题** ✓
-#   ⇒ 故此项**不作为失败项**,只作提示:显式设 false 可让"无 tools 的中间轮"也保留 ✓
-_ctk = (m.get("compat") or {}).get("chatTemplateKwargs") or {}
+#   ⇒ 故此项**不作为失败项**,只作提示 ✓
+_ctk = mc.get("chatTemplateKwargs") or {}
 print("  %s compat.chatTemplateKwargs.drop_thinking = %s(可选;带 tools 时服务端会自动保留思考 ✓)"%(
     "•", _ctk.get("drop_thinking")))
-chk("models[0].compat", bool(m.get("compat")), "⚠️ schema 里 compat 属【模型级】(放 provider 级可能不生效)")
-chk("compat.thinkingFormat", (m.get("compat") or {}).get("thinkingFormat")=="deepseek", "按 deepseek 格式读写思考(缺失=选不了思考强度 ✗)")
-chk("多模态字段", bool(m.get("input") or m.get("inputModalities")), "图片输入(新 schema 用 input)")
-chk("无过期字段 reasoning", "reasoning" not in m or m.get("reasoning") is None, "旧 schema 的字段,新版不存在(留着无用)")
+chk("多模态字段", bool(m.get("input")), "图片输入(0.2 用 input;inputModalities 会被静默忽略)")
+chk("无旧字段名(模型条目内)", ("reasoning" not in m) and ("thinkingLevelMap" not in m),
+    "`reasoning: true` / `thinkingLevelMap` 是 pi-ai 内部名,0.2 schema 会静默丢弃 ⇒ 写了等于没写 ✗")
 chk("agent-default-model", bool(ad.get("provider")) and bool(ad.get("model")), "默认模型指向 %s/%s"%(ad.get("provider"),ad.get("model")))
 
 print("  --- 官方端点(llm-deepseek)---")

@@ -35,7 +35,7 @@ MAXLEN="${MAXLEN:-8192}"    # 【纪律】上下文尽量短
 MBT="${MBT:-2048}"
 SEQS="${SEQS:-1}"
 GPU_UTIL="${GPU_UTIL:-0.90}"
-THREADS="${THREADS:-120}"   # ⭐ qfn 服务默认 = n_ccd×5(本机 24 CCD ⇒ 120);见下方资源纪律段 ✓
+THREADS="${THREADS:-48}"    # ⭐⭐【2026-10-07 用户明令】48 = n_ccd×2;原 n_ccd×5(=120)【已作废】✗
 LOAD="${LOAD:-auto}"        # auto=读真权重;dummy=不读盘,只验架构与显存
 EAGER="${EAGER:-1}"         # 单卡调试先从全 eager 起,稳了再上图
 PLE_CPU="${XIAOTU_PLE_CPU:-1}"   # 必须有:PLE 47.8GiB 走主机内存(UVA)
@@ -124,12 +124,24 @@ OOM_SCORE_ADJ="${OOM_SCORE_ADJ:-800}"
 #   ⚠️ 代价(用户已知并接受):生产 8070 自身也吃 CPU;用户说明**当前引擎实现的核心利用率
 #      本就吃不满**,故按 120 设定。若生产转为满载,应把 THREADS_MAX 调回 64 ✗。
 #   ⚠️ 本项与 GPU 预填无关 —— 本次任务不关注 GPU 预填性能,只要求行为正确 ✓。
+# ⛔⛔【2026-10-07 用户明令 · 上面 120 那条【已作废】】✗✗
+#   用户原话:"直接设置 qfn 的线程数为 **48**，**不准手工绑定核心**" ✓
+#   ⇒ 默认改为 **48**(= n_ccd×2),并**取消手工核绑定**(见下方 TASKSET 段)✓
+#   ⇒ 上面那段"120 = n_ccd×5"的实测依据**仍然成立**(那是"120 比 60 快 1.62×"的历史事实),
+#     但它**不再是本脚本的默认**;要复现旧口径请显式传 `THREADS=120` ✓
 THREADS_MAX="${THREADS_MAX:-192}"
 THREADS="$(awk -v t="$THREADS" -v m="$THREADS_MAX" 'BEGIN{print (t+0>m)?m:(t+0)}')"
-TASKSET="${TASKSET:-0-191}"          # 与 120 线程(=5 core/CCD,铺满 8 NUMA node)配套
+# ⛔ 手工绑核【默认不做】(用户 2026-10-07 明令:"不准手工绑定核心")✓
+#   ⚠️ 语义(务必分清,否则会悄悄改变别人的实例 ✗):
+#     · 取值 **`0-191`**(默认)= 全部 192 个在线核 ⇒ **等价于不绑**,既有调用方行为**不变** ✓
+#     · 显式传【空字符串】`TASKSET=` ⇒ 连 `taskset` 包装都不加 ✓
+#       ⭐ 核分配交给引擎自身(它按 CCD/NUMA 拓扑自己 pin `cores_`,见 numa_pool.hpp)✓
+#   ⚠️ 故这里用 `${TASKSET-0-191}`【不带冒号】—— 带冒号会把"显式空"当未设 ⇒ 退回 0-191 ✗
+TASKSET="${TASKSET-0-191}"
+TS_PREFIX=(); [ -n "$TASKSET" ] && TS_PREFIX=(taskset -c "$TASKSET")
 MEM_GATE_GIB="${MEM_GATE_GIB:-250}"  # QFN 实测宿主 ~163 GiB(FP8)/~107 GiB(MXFP4)
 _avail="$(awk '/MemAvailable/{printf "%d", $2/1048576}' /proc/meminfo)"
-echo "[qwen38] 资源纪律: THREADS=$THREADS taskset=$TASKSET nice=19 oom_score_adj=$OOM_SCORE_ADJ MemAvailable=${_avail}GiB"
+echo "[qwen38] 资源纪律: THREADS=$THREADS taskset=${TASKSET:-<不加taskset>} nice=19 oom_score_adj=$OOM_SCORE_ADJ MemAvailable=${_avail}GiB"
 if [ "${ALLOW_LOW_MEM:-0}" != "1" ] && [ "$_avail" -lt "$MEM_GATE_GIB" ]; then
   echo "[qwen38] ✗ 拒绝启动:MemAvailable=${_avail}GiB < MEM_GATE_GIB=${MEM_GATE_GIB}GiB" >&2
   echo "[qwen38]   同机很可能已有生产在跑 ⇒ 确需放行请显式 ALLOW_LOW_MEM=1(自担风险)" >&2
@@ -155,7 +167,7 @@ fi
     VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$GPU_PREFILL_MIN" \
     XIAOTU_MOE_THREADS="$THREADS" \
     OMP_NUM_THREADS=1 \
-    "${NCTL[@]}" taskset -c "$TASKSET" nice -n 19 \
+    "${NCTL[@]}" "${TS_PREFIX[@]}" nice -n 19 \
     "$PY" -m vllm.entrypoints.openai.api_server "${ARGS[@]}"
 ) &
 SVC_PID="$(cat "$OUTDIR/$TAG.pid" 2>/dev/null)"

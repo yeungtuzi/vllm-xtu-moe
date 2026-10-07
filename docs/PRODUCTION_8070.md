@@ -88,50 +88,84 @@ bash scripts/proc.sh adopt vllm_prod_8070 "$APIP"                       # 记进
    `Successful requests: 0` ✗)
 * **判断"是否在推进"** 的正确方式 ✓:`wc -l v41_8070.log` 是否增长 + `ps -o %cpu,stat` 看 worker 是否 `R`/`D` ✓
 
-## 7. DSH 侧配置(`~/.dsh/settings.yaml`;0.2 格式 ✓)
+## 7. DSH 侧配置(`~/.dsh/profiles/web/cordis.patch.yml`;0.2 格式 ✓)
 
 ⚠️ **DSH 升级到 0.2 会删掉 `settings.yaml`** ✗(2026-09-30 实测:只剩若干 `.bak*` 与 `.imported` ✓)
 ⇒ 升级后必须按 **0.2 格式**重写 ✓(字段名变了 ✓)。
 
+⭐⭐ **2026-10-07 又踩一次(重启生产后暴露)**:
+`本轮运行失败 provider "epyc-a100-server" model "DeepSeek-V4.1-Flash" does not support reasoning effort "high"` ✗
+* **根因**:迁移到 patch 层时**漏了 `reasoningEfforts`**;而这条自定义 route 在 pi-ai 目录里不存在
+  ⇒ 能力只能是 `base?.reasoning ?? false` = **无** ⇒ `dsh-llm resolveCallWithInfo()` 对任何
+  **显式**档位在**发请求之前**就抛 `UNSUPPORTED_REASONING_EFFORT` ✗
+* **逐行依据**:`dsh-llm/lib/index.js` `resolveCallWithInfo` 2174-2192;
+  `dsh-llm-pi-ai/lib/index.js` `resolveModelReasoning` 567-590 ✓
+* **完整复盘**:`docs/EXPERIMENTS.md` **B335** ✓
+
 ```yaml
 llm-pi-ai:
   providers:
-    {
-      epyc-a100-server:
-        {
-          apiKeyEnv: EPYC_A100_SERVER_API_KEY,
-          api: openai-completions,
-          baseURL: http://127.0.0.1:8070/v1,
-          compat: { thinkingFormat: deepseek },
-          streamIdleTimeoutMs: 1500000,
-          models:
-            [
-              { id: DeepSeek-V4.1-Flash, name: DeepSeek-V4.1-Flash, contextWindow: 768000,
-                input: [text, image],
-                reasoningEfforts: { "off": none, minimal: low, low: low, medium: high,
-                                    high: high, xhigh: xhigh, max: max } }
-            ]
-        }
-    }
+    epyc-a100-server:
+      apiKeyEnv: EPYC_A100_SERVER_API_KEY
+      api: openai-completions
+      baseURL: http://127.0.0.1:8070/v1
+      reasoning: high            # ⭐ "Default" 档 = high(缺它 ⇒ Default 落成 off 的拼写 none)
+      streamIdleTimeoutMs: 1500000
+      models:
+        - id: DeepSeek-V4.1-Flash
+          name: DeepSeek-V4.1-Flash
+          contextWindow: 524288   # = 生产 /v1/models 的 max_model_len(512K)
+          input: [text, image]
+          compat:
+            thinkingFormat: openai          # ⭐ vLLM 只认【顶层 reasoning_effort】
+            supportsReasoningEffort: true   # ⭐ 缺它 ⇒ 选了档位也不改变请求
+            supportsDeveloperRole: false    # ⭐ 缺它 ⇒ system 被改成 developer ⇒ system prompt 被丢
+          reasoningEfforts:                 # 键 = UI 档位;值 = 发给 API 的拼写
+            "off": none
+            minimal: low
+            low: low
+            medium: high
+            high: high
+            xhigh: xhigh
+            max: max
 ```
+
+**实测(离线探针,零生产流量 ✓)**:`node dev-docs/dsh_wire_probe_v41.mjs` ⇒
+UI 出现 7 档(`off…max`),每档送出的顶层 `reasoning_effort` 依次为
+`none/low/low/high/high/xhigh/max`,且 **system 消息未被改成 `developer`** ✓
 
 **0.2 与旧格式的差别(踩过 ✓)**:
 | 项 | 旧 | **0.2** |
 |---|---|---|
-| 多模态字段 | `inputModalities` | **`input`** ✓(π-ai 插件用 `input`;`inputModalities` 是 DeepSeek 插件用的)|
-| 推理能力 | `reasoning: true` | **改用 `reasoningEfforts`** ✓(省略=沿用目录;`false`=非推理)|
-| 选择器等级来源 | — | **`reasoningEfforts` 的【键】** = 选择器提供的等级 ✓ |
-| 送出的拼写 | — | **`reasoningEfforts` 的【值】** = 上线拼写 ✓ |
+| 多模态字段 | `inputModalities` | **`input`** ✓ |
+| 推理能力 | `reasoning: true` + `thinkingLevelMap` | **`reasoningEfforts`** ✓(旧名会被 schema **静默丢弃** ✗)|
+| 选择器等级来源 | — | **`reasoningEfforts` 的【键】** ✓ |
+| 送出的拼写 | — | **`reasoningEfforts` 的【值】** ✓ |
+| 默认档 | — | **route 级 `reasoning`** ✓(省它 ⇒ Default 落成 off 的拼写)|
+| 是否真的发 effort | `compat.supportsReasoningEffort` | 同名,**必须显式 `true`** ✓ |
+| system 角色 | — | **`compat.supportsDeveloperRole: false`** ✓ |
 
 **思考强度映射(关键 ✓)**:DSH 的等级键 = `off/minimal/low/medium/high/xhigh/max` ✓;
 而 **V4.1 只认 `low/high/xhigh/max` / `none` / 整数 1–100** ✓ —— **没有 `medium`** ✗
-(发 `medium` 直接 **400**,B160 ✓)⇒ 所以 **`medium` 必须映射成 `high`** ✓(上表已如此 ✓)。
+(发 `medium` 直接 **400**,B160 ✓)⇒ **`medium` 必须映射成 `high`** ✓(上表已如此 ✓)。
+
+⚠️ **为什么 `thinkingFormat` 用 `openai` 而不是 `deepseek`** ✓(B335 实测):
+`deepseek` 分支会发 `thinking:{type:…}` 且**在 off 档不发 `reasoning_effort`** ✗ ——
+而 vLLM 没有顶层 `thinking` 字段(其 `OpenAIBaseModel` 是 `extra="allow"`,只会静默忽略)
+⇒ **Off 档会静默失效** ✗ ⇒ 改用 `openai`(只发顶层 `reasoning_effort`)✓
 
 ⚠️ **YAML 陷阱** ✓:`off` 作**键名必须加引号** ✗ 否则 YAML 1.1 会解析成**布尔 `False`** ✓
 (`on/yes/no` 同类)⇒ 写成 `"off": none` ✓。
 
-**vLLM 侧**已是默认 ✓(`serve_v41.sh` 的 `TOOL_PARSER` / `REASONING_PARSER` / `DEFAULT_CHAT_KWARGS` ✓);
-**改完 settings.yaml 后 DSH 会热加载 ✓**(`watch` ✓)。
+**⭐ 改完必须两步都验(缺一不可)** ✓:
+```bash
+bash scripts/check_dsh_settings.sh     # ① 配置自检(0.2 字段级,缺失即 ❌)
+node dev-docs/dsh_wire_probe_v41.mjs   # ② 离线上线行为(假 endpoint,不碰生产)
+```
+**生效方式**:patch 层由 dsh 监听;**若前端模型目录仍是旧能力,点一次「刷新」**;
+仍不行再重启 `dsh web` ✓ —— ⛔ **不要因此重启 8070**(那是本 agent 自己的推理后端,一次 ≈40 分钟)✗
+
+**vLLM 侧**已是默认 ✓(`serve_v41.sh` 的 `TOOL_PARSER` / `REASONING_PARSER` / `DEFAULT_CHAT_KWARGS` ✓)。
 
 ## 8. 状态自检(一条)
 

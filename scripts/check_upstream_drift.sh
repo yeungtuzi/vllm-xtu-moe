@@ -24,7 +24,7 @@ set -uo pipefail
 # The mainline commit our installed plugin/patch set was last verified against.
 BASE="${BASE:-dabc4362b47ad2665b0802b0b42b13f660efe634}"
 UPSTREAM="${UPSTREAM:-https://github.com/vllm-project/vllm.git}"
-PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 VARIANT="${VARIANT:-cu130}"
 WHEEL_INDEX="${WHEEL_INDEX:-https://wheels.vllm.ai}"
 

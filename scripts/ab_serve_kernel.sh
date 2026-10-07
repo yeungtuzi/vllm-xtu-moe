@@ -31,7 +31,9 @@ run_leg() {
   local which="$1" tag="aba_$1"
   cp "/tmp/${which}_vnni.so" "$SO"
   stop_server "$tag"; stop_server "${2:-none}"; sleep 8
-  MODE=dsv4 TAG="$tag" PORT=8070 TP=1 MAXLEN=262144 SEQS=128 MAX_NBT=8192 \
+  # ⭐ 2026-10-07 审计修:原为 PORT=8070(= 生产端口)⇒ 生产在跑时起不来、生产不在时
+  #   又会【占住生产端口】让门/bringup 误判 ⇒ 调试实例改用 8091(非保留端口)✓
+  MODE=dsv4 TAG="$tag" PORT=8091 TP=1 MAXLEN=262144 SEQS=128 MAX_NBT=8192 \
     GPU_UTIL=0.85 KV_DTYPE=fp8_ds_mla KV_MEM_BYTES=8589934592 \
     THREADS=192 OMP=96 EAGER=0 EP=0 GPUS=2 ENV_EXTRA="XIAOTU_CD_TIMING=1" \
     SPEC="$SPEC" scripts/tune_serve.sh >/dev/null 2>&1 || { echo "serve failed $which"; return 1; }

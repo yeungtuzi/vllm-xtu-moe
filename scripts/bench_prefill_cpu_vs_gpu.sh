@@ -14,7 +14,7 @@
 # 输出: /tmp/bench_prefill/ 下的 jsonl + summary.tsv
 
 set -uo pipefail
-cd "$(dirname "$0")/.." || exit 1
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 ROOT="$PWD"
 
 MBTS="${MBTS:-4096 8192 16384}"
@@ -87,7 +87,12 @@ run_one(){  # $1=mbt $2=arm $3=threshold
   if [ "$rc" -ne 0 ]; then
     log "FAIL arm=$arm mbt=$mbt rc=$rc"
     printf '%s\t%s\t%s\n' "$arm" "$mbt" "startup rc=$rc: $(grep -m1 -E 'Traceback|OutOfMemoryError|CUDA out of memory|ValueError|Error' "$lf" 2>/dev/null | cut -c1-180)" >> "$FAILED"
-    bash scripts/proc.sh stop "$tag" >/dev/null 2>&1
+    # ⭐ 2026-10-07 审计修:stop 的 rc 必须判 —— 这里是【启动失败后的收尾清理】,
+    #   后面紧接着 return 1(不会再 spawn)⇒ 记下 rc + 明确警告,但不许抹掉 rc ✗
+    _s_out=$(bash scripts/proc.sh stop "$tag" 2>&1); _s_rc=$?
+    if [ "$_s_rc" -ne 0 ] && [ "$_s_rc" -ne 3 ]; then
+      echo "  ⛔ 清理 stop rc=$_s_rc(被拒 4/未死 5)⇒ 实例可能仍在跑,需人工处置:$_s_out" >&2
+    fi
     return 1
   fi
   log "READY arm=$arm mbt=$mbt"
@@ -111,7 +116,13 @@ with open(summary,"a") as f:
                 f"{r.get('cached_tokens')}\t{r.get('ttft_s')}\t{r.get('prefill_tok_per_s')}\t{r.get('label')}\n")
 PYEOF
   log "DONE arm=$arm mbt=$mbt"
-  bash scripts/proc.sh stop "$tag" >/dev/null 2>&1
+  # ⭐ 2026-10-07 审计修:stop 的 rc 必须判 —— rc=0(已停/本就没在跑)· rc=3(无 PID 文件)属正常;
+  #   被拒(rc=4)/未死(rc=5)⇒ 绝不 spawn 下一个 arm(事故②:没停干净又起一个)✗
+  _s_out=$(bash scripts/proc.sh stop "$tag" 2>&1); _s_rc=$?
+  if [ "$_s_rc" -ne 0 ] && [ "$_s_rc" -ne 3 ]; then
+    echo "  ⛔ stop rc=$_s_rc(被拒/未死)⇒ 不再 spawn 下一个 arm:$_s_out" >&2
+    exit "$_s_rc"
+  fi
   sleep 5
 }
 

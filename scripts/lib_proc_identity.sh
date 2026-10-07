@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# lib_proc_identity.sh —— ⭐⭐【进程归属证据的唯一真源】(2026-10-07)
+#
+# 为什么要有这个文件(用户 2026-10-07 明令 + 上一个会话连错三版的根因):
+#   ⭐ 同一个事实存在【两处表示】,而"分别手写、从不交叉校验" ⇒ 必然对不上 ✗
+#   证据:① 赋值 `"✓ 我的调试实例"` / 比较 `"✓ 我自己的调试实例"` ⇒ 门恒拒
+#         ② `scripts` 与 `proc.sh` 的分隔符写成点号 / 正确斜杠 ⇒ 4 个文件全错
+#         ③ `awk substr($0,21)` / 真实长度 ⇒ off-by-one ⇒ 又一次恒拒
+#   ⇒ 所以:**生产名单/端口/解析逻辑只允许在这里定义一次**,别处一律 `. lib` 引用 ✓
+#
+# 被谁引用:scripts/whoami_proc.sh、scripts/proc.sh 以及各 runner(禁止重复定义名单 ✗)
+#
+# ⭐ 三条不可违背的设计约束:
+#   1. **默认不可杀**:任何"读不到 / 解析不出 / 不确定"一律返回"不可杀" ✓
+#   2. **绝不用进程名做【放行】判据** —— 名字只用于"拦截",永不用于"放行" ✓
+#   3. **禁止手算偏移**:一律 `cut -d=` / 前缀剥离 / `awk -F`,禁止 `substr` 下标 ✓
+#
+# 用法:  . "$(dirname "${BASH_SOURCE[0]}")/lib_proc_identity.sh"
+
+# 防止被重复 source(幂等)
+[ -n "${_LIB_PROC_IDENTITY_LOADED:-}" ] && return 0
+_LIB_PROC_IDENTITY_LOADED=1
+
+_LIB_PI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROC_ROOT="${PROC_ROOT:-$(cd "$_LIB_PI_DIR/.." && pwd)}"
+# ⭐ 日志/PID 目录:允许 LOGDIR 覆盖(测试用);解析结果全局唯一 ✓
+PROC_LOGDIR="${LOGDIR:-$PROC_ROOT/dev-docs/report/tuning/logs}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⭐ 生产判据 A:PID 文件名(唯一真源)
+#   ⛔ 名单漂移会误判 ⇒ 由 scripts/gates/check_prod_identity.sh 运行期反查维护 ✓
+PROD_PIDFILES_RE='^(vllm_prod_8070|v41_8070|prod768|dsv41_prod|lmcache_server|prometheus|grafana|node_exporter|xtu_exporter|coremap|coremap_png|vram_sampler|vram_watch|hang_watch|sess_watch.*|deg_watch|lmcache.*)\.pid$'
+
+# ⭐ 生产判据 B:端口(生产 vLLM + LMCache + 看板/监控栈,同生命周期 ✓)
+PROD_PORTS='8070 5555 8080 9090 3000 9100 8787'
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ⭐ 所有"证据输出"全局变量的初值 —— 必须在 lib 里初始化,
+#   否则调用方在 `set -u` 下会因"未绑定变量"直接退出(实测踩到 ⇒ 门 rc=1 而不是 rc=3)✗
+PI_PORTS=""; PI_SS_OK=0
+PI_PIDFILES=""; PI_PROD_PIDFILES=""
+PI_PROD_PORTS=""
+PI_PORT_PIDS=""
+PI_CV=""; PI_CV_READ_OK=0
+PI_DESC_SEEN=" "
+
+pi_valid_pid() {   # 严格:纯十进制正整数,且拒绝 0
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+    0*)          return 1 ;;
+    *)           return 0 ;;
+  esac
+}
+
+pi_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+
+# ⭐ 用 sed 解析 /proc/<pid>/stat 的 PPid 字段
+#   ⛔ 禁止 `awk '{print $4}'`:comm 含空格时字段会错位(审计 fix #4)✗
+#   格式: `pid (comm) state ppid ...` ⇒ 贪婪吃掉 `(...)` 才是对的 ✓
+pi_ppid() {
+  sed -E 's/^[0-9]+ \(.*\) [A-Z] ([0-9]+) .*/\1/' "/proc/$1/stat" 2>/dev/null
+}
+
+pi_pgid() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
+
+# ⭐ 自身 + 全部祖先(最多 64 层)⇒ 打印为 " pid pid ... " (两端带空格,便于整词匹配)
+pi_self_chain() {
+  local p="$$" out=" $$ " n=0 pp
+  p="${PPID:-0}"
+  while [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "1" ] && [ "$n" -lt 64 ]; do
+    out="$out$p "
+    pp="$(pi_ppid "$p")"
+    # 解析失败/不前进 ⇒ 停止(不得死循环)
+    [ -n "$pp" ] && [ "$pp" != "$p" ] || break
+    p="$pp"; n=$((n+1))
+  done
+  printf '%s' "$out"
+}
+
+pi_is_self_or_ancestor() {   # rc=0 ⇒ 是(⇒ 不许杀)
+  local pid="$1" chain
+  chain="$(pi_self_chain)"
+  case "$chain" in *" $pid "*) return 0 ;; esac
+  return 1
+}
+
+# ⚠️ 先判可读再读:否则对已死 pid 会在 stderr 冒 `tr: No such file or directory` 噪声
+#    (审计 A 报告的问题;功能无影响,但会污染调用方日志)
+pi_cmdline() { [ -r "/proc/$1/cmdline" ] || return 0; tr '\0' ' ' < "/proc/$1/cmdline"; }
+
+# ⭐ CUDA_VISIBLE_DEVICES(设置 PI_CV / PI_CV_READ_OK)
+pi_cv() {
+  local pid="$1" line
+  PI_CV=""; PI_CV_READ_OK=0
+  [ -r "/proc/$pid/environ" ] || return 1
+  line="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -m1 '^CUDA_VISIBLE_DEVICES=')"
+  [ -n "$line" ] || return 0
+  PI_CV_READ_OK=1
+  PI_CV="${line#CUDA_VISIBLE_DEVICES=}"      # ⭐ 前缀剥离,禁止手算偏移 ✓
+  PI_CV="$(printf '%s' "$PI_CV" | tr -d ' ')"
+  return 0
+}
+
+# ⭐ 该 pid 监听的全部端口(结果写入 PI_PORTS,每行一个)。
+#   ⚠️ 必须用【输出全局变量】而不是 stdout:否则调用方的 $(...) 会开子 shell,
+#   PI_SS_OK 传不回来 ⇒ 又会退化成"读不到却静默放行" ✗(审计 fix #2)
+#   审计 fix #3:不得 `break` 只取第一条(否则生死由 ss 输出顺序决定 ✗)
+pi_all_ports() {
+  local pid="$1" tmp rc p
+  PI_PORTS=""; PI_SS_OK=0
+  tmp="$(mktemp 2>/dev/null)" || { PI_SS_OK=0; return 1; }
+  timeout 5 ss -ltnp >"$tmp" 2>/dev/null; rc=$?
+  [ "$rc" = "0" ] && PI_SS_OK=1
+  # `pid=$pid,` 带逗号 ⇒ 防止 pid=114 误匹配 pid=1145 ✓
+  while IFS= read -r p; do
+    case "$p" in *:*) PI_PORTS="$PI_PORTS${p##*:}"$'\n' ;; esac
+  done < <(awk -v want="pid=$pid," 'index($0,want){print $4}' "$tmp")
+  rm -f "$tmp"
+  return 0
+}
+
+# ⭐ 该 pid 监听的生产端口(写入 PI_PROD_PORTS,每行一个)
+#   ⛔ 2026-10-07 独立审计:原来只调用 pi_all_ports 而不看返回码 ⇒
+#      pi_prod_hit 里那句"端口证据读不到 ⇒ fail-closed"是**死代码** ✗
+#      ⇒ 现在:ss 失败 ⇒ **返回 1**(调用方据此判"证据缺失 ⇒ 不可杀")✓
+pi_prod_ports_of() {
+  local pid="$1" p
+  pi_all_ports "$pid" || return 1
+  PI_PROD_PORTS=""
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case " $PROD_PORTS " in *" $p "*) PI_PROD_PORTS="$PI_PROD_PORTS$p"$'\n' ;; esac
+  done <<<"$PI_PORTS"
+  [ "$PI_SS_OK" = "1" ] || return 1
+  return 0
+}
+
+# ⭐ 内容严格等于 <pid> 的 *.pid 文件名 ⇒ 写入 PI_PIDFILES(每行一个)
+#   rc=1 ⇒ 目录不可读(证据缺失 ⇒ 调用方必须判"不可杀" ✓)
+pi_pidfiles_of() {
+  local pid="$1" d="${2:-$PROC_LOGDIR}" f v
+  PI_PIDFILES=""
+  [ -d "$d" ] && [ -r "$d" ] && [ -x "$d" ] || return 1
+  for f in "$d"/*.pid; do
+    [ -f "$f" ] || continue
+    v="$(cat "$f" 2>/dev/null)" || continue
+    [ "$v" = "$pid" ] && PI_PIDFILES="$PI_PIDFILES$(basename "$f")"$'\n'
+  done
+  return 0
+}
+
+# ⭐ 其中命中【生产名单】的 ⇒ 写入 PI_PROD_PIDFILES(每行一个);rc=1 ⇒ 目录不可读
+pi_prod_pidfiles_of() {
+  local pid="$1" d="${2:-$PROC_LOGDIR}" f
+  PI_PROD_PIDFILES=""
+  pi_pidfiles_of "$pid" "$d" || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if printf '%s\n' "$f" | grep -qE "$PROD_PIDFILES_RE"; then
+      PI_PROD_PIDFILES="$PI_PROD_PIDFILES$f"$'\n'
+    fi
+  done <<<"$PI_PIDFILES"
+  return 0
+}
+
+# ⭐ 监听 <port> 的 pid(结果写入 PI_PORT_PIDS,每行一个;PI_SS_OK 同步)
+#   ⛔ 审计 G9:`awk '$4 ~ ":814"'` 会把 `:8143` 也算命中 ⇒ **必须按 `:` 切分后整段相等** ✗
+pi_port_listeners() {
+  local port="$1" tmp rc
+  PI_PORT_PIDS=""; PI_SS_OK=0
+  tmp="$(mktemp 2>/dev/null)" || return 1
+  timeout 5 ss -ltnp >"$tmp" 2>/dev/null; rc=$?
+  [ "$rc" = "0" ] && PI_SS_OK=1
+  while IFS= read -r p; do
+    [ -n "$p" ] && PI_PORT_PIDS="$PI_PORT_PIDS$p"$'\n'
+  done < <(awk -v want="$port" '
+             $1=="LISTEN" { n=split($4,a,":"); if (n>0 && a[n]==want) print $0 }
+           ' "$tmp" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+  rm -f "$tmp"
+  return 0
+}
+
+# ⭐ 综合"生产证据"判定 —— 供 runner 在停【自己的】实例之前做归属校验 ✓
+#   rc=0 ⇒ 命中生产证据(调用方必须【拒绝停】),并把原因打到 stdout
+#   判据:我们自己的祖先链、生产 PID 文件、生产端口、命令行里的生产端口、
+#        以及该 pid 的【父链上】有生产证据(挡住"停生产的子进程"这个洞,如 VLLM::EngineCore)✓
+#   ⚠️ 证据读不到(PID 文件目录不可读)也算命中 ⇒ **fail-closed** ✓
+pi_prod_hit() {
+  local pid="$1" _p _n
+  if pi_is_self_or_ancestor "$pid"; then echo "自身/祖先链"; return 0; fi
+  if ! pi_prod_pidfiles_of "$pid"; then echo "PID 文件目录不可读(证据缺失)"; return 0; fi
+  if [ -n "$PI_PROD_PIDFILES" ]; then
+    echo "生产PID文件:$(printf '%s' "$PI_PROD_PIDFILES" | paste -sd, -)"; return 0
+  fi
+  if ! pi_prod_ports_of "$pid"; then echo "端口证据读不到(证据缺失)"; return 0; fi
+  if [ -n "$PI_PROD_PORTS" ]; then
+    echo "生产端口:$(printf '%s' "$PI_PROD_PORTS" | paste -sd, -)"; return 0
+  fi
+  if pi_cmdline_has_prod_port "$pid"; then echo "命令行写了生产端口"; return 0; fi
+  # ⭐ 父链检查:生产的【子进程】(EngineCore/Worker)自己既不在生产 PID 文件里、
+  #    也不监听生产端口 ⇒ 只看它自己会漏判 ⇒ 必须往上看祖先 ✓
+  _p="$(pi_ppid "$pid")"; _n=0
+  while [ -n "$_p" ] && [ "$_p" != "0" ] && [ "$_p" != "1" ] && [ "$_n" -lt 64 ]; do
+    if ! pi_prod_pidfiles_of "$_p"; then echo "父进程 pid=$_p 的 PID 文件证据读不到(证据缺失)"; return 0; fi
+    if [ -n "$PI_PROD_PIDFILES" ]; then
+      echo "父进程 pid=$_p 在生产 PID 文件里($(printf '%s' "$PI_PROD_PIDFILES" | paste -sd, -))"; return 0
+    fi
+    if ! pi_prod_ports_of "$_p"; then echo "父进程 pid=$_p 的端口证据读不到(证据缺失)"; return 0; fi
+    if [ -n "$PI_PROD_PORTS" ]; then
+      echo "父进程 pid=$_p 监听生产端口($(printf '%s' "$PI_PROD_PORTS" | paste -sd, -))"; return 0
+    fi
+    if pi_cmdline_has_prod_port "$_p"; then echo "父进程 pid=$_p 命令行写了生产端口"; return 0; fi
+    _p="$(pi_ppid "$_p")"; _n=$((_n+1))
+  done
+  return 1
+}
+
+# ⭐ 该 pid 的后代里是否有【生产证据】(停一棵树之前用)✓ rc=0 ⇒ 有(拒停)
+pi_prod_hit_tree() {
+  local root="$1" d why
+  if why="$(pi_prod_hit "$root")"; then echo "pid=$root:$why"; return 0; fi
+  for d in $(pi_descendants "$root"); do
+    if why="$(pi_prod_hit "$d")"; then echo "后代 pid=$d:$why"; return 0; fi
+  done
+  return 1
+}
+
+# ⭐ 命令行里是否【显式】写了生产端口(防御 ss 看不到属主时的漏判)✓
+#   只做"拦截"用途:命中 ⇒ 判不可杀 ✓
+pi_cmdline_has_prod_port() {
+  local pid="$1" cl p
+  cl="$(pi_cmdline "$pid")"
+  for p in $PROD_PORTS; do
+    case "$cl" in
+      *"--port $p "*|*"--port $p"|*"--port=$p "*|*"--port=$p") return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# ⭐ 命令行是否像一个 vLLM API server(仅用于"放行路径"的入口判据 ⇒ 保守)
+pi_cmd_is_vllm() {
+  local cl; cl="$(pi_cmdline "$1")"
+  case "$cl" in *"-m vllm.entrypoints"*) return 0 ;; esac
+  return 1
+}
+
+# ⭐ 该 pid 的全部后代(BFS,纯 PID 派生 ⇒ 不用进程名)✓ 每行一个
+#   用 PI_DESC_SEEN 做去重,防止 ppid 环导致重复输出/死循环 ✓
+#
+# ⛔⛔ 2026-10-07 独立审计抓出的真 bug(我写的):原来把整层 frontier 拼成一个字符串再
+#   喂给 `ps --ppid "$frontier"` ⇒ ① 只有【第一层】会被查一次就停(第二层再也查不到)
+#    ② 更糟:拼出来的字符串带【前导空格】⇒ 本机 procps-ng 3.3.17 对
+#       `ps -o pid= --ppid " 1"` 直接 SIGABRT(core dumped, rc=134)✗
+#    ⇒ 实测后果:对生产 114597 只返回 122254/122257,而真正的 Worker 孙进程被漏掉 ⇒
+#       "后代逐个体检"与"杀后验尸"都会在第二层静默失效 ✗
+#    ⇒ 现在:逐个父 pid 单独查(不拼串),next 用 ${next:+…} 拼接(无前导空格)✓
+pi_descendants() {
+  local root="$1" frontier="$1" next c f
+  PI_DESC_SEEN=" "
+  # ⭐ 2026-10-07 独立审计:ps 不可用/失败时**必须返回非 0**,不能静默返回空 ✗
+  #   (否则"后代体检"与"杀后验尸"会退化成只查主 pid,却仍打印"已验尸 ✓" ⇒ fail-open)
+  ps -o pid= -p $$ >/dev/null 2>&1 || return 1
+  while [ -n "$frontier" ]; do
+    next=""
+    for f in $frontier; do
+      # ⚠️ 不能拿 `ps --ppid X` 的退出码当"ps 失败":**没有子进程时它本来就返回 1** ✗
+      #   (实测:据此判失败 ⇒ 每个叶子节点都让 pi_descendants 返回 1 ⇒ proc.sh stop 全部 REFUSE)
+      #   ⇒ 只在函数开头探一次 ps 可用性;这里只把"空输出"当"无子进程" ✓
+      for c in $(ps -o pid= --ppid "$f" 2>/dev/null | tr -d ' '); do
+        case "$c" in ''|*[!0-9]*) continue ;; esac
+        case "$PI_DESC_SEEN" in *" $c "*) continue ;; esac
+        PI_DESC_SEEN="$PI_DESC_SEEN$c "
+        printf '%s\n' "$c"
+        next="${next:+$next }$c"
+      done
+    done
+    frontier="$next"
+  done
+}
+
+# ⭐ 名字合法性:实例名会直接拼进 `<name>.pid` 路径 ⇒ 必须拒绝路径穿越/空格 ✓
+pi_valid_name() {
+  case "${1:-}" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    .|..)                return 1 ;;
+    *)                   return 0 ;;
+  esac
+}

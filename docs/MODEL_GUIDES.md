@@ -151,6 +151,68 @@ XIAOTU_GPF_STAGE=1  ...        # staging 三段 dma/asm/tr;dma 大 ⇒ 上传带
 > `[vllm-xtu-moe] GPU prefill ACTIVE: first <N> tokens >= threshold <T>`。
 > **⇒ 测 prefill 性能之前先 grep 这一行**;没有它,得到的数字是 **CPU 口径**,不能与 GPU 口径的数字放在同一张表里比较。
 
+### 0.2b ⭐⭐⭐ **选型判据：看「KV 压缩方式 + MoE 占比」，不看参数量**（用户 2026-10-06 经验 + 本仓核对）
+
+> ⭐ **用户原话（开发 qfn 时发现）**：
+> *"虽然社区普遍反映 qfn 比较小比较快，但是对我们的架构来说它并不友好，
+>  它的稠密层/共享专家大，**每 token 的 kv-cache 代价也大**，倒是 moe 比较小……
+>  但是**显存占用一点都不小**（相比更大很多的 ds41f）"*
+
+**为什么会这样（机制 ✓）**：本架构把【专家】搬到 CPU、【非专家】留在 GPU，所以真实成本是
+
+```
+主机内存需求 ≈ MoE 专家权重      ← 我们有 1.5 TB，便宜 ✓
+显存需求     ≈ 非专家权重 + KV(seq × per_token)   ← A100 48 GB，贵 ✗
+⇒ ⇒ 所以判据是【MoE : 非专家之比】+ 【KV/token】，而【不是】模型绝对大小 ✗
+```
+
+**结构事实（从两个 config 核对，可复现 ✓）**
+
+| 维度 | **ds41f** | **qfn** |
+|---|---|---|
+| 注意力类型 | ⭐ **MLA**（单组 latent） | **GQA** |
+| `num_key_value_heads` | ⭐ **1** | 2 |
+| `head_dim` | **512** | 256 |
+| 层数 | 40 | 48 |
+| 全注意力层占比 | 全部 | ⭐ **1/4**（`full_attention_interval=4`） |
+| 线性/SSM 层 | 无 | ⭐ **有**（`linear_*` / `mamba_ssm_dtype`） |
+| 稀疏索引器 | 有 | 有（`indexer_*`） |
+| vocab | 129,280 | ⭐ **248,320**（1.9×） |
+| MoE 专家数 / 专家中间维 | 384 / 2,304 | 512 / ⭐ **640** |
+| hidden | 5,120 | 2,560 |
+
+**⭐⭐⭐ 更精确：ds41f 那个「官方 feature」到底是什么（用户 2026-10-06 指出 + 本仓核对 ✓）**
+
+> 用户原话：*"ds41f 的一个官方 feature 就是大大降低了每 token 的 kv-cache size"* ✓
+
+它是**两项叠加**（都是 ds41f 官方带来的，不是我们加的✗）：
+
+| 项 | 作用 | 本仓证据 |
+|---|---|---|
+| ⭐ **MLA**（Multi-head Latent Attention）| 单组 latent（`num_key_value_heads=1`, `head_dim=512`）而非多组 K/V | config 核对 ✓ |
+| ⭐⭐ **CED**（decoder-side SWA bounded replay，上游 **#56752**）| ⭐ **每 token KV：~5437 B ⇒ ~2106 B**（−61% ✓）| `README.md:26`、`CHANGELOG.md:31-32`、`EXPERIMENTS.md` B84 ✓ |
+
+```
+⇒ 实测对账：1M 上下文只需 KV ~2.2 GiB；我们池 2.5 GiB ⇔ 1,190,518 token ⇒ ⭐ 2.2 KiB/token ✓
+⇒ 开关：`serve_v41.sh` 的 `CED=0/1`（默认 1）；`CED=0` 会加 `--no-swa-bounded-replay`✗
+   （上游复用 `CacheConfig.swa_bounded_replay`，**没有独立 CED 旗标**⇒ A/B 必须各起一次服务 ✗）
+```
+
+⇒ ⇒ ⭐⭐⭐ **所以选型的第一条判据应是【是否有这类官方 KV 压缩】**：
+**MLA + CED 类 ≫ 纯 GQA ≫ 纯 MHA** ✓。**qfn 是 GQA（无 MLA 压缩）**⇒ KV 不仅不小，而且我们的预算模型会**系统性地低估**它 ✗
+
+> ⚠️ **本仓已有约束：`docs/MODEL_GUIDES.md` 本身就写着「不要按 `config.json` 推算每 token KV」** ✗
+> （我在 2026-10-06 又犯了一次，且算错 ✗）⇒ **要比就拿两者的 `GPU KV cache size: N tokens` 与池字节数同口径比** ✓
+
+**⇒ 结论（经用户实测经验确认 ✓）**
+1. ⭐⭐ **qfn 的【每 token 显存代价】远大于 ds41f**（用户：很确定）✗
+   ⇒ 机理：**MLA 的 KV 压缩强得多**（ds41f 实测 **2.2 KiB/token**：池 2.5 GiB 装 1,190,518 token ✓）
+   而 qfn 是 GQA + 只有 1/4 层全注意力 + 线性层 state + 稀疏索引器 ✗
+   ⚠️ **精确倍数本仓尚无同口径实测记录** ✗（要比就要拿两者的 `GPU KV cache size: N tokens` 与池字节数 ✓）
+2. ⭐ **qfn 在 ds41f 的地方反而“大”**：vocab 1.9×（logits/embedding 张量加倍 ✗）、稠密与线性层很多、而专家只有 640 中间维（对我们意味着主机内存省不出优势 ✗）
+3. ⭐⭐ **以后选型建议**：优先 **MLA 类**（KV 压缩强 ✓）+ **MoE 占比高**；
+   社区“小模型快”的经验是**单卡纯 GPU 视角**，在本架构（专家在 CPU）下**失效** ✗
+
 ### 0.2 资源估算
 
 | 资源 | 估算方式 |

@@ -40,7 +40,8 @@ prev=""
 for spin in $SPINS; do
   tag="spin${spin}"
   for t in "$tag" "$prev" aba_new ilp23 blk23 prof23 nat_k5; do [ -n "$t" ] && stop_server "$t"; done; sleep 8
-  MODE=dsv4 TAG="$tag" PORT=8070 TP=1 MAXLEN=262144 SEQS=128 MAX_NBT=8192 \
+  # ⭐ 2026-10-07 审计修:PORT=8070 是生产端口 ⇒ 调试实例改用 8091(见 ab_serve_kernel.sh 同条)✓
+  MODE=dsv4 TAG="$tag" PORT=8091 TP=1 MAXLEN=262144 SEQS=128 MAX_NBT=8192 \
     GPU_UTIL=0.85 KV_DTYPE=fp8_ds_mla KV_MEM_BYTES=8589934592 THREADS=192 OMP=96 \
     EAGER=0 EP=0 GPUS=2 ENV_EXTRA="XIAOTU_CD_TIMING=1 XIAOTU_MOE_SPIN_IDLE_US=$spin" \
     SPEC="$SPEC" scripts/tune_serve.sh >/dev/null 2>&1 || { echo "serve failed spin=$spin" | tee -a "$OUT"; continue; }

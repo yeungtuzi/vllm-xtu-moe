@@ -69,14 +69,21 @@ for sid,bad,first,n in h:
 while true; do
   # ⭐ A28 后新增:崩溃关键词告警(aten::new_empty / EngineDeadError ⇒ 说明 A28 修法未生效,需回滚)
   CL=$(ls -t "$LOGDIR"/v41_8070.[0-9]*.log 2>/dev/null | head -1)
-  if [ -n "$CL" ] && grep -qaE "aten::new_empty|EngineDeadError" "$CL" 2>/dev/null; then
+  # ⭐ 只看【新增行】:记录已扫过的 offset ⇒ 历史命中不会每轮重报 ✓
+  OFFS="$OUT/.crash_scan_offset"
+  CUR=0; [ -n "$CL" ] && CUR=$(stat -c %s "$CL" 2>/dev/null || echo 0)
+  PREV=$(cat "$OFFS" 2>/dev/null || echo 0)
+  if [ "$CUR" -lt "$PREV" ]; then PREV=0; fi     # 日志轮转 ⇒ 从头扫
+  if [ -n "$CL" ] && [ "$CUR" -gt "$PREV" ] && tail -c +$((PREV+1)) "$CL" 2>/dev/null | grep -qaE "aten::new_empty|EngineDeadError"; then
     TS=$(date '+%Y%m%d-%H%M%S'); D="$OUT/CRASH-$TS"; mkdir -p "$D"
-    grep -aE "aten::new_empty|EngineDeadError" "$CL" | tail -20 > "$D/crash_lines.txt"
+    tail -c +$((PREV+1)) "$CL" 2>/dev/null | grep -aE "aten::new_empty|EngineDeadError" | tail -20 > "$D/crash_lines.txt"
+    echo "崩溃关键词命中(新增部分)" > "$D/README.txt"
     cp -f "$CL" "$D/engine.log" 2>/dev/null
     nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv > "$D/gpu.txt" 2>/dev/null
     echo "⚠️ A28 修法后仍出现崩溃关键词 ⇒ 需回滚 ACT_RESERVE 或继续排查" > "$D/README.txt"
     echo "[$(date '+%F %T')] 🚨 崩溃关键词命中 ⇒ 现场 $D"
   fi
+  [ -n "$CL" ] && echo "$CUR" > "$OFFS"     # ⭐ 记下已扫位置 ✓
   HITS=$(python3 -c "$PY" 2>/dev/null)
   MARKS=$(python3 -c "$TITLE_PY" 2>/dev/null)
   # 过滤掉已经抓过的会话(避免对老标记反复触发)
@@ -125,7 +132,7 @@ except Exception as e:
 MPY
     nvidia-smi --query-gpu=index,utilization.gpu,memory.used,power.draw --format=csv > "$D/gpu.txt" 2>/dev/null
     # 4) ⭐ 进程态对照:一个【极短】的新请求(若它也异常 ⇒ 进程被污染 ⇒ 需重启)
-    $R/../anaconda3/envs/vllm-xiaotu-moe/bin/python - <<PY >> "$D/control_request.txt" 2>&1
+    /home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python - <<PY >> "$D/control_request.txt" 2>&1
 import requests
 r=requests.post("http://127.0.0.1:8070/v1/chat/completions",
   json={"model":"DeepSeek-V4.1-Flash","max_tokens":16,"temperature":0.0,

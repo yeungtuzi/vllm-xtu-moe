@@ -10,7 +10,7 @@
 #   ☆ B(可疑,告警):有请求在跑,但 prompt+generation 计数 **连续 >MAXSTALL 分钟不变**,且 GPU 满载
 #       ⇒ 可能是极慢的 step,也可能卡死 ⇒ 告警并留档,由人判断 ✓
 set -uo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 L="$HERE/../dev-docs/report/tuning/logs"
 INTERVAL="${INTERVAL:-30}"; MAXSTALL="${MAXSTALL:-600}"     # 秒
 OUT="$L/watch_hang.log"

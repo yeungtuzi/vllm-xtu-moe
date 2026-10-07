@@ -51,3 +51,7 @@ report/tuning/replay/dsh_*.jsonl
 # 所以内部文档(开发纪律、详细调优记录、内部报告、pptx/pdf)一律不进版本库,
 # 只保留在本地工作副本 / 独立的私有仓库里。对外发布的是 docs/ 与 RELEASE_NOTES_*.md。
 dev-docs/
+
+# ---- doc_write.sh 的独占锁文件(R36:共享文档写入必须独占)------------------
+# 锁文件是 <file>.lock(0 字节占位);只忽略仓库根层那些(dev-docs/ 已被整体忽略)
+*.lock

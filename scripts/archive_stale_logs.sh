@@ -13,7 +13,7 @@
 set -uo pipefail
 DAYS="${DAYS:-3}"
 DRY="${DRY:-0}"
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 L="$HERE/../dev-docs/report/tuning/logs"
 cd "$L" || exit 0
 [ -d archive ] || mkdir -p archive

@@ -4,7 +4,7 @@
 # 为什么需要它:2026-10-04 14:42:36 那次卡死,两个 worker 处于 State=R / wchan=0(用户态自旋),
 # GPU 93–96% / 245–258 W 却 **零 token 产出** ⇒ 若当时有这一条命令,证据链就完整了 ✓
 set -uo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd)"; L="$HERE/../dev-docs/report/tuning/logs"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; L="$HERE/../dev-docs/report/tuning/logs"
 GAP="${GAP:-8}"
 TS=$(date +%Y%m%d-%H%M%S); OUT="$L/hang_$TS"; mkdir -p "$OUT"
 log(){ echo "$@" | tee -a "$OUT/summary.txt"; }

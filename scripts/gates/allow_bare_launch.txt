@@ -1,0 +1,33 @@
+# allow_bare_launch.txt —— G8 的【文件级豁免名单】
+#   格式: <相对路径或 glob><TAB><理由>
+#
+# ⚠️ 纪律:每一行都必须写明"为什么这个文件【按设计】要裸起后台进程"或"这是显式技术债"。
+#   不许写"懒得改"。G8 对【未列入本文件】的任何新裸起仍然 fatal ✓
+#
+# ── 一、proc.sh spawn 的【载荷脚本】(按设计豁免,不是债)─────────────────────
+#    这些脚本正是 `proc.sh spawn <name> bash scripts/serve_*.sh` 里的那个 payload:
+#    它内部用 nohup/setsid 把【真正的 python 服务】交出去,然后自己退出 ——
+#    bringup 注释已记录该模型("proc.sh 的 PID 文件记的是包装脚本,真服务 PID 靠端口派生 + adopt 认领")。
+#    ⇒ 让载荷脚本再去调 proc.sh spawn 会变成"嵌套管理",且丢失 adopt 认领语义 ✗
+scripts/serve_mainline.sh	载荷脚本:内部 nohup 把真服务交出去后退出;PID 由端口派生 + proc.sh adopt 认领(bringup 注释已记录)
+scripts/serve_glm53_mainline.sh	载荷脚本:同上(serve_* 家族统一模型)
+
+# ── 二、runner 的裸起 = 【显式技术债】(尚未迁移到 proc.sh spawn)────────────
+#    这些 runner 自己写 PID 文件与日志(同单元可见 `echo $! > …pid` / `> $log`),
+#    可追溯性由它们自己承担 ⇒ 不是"日志丢了"那一类事故;但确实不符合 AGENTS 第 0 条第 2 项
+#    ("启动进程必须走 proc.sh spawn")。迁移需要逐个改臂/阶段的生命周期,属【后续工作】,
+#    不在本次验收必备集(G1/G2/G3/G4/G5/G7)内。★ 每迁一个就删一行 ✓
+scripts/ab_lvllm_matrix.sh	技术债:自写 pidfile+log(abmx_$arm.pid);待迁移到 proc.sh spawn
+scripts/bench_random_12cells.sh	技术债:自写 pidfile+log;待迁移到 proc.sh spawn
+scripts/bench_resident_sweep.sh	技术债:自写 pidfile+log;待迁移到 proc.sh spawn
+scripts/longprefill_probe.sh	技术债:自写 pidfile+log;待迁移到 proc.sh spawn
+scripts/glm53_status.sh	技术债:状态脚本里嵌了"起服务"动作;待迁移到 proc.sh spawn
+dev-docs/report/tuning/probes/ced_v41_ab.sh	技术债:自写 log;待迁移到 proc.sh spawn
+dev-docs/report/tuning/probes/mem_footprint.sh	技术债:自写 log;待迁移
+dev-docs/w4a8-assets/phase_run.sh	技术债:自写 log;待迁移
+dev-docs/w4a8-assets/run_accept_safe.sh	技术债:自写 log;待迁移
+
+# ── 三、测试夹具 ─────────────────────────────────────────────────────────
+scripts/tests/test_whoami_gate.sh	测试夹具:setsid sleep 300 造一个"无身份证据"的进程;只在临时目录里跑,绝不作用于真实服务
+dev-docs/glm_256k_mbt8192_test.sh	技术债:自写 log(TAG/LOG);待迁移到 proc.sh spawn
+dev-docs/glm_fp8_prefill_probe.sh	技术债:自写 log(TAG/LOG);待迁移到 proc.sh spawn

@@ -27,6 +27,9 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# ⭐ 2026-10-07 审计修:归属证据一律走【唯一真源】(pi_prod_hit / pi_alive …)✓
+# shellcheck source=lib_proc_identity.sh
+. "$ROOT/scripts/lib_proc_identity.sh"
 ENVDIR="${BENCH_ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}"
 PY="$ENVDIR/bin/python"
 export PATH="$ENVDIR/bin:$PATH" HF_HUB_OFFLINE=1 VLLM_USE_FLASHINFER_SAMPLER=0
@@ -48,15 +51,41 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$RUN"; }
 step(){ printf '\n=== STEP %s: %s ===\n' "$1" "$2" | tee -a "$RUN"; }
 
 freegpu() {
-  local f p
+  local f p why
   for f in "$LOGD"/lp_*.pid; do
     [ -f "$f" ] || continue; p=$(cat "$f" 2>/dev/null)
-    [ -n "$p" ] && { kill -9 -"$(ps -o pgid= -p "$p" 2>/dev/null|tr -d ' ')" 2>/dev/null; kill -9 "$p" 2>/dev/null; }
+    # ⭐ 2026-10-07 审计修(major):PID 文件内容先过 pi_valid_pid(拒绝空/非数字/`0*`)——
+    #   `kill -9 0` = 对本进程组发 SIGKILL(自杀);`kill -9 -1` = 广播级误杀 ⇒ 必须拒绝 ✗
+    if ! pi_valid_pid "$p"; then
+      printf '⛔ freegpu 拒绝:PID 文件 %s 内容非法(%s)⇒ 不可杀,中止本轮 ✗\n' "$f" "'${p:-空}'" | tee -a "$RUN" >&2
+      return 1
+    fi
+    # ⭐ 2026-10-07 审计修:杀【本脚本 PID 文件派生】的 pid 之前,先做归属校验:
+    #   命中生产证据(生产 PID 文件/生产端口/自身祖先链/证据读不到)⇒ 打印原因 + 整轮中止 ✓
+    #   ⛔ fail-closed:宁可不跑,也不许误杀生产 ✗
+    if why="$(pi_prod_hit "$p")"; then
+      printf '⛔ freegpu 拒绝:pid=%s(来自 %s)命中生产证据:%s ⇒ 中止本轮,不杀任何进程 ✗\n' \
+        "$p" "$f" "$why" | tee -a "$RUN" >&2
+      return 1
+    fi
+    # ⭐ 2026-10-07 审计修(major):进程组号也过数值守卫(`kill -9 -0` = 打自己的进程组 ⇒ 自杀)✗
+    # ⛔ 2026-10-07 独立审计(blocker):不再 `kill -9 -PGID` —— 进程组成员 ≠ 我们的后代,
+    #   生产 API 的 pgid!=pid 且组长可能已 DEAD ⇒ 组里会混进别人的进程 ✗
+    #   ⇒ 只 kill 本实例 pid 文件里的那个 pid;残留下游由"等显存"超时如实报错 ✓
+    if pi_valid_pid "$p"; then kill -9 "$p" 2>/dev/null; fi
+    kill -9 "$p" 2>/dev/null
   done
-  for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
-  local i=0; while [ $i -lt 60 ]; do
+  # ⛔ 2026-10-07 审计修:删除 `for p in $(nvidia-smi --query-compute-apps=pid …); do kill -9 "$p"; done`
+  #   —— 它把【全机所有 GPU 进程】当目标,会杀掉同机共存的其它服务
+  #      (LMCache 服务自身也用 CUDA,本机已因此被误杀两次)✗✗
+  #   ⇒ 改为【只等待显存释放】;等待超时 ⇒ 醒目报错并中止,而不是去杀别的进程 ✓
+  local i=0
+  while [ $i -lt 60 ]; do
     nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q . || return 0
     sleep 5; i=$((i+1)); done
+  printf '⛔ freegpu 超时:GPU 上仍有【不是本脚本 PID 文件派生】的进程占卡 ⇒ 中止本轮;请人工用 PID 文件/端口确认,不再按模式补杀 ✗\n' \
+    | tee -a "$RUN" >&2
+  return 1
 }
 
 wait_ready() { # port pidfile log timeout tagname
@@ -130,7 +159,8 @@ launch() { # tagname port extra_env...
   # KV cap 必须与 MAXLEN 匹配:池要装得下 max_model_len 才能起服务。
   # 默认 2 GiB 只够 32K;保证 1M 上下文要 ~19.05 GiB(引擎反算 19,505 B/token)。
   local kv="${KV_CACHE_BYTES:-2147483648}"
-  freegpu; rm -f "$LOGD/$tag.pid"
+  # ⭐ 2026-10-07 审计修:freegpu 命中生产证据/等待超时 ⇒ 必须真的中止(不能只是它自己 return 1)✓
+  freegpu || return 1; rm -f "$LOGD/$tag.pid"
   setsid env PYTHONPATH="$XTU_TREE" TAG="$tag" PORT="$port" \
     GPU_UTIL="$UTIL" SPEC_K=0 SEQS="$SEQS" MAXLEN="$MAXLEN" MBT="$MBT" \
     KV_CACHE_BYTES="$kv" \

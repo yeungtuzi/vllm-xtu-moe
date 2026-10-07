@@ -12,7 +12,7 @@
 # 用法: INTERVAL=1 DURATION=2400 bash scripts/dense_sample.sh      # 1 秒一次,最多 40 分钟
 #       bash scripts/proc.sh spawn dense_sample env INTERVAL=1 DURATION=2400 bash scripts/dense_sample.sh
 set -uo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd)"; L="$HERE/../dev-docs/report/tuning/logs"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; L="$HERE/../dev-docs/report/tuning/logs"
 INTERVAL="${INTERVAL:-1}"; DURATION="${DURATION:-2400}"
 TS=$(date +%Y%m%d-%H%M%S); OUT="$L/dense_$TS"; mkdir -p "$OUT"
 CSV="$OUT/samples.csv"; PFLOG="$OUT/pf_progress.txt"
