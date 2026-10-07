@@ -13,14 +13,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 LOGS="$ROOT/dev-docs/report/tuning/logs"
 TAG="${TAG:-nat_k5}"
-PORT="${PORT:-8070}"
+PORT="${PORT:-8096}"
 SKIP_SERVE="${SKIP_SERVE:-0}"
 MODEL_DIR="${MODEL_DIR:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/master}"
 SPEC="${SPEC:-{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"probabilistic\",\"model\":\"$MODEL_DIR\"}}"
 
 if [ "$SKIP_SERVE" != "1" ]; then
   pid="$(cat "$LOGS/$TAG.pid" 2>/dev/null || true)"
-  pi_stop_pid_safe "$pid" || return 1
+  # ⭐ N2 修:本行在【顶层】(不在函数里),`return 1` 只会报错、**不会中止** ✗
+#   ⇒ 必须显式 exit 1(否则"停不掉/被拒"之后仍会继续启动,与 F2 的原意相反)
+pi_stop_pid_safe "$pid" || { echo "[nat-curve] ⛔ 停止旧实例被拒/未停 ⇒ 中止,不启动" >&2; exit 1; }
   MODE=dsv4 TAG="$TAG" PORT="$PORT" TP=1 MAXLEN=262144 SEQS=128 MAX_NBT=8192 \
     GPU_UTIL=0.85 KV_DTYPE=fp8_ds_mla KV_MEM_BYTES=8589934592 \
     THREADS=192 OMP=96 EAGER=0 EP=0 GPUS=2 SPEC="$SPEC" \

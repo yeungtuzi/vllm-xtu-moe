@@ -28,7 +28,7 @@ N1="${N1:-4}"; N2="${N2:-8}"; OUT="${OUT:-200}"; IN_LEN="${IN_LEN:-1024}"
 kill_port() {
   local pid
   pid="$(cat "$LOGS/$1.pid" 2>/dev/null || true)"
-  pi_stop_pid_safe "$pid" || return 1
+  pi_stop_pid_safe "$pid" || { echo "  ⛔ 停止旧实例被拒/未停 ⇒ 中止,不启动" >&2; exit 1; }
 }
 
 # 先把上一轮的实验服务(grp_c)关掉,避免抢 8070 端口/抢 CPU 线程

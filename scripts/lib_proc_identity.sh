@@ -37,7 +37,7 @@ PROD_PORTS='8070 5555 8080 9090 3000 9100 8787'
 
 # ⭐ 所有"证据输出"全局变量的初值 —— 必须在 lib 里初始化,
 #   否则调用方在 `set -u` 下会因"未绑定变量"直接退出(实测踩到 ⇒ 门 rc=1 而不是 rc=3)✗
-PI_PORTS=""; PI_SS_OK=0
+PI_PORTS=""; PI_SS_OK=0; PI_PORT_LISTEN_N=0
 PI_PIDFILES=""; PI_PROD_PIDFILES=""
 PI_PROD_PORTS=""
 PI_PORT_PIDS=""
@@ -166,11 +166,16 @@ pi_prod_pidfiles_of() {
 # ⭐ 监听 <port> 的 pid(结果写入 PI_PORT_PIDS,每行一个;PI_SS_OK 同步)
 #   ⛔ 审计 G9:`awk '$4 ~ ":814"'` 会把 `:8143` 也算命中 ⇒ **必须按 `:` 切分后整段相等** ✗
 pi_port_listeners() {
-  local port="$1" tmp rc
-  PI_PORT_PIDS=""; PI_SS_OK=0
+  local port="$1" tmp rc p   # ⭐ 2026-10-07 复审:必须声明 p —— 否则 read -r p 会写进调用者的 local p(bash 动态作用域)⇒ wait_port 循环被清空 ✗
+  PI_PORT_PIDS=""; PI_SS_OK=0; PI_PORT_LISTEN_N=0
   tmp="$(mktemp 2>/dev/null)" || return 1
   timeout 5 ss -ltnp >"$tmp" 2>/dev/null; rc=$?
   [ "$rc" = "0" ] && PI_SS_OK=1
+  # ⭐ N4 修:单独统计【匹配到的 LISTEN 行数】—— 用于区分
+  #   "没人听"(0 行 ⇒ DOWN)与"有人在听但属主读不到"(>0 行且无 pid ⇒ UNKNOWN)✓
+  PI_PORT_LISTEN_N="$(awk -v want="$port" '
+             $1=="LISTEN" { n=split($4,a,":"); if (n>0 && a[n]==want) c++ }
+             END { print c+0 }' "$tmp")"
   while IFS= read -r p; do
     [ -n "$p" ] && PI_PORT_PIDS="$PI_PORT_PIDS$p"$'\n'
   done < <(awk -v want="$port" '
@@ -299,7 +304,23 @@ pi_valid_name() {
 #   返回:0 = 已停 / 本就没在跑 ; 1 = 拒绝(非法 PID / 命中生产证据 / 证据缺失)或未死
 pi_stop_pid_safe() {
   local pid="$1" desc p why still i
-  case "${pid:-}" in ''|0|1|*[!0-9]*) echo "  ⛔ 非法 PID('${pid:-空}')⇒ 不可杀(kill 0=自杀, -1=广播)" >&2; return 1 ;; esac
+  # ⭐ N1 修:复用唯一真源的 pi_valid_pid(它已拒绝 空/非数字/**前导零 0***)✗
+  #   原来手写 `''|0|1|*[!0-9]*` 漏了前导零:`kill -0 00` 会被 kill(2) 当 **pid 0 = 本进程组** ✗
+  if [ -z "${pid:-}" ]; then
+    echo "  (PID 文件为空 ⇒ 本就没在跑)"; return 0     # ⭐ M3:空值不是"非法",而是"无事可做"
+  fi
+  if ! pi_valid_pid "$pid"; then
+    echo "  ⛔ 非法 PID('$pid')⇒ 不可杀(前导零会被 kill(2) 当 pid 0 = 自杀进程组;-1 = 广播)" >&2
+    return 1
+  fi
+  [ "$pid" != "1" ] || { echo "  ⛔ 拒绝 pid=1" >&2; return 1; }
+  # ⭐ N3 修:PID 文件里放的不该是 vLLM 引擎/worker 子进程;若是,极可能是陈旧 pidfile 的 pid
+  #   被复用(被 reparent 的生产 EngineCore 会让 pi_prod_hit 漏判)⇒ 一律拒杀 ✓
+  case "$(pi_cmdline "$pid")" in
+    *"VLLM::EngineCore"*|*"VLLM::Worker"*)
+      echo "  ⛔ 拒绝:pid=$pid 是 vLLM 引擎/worker 子进程(PID 文件不该指向它;疑 pid 复用)⇒ 不杀" >&2
+      return 1 ;;
+  esac
   if why="$(pi_prod_hit "$pid")"; then echo "  ⛔ 拒绝:pid=$pid 命中生产证据:$why ⇒ 不杀任何进程" >&2; return 1; fi
   if ! pi_alive "$pid"; then echo "  already dead: pid=$pid"; return 0; fi
   if ! desc="$(pi_descendants "$pid")"; then echo "  ⛔ 后代枚举失败(ps 不可用)⇒ 证据缺失,不杀" >&2; return 1; fi

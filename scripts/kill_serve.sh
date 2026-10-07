@@ -61,7 +61,9 @@ _wait_dead() {
 # ⭐ 显式数字 PID:归属校验 ⇒ TERM ⇒ 等 ⇒ KILL ⇒ 验尸(全程只按 PID)✓
 stop_pid() {
   local pid="$1" why _g _grc
-  case "$pid" in ''|0|1|*[!0-9]*) echo "⛔ 拒绝:非法 PID '$pid'(0/-1 会被 kill 解释成进程组/广播)✗" >&2; return 1 ;; esac
+  # ⭐ N1 修:复用 pi_valid_pid(它连【前导零】一起拒 —— `kill -0 00` = pid 0 = 自杀进程组)✗
+  if ! pi_valid_pid "${pid:-}"; then echo "⛔ 拒绝:非法 PID '$pid'(前导零会被 kill(2) 当 pid 0;-1 = 广播)✗" >&2; return 1; fi
+  [ "$pid" != "1" ] || { echo "⛔ 拒绝 pid=1" >&2; return 1; }
   # ⛔ 命中生产证据(PID 文件/端口/自身祖先链/父链/证据读不到)⇒ 拒绝,exit≠0 ✓
   if why="$(pi_prod_hit "$pid")"; then
     echo "⛔ 拒绝:pid=$pid 命中生产证据:$why" >&2

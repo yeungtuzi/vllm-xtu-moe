@@ -143,6 +143,9 @@ port_state() {   # 结果写入 PORT_STATE;rc:0=UP 1=DOWN 2=UNKNOWN
   pi_port_listeners "$1"
   if [ "$PI_SS_OK" != "1" ]; then PORT_STATE=UNKNOWN; return 2; fi
   if [ -n "$PI_PORT_PIDS" ]; then PORT_STATE=UP; return 0; fi
+  # ⭐ N4 修:有 LISTEN 行、但属主 pid 读不到(如别的 uid 的 socket)⇒ **UNKNOWN,不是 DOWN** ✗
+  #   原先判 DOWN ⇒ 安全门不拒、启动决策"该起"、--status 反报 DOWN,与 F1 同类 fail-open
+  if [ "${PI_PORT_LISTEN_N:-0}" -gt 0 ]; then PORT_STATE=UNKNOWN; return 2; fi
   PORT_STATE=DOWN; return 1
 }
 # 兼容旧调用:只有【确定在跑】才为真(UNKNOWN 不再算"在跑")

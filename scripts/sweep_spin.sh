@@ -22,7 +22,7 @@ SPEC='{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"proba
 
 stop_server() {
   local pid; pid="$(cat "$LOGS/$1.pid" 2>/dev/null || true)"
-  pi_stop_pid_safe "$pid" || return 1
+  pi_stop_pid_safe "$pid" || { echo "  ⛔ 停止旧实例被拒/未停 ⇒ 中止,不启动" >&2; exit 1; }
 }
 
 cpu_cores() {  # $1=pid $2=秒 → 该窗口内平均占用核数
