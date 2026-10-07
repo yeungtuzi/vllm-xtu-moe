@@ -7,6 +7,8 @@
 #
 # License: Apache-2.0
 set -uo pipefail
+# ⭐ 唯一真源:归属证据 + 安全按 PID 停止(2026-10-07 审计修 F2)
+_SD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "$_SD/lib_proc_identity.sh"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 LOGS="$ROOT/dev-docs/report/tuning/logs"
@@ -18,12 +20,7 @@ SPEC="${SPEC:-{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample
 
 if [ "$SKIP_SERVE" != "1" ]; then
   pid="$(cat "$LOGS/$TAG.pid" 2>/dev/null || true)"
-  if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid" 2>/dev/null || true
-    for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 2; done
-    kill -KILL "$pid" 2>/dev/null || true
-    [ -n "$pid" ] && pkill -9 -P "$pid" 2>/dev/null || true
-  fi
+  pi_stop_pid_safe "$pid" || return 1
   MODE=dsv4 TAG="$TAG" PORT="$PORT" TP=1 MAXLEN=262144 SEQS=128 MAX_NBT=8192 \
     GPU_UTIL=0.85 KV_DTYPE=fp8_ds_mla KV_MEM_BYTES=8589934592 \
     THREADS=192 OMP=96 EAGER=0 EP=0 GPUS=2 SPEC="$SPEC" \

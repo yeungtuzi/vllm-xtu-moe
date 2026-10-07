@@ -287,3 +287,38 @@ pi_valid_name() {
     *)                   return 0 ;;
   esac
 }
+
+# ⭐⭐ 按【单个 PID】安全停止(2026-10-07 独立审计 F2 的统一修法)✓
+#   背景:sweep_spec_k / ab_serve_kernel / run_nat_curve / sweep_spin 原先对
+#   **未校验的 pidfile 内容**直接 `kill -TERM/-KILL` 并 `pkill -9 -P`:
+#     ① pidfile 是 `0` ⇒ `kill 0` = 杀本进程组(自杀);`-1` ⇒ 广播级误杀 ✗
+#     ② 陈旧 pidfile 的 pid 被生产复用时,会先 TERM 生产 ✗
+#     ③ `pkill -9 -P` 杀的是"所有子进程",**不过归属门** ✗
+#   ⇒ 现在统一走这里:数值守卫 → 归属门(自身/祖先、生产 PID 文件/端口/cmdline、父链)
+#      → 只对 main + 已枚举后代发信号 → **验尸**(未死则如实报错,不谎报)✓
+#   返回:0 = 已停 / 本就没在跑 ; 1 = 拒绝(非法 PID / 命中生产证据 / 证据缺失)或未死
+pi_stop_pid_safe() {
+  local pid="$1" desc p why still i
+  case "${pid:-}" in ''|0|1|*[!0-9]*) echo "  ⛔ 非法 PID('${pid:-空}')⇒ 不可杀(kill 0=自杀, -1=广播)" >&2; return 1 ;; esac
+  if why="$(pi_prod_hit "$pid")"; then echo "  ⛔ 拒绝:pid=$pid 命中生产证据:$why ⇒ 不杀任何进程" >&2; return 1; fi
+  if ! pi_alive "$pid"; then echo "  already dead: pid=$pid"; return 0; fi
+  if ! desc="$(pi_descendants "$pid")"; then echo "  ⛔ 后代枚举失败(ps 不可用)⇒ 证据缺失,不杀" >&2; return 1; fi
+  for p in $desc; do
+    if why="$(pi_prod_hit "$p")"; then echo "  ⛔ 拒绝:后代 pid=$p 命中生产证据:$why ⇒ 不杀任何进程" >&2; return 1; fi
+  done
+  for p in "$pid" $desc; do kill -TERM "$p" 2>/dev/null || true; done
+  i=0
+  while [ "$i" -lt 60 ]; do
+    still=""; for p in "$pid" $desc; do pi_alive "$p" && still="$still $p"; done
+    [ -z "$still" ] && { echo "  stopped pid=$pid(含后代;已验尸 ✓)"; return 0; }
+    sleep 1; i=$((i+1))
+  done
+  for p in "$pid" $desc; do kill -KILL "$p" 2>/dev/null || true; done
+  i=0
+  while [ "$i" -lt 10 ]; do
+    still=""; for p in "$pid" $desc; do pi_alive "$p" && still="$still $p"; done
+    [ -z "$still" ] && { echo "  stopped pid=$pid(强杀后已验尸 ✓)"; return 0; }
+    sleep 1; i=$((i+1))
+  done
+  echo "  ⛔ FAILED:发信号后仍存活:$still ⇒ 需人工处置" >&2; return 1
+}

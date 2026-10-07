@@ -9,6 +9,8 @@
 #
 # License: Apache-2.0
 set -uo pipefail
+# ⭐ 唯一真源:归属证据 + 安全按 PID 停止(2026-10-07 审计修 F2)
+_SD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "$_SD/lib_proc_identity.sh"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 LOGS="$ROOT/dev-docs/report/tuning/logs"
@@ -20,11 +22,7 @@ PY=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python
 stop_server() {
   local pid
   pid="$(cat "$LOGS/$1.pid" 2>/dev/null || true)"
-  [ -n "${pid:-}" ] || return 0
-  kill -TERM "$pid" 2>/dev/null || true
-  for _ in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 2; done
-  kill -KILL "$pid" 2>/dev/null || true
-  pkill -9 -P "$pid" 2>/dev/null || true
+  pi_stop_pid_safe "$pid" || return 1
 }
 
 run_leg() {

@@ -59,7 +59,7 @@ VLLM_ENV=(
               #    GPU 预填触发率=0(device=cuda 0 次 ✗)⇒ 丢掉 1.41× 预填优化
               #    安全改由 ACT_RESERVE 承担(见下)
               #    原 8192(用户 2026-10-03 指示)⇒ 崩溃回归;详见 BUG_REGISTRY A19/A20/A21/A24
-  MAXSEQS=1
+  MAXSEQS=2    # ⭐ 2026-10-07 用户定案:并发 1 → 2(实测运行实例仍是 1,改了要下次 bringup 才生效)
   GPUS=1,2        # 【2026-10-03 用户明令】TP=2 一律 GPU1+GPU2(GPU0 只有 PCIe x8)⇒ IRON_RULES R19
   TP=2
   GPU_UTIL=0.90
@@ -134,12 +134,32 @@ fi
 #   会在活生产 8070 上照常起第二个全量实例(2026-10-04 OOM 事故同型)✗
 #   ⇒ 改为唯一真源:pi_port_listeners(`:` 整段相等 + timeout + PI_SS_OK)✓
 #   ⭐ 证据读不到(ss 失败)一律【当作在跑】⇒ fail-closed ✓
-port_up() {
+# ⭐⭐ 2026-10-07 独立审计 F1:原来的二元 port_up 把"ss 读不到"当成"在跑" ✗
+#   对【安全门】(非 8070 + 生产在跑 ⇒ 拒绝)方向正确,但同一函数被 12 个调用点复用 ⇒
+#   在【启动决策】处方向相反:会**静默跳过**启动监控栈/LMCache/coremap,
+#   而 --status/⑤汇总还会**反报 RUNNING** ✗
+#   ⇒ 改为三态:UP / DOWN / UNKNOWN(= 证据读不到)✓
+port_state() {   # 结果写入 PORT_STATE;rc:0=UP 1=DOWN 2=UNKNOWN
   pi_port_listeners "$1"
-  [ "$PI_SS_OK" = "1" ] || return 0
-  [ -n "$PI_PORT_PIDS" ]
+  if [ "$PI_SS_OK" != "1" ]; then PORT_STATE=UNKNOWN; return 2; fi
+  if [ -n "$PI_PORT_PIDS" ]; then PORT_STATE=UP; return 0; fi
+  PORT_STATE=DOWN; return 1
 }
-wait_port() { local p="$1" n="${2:-60}"; for _ in $(seq 1 "$n"); do port_up "$p" && return 0; sleep 5; done; return 1; }
+# 兼容旧调用:只有【确定在跑】才为真(UNKNOWN 不再算"在跑")
+port_up() { port_state "$1" || return 1; }
+# ⭐ 启动决策用这个:确定 DOWN ⇒ 该起;UP ⇒ 跳过;UNKNOWN ⇒ **拒绝静默跳过,报错中止** ✓
+port_maybe_start() {   # rc:0=该起(确定 DOWN) 1=已在跑 2=无法判定(调用方必须中止)
+  port_state "$1" && return 1
+  [ "$PORT_STATE" = "DOWN" ] && return 0
+  return 2
+}
+# ⭐ 状态展示用:UNKNOWN 必须显示 UNKNOWN,不得显示 RUNNING ✗
+port_label() { port_state "$1"; case "$PORT_STATE" in UP) echo RUNNING;; DOWN) echo DOWN;; *) echo UNKNOWN;; esac; }
+wait_port() {   # ⭐ UNKNOWN 不算就绪(继续等),等不到就失败 ✓
+  local p="$1" n="${2:-60}" _
+  for _ in $(seq 1 "$n"); do port_up "$p" && return 0; sleep 5; done
+  return 1
+}
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
 # ⭐ 统一 spawn:被拒(rc≠0)⇒ 立刻退出 —— 绝不在"门拒绝"之后继续后面的动作 ✓
@@ -168,10 +188,11 @@ recycle_helper() {   # <name> <cmd...>
 
 if [ "${1:-}" = "--status" ]; then
   say "生产状态"
-  printf '  %-24s %s\n' "8070 vLLM" "$(port_up 8070 && echo RUNNING || echo DOWN)"
-  printf '  %-24s %s\n' "5555 LMCache MP" "$(port_up 5555 && echo RUNNING || echo DOWN)"
-  printf '  %-24s %s\n' "8080 LMCache HTTP" "$(port_up 8080 && echo RUNNING || echo DOWN)"
-  for p in 9090 3000 9100 8787; do printf '  %-24s %s\n' "监控 $p" "$(port_up $p && echo RUNNING || echo DOWN)"; done
+  printf '  %-24s %s\n' "8070 vLLM" "$(port_label 8070)"
+  printf '  %-24s %s\n' "5555 LMCache MP" "$(port_label 5555)"
+  printf '  %-24s %s\n' "8080 LMCache HTTP" "$(port_label 8080)"
+  for p in 9090 3000 9100 8787; do printf '  %-24s %s\n' "监控 $p" "$(port_label $p)"; done
+  port_state 8070; [ "$PORT_STATE" != "UNKNOWN" ] || echo "  ⚠️ 8070 端口状态无法判定(ss 失败)⇒ 上面的 RUNNING/DOWN 不可信" >&2
   echo "  真服务 PID 文件: $(cat "$LOGDIR/vllm_prod_8070.pid" 2>/dev/null || echo '无')"
   curl -s --noproxy 127.0.0.1 --max-time 10 "http://127.0.0.1:8070/v1/models" | head -c 200; echo
   exit 0
@@ -180,7 +201,9 @@ fi
 # ⭐ 同机多实例硬门(AGENTS「同机多实例纪律」)—— 必须放在【任何 spawn 之前】✓
 #   来由(2026-10-07 自查):原先它排在 ①LMCache 之后 ⇒ 用 PORT=8071 起第二个实例时,
 #   会先把 LMCache 服务端拉起来、再拒绝 ⇒ "拒绝了却已经动了东西" ✗ ⇒ 现在提到最前 ✓
-if [ "$PORT" != "8070" ] && port_up 8070; then
+# ⭐ 安全门:生产"确定在跑"或"无法判定"都拒绝(fail-closed)✓
+port_state 8070; _prod_st=$?
+if [ "$PORT" != "8070" ] && { [ "$_prod_st" -eq 0 ] || [ "$PORT_STATE" = "UNKNOWN" ]; }; then
   echo "⛔ 生产 8070 正在运行,而本次要起 PORT=$PORT 的第二个实例 ⇒ 拒绝执行(同机多实例纪律)✗" >&2
   echo "   若确需如此:必须由用户决定是否暂停生产(AGENTS 第 1 条:每次都要当次许可)✗" >&2
   exit 3
@@ -190,7 +213,9 @@ say "① LMCache 服务端"
 # ⭐ 数组元素【不是】shell 变量 ⇒ 必须先取出真实变量(否则 set -u 会直接退出 ✗)
 _LMCACHE_ON="${LMCACHE:-0}"
 if [ "$_LMCACHE_ON" = "1" ]; then
-  if port_up 5555; then
+  port_maybe_start 5555; _lm=$?
+  if [ "$_lm" = "2" ]; then echo "  ⛔ :5555 端口状态无法判定(ss 失败)⇒ 中止 ✗" >&2; exit 1; fi
+  if [ "$_lm" = "1" ]; then
     echo "  已在跑 ⇒ 跳过 ✓"
   else
     spawn_or_die lmcache_server env "${LMCACHE_ENV[@]}" bash scripts/serve_lmcache.sh
@@ -202,7 +227,9 @@ fi
 
 say "② vLLM 生产(LMCache + 512K + GPU 预填 + dspark ✓)"
 # (同机多实例硬门已提到 ① 之前 —— 见上面)✓
-if port_up "$PORT"; then
+port_maybe_start "$PORT"; _vp=$?
+if [ "$_vp" = "2" ]; then echo "  ⛔ :$PORT 端口状态无法判定(ss 失败)⇒ 中止(不静默跳过启动)✗" >&2; exit 1; fi
+if [ "$_vp" = "1" ]; then
   echo "  $PORT 已在跑 ⇒ 跳过启动 ✓(要重启请先 proc.sh stop vllm_prod_8070)"
 else
   spawn_or_die dsv41_prod env "${VLLM_ENV[@]}" bash scripts/serve_v41.sh
@@ -266,12 +293,15 @@ echo "  ✅ 真 PID=$APIP(PGID=$PG)已写入 $ADOPT_NAME.pid ✓;真服务日志
 say "④ 监控栈"
 if [ "$WITH_MONITORING" = "1" ]; then
   M="$MONITORING_ROOT"
-  port_up 9090 || spawn_or_die prometheus "$M/prometheus-2.45.6.linux-amd64/prometheus" \
+  port_maybe_start 9090; case $? in 0) : ;; 1) : ;; *) echo "  ⛔ :9090 端口状态无法判定(ss 失败)⇒ 拒绝静默跳过,中止 ✗" >&2; exit 1 ;; esac
+  [ "$PORT_STATE" = "UP" ] || spawn_or_die prometheus "$M/prometheus-2.45.6.linux-amd64/prometheus" \
     --config.file="$M/prometheus/prometheus.yml" --storage.tsdb.path="$M/prometheus/data" \
     --web.listen-address=127.0.0.1:9090 --web.enable-lifecycle
-  port_up 3000 || spawn_or_die grafana "$M/grafana-v11.4.0/bin/grafana" server \
+  port_maybe_start 3000; case $? in 0) : ;; 1) : ;; *) echo "  ⛔ :3000 端口状态无法判定(ss 失败)⇒ 中止 ✗" >&2; exit 1 ;; esac
+  [ "$PORT_STATE" = "UP" ] || spawn_or_die grafana "$M/grafana-v11.4.0/bin/grafana" server \
     --homepath "$M/grafana-v11.4.0" --config "$M/grafana/grafana.ini"
-  port_up 9100 || spawn_or_die node_exporter "$M/node_exporter-1.8.2.linux-amd64/node_exporter" \
+  port_maybe_start 9100; case $? in 0) : ;; 1) : ;; *) echo "  ⛔ :9100 端口状态无法判定(ss 失败)⇒ 中止 ✗" >&2; exit 1 ;; esac
+  [ "$PORT_STATE" = "UP" ] || spawn_or_die node_exporter "$M/node_exporter-1.8.2.linux-amd64/node_exporter" \
     --web.listen-address=127.0.0.1:9100 --collector.textfile.directory="$M/textfile"
   # 【2026-10-05 修】回收上一批监控助手 —— 否则 **每次 bringup 都留 2 个孤儿** ✗
   # 实测:一天内 10 次 bringup ⇒ 33 个孤儿(`coremap_png.py` / `textfile_exporter.py`)
@@ -281,7 +311,13 @@ if [ "$WITH_MONITORING" = "1" ]; then
   # 【规则·用户 2026-10-05】把"进程已消失满 3 天"的陈旧 .pid/日志打包归档 ✓
   bash scripts/archive_stale_logs.sh >/dev/null 2>&1 || true
   recycle_helper xtu_exporter "$PY" "$M/textfile_exporter.py" "$M/textfile/xtu.prom" || true
-  if ! port_up 8787; then
+  port_maybe_start 8787
+  case $? in
+    0) _start_coremap=1 ;;
+    1) _start_coremap=0 ;;
+    *) echo "  ⛔ :8787 端口状态无法判定(ss 失败)⇒ 中止 ✗" >&2; exit 1 ;;
+  esac
+  if [ "$_start_coremap" = "1" ]; then
     if bash scripts/proc.sh status coremap >/dev/null 2>&1; then
       echo "  ⚠️ coremap 进程在但 8787 未监听 ⇒ 不重复起(请排查)" >&2
     else
@@ -295,7 +331,7 @@ fi
 
 say "⑤ 汇总"
 for p in 8070 5555 8080 9090 3000 9100 8787; do
-  printf '  %-5s %s\n' "$p" "$(port_up "$p" && echo RUNNING ✓ || echo DOWN)"
+  printf '  %-5s %s\n' "$p" "$(port_label "$p")"
 done
 echo "  看板: http://127.0.0.1:3000/d/dsh-overview"
 echo "  冒烟: curl -s --noproxy 127.0.0.1 http://127.0.0.1:8070/v1/models"
