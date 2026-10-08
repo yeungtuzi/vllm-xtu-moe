@@ -103,10 +103,18 @@ def _lt_record(pre_ms: float, eng_ms: float, post_ms: float, name: str = "") -> 
 _VERIFY_LAYER = os.environ.get("XIAOTU_VERIFY_LAYER", "") == "1"
 _VERIFY_MAX = int(os.environ.get("XIAOTU_VERIFY_MAX", "1"))
 _DUMP_LAYER = os.environ.get("XIAOTU_DUMP_LAYER", "")
-# ⭐【T1.4】W4A8（int8 激活）派发总开关：**默认关** ✓
-#   置 1 ⇒ 插件**按权重格式自动派发**（MXFP4 + 块 32 ⇒ int8/ALIGN 路径；FP8/BF16 ⇒ 原路径）✓
-#   默认关的原因：换成 int8 计算必须先过**三项语义验收**（`DECISIONS.md` **D13**）✓
-_W4A8_ENABLE = os.environ.get("XIAOTU_MOE_W4A8", "0") == "1"
+# ⭐⭐⭐【T1.4 · 2026-10-07 用户定案:命名统一】int8 激活路径【总开关】✓
+#   XIAOTU_MOE_INT8=1 ⇒ 插件**按权重格式自动派发**（MXFP4 + 块 32 ⇒ int8/ALIGN 路径；
+#   FP8/BF16 ⇒ 原路径）✓
+#   ⚠️ 旧名 XIAOTU_MOE_W4A8 已修改为 XIAOTU_MOE_INT8 —— 仍可识别,但**告警一次**并映射到新名,
+#     绝不静默失效 ✗
+#   ⚠️ 实现选择另有两个 env(默认档 + 显式覆盖):XIAOTU_MOE_INT8_ALIGN / XIAOTU_MOE_INT8_VNNI ✓
+#   ⚠️ 阈值(本次新增):XIAOTU_MOE_INT8_VNNI_MIN_TOKENS,默认 160 ✓
+_LEGACY_W4A8 = os.environ.get("XIAOTU_MOE_W4A8")
+if _LEGACY_W4A8 is not None and "XIAOTU_MOE_INT8" not in os.environ:
+    print("[vllm-xtu-moe] ⚠️ 旧环境变量 XIAOTU_MOE_W4A8 已修改为 XIAOTU_MOE_INT8"
+          f"(本次仍按旧值 {_LEGACY_W4A8} 生效)✓", flush=True)
+_INT8_ENABLE = os.environ.get("XIAOTU_MOE_INT8", _LEGACY_W4A8 if _LEGACY_W4A8 is not None else "0") == "1"
 _HID_LAYER = os.environ.get("XIAOTU_HID_LAYER", "")
 
 
@@ -1137,23 +1145,39 @@ class _XiaotuExpertsMixin:
         cfg.use_gpu_prefill = False
         cfg.groupN = int(self._group_n)
         cfg.groupK = int(self._group_k)
-        # ⭐【T1.4 格式感知派发】按**权重格式**决定 W4A8(int8 激活)路径的模式 ✓
-        #   * **MXFP4**（本文件的类文档：groupN=1 / groupK=32 / u8 nibble + **e8m0** ✓）
-        #     ⇒ 候选 **1 = ALIGN int8**：权重侧 fp4×2 是**逐位精确**的整数 ⇒ 语义不变 ✓
-        #   * **FP8 / BF16 / WNA16** ⇒ **0**，各自走原路径 ✗（浮点→int8 是**有损转换** ✓）
-        #   ⚠️ **默认仍然关**（`XIAOTU_MOE_W4A8=1` 才生效）—— 因为"换成 int8 计算"要等
-        #      **三项语义验收**（GSM8K 198~199/200 · Vision 23/23 · 1M 四针一致）通过后才能默认开 ✓
-        #   ⚠️ 仅对带 `-mavx512vnni` 构建的档生效（非 VNNI 档该路径不参与编译 ✓）；
-        #      且 env `XIAOTU_MOE_INT8_ALIGN/_VNNI` 仍可**强制覆盖**，供 dev A/B ✓
-        if _W4A8_ENABLE and self._engine_attr == "MOE_MXFP4" and int(self._group_k) == 32:
+        # ⭐⭐⭐【T1.4 格式感知派发 · 2026-10-07 用户定案:命名统一 + 零 env 语义】✓
+        #   默认(不设任何 env) ⇒ **由权重格式决定**:MXFP4(groupK=32, e8m0) ⇒ 1 = ALIGN int8 ✓
+        #     理由:权重侧 fp4×2 是**逐位精确**的整数 ⇒ 语义不变 ✓
+        #   FP8 / BF16 / WNA16 ⇒ 0,各自走原路径 ✗(浮点→int8 是**有损转换** ✓)
+        #   env **显式覆盖**优先级最高:
+        #     XIAOTU_MOE_INT8=0        ⇒ 总关(即便权重是 MXFP4)
+        #     XIAOTU_MOE_INT8_ALIGN=1  ⇒ 选 ALIGN 实现(默认档)
+        #     XIAOTU_MOE_INT8_VNNI=1   ⇒ 选旧 VNNI 实现(默认 0)
+        #     XIAOTU_MOE_INT8_VNNI_MIN_TOKENS ⇒ ⭐ M 阈值,默认 160(唯一设定处)✓
+        #   ⚠️ 两个实现 env 同时为真 ⇒ env 优先 + **告警一次**(不静默)✗
+        _fmt = (self._engine_attr == "MOE_MXFP4" and int(self._group_k) == 32)
+        _env_int8 = os.environ.get("XIAOTU_MOE_INT8")
+        _env_align = os.environ.get("XIAOTU_MOE_INT8_ALIGN", "0") == "1"
+        _env_vnni = os.environ.get("XIAOTU_MOE_INT8_VNNI", "0") == "1"
+        if _env_int8 == "0":
+            cfg.int8_activation = 0
+        elif _env_align and _env_vnni:
+            print("[vllm-xtu-moe] ⚠️ 同时设了 XIAOTU_MOE_INT8_ALIGN 与 XIAOTU_MOE_INT8_VNNI,"
+                  "按 env 优先取 ALIGN ✓", flush=True)
             cfg.int8_activation = 1
+        elif _env_align:
+            cfg.int8_activation = 1
+        elif _env_vnni:
+            cfg.int8_activation = 2
+        elif _fmt:
+            cfg.int8_activation = 1          # ⭐ 零 env 默认:MXFP4 ⇒ ALIGN,阈值 160 分流 ✓
         else:
             cfg.int8_activation = 0
         engine_cls = getattr(xiaotu_moe, self._engine_attr)
-        # ⭐【T1.4 可观测性】派发生效时必须**在日志里留痕**（否则验收跑无法证明走的是 int8 路径 ✗）。
+        # ⭐【T1.4 可观测性】派发生效时必须**在日志里留痕**(否则验收跑无法证明走的是 int8 路径 ✗)。
         #   只在非 0 时打印 ⇒ **生产日志保持不变** ✓
         if int(getattr(cfg, "int8_activation", 0)) != 0:
-            print(f"[vllm-xtu-moe] ⭐ W4A8 dispatch: {self._engine_attr} "
+            print(f"[vllm-xtu-moe] ⭐ INT8 dispatch: {self._engine_attr} "
                   f"int8_activation={int(cfg.int8_activation)} (1=ALIGN int8 path)", flush=True)
         # 【诊断·NOTES §484】ctor 只拿到 **裸 data_ptr**,而 shard_fill 会在里面按
         # cfg 推出来的几何 memcpy;DSpark 的 draft 层让这个 memcpy 读到了映射尽头

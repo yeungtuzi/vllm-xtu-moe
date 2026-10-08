@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdlib>   // std::getenv / std::atoi
+#include <cstdio>    // std::fprintf(启动打印)
+
 // ---------------------------------------------------------------------------
 // 【T1.4 格式感知派发】W4A8（int8 激活）路径的 **进程级** 模式 ✓
 //
@@ -42,5 +45,34 @@ inline int g_cur_tokens = 0;                       // C++17 inline variable ⇒ 
 inline void set_cur_tokens(int m) { g_cur_tokens = m; }
 
 inline int cur_tokens() { return g_cur_tokens; }
+
+// ⭐⭐⭐【2026-10-07 用户定案 · 命名统一】本功能的【唯一】M 阈值环境变量 ✓
+//   XIAOTU_MOE_INT8_VNNI_MIN_TOKENS   默认 160
+//   语义:某次 forward 的 token 数(chunk = min(prompt, MBT))达到该值 ⇒ 开始走 int8(ALIGN)✓
+//   ⛔ 这是【唯一】设定该阈值的变量:旧名 XIAOTU_MOE_I8_MIN_M 只做"告警一次 + 映射到新名",
+//      绝不静默退回 fp32 ✗(见 USER_QA_LEDGER #111)
+//   ⚠️ 解析必须在【namespace scope】完成:若写成函数内 static,会生成线程安全初始化守卫
+//      (`__cxa_guard_acquire` ⇒ 原子读),在百万次 tile 上跨线程争用 ✗(本文件 353–360 行的教训)
+inline int g_min_tokens = [] {
+    if (const char* e = std::getenv("XIAOTU_MOE_INT8_VNNI_MIN_TOKENS")) {
+        return std::atoi(e);
+    }
+    if (const char* e = std::getenv("XIAOTU_MOE_I8_MIN_M")) {   // 旧名(唯一兼容入口)
+        std::fprintf(stderr,
+                     "[int8] ⚠️ 旧环境变量 XIAOTU_MOE_I8_MIN_M 已修改为 "
+                     "XIAOTU_MOE_INT8_VNNI_MIN_TOKENS(本次仍按旧值 %s 生效)✓\n", e);
+        return std::atoi(e);
+    }
+    return 160;                                                  // 默认:见上方口径说明
+}();
+
+inline int  min_tokens() { return g_min_tokens; }
+
+// 启动打印用:阈值来源("default" / "env" / "legacy_env")✓
+inline const char* g_min_tokens_source =
+    std::getenv("XIAOTU_MOE_INT8_VNNI_MIN_TOKENS") ? "env" :
+    (std::getenv("XIAOTU_MOE_I8_MIN_M")            ? "legacy_env" : "default");
+
+inline const char* min_tokens_source() { return g_min_tokens_source; }
 
 }  // namespace xiaotu_int8

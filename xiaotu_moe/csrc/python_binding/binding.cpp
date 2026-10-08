@@ -591,10 +591,29 @@ static void bind_moe_class(py::module& m, const char* name) {
             MOE* p = new MOE(cfg, as_ptr(w13), as_ptr(w2), as_ptr(w13_g), as_ptr(w2_g),
                              static_cast<const float*>(as_ptr(w13_global)),
                              static_cast<const float*>(as_ptr(w2_global)));
-            // 【T1.4 格式感知派发】把 cfg 的 W4A8 模式写进进程级存储 ✓
+            // 【T1.4 格式感知派发】把 cfg 的 INT8 模式写进进程级存储 ✓
             //   必须在**第一次 matmul 之前**（构造函数里 ⇒ 天然满足 ✓）。
             //   非 VNNI 档只是把值存下来、无人读取 ⇒ 零影响 ✓
             xiaotu_int8::set_activation(cfg.int8_activation);
+            // ⭐⭐⭐【2026-10-07 用户定案】启动必须打印 int8 模式与阈值(口径可核对)✓
+            //   格式:[int8] mode=ALIGN min_tokens=160 source=default|env|legacy_env
+            //   mode 按【本档是否真能走 int8】判定:
+            //     · cfg.int8_activation==2 ⇒ VNNI(旧 VNNI tile)
+            //     · cfg.int8_activation==1 ⇒ ALIGN
+            //     · 未显式开,但本档带 -mavx512vnni 且阈值>0 ⇒ ALIGN(按 M 分流)✓
+            //     · 其余(base 档 / 阈值<=0)⇒ off —— base 档**永不**走 int8 ✓
+            const char* _i8mode =
+#ifdef __AVX512VNNI__
+                cfg.int8_activation == 2 ? "VNNI"
+                : ((cfg.int8_activation == 1 ||
+                    (cfg.int8_activation != 0 && xiaotu_int8::min_tokens() > 0)) ? "ALIGN"
+                   : "off");
+#else
+                "off";   /* 非 VNNI 档:该路径不参与编译 ⇒ 恒 off ✓ */
+#endif
+            std::fprintf(stderr, "[int8] mode=%s min_tokens=%d source=%s\n",
+                         _i8mode, xiaotu_int8::min_tokens(),
+                         xiaotu_int8::min_tokens_source());
             // lk 链只给 num_processes/process_id:引擎自建跨 rank 归约(见 auto_ep_setup)
             auto_ep_setup((const void*)p, cfg);
             // 必须在任何 CUDA graph 捕获之前把解码 pinned 缓冲开好(R103)。
@@ -885,7 +904,7 @@ static void bind_moe_class(py::module& m, const char* name) {
                 // 用途:在服务里量出"该层纯 GPU 侧(注意力/dense+拷贝+派发)每层耗多少",
                 // 从而把 period 精确拆成 GPU 部分 与 CPU 部分。**绝不能用于正确性测试**。
                 // ⭐【2026-10-07】把【引擎调用级 token 数】广播给内核门控
-                //   (`M >= XIAOTU_MOE_I8_MIN_M ⇒ 走 int8`;见 xiaotu_int8_mode.h + 台账 #111)✓
+                //   (`M >= XIAOTU_MOE_INT8_VNNI_MIN_TOKENS ⇒ 走 int8`;见 xiaotu_int8_mode.h + 台账 #111)✓
                 //   ⚠️ 必须在 run_moe_and_ep 之前写:同一次调用的所有 worker 看到同一个值 ✓
                 xiaotu_int8::set_cur_tokens(qlen);
                 run_moe_and_ep(engine, qlen, k, hid, ids, wts, out, &ep_ms_last, &fwd_ms_last);
