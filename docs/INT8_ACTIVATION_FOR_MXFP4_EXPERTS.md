@@ -1,5 +1,13 @@
 # INT8 激活 × MXFP4 专家权重 —— 计算路径详解
 
+> ⚠️ **命名变更(2026-10-07,用户定案)**:本文件里出现的旧环境变量名**已修改为**下面的规范名 ——
+> `XIAOTU_MOE_W4A8` **已修改为** `XIAOTU_MOE_INT8`(int8 激活路径**总开关**,默认由权重格式决定);
+> `XIAOTU_MOE_INT8_ALIGN` **已修改为** `XIAOTU_MOE_INT8_ALIGN`(实现选择:ALIGN tile,默认档);
+> `XIAOTU_MOE_INT8_VNNI` **已修改为** `XIAOTU_MOE_INT8_VNNI`(实现选择:旧 VNNI tile,默认 0);
+> `XIAOTU_MOE_I8_MIN_M` **已修改为** `XIAOTU_MOE_INT8_VNNI_MIN_TOKENS`(⭐ M 阈值,**默认 160**,唯一设定处)。
+> 旧名仍被识别:会**告警一次**并映射到新名(**仍按旧值生效**),绝不静默退回 fp32 ✓
+
+
 > 本文是本次发布的详细说明版,面向**使用方**。概述见 [README](../README.md),
 > 原始实测数据见 [`EXPERIMENTS.md`](EXPERIMENTS.md)。
 > ⚠️ 文中标注"内部 harness"的复现命令**不随发行提供**(属本项目的内部开发工作区);其口径已在 §二/§三 写明,便于自行复刻。
@@ -70,7 +78,7 @@ qfn(第三方量化的 Qwen3.8-Flash-Next,**MXFP4-FP8**)。其中专家权重是
 W4A8 路径由**检查点量化格式驱动**,默认**不启用**:
 
 * 插件侧开关:`cfg.int8_activation`(`0`=off / `1`=ALIGN int8 / `2`=旧 VNNI 实现)
-* 环境变量:`XIAOTU_MOE_W4A8=1` 才打开
+* 环境变量:`XIAOTU_MOE_INT8=1` 才打开
 * 引擎变体:`avx512_bf16_vbmi_vnni`(int8 派发) 对比 `avx512_bf16_vbmi`(base 实现,生产默认)
 
 引擎构建:

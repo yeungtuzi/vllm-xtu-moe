@@ -1,7 +1,35 @@
 # Changelog
 
+> ⚠️ **命名变更(2026-10-07,用户定案)**:本文件里出现的旧环境变量名**已修改为**下面的规范名 ——
+> `XIAOTU_MOE_W4A8` **已修改为** `XIAOTU_MOE_INT8`(int8 激活路径**总开关**,默认由权重格式决定);
+> `XIAOTU_MOE_INT8_ALIGN` **已修改为** `XIAOTU_MOE_INT8_ALIGN`(实现选择:ALIGN tile,默认档);
+> `XIAOTU_MOE_INT8_VNNI` **已修改为** `XIAOTU_MOE_INT8_VNNI`(实现选择:旧 VNNI tile,默认 0);
+> `XIAOTU_MOE_I8_MIN_M` **已修改为** `XIAOTU_MOE_INT8_VNNI_MIN_TOKENS`(⭐ M 阈值,**默认 160**,唯一设定处)。
+> 旧名仍被识别:会**告警一次**并映射到新名(**仍按旧值生效**),绝不静默退回 fp32 ✓
+
+
 本文件记录 `vllm-xtu-moe` 的显著变更。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## [Unreleased]
+
+### Changed
+
+* ⭐ **环境变量改名(int8 激活路径),旧名仍兼容** —— 目标是让变量名自说明,并让 M 阈值只有**一个**设定处:
+
+  | 旧名 | **已修改为** | 语义 |
+  |---|---|---|
+  | `XIAOTU_MOE_W4A8=1` | `XIAOTU_MOE_INT8=1` | int8 激活路径**总开关**;不设时由**权重格式**决定(MXFP4+E8M0 ⇒ 1) |
+  | — | `XIAOTU_MOE_INT8_ALIGN=1` | 实现选择:ALIGN tile(**默认档**) |
+  | — | `XIAOTU_MOE_INT8_VNNI=1` | 实现选择:旧 VNNI tile(默认 0) |
+  | `XIAOTU_MOE_I8_MIN_M` | `XIAOTU_MOE_INT8_VNNI_MIN_TOKENS` | ⭐ **M 阈值,默认 160**;判据量 = 该次 forward 的 token 数(`chunk = min(prompt, MBT)`) |
+
+  * 旧名**不静默失效**:识别到旧名 ⇒ 打印**一次**告警并映射到新名(**仍按旧值生效**),绝不静默退回 fp32 ✓
+  * 启动打印一行口径:`[int8] mode=ALIGN min_tokens=160 source=default|env|legacy_env` ✓
+  * ⚠️ `XIAOTU_MOE_INT8=0` 才是"总关";`XIAOTU_MOE_INT8_VNNI=0` 只关**旧 VNNI 实现**,ALIGN 仍可能走。
+  * 默认 160 的口径:**Zen4 + THREADS=48 + 不绑核**;生产 `THREADS=60` ⇒ 生产采用前须按 60 口径重测(R35)。
 
 ---
 
@@ -19,7 +47,7 @@
   * 端到端(qfn · MXFP4-FP8 · 实验线 ①VNNI-int8):GSM8K 全量 200 题
     **base 193/200 · int8 193/200**,逐题一致 **194/200、净变化 0**;
     256K 四针 **两臂 4/4 + `finish_reason=stop`**;Vision 23 逐项一致 18/23。
-  * 开关:`XIAOTU_MOE_W4A8=1` + 引擎变体 `avx512_bf16_vbmi_vnni`;
+  * 开关:`XIAOTU_MOE_INT8=1` + 引擎变体 `avx512_bf16_vbmi_vnni`;
     **不设即退回 base 实现(行为逐字不变)** ✓
   * 内核级对拍:`w13`/`w2`/`s13`/`s2` 四张量**逐字节相同**;门控关 ≡ base、门控开 ≡ 重构前,均**逐字节一致**。
 * **MTP(多令牌预测)在 qfn 上打通** —— 修复 compressed-tensors 的 FP8 MoE 在块量化下把 scale 参数名

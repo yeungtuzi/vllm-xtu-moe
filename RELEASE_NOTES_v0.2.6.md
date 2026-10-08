@@ -1,5 +1,13 @@
 # v0.2.6 —— 自举开发:全程用自己开发的引擎作推理后端，打通 FP4 专家权重的 INT8 激活计算路径
 
+> ⚠️ **命名变更(2026-10-07,用户定案)**:本文件里出现的旧环境变量名**已修改为**下面的规范名 ——
+> `XIAOTU_MOE_W4A8` **已修改为** `XIAOTU_MOE_INT8`(int8 激活路径**总开关**,默认由权重格式决定);
+> `XIAOTU_MOE_INT8_ALIGN` **已修改为** `XIAOTU_MOE_INT8_ALIGN`(实现选择:ALIGN tile,默认档);
+> `XIAOTU_MOE_INT8_VNNI` **已修改为** `XIAOTU_MOE_INT8_VNNI`(实现选择:旧 VNNI tile,默认 0);
+> `XIAOTU_MOE_I8_MIN_M` **已修改为** `XIAOTU_MOE_INT8_VNNI_MIN_TOKENS`(⭐ M 阈值,**默认 160**,唯一设定处)。
+> 旧名仍被识别:会**告警一次**并映射到新名(**仍按旧值生效**),绝不静默退回 fp32 ✓
+
+
 **发布日期**:2026-10-06 · **上一版本**:[v0.2.5](RELEASE_NOTES_v0.2.5.md)(2026-10-03)
 
 ---
@@ -69,7 +77,7 @@ W4A8 路径由**检查点量化格式驱动**,**默认不启用**:
 | 层 | 开关 |
 |---|---|
 | 插件 | `cfg.int8_activation`:`0` = off(默认) / `1` = ALIGN int8 / `2` = 旧 VNNI 实现 |
-| 环境变量 | `XIAOTU_MOE_W4A8=1` |
+| 环境变量 | `XIAOTU_MOE_INT8=1` |
 | 引擎变体 | `avx512_bf16_vbmi_vnni`(int8 派发) vs `avx512_bf16_vbmi`(**base 实现,生产默认**) |
 
 构建 int8 派发变体:
@@ -147,7 +155,7 @@ agent 侧性能统计(本次会话;后端 = **DeepSeek-V4.1-Flash**,TP=2):
 
 ## 六、升级注意
 
-* **启用 INT8 激活路径**须**同时**满足:`XIAOTU_MOE_W4A8=1` **且**引擎变体为
+* **启用 INT8 激活路径**须**同时**满足:`XIAOTU_MOE_INT8=1` **且**引擎变体为
   `avx512_bf16_vbmi_vnni`;不设即退回 base 实现(**逐字不变** ✓)。
 * **不要**用"逐次 token 严格相等"做验收判据 —— 见 §二 的注 ✓
 * qfn 服务默认线程数现为 **120**(= 5 核/CCD);与生产同机时请做资源回避 ✓

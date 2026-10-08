@@ -416,20 +416,20 @@ namespace { const bool g_align8_env = [] {
 // 【T1.4 格式感知派发】env **或** cfg 派发（`activation()==1` = ALIGN int8 路径 ✓）
 //   同样保持无函数内 static（见上一条注释 ✓）
 static inline bool xiaotu_int8_align_on() {
-    if (g_align8_env || xiaotu_int8::activation() == 1) return true;
-    // ⭐⭐【2026-10-07 · 用户批准 · 修正版】`本次调用 token 数 >= XIAOTU_MOE_I8_MIN_M(默认 160)` ⇒ 也走 ALIGN ✓
-    //   ⚠️⚠️ 必须加在【这个唯一真源】里,而不是某个调用点 —— 本函数有三处调用
-    //     (`:734` 量化助手整函数派发 · `:1233` 门控序言 · 内含于 `xiaotu_int8_vnni_on` 的互斥判断),
-    //     ★ 只改一处会造成**自相矛盾的组合**:`i8a_pre_` 为真 ⇒ 白做 `with_wt` 预解码,
-    //       而 `:734` 仍走旧量化 ⇒ ALIGN tile 永不激活 ⇒ **比 fp32 还慢**(实测 M=987:55.66 vs 48.99)✗
-    //     (上一轮我就是这么失败的:见 USER_QA_LEDGER **#111**)
+    // ⭐⭐⭐【2026-10-07 用户定案】ALIGN 生效需要【两个条件同时成立】:
+    //   ① 允许 int8(实现选择):env `XIAOTU_MOE_INT8_ALIGN=1` 显式覆盖,
+    //      或插件按**权重格式**给出的默认档(`activation()==1`,MXFP4+E8M0)✓
+    //   ② M 到阈值:本次 forward 的 token 数 >= XIAOTU_MOE_INT8_VNNI_MIN_TOKENS(默认 160)✓
+    //   ⇒ ⚠️ 只有①没有② ⇒ 小 M(decode M≤16)上**变慢**(实测 M=1: int8 0.44ms vs fp32 0.27ms)✗
+    //     故阈值是"启用后的分界线",不是"总开关";总开关是①。
+    //   ⚠️ 阈值与来源都在 namespace scope 解析(`xiaotu_int8::g_min_tokens`),此处只是普通 load,
+    //      不引入函数内 static 的线程安全守卫 ✓
     //   依据:crossover 实测 ≈150(M=124: 7.02/7.42 · M=185: 9.97/**9.44** · M=987: 48.99/**32.08**)
-    //   语义:`cur_tokens()==0`(离线 harness/未写)⇒ 本条件恒假 ⇒ 零行为改变 ✓;`MIN_M<=0` ⇒ 关闭 ✓
-    static const int min_m = [] {
-        const char* e = std::getenv("XIAOTU_MOE_I8_MIN_M");
-        return e ? std::atoi(e) : 160;
-    }();
-    return (min_m > 0) && (xiaotu_int8::cur_tokens() >= min_m);
+    //   语义:`cur_tokens()==0`(离线 harness 未写)⇒ ② 恒假 ⇒ 零行为改变 ✓;`MIN_TOKENS<=0` ⇒ 强制 fallback ✓
+    if (g_align8_env) return true;                    // env 显式覆盖:不看 M ✓
+    if (xiaotu_int8::activation() != 1) return false; // 未允许 int8 ⇒ 旧路径 ✓
+    return (xiaotu_int8::min_tokens() > 0) &&
+           (xiaotu_int8::cur_tokens() >= xiaotu_int8::min_tokens());
 }
 
 #define XIAOTU_I8_OFF_MIN  (-24)  /* off = cmin + emin - 128 下限(acc ≈ 真值·2^-off,越负越险 ✓) */
