@@ -32,6 +32,7 @@
 > **📌 当前版本：v0.2.6**（2026-10-06）
 > ⚠️ **v0.2.7 未发布**(2026-10-08 用户决定):当天工作**未产生新的性能能力** ——
 > `MBT 6144→8192` 是**已知道**的配置收益,源自 Strata 的四条设想**三条被否、一条未做** ⇒ **不发布** ✓
+> ⛔ **并更正一条说法**：「0.2.7 才敢开 `MBT=8192`」**站不住** —— 本版**内存侧一行未改**（省 3.36 GiB 的消灭转置**已被否决** ✗）⇒ **0.2.6 同样能开 8192**（本会话用 8192 跑了一整天 ✓）。⚠️ 但**长稳（数小时级）是否 OOM / 退化，未曾验证** ✗。
 > 发行说明：[`RELEASE_NOTES_v0.2.6.md`](RELEASE_NOTES_v0.2.6.md)
 
 ---
@@ -95,7 +96,7 @@
 
 * 口径：**聚合吞吐**——`prefill (tok/s) = 并发数 × prompt_tokens / TTFT`、`decode (tok/s) = 并发数 × 1000 / median(ITL)`
   > `decode` 取 **median ITL**(相邻 token 间隔中位数)而不是 median TPOT:`median TPOT` 是**每请求平均**,会把**同一 step 里混进来的 prefill 工作**算进解码时间,导致长上下文 C=2 时被严重低估(实测同一批数据:median TPOT 口径下 MiMo 长 C=2 = 9.8,而 median ITL 口径 = **39.6**,真实争用只有 **1.36×**;GLM 更极端:2.9 vs **29.6**)。详见 `docs/EXPERIMENTS.md` B126。
-  （C=1 时即单流速率；等价于「该阶段的总 token 数 ÷ 该阶段墙钟」）。均由同一次 `vllm bench serve` 换算；
+  ⚠️ **勘误（2026-10-08，用户指出）**：`1/median(ITL)` **不是速度** ✗ —— 速度的定义是 **个数 ÷ 时间**；而 `median(1/x) != 1/median(x)` ⇒ **中位间隔的倒数不等于速率**。 本表该列**只能当【典型 token 间隔】的延迟指标看，不能当吞吐** ✓。 ⭐ **真实 decode 吞吐 = (输出 token 数 - 1) / (末 token 时刻 - 首 token 时刻)** ✓。均由同一次 `vllm bench serve` 换算；
   `decode` 取 **median ITL**（`mean` 会被极少数离群步拉高,`median TPOT` 会被混入的 prefill 拉低）。
   > ℹ️ **decode 与 C 的关系**:真实解码争用很小(倍率 **1.13–1.77×**,按 median ITL);早期表里曾出现「长 C=2 的 decode 明显低于 C=1」,那是 **median TPOT 被混入的 prefill 步污染**所致,另一部分来自把 `--max-num-seqs` 设成 1 导致 C=2 退化为串行。两者均已修正,判据见 `docs/EXPERIMENTS.md` **B124/B126**。
 * 数据集：**random 随机 token**，`--random-input-len` 固定为短 128 / 长 16384，输出 128；前缀缓存开；每格 8 个请求、**每格不同 seed**。
