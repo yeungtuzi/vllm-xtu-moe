@@ -416,7 +416,20 @@ namespace { const bool g_align8_env = [] {
 // 【T1.4 格式感知派发】env **或** cfg 派发（`activation()==1` = ALIGN int8 路径 ✓）
 //   同样保持无函数内 static（见上一条注释 ✓）
 static inline bool xiaotu_int8_align_on() {
-    return g_align8_env || xiaotu_int8::activation() == 1;
+    if (g_align8_env || xiaotu_int8::activation() == 1) return true;
+    // ⭐⭐【2026-10-07 · 用户批准 · 修正版】`本次调用 token 数 >= XIAOTU_MOE_I8_MIN_M(默认 160)` ⇒ 也走 ALIGN ✓
+    //   ⚠️⚠️ 必须加在【这个唯一真源】里,而不是某个调用点 —— 本函数有三处调用
+    //     (`:734` 量化助手整函数派发 · `:1233` 门控序言 · 内含于 `xiaotu_int8_vnni_on` 的互斥判断),
+    //     ★ 只改一处会造成**自相矛盾的组合**:`i8a_pre_` 为真 ⇒ 白做 `with_wt` 预解码,
+    //       而 `:734` 仍走旧量化 ⇒ ALIGN tile 永不激活 ⇒ **比 fp32 还慢**(实测 M=987:55.66 vs 48.99)✗
+    //     (上一轮我就是这么失败的:见 USER_QA_LEDGER **#111**)
+    //   依据:crossover 实测 ≈150(M=124: 7.02/7.42 · M=185: 9.97/**9.44** · M=987: 48.99/**32.08**)
+    //   语义:`cur_tokens()==0`(离线 harness/未写)⇒ 本条件恒假 ⇒ 零行为改变 ✓;`MIN_M<=0` ⇒ 关闭 ✓
+    static const int min_m = [] {
+        const char* e = std::getenv("XIAOTU_MOE_I8_MIN_M");
+        return e ? std::atoi(e) : 160;
+    }();
+    return (min_m > 0) && (xiaotu_int8::cur_tokens() >= min_m);
 }
 
 #define XIAOTU_I8_OFF_MIN  (-24)  /* off = cmin + emin - 128 下限(acc ≈ 真值·2^-off,越负越险 ✓) */
@@ -991,6 +1004,20 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         // 默认**关**(2026-09-11):实测只快 1.10×(TOTAL 1780→1616 µs,DEDUP=18 真实形状),
         // 而且在受控对拍的 me=2 用例上 max_rel 8.4e-3 > 项目门限 2e-3(fp32 路径同档
         // 只有 3.9e-4)⇒ 收益不足以为精度买单,保留代码+开关待后续再评估
+        // ⚠️⚠️【2026-10-07 原地修正】上面「项目门限 2e-3」的措辞**不准确**,不得再据此否决本路径 ✗：
+        //   · 2e-3 只是 `scripts/test_block23_equiv.py` 里的**一个脚本常量**,不是项目门限
+        //     （对 `IRON_RULES.md` / `BUG_REGISTRY.md` 的 grep **零命中**）;
+        //   · 本项目**实际接受**的包线更松：`BUG_REGISTRY` Tier A1 基准本身就是 `OK=7 BAD=1`,
+        //     唯一 BAD = me=1 档 `max_rel≈1.873e-02`（比这里的 8.4e-3 **还差 2.2×**）;
+        //   · 该常量的用途是给参考实现留**抓结构性 bug（错索引 / 错 scale）的余量**,
+        //     不是「精度必须优于 2e-3」;
+        //   ⇒ 「bf16 乘积够不够」应改由**端到端**裁决（GSM8K 200 / 256K 四针 / Vision 23）,
+        //     见 `dev-docs/USER_QA_LEDGER.md` **#90** ✓
+        // ⚠️ 另一条同轴依据：GPU 侧 fp8/fp4 tile 本就**解码成 bf16 再跑 bf16 MMA**
+        //   （`vllm_xiaotu_moe/gpu_prefill_fp8.py` 头注原文:"A100 has no FP8 tensor cores, so
+        //   the tile is decoded to bf16 and the MMA runs in bf16"）⇒ 只要求 CPU 侧必须 fp32
+        //   乘积是**不对称**的 ✓
+        // ⚠️ 本次修正**只改 dev 树**;主树同名副本待下次合并时一并带入。
         // (可能的精度来源:Zen4 vdpbf16ps 的成对乘积求和舍入)。置 1 可开启做实验。
         static const bool dotp16 = [] {
             const char* e = std::getenv("XIAOTU_MOE_DPBF16");

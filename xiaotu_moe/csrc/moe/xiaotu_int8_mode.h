@@ -28,4 +28,19 @@ inline void set_activation(int m) { g_activation = m; }
 
 inline int activation() { return g_activation; }
 
+// ⭐⭐【2026-10-07】本次【引擎调用级】的 token 数(M)—— 供"M >= 阈值 ⇒ 走 int8"的门控读取 ✓
+//   为什么需要它(上一轮踩过的坑,见 USER_QA_LEDGER **#111**):
+//     · `matmul_packed4_group` 的 `M` 是**逐专家行数 `me`**(还会被 `fast_m_chunk` 再切块),
+//       **不是**引擎调用级的 token 数 ⇒ 在那里下阈值 = **永不触发** ✗
+//     · 正确的层级 = "本次 CPU 前向进了多少 token"(即 `[cd-timing]` 的 `qlen`)✓
+//   写入点:**`binding.cpp` 的 CPU-decode `host_fn`**(它手里就有 `c->qlen`)——
+//     ⚠️ 必须在 `run_moe_and_ep` **之前**写;同一次调用里所有 worker 看到同一个值
+//     ⇒ 与 `g_activation` 一样只是"普通 load"、无锁、无守卫 ✓
+//   语义安全:`0` = 未设置 ⇒ 门控恒关(离线 harness 不写它 ⇒ 不改变任何既有行为 ✓)
+inline int g_cur_tokens = 0;                       // C++17 inline variable ⇒ 无守卫 ✓
+
+inline void set_cur_tokens(int m) { g_cur_tokens = m; }
+
+inline int cur_tokens() { return g_cur_tokens; }
+
 }  // namespace xiaotu_int8

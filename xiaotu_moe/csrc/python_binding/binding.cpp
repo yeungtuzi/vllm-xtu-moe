@@ -884,6 +884,10 @@ static void bind_moe_class(py::module& m, const char* name) {
                 // 【诊断专用】XIAOTU_MOE_FAKE_CPU=1:跳过 CPU MoE 计算(输出保持原值)。
                 // 用途:在服务里量出"该层纯 GPU 侧(注意力/dense+拷贝+派发)每层耗多少",
                 // 从而把 period 精确拆成 GPU 部分 与 CPU 部分。**绝不能用于正确性测试**。
+                // ⭐【2026-10-07】把【引擎调用级 token 数】广播给内核门控
+                //   (`M >= XIAOTU_MOE_I8_MIN_M ⇒ 走 int8`;见 xiaotu_int8_mode.h + 台账 #111)✓
+                //   ⚠️ 必须在 run_moe_and_ep 之前写:同一次调用的所有 worker 看到同一个值 ✓
+                xiaotu_int8::set_cur_tokens(qlen);
                 run_moe_and_ep(engine, qlen, k, hid, ids, wts, out, &ep_ms_last, &fwd_ms_last);
                 if (timing) {
                     auto t_end = std::chrono::steady_clock::now();
