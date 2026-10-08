@@ -29,12 +29,10 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 当前版本：v0.2.7**（2026-10-08）—— **性能优化：长 prompt 预填 +17~22%（TTFT −6~18%）**
-> 本版是**配置与运行时路径**的优化（**不引入新内核**）：把此前**静默失效的 GPU 预填**恢复回来，
-> 并把生产配置调整为 **512K 上下文 + 4 路并发 + `MBT=8192`** ⇒ **真实在线负载下解码显著更快** ✓
-> ⚠️ **口径说明**：本版性能数据是**合成基准**(random token)；而**真实会话的解码速率**是**另一个口径**，
-> 两者**不可互相推算**。本版**暂不写具体提升百分比** —— 因为**手上还没有与真实会话同口径的新读数**。
-> 发行说明：[`RELEASE_NOTES_v0.2.7.md`](RELEASE_NOTES_v0.2.7.md)
+> **📌 当前版本：v0.2.6**（2026-10-06）
+> ⚠️ **v0.2.7 未发布**(2026-10-08 用户决定):当天工作**未产生新的性能能力** ——
+> `MBT 6144→8192` 是**已知道**的配置收益,源自 Strata 的四条设想**三条被否、一条未做** ⇒ **不发布** ✓
+> 发行说明：[`RELEASE_NOTES_v0.2.6.md`](RELEASE_NOTES_v0.2.6.md)
 
 ---
 
@@ -218,7 +216,7 @@ pip install vllm==2.5.0
 
 # 2) 本插件(发行名 vllm-xtu-moe,**不发 PyPI**;二选一)
 # (a) 从 GitHub Release 附件装:wheel 里已含 6 个 ISA 变体,无需本地编译器
-pip install ./vllm_xtu_moe-0.2.7-cp312-cp312-manylinux_2_34_x86_64.whl
+pip install ./vllm_xtu_moe-0.2.3-cp312-cp312-manylinux_2_34_x86_64.whl
 # (b) 源码安装(需要本地编译器):
 # CXX=g++-16 PYTHON=$(which python) bash scripts/build_engine_variants.sh && pip install -e .
 
@@ -237,7 +235,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 
 | 版本 | 主题 |
 |---|---|
-| **v0.2.7** | **性能优化：长 prompt 预填 +17~22%（TTFT −6~18%）** —— 恢复此前**静默失效的 GPU 预填**；生产配置改为 **512K × seqs=4 × `MBT=8192`**；⚠️ **解码在可复现口径下持平**；**补发二进制 wheel**(自 v0.2.3 起首次)|
+| ~~v0.2.7~~ | **未发布**(2026-10-08)—— 当天无新性能能力;`MBT 6144→8192` 属已知配置收益 ⇒ 决定不发 |
 | **v0.2.6** | **自举开发：INT8 激活 × FP4 专家权重 的计算路径** —— 为 **MXFP4** 专家权重增加 **INT8 激活**路径（fp4 码值全含于 int8 ⇒ **权重侧零代价**）：内核级 **24.9 → 15.1–15.7 ms/层（1.54–1.62×）**；端到端（qfn·MXFP4-FP8）GSM8K **两臂 193/200**、逐题一致 194/200（净 0）、256K 四针两臂 4/4 + `stop`、Vision 23 逐项一致 18/23；修复**回退路径回归**（慢 16–22% ⇒ +1.49% 指令）；打通 **qfn 的 MTP**（**2.44×**）；qfn 默认线程数 **120（5 核/CCD）**；路径默认关（`XIAOTU_MOE_INT8=1`）|
 | **v0.2.5** | **优化 GPU prefill 内存机制** —— **为 GPU 算子增加对 NUMA 切片权重的处理路径,节省了一层权重空间**(对 DeepSeek-V4.1-Flash **节约 6.33 GiB**;2 个 GPU 时**每卡节约 3.16 GiB**):单层 staging 10.73→**7.56 GiB/rank**、离线同层 364.91→**341.31 ms**、数值逐字节相同;**支持 1M 上下文 + GPU 预填充**(CED 让每 token KV 5437→2106 B,1M 只需 KV ~2.2 GiB);**Engram pinned 浪费修复**(宿主内存 **−75 GiB**);rebase 到上游后 **CED 恢复生效**(16k prefill 527.8→**982.4** tok/s);**TP=2 一律用 GPU1+GPU2**(GPU0 只有 x8);服务日志按 **PID** 命名 |
 | **v0.2.4** | **支持 MiMo-V2.6-Flash-RL + 性能优化** —— 新模型接入（MXFP4/TP=2/1M/多模态/MTP k=1，**层内数值门禁 94/94 层通过**、312K 针测试命中、多模态真图通过）；**GPU 预填充「0=关闭」陷阱修复**（长 prefill 313→**811** tok/s）；**`--max-num-seqs` 默认统一为 4**（短 C=2 prefill 236→**367**）；**decode 口径改为 median ITL**（真实争用 1.13–1.77×）；修好 MXFP4 上的层内数值门禁 |
@@ -248,7 +246,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 | v0.1.0 | 首个公开版:混合模式(CPU 专家 + GPU 其余)、AVX2 / AVX-512 多 ISA、DeepSeek-V4 系列 |
 
 改动清单、性能对照与运行参数变更:
-[**v0.2.7**](RELEASE_NOTES_v0.2.7.md) · [**v0.2.6**](RELEASE_NOTES_v0.2.6.md) · [**v0.2.5**](RELEASE_NOTES_v0.2.5.md) · [**v0.2.4**](RELEASE_NOTES_v0.2.4.md) · [**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
+[**v0.2.6**](RELEASE_NOTES_v0.2.6.md) · [**v0.2.5**](RELEASE_NOTES_v0.2.5.md) · [**v0.2.4**](RELEASE_NOTES_v0.2.4.md) · [**v0.2.3**](RELEASE_NOTES_v0.2.3.md) · [**v0.2.2**](RELEASE_NOTES_v0.2.2.md) · [**v0.2.1**](RELEASE_NOTES_v0.2.1.md) · [**v0.2**](RELEASE_NOTES_v0.2.md) · [**v0.1.0**](RELEASE_NOTES_v0.1.0.md)
 (归档:[v0.2pre](RELEASE_NOTES_v0.2pre.md))
 
 ---

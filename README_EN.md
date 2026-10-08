@@ -162,7 +162,7 @@ pip install vllm==2.5.0
 
 # 2) this plugin (distribution name vllm-xtu-moe, NOT on PyPI) -- pick one
 # (a) install the wheel attached to the GitHub Release (all 6 ISA variants included):
-pip install ./vllm_xtu_moe-0.2.7-cp312-cp312-manylinux_2_34_x86_64.whl
+pip install ./vllm_xtu_moe-0.2.3-cp312-cp312-manylinux_2_34_x86_64.whl
 # (b) or install from source (needs a local compiler):
 # CXX=g++-16 PYTHON=$(which python) bash scripts/build_engine_variants.sh && pip install -e .
 
