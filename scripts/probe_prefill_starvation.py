@@ -79,8 +79,12 @@ def main():
 
     url = f"http://{args.host}:{args.port}/v1/chat/completions"
     # A、B 用**不同内容**的 prompt(避免前缀缓存让 B 变便宜),且都是"可判定的无意义长文本"
-    filler = lambda n, seed: ("请逐字复述下面这段无意义文本,不要总结、不要解释:" +
+    # ⭐⭐ 2026-10-08 修:只靠 seed 区分**不够** —— 同一 seed 在别的探针里用过 ⇒ 前缀缓存命中 ⇒
+    #    B 的"预填窗口"掉到 1.1 s(实测),整组数据作废 ✗ ⇒ 必须加**唯一 nonce** ✓
+    _nonce = os.environ.get("NONCE") or f"[run{int(time.time())}]"
+    filler = lambda n, seed: ("请逐字复述下面这段无意义文本,不要总结、不要解释:" + _nonce +
                               "".join(chr(0x4E00 + ((i * 7 + seed) % 2000)) for i in range(n)))
+    print(f"  (prompt nonce={_nonce!r} —— 保证两臂都是【冷】预填)")
     pa, pb = filler(args.len_a, 1), filler(args.len_b, 99)
 
     sink = {}

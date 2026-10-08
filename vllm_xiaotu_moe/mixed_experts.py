@@ -39,6 +39,9 @@ import torch
 
 from vllm import envs
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+from vllm_xiaotu_moe import mem_probe as _mem_probe
+from vllm_xiaotu_moe import route_probe as _route_probe
 from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
     CPUExpertsFp8,
     CPUExpertsInt4,
@@ -797,7 +800,7 @@ class _XiaotuExpertsMixin:
     def _select_topk(self, hidden_states, router_logits, input_ids=None):
         router = self._get_router()
         if router:
-            return router.select_experts(
+            _r = router.select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 topk_indices_dtype=torch.int32,
@@ -808,6 +811,8 @@ class _XiaotuExpertsMixin:
                 # (mainline_shims) parks it on the layer.
                 input_ids=input_ids,
             )
+            _route_probe.observe(self, _r)   # ⭐ 路由探针(失败静默)
+            return _r
         # `select_experts` only implements softmax/sigmoid. Silently mapping any
         # other scoring function onto softmax picks the WRONG experts (see
         # dev-docs/UPSTREAM.md §2.1), so refuse instead of degrading quietly.
@@ -819,7 +824,7 @@ class _XiaotuExpertsMixin:
                 f"instead — check that e_score_correction_bias reached the router "
                 f"factory."
             )
-        return select_experts(
+        _r = select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
             use_grouped_topk=self.use_grouped_topk,
@@ -832,6 +837,8 @@ class _XiaotuExpertsMixin:
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.e_score_correction_bias,
         )
+        _route_probe.observe(self, _r)       # ⭐ 路由探针(失败静默)
+        return _r
 
     def _local_expert_map(self, expert_map, device):
         """把 expert_map 缓存在 ids 所在的设备上(EP 下每层一份)。"""
@@ -1498,6 +1505,13 @@ class _XiaotuExpertsMixin:
                     local = torch.where(miss, torch.zeros_like(local), local)
                 topk_ids = local.to(torch.int32)
 
+        # ⭐⭐ B377:**探针必须在 `if/else` 【之外】**(8 空格)—— 真机走 modular 分支,
+        #     而 modular 分支只做两次 `.to()`,**并不调用 `_select_topk`** ✗
+        #     ⇒ 我先前把它放在 `else` 内部(12 空格)⇒ **依然一次都不触发** ✗(实测日志 0 行)
+        try:
+            _route_probe.observe(self, (topk_weights, topk_ids))
+        except Exception:  # noqa: BLE001
+            pass
         layer = self._layer_ref
         if layer is None:
             raise RuntimeError(
@@ -1506,6 +1520,13 @@ class _XiaotuExpertsMixin:
         # GPU 常驻层:不建 CPU 引擎、也不释放源张量(它还要被常驻槽位用)。
         _resident = self._is_resident_layer(layer)
         qlen = hidden_states.size(0)
+        # ⭐ 引擎内内存探针(B356/B349):nvidia-smi 对 A39 的失败模式【全平】,
+        #    而闸门【每进程只判一次】⇒ 只有这里能连续看到"还能再分配多少"。
+        #    `XIAOTU_MEM_PROBE=1` 打开;失败静默,绝不影响主流程 ✓
+        try:
+            _mem_probe.sample("apply", qlen=qlen, layer=layer)
+        except Exception:  # noqa: BLE001
+            pass
         # ---- 长 prefill 的 GPU **流式**路径(阈值门控) ----------------------
         # 与"常驻层"是两件事:常驻层把权重永久留在显存;这里每次 forward 把本层
         # 原始 MXFP4 权重 H2D 一遍、算完即弃(V4.1 = 6.72 GiB/层)。

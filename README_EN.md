@@ -120,13 +120,19 @@ Every performance number below was taken on this machine:
   > prefill efficiency, because every chunk re-streams all forty layers of weights (a 2048-token chunk
   > runs at about 410 tok/s against roughly 1000 for 8192), so it makes the throughput **worse**
   > (1.25 -> 0.57 tok/s). There is no scheduler knob that fixes this.
-  > * **Single-stream serving** (what this repo's 8070 does): use `--max-num-seqs 1`, which serialises
-  >   requests so nothing is mixed; per-stream ITL stays a steady ~65 ms.
+  > * **Single-stream serving** (the 1M x `seqs=1` preset): `--max-num-seqs 1` serialises requests so
+  >   nothing is mixed; per-stream ITL stays a steady ~65 ms. Pick by scenario: **1M x 1 / 512K x 2 /
+  >   256K x 4**, plus the **`512K` x 4 combination production uses** (high ceiling + many short tasks;
+  >   only about **2 full-length lanes** can run at once, the rest **queue** rather than fail).
+  >   `seqs x maxlen <= pool` is a **saturation threshold, not a hard invariant**. See
+  >   `docs/MODEL_GUIDES.md` section 0.1b.
   > * **Multi-user concurrency**: use **prefill/decode disaggregation**, not `max-num-seqs`,
   >   `max-num-batched-tokens` or `long-prefill-token-threshold`.
-  > * **Root cause**: prefill throughput is **GPU-compute-bound** -- the A100 has no native FP4 and must
-  >   unpack, giving **94-100% SM utilisation against only 5-48% memory-controller utilisation**. Faster
-  >   prefill needs GPU-side MoE kernel/quantisation work, not scheduling.
+  > * **Root cause**: prefill throughput is **DMA / assembly-bound** -- every chunk re-streams about
+  >   **3.84 GB** of weights per card per layer; the device-side **strided transpose** measures only
+  >   **84 GB/s** against **1361 GB/s** contiguous, and assembly takes **250 ms/layer = 85%**, while that
+  >   layer's MoE compute needs only **5-50 ms**. Faster prefill needs the strided transpose removed or the
+  >   assembly fused, not scheduling.
   > * The old note that "`--max-num-seqs` must be >=2" holds only for **benchmarking**: with `seqs=1` a
   >   `C=2` run degrades to serial and depresses short-C=2 aggregate prefill to 54 (a **configuration**
   >   problem, **B124**). Use `seqs>=2` for concurrency benchmarks and `seqs=1` for single-stream serving.
@@ -156,7 +162,7 @@ pip install vllm==2.5.0
 
 # 2) this plugin (distribution name vllm-xtu-moe, NOT on PyPI) -- pick one
 # (a) install the wheel attached to the GitHub Release (all 6 ISA variants included):
-pip install ./vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl
+pip install ./vllm_xtu_moe-0.2.7-cp312-cp312-manylinux_2_34_x86_64.whl
 # (b) or install from source (needs a local compiler):
 # CXX=g++-16 PYTHON=$(which python) bash scripts/build_engine_variants.sh && pip install -e .
 
