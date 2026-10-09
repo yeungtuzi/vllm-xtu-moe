@@ -1,13 +1,5 @@
 # vllm-xtu-moe
 
-> ⚠️ **命名变更(2026-10-07,用户定案)**:本文件里出现的旧环境变量名**已修改为**下面的规范名 ——
-> `XIAOTU_MOE_W4A8` **已修改为** `XIAOTU_MOE_INT8`(int8 激活路径**总开关**,默认由权重格式决定);
-> `XIAOTU_MOE_INT8_ALIGN` **已修改为** `XIAOTU_MOE_INT8_ALIGN`(实现选择:ALIGN tile,默认档);
-> `XIAOTU_MOE_INT8_VNNI` **已修改为** `XIAOTU_MOE_INT8_VNNI`(实现选择:旧 VNNI tile,默认 0);
-> `XIAOTU_MOE_I8_MIN_M` **已修改为** `XIAOTU_MOE_INT8_VNNI_MIN_TOKENS`(⭐ M 阈值,**默认 160**,唯一设定处)。
-> 旧名仍被识别:会**告警一次**并映射到新名(**仍按旧值生效**),绝不静默退回 fp32 ✓
-
-
 > **XTU = X Transformers Unity** (pronounced *"xiao tu"*, Chinese for "little rabbit") —
 > a **high-performance MoE inference acceleration layer**.
 >
@@ -30,13 +22,8 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.2.7** (2026-10-09) — **Optimized engine: CPU→GPU DMA buffers cut, 11 GB of VRAM saved in total, no performance loss**:
-> ⭐ **micro ping/pong** (`XIAOTU_GPF_STAGE_TILE_E=96`): GPU-prefill **staging 7.56 → 1.89 GiB/rank** (**5.67 GiB/rank saved**), and
-> **long-prompt TTFT −16.8%** (same-session interleaved A/B, 3 rounds, **0.4%** dispersion on both arms, **byte-identical output**).
-> Scope: official quantization of this model · `TP=2` · `MBT=8192` · `MAXSEQS=2` · `MAXLEN=524288` · ~32K-char prompt · **prefill phase only** (short requests use CPU prefill and are unaffected).
-> ⚠️ **No decode improvement is claimed** — the 2026-10-08 "decode +2.5~8%" figure was corrected and **retracted** on 2026-10-09. ⚠️ **Long-run stability (hours) not verified.**
-> Release notes: [`RELEASE_NOTES_v0.2.7.md`](RELEASE_NOTES_v0.2.7.md)
-> Work report: [`docs/WORK_REPORT_2026-10-09.md`](docs/WORK_REPORT_2026-10-09.md)
+> **📌 Current release: v0.2.7** (2026-10-09) — Optimized engine: CPU→GPU DMA buffers cut, 11 GB of VRAM saved in total, no performance loss
+> [Release notes](RELEASE_NOTES_v0.2.7.md) · [Work report](docs/WORK_REPORT_2026-10-09.md)
 
 ---
 
@@ -102,12 +89,7 @@ Every performance number below was taken on this machine:
 
 ## Performance
 
-* Metric: **aggregate throughput** -- `prefill (tok/s) = concurrency x prompt_tokens / TTFT`, `decode (tok/s) = concurrency x 1000 / median(TPOT)`
-  (at C=1 this is just the per-stream rate; equivalently "total tokens of that phase / that phase's wall clock"), both from the same `vllm bench serve` run; `decode` uses the **median** TPOT.
-  > **Correction (2026-10-04): the long/C=2 decode figure is largely a metric artefact.** `median TPOT`
-  > counts **prefill steps in its denominator**, so a handful of mixed-in chunks wrecks it. On the clean
-  > metric (**median ITL**) the real per-stream decode contention is only **1.13-1.77x** (see **B126**).
-  > The MiMo 203.6 ms and GLM 700.8 ms figures are wrong for the same reason.
+* Metric: **aggregate throughput** -- `prefill (tok/s) = concurrency x prompt_tokens / TTFT`, `decode (tok/s) = (output tokens - concurrency) / (last-token time - first-token time)`
   > **What is real** is that mixing a long prefill with a decoding request on one engine starves the
   > decoder (measured, **B277**/**B279**): its inter-token latency is bounded below by the prefill
   > scheduled between its steps divided by prefill throughput. Injecting a 32768-token prompt into a
