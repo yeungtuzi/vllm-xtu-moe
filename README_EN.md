@@ -27,25 +27,6 @@
 
 ---
 
-> [!WARNING]
-> ## ⚠️ Do NOT enable LMCache (known critical issue)
->
-> **This project disables LMCache by default** (`LMCACHE=0`, and the `lmcache_server` is not started), because:
->
-> * 🔴 **A long prompt can take the whole engine down**: one large request can trigger
->   `KV connector reported block-level load failures (invalid_block_ids)` -> `EngineDeadError`,
->   killing **every** session. Measured here: the *same* 780k-token request crashed the engine
->   **twice** with LMCache on, while with it off a 200k-token request returned 200 and GPU prefill
->   went from **0 to 686** `device=cuda` launches.
-> * 🔴 **Strongly correlated with output degeneration** (repetition, intent drift, corrupted paths),
->   matching several unfixed upstream issues.
-> * ✅ **Disabling it also helps**: ~**0.85 GiB** less GPU memory and ~**65 GiB** less host RSS,
->   and GPU prefill starts working again.
->
-> **Full evidence, upstream issue list, and how to disable / roll back:
-> [`docs/KNOWN_ISSUES_LMCACHE.md`](docs/KNOWN_ISSUES_LMCACHE.md).**
-> **Do not enable it in production until upstream fixes it** — any LMCache reference below is historical.
-
 ## Project highlights
 
 1. Any MoE model. Not tied to one architecture generation. DeepSeek-V4 / V4.1 work

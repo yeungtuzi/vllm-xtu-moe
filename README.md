@@ -26,29 +26,6 @@
 
 ---
 
-> [!WARNING]
-> ⚠️ **关掉它的代价（必须一起知道）**：LMCache 的原始价值是
-> **让服务重启变得可接受**（跨重启复用前缀）✓。
-> 关掉后每次重启都要**全量重预填**：实测一个长会话的开发 agent
-> 重新 prefill 了 **21 分钟**才能开始工作（原来的 10K 前缀对比：冷 26.7 s
-> ⇒ 重启后 1.27 s）✗。⇒ 所以“关 LMCache”与“不能重启”是一对互相强化的约束 ✓
->
-
-> ## ⚠️ 请勿开启 LMCache(已知恶性问题)
->
-> **本项目已默认关闭 LMCache**(`LMCACHE=0`,且不启动 `lmcache_server`)。原因:
->
-> * 🔴 **长 prompt 会让整个引擎崩掉**:一次大请求即可触发
->   `KV connector reported block-level load failures (invalid_block_ids)` ⇒ `EngineDeadError`
->   ⇒ **所有会话一起断**(我们实测:同一 78 万 token 请求,开 LMCache 两次都崩;
->   关掉后 20 万 token 请求 200 通过、GPU 预填从 0 次恢复到 686 次)。
-> * 🔴 **与输出退化(重复、意图漂移、写错路径)高度相关**,且与上游多条未修完的 issue 吻合。
-> * ✅ **关掉还有额外收益**:GPU 省 **0.85 GiB**、宿主省 **~65 GiB** RSS,且 **GPU 预填恢复工作**。
->
-> **完整证据、上游 issue 清单、关闭/回滚方法见
-> [`docs/KNOWN_ISSUES_LMCACHE.md`](docs/KNOWN_ISSUES_LMCACHE.md)。**
-> **在上游修复前,请勿在生产启用** —— 下文凡提到 LMCache 的段落均**仅作历史记录**。
-
 ## 项目特色
 
 1. 任意 MoE 模型:不绑死某一代架构。已跑通 DeepSeek-V4 / V4.1 系列、
