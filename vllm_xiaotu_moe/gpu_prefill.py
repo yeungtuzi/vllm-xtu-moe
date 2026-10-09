@@ -755,6 +755,20 @@ def in_profile_run() -> bool:
     return _IN_PROFILE_RUN or _IN_STARTUP[0]
 
 
+def in_vllm_profile_run() -> bool:
+    """⭐ True **只在** vLLM 的 `profile_run` 期间(**不含** warmup / CUDA graph 捕获)✓
+
+    为什么必须与 `in_profile_run()` 分开(2026-10-09 实测事故,教训见事故报告):
+      * **`profile_run` 期要【允许】GPU 预填** —— 只有 staging 真的被分配,vLLM 的
+        `total_consumed` / `non_kv_cache_memory` 才会把它算进去(SPEC_mbt_budget 改动②)✓
+      * **`compile_or_warm_up_model`(warmup + **图捕获**)期必须【继续挡住】** ✗ ——
+        否则侧流 GPU 预填会与 CUDA graph 捕获交错 ⇒ 捕获被污染 ⇒ replay 时
+        `cuGraphLaunch` **SIGSEGV**:实测 2026-10-09 17:35,两个 rank 同构栈
+        `at::cuda::CUDAGraph::replay → cudaGraphLaunch → cuGraphLaunch`,服务整体下线 ✗
+    """
+    return bool(_IN_PROFILE_RUN)
+
+
 def install_profile_guard() -> list[str]:
     """Make ``GPUModelRunner.profile_run`` visible to us as a flag."""
     global _IN_PROFILE_RUN

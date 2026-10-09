@@ -1547,21 +1547,27 @@ class _XiaotuExpertsMixin:
         _gp_mod = None if _resident else _gpu_prefill_mod(
             getattr(self, "_engine_attr", ""))
         if _gp_mod is not None:
-            from vllm_xiaotu_moe.gpu_prefill import gpu_prefill_min_tokens
+            from vllm_xiaotu_moe.gpu_prefill import (
+                gpu_prefill_min_tokens,
+                in_profile_run,
+                in_vllm_profile_run,
+            )
 
             _gp_min = gpu_prefill_min_tokens()
             _gp_on = _gp_min > 0
-            # ⭐⭐ 2026-10-09(SPEC_mbt_budget 改动②):**不再用 `in_profile_run()` 挡住 GPU 预填**
-            # —— 必须让 vLLM 的 profile **看到 staging 的真实占用**,否则它的账本里根本没有
-            # staging,我们只能靠"跑一阵才崩"才发现不够(见 docs/STRATA_ANALYSIS.md R2)✓
-            #   * profile 期 staging 真的分配 ⇒ 进 vLLM 的 `total_consumed`
-            #     ⇒ `non_kv_cache_memory` 抬升 ⇒ KV 池按"剩下的"定容 = **vLLM 统一管理** ✓✓
-            #   * ⛔ 我们**不再**用预检结果决定 GPU/CPU(那个门已删,见下方 `_GPF_INFO` 处):
-            #     装不下就让它抛 ⇒ 由 vLLM 自己失败并结束;降档是**用户看日志后**的选择 ✓
-            #   * ⚠️ **图捕获期仍然一律挡住**(侧流分配会破坏捕获),这条不动 ✓
+            # ⭐⭐ 2026-10-09(SPEC_mbt_budget 改动②,已按实测事故**收紧**):
+            #   要放行的**只是 vLLM 的 `profile_run`**(KV 池大小就是在那里定的),
+            #   目的是让 staging 真的被分配 ⇒ 进入 vLLM 的 `total_consumed` ✓
+            #   ⛔ **warmup / CUDA graph 捕获期必须继续挡住** —— 2026-10-09 17:35 实测:
+            #   把 `in_profile_run()` 整个删掉后,侧流 GPU 预填与图捕获交错,两个 rank 在
+            #   第一个 32K 请求后**同时** `cuGraphLaunch` SIGSEGV ⇒ 服务整体下线 ✗
+            #   判据:`(不在 startup) or (正在 profile_run)`,且**任何**捕获中的流都不放行 ✓
+            _in_startup = in_profile_run()
+            _prof_only = in_vllm_profile_run()
             _gpu_pf = (
                 _gp_on
                 and qlen >= _gp_min
+                and ((not _in_startup) or _prof_only)
                 and not torch.cuda.is_current_stream_capturing()
             )
         # ⚠️ 释放条件是 `_gp_on`,不是 `_gpu_pf`。引擎是**惰性**建的:第一个请求
