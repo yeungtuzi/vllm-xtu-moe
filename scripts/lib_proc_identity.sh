@@ -190,8 +190,15 @@ pi_port_listeners() {
 #   判据:我们自己的祖先链、生产 PID 文件、生产端口、命令行里的生产端口、
 #        以及该 pid 的【父链上】有生产证据(挡住"停生产的子进程"这个洞,如 VLLM::EngineCore)✓
 #   ⚠️ 证据读不到(PID 文件目录不可读)也算命中 ⇒ **fail-closed** ✓
-pi_prod_hit() {
-  local pid="$1" _p _n
+# ⭐ 2026-10-09(R38 审计 must_fix#3)新增:`pi_prod_hit` 的【非父链】部分 ✓
+#   为什么需要拆:授权停生产时,生产**自己的子进程**必然命中"父链在生产 PID 文件里"这一类,
+#   而那一类恰恰是我们要豁免的;但同一函数里还有**与豁免动机无关、必须继续生效**的证据:
+#     ① 自身/祖先链(防自杀 —— 2026-10-07 第③类"runner 名 = 被管实例名 ⇒ stop 自己"事故)
+#     ② 自身在生产 PID 文件里  ③ 自身监听生产端口  ④ 自身 cmdline 写了生产端口
+#   以及"证据读不到 ⇒ 命中"(fail-closed)✓
+#   ⇒ 拆出本函数后,授权旁路**只换用它**,`pi_prod_hit`(含父链)对所有其它调用点**逐字不变** ✓
+pi_prod_hit_self() {
+  local pid="$1"
   if pi_is_self_or_ancestor "$pid"; then echo "自身/祖先链"; return 0; fi
   if ! pi_prod_pidfiles_of "$pid"; then echo "PID 文件目录不可读(证据缺失)"; return 0; fi
   if [ -n "$PI_PROD_PIDFILES" ]; then
@@ -202,6 +209,13 @@ pi_prod_hit() {
     echo "生产端口:$(printf '%s' "$PI_PROD_PORTS" | paste -sd, -)"; return 0
   fi
   if pi_cmdline_has_prod_port "$pid"; then echo "命令行写了生产端口"; return 0; fi
+  return 1
+}
+
+pi_prod_hit() {
+  local pid="$1" _p _n
+  # ①~④ 与 fail-closed 全部复用 `pi_prod_hit_self`(语义与拆分前逐字相同)✓
+  if pi_prod_hit_self "$pid"; then return 0; fi
   # ⭐ 父链检查:生产的【子进程】(EngineCore/Worker)自己既不在生产 PID 文件里、
   #    也不监听生产端口 ⇒ 只看它自己会漏判 ⇒ 必须往上看祖先 ✓
   _p="$(pi_ppid "$pid")"; _n=0

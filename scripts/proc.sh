@@ -38,10 +38,11 @@ usage() { echo "usage: proc.sh {spawn|stop|status|pid|adopt} <name> [args...]" >
 
 # 【2026-10-05】启动/停止审计:一行一条,谁在什么时候动了哪个实例(便于事后定案)
 _launch_audit() {
-  local act="$1" nm="$2" pid="${3:-}"
+  local act="$1" nm="$2" pid="${3:-}" reason="${4:-}"
   local f="$LOGDIR/_launch_audit.log"
-  printf '%s  %-12s %-22s pid=%-9s caller=pid:%s(%s)\n' \
+  printf '%s  %-12s %-22s pid=%-9s caller=pid:%s(%s)%s\n' \
     "$(date '+%F %T')" "$act" "$nm" "$pid" "$$" "$(ps -o comm= -p $PPID 2>/dev/null | head -1)" \
+    "${reason:+ reason=$reason}" \
     >>"$f" 2>/dev/null || true
 }
 
@@ -163,6 +164,14 @@ case "$cmd" in
     # ⛔ FORCE 环境变量**不再被读取**(审计 ⑤:一句 export FORCE=1 会静默关掉全部门)✗
     case "${FORCE:-}" in ""|0) : ;; *) echo "  (忽略环境变量 FORCE=${FORCE} —— 旁路只能用 --force --reason=…)" >&2 ;; esac
 
+    # ⭐⭐ 2026-10-09(R38 审计 must_fix#1)**无条件**校验:凡给了 `--force` 就必须给 `--reason`,
+    #   而不是只在"归属门失败"分支里才要求 —— 否则当目标**能通过归属门**时,
+    #   `--force` 会静默跳过下面的后代体检、且一行旁路痕迹都不留 ✗(审计员已沙盒复现)
+    if [ "$_force" = "1" ] && [ -z "$_reason" ]; then
+      echo "REFUSE: --force 必须同时给 --reason=<理由>(旁路要留痕)" >&2
+      _launch_audit REFUSE "$name" "$_pid"; exit 4
+    fi
+
     # ---- ① 先判存活:死了 ⇒ not running + 0(陈旧 PID 文件不再让 stop 恒 REFUSE)----
     if ! pi_alive "$_pid"; then
       echo "not running: name=$name pid=$_pid(PID 文件陈旧,未删)"
@@ -190,16 +199,37 @@ case "$cmd" in
     #   漏掉 lib 的 pi_prod_hit 里另外两条(cmdline 写了生产端口、父链上有生产证据),
     #   且把 pi_prod_pidfiles_of / pi_prod_ports_of 的"证据读不到"当成"没命中"(fail-open)✗
     #   ⇒ 改为直接复用唯一真源 pi_prod_hit(它已是 fail-closed,且含父链检查)✓
+    # ⭐⭐ 2026-10-09(R38 审计 must_fix#3,第二版修法):
+    #   动机:`--force --reason` 是"已取得用户当次许可后停生产"的**唯一留痕旁路**;而生产
+    #   自己的子进程(EngineCore / VLLM::Worker)**必然**命中"父链在生产 PID 文件里"⇒
+    #   原先旁路在这条路上**永远无效**(实测:停 8070 被它自己的子进程挡住)✗
+    #   ⛔ 第一版修法是"force 就整条跳过 pi_prod_hit",审计判 FAIL:它连
+    #     **自身/祖先链(防自杀)**与"自身在生产 PID 文件/端口/cmdline"也一并关掉,
+    #     审计员实测复现了"改动版真的 SIGTERM 到 proc.sh 自己的父进程"✗
+    #   ⇒ 本版**只豁免【父链】这一类**:授权时改调 `pi_prod_hit_self`(不含父链),
+    #     其余四类证据 + fail-closed **一律继续生效** ✓;且**无论归属门是否通过**,
+    #     豁免一旦发生就写 `FORCE-DESC-BYPASS` 审计行(含理由)✓
     if ! _desc="$(pi_descendants "$_pid")"; then
       echo "REFUSE: 后代枚举失败(ps 不可用)⇒ 证据缺失,不许停 ✗" >&2
       _launch_audit REFUSE "$name" "$_pid"; exit 4
     fi
-    for _d in $_desc; do
-      if _why="$(pi_prod_hit "$_d")"; then
-        echo "REFUSE: 后代 pid=$_d 命中生产证据:$_why ⇒ 不许停 ✗" >&2
-        _launch_audit REFUSE "$name" "$_pid"; exit 4
-      fi
-    done
+    if [ "$_force" = "1" ]; then
+      for _d in $_desc; do
+        if _why="$(pi_prod_hit_self "$_d")"; then
+          echo "REFUSE: 后代 pid=$_d 命中生产证据($_why)⇒ 即使 --force 也不许停 ✗" >&2
+          _launch_audit REFUSE "$name" "$_pid"; exit 4
+        fi
+      done
+      echo "  ⚠️ FORCE-DESC-BYPASS:仅豁免【父链类】生产证据(reason=$_reason)" >&2
+      _launch_audit FORCE-DESC-BYPASS "$name" "$_pid" "$_reason"
+    else
+      for _d in $_desc; do
+        if _why="$(pi_prod_hit "$_d")"; then
+          echo "REFUSE: 后代 pid=$_d 命中生产证据:$_why ⇒ 不许停 ✗" >&2
+          _launch_audit REFUSE "$name" "$_pid"; exit 4
+        fi
+      done
+    fi
 
     # ---- ② 按 PGID/PID 发信号,然后【验尸】----
     _kill_set TERM "$_pid" $_desc
