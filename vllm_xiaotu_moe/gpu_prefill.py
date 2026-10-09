@@ -748,6 +748,11 @@ _IN_PROFILE_RUN = False
 # 负数(NOTES §460.1)。用 "_initialize_kv_caches 返回" 作为 startup 结束的锚点,
 # 它与"KV cache 已定容"是同一件事,比去找具体的 profile 调用稳。
 _IN_STARTUP = [True]
+# ⭐ 2026-10-09:`Worker.compile_or_warm_up_model` 的执行窗口 = **warmup + CUDA graph 捕获** ⇒
+#   该窗口内**必须挡住** GPU 预填(侧流预填与捕获交错 ⇒ replay 时 `cuGraphLaunch` SIGSEGV,实测)✗
+#   而 **profile_run 期必须放行**(只有真分配 staging,vLLM 的账本才含它)✓
+#   ⇒ 两者必须分开:本 flag 只覆盖 warmup/捕获,不覆盖 profile ✓
+_IN_WARMUP = [False]
 
 
 def in_profile_run() -> bool:
@@ -755,18 +760,20 @@ def in_profile_run() -> bool:
     return _IN_PROFILE_RUN or _IN_STARTUP[0]
 
 
-def in_vllm_profile_run() -> bool:
-    """⭐ True **只在** vLLM 的 `profile_run` 期间(**不含** warmup / CUDA graph 捕获)✓
+def in_warmup_or_capture() -> bool:
+    """⭐ True **只在** `Worker.compile_or_warm_up_model` 执行期间(= warmup + 图捕获)✓
 
-    为什么必须与 `in_profile_run()` 分开(2026-10-09 实测事故,教训见事故报告):
+    为什么要与 `in_profile_run()` 分开(2026-10-09 实测事故):
       * **`profile_run` 期要【允许】GPU 预填** —— 只有 staging 真的被分配,vLLM 的
         `total_consumed` / `non_kv_cache_memory` 才会把它算进去(SPEC_mbt_budget 改动②)✓
-      * **`compile_or_warm_up_model`(warmup + **图捕获**)期必须【继续挡住】** ✗ ——
-        否则侧流 GPU 预填会与 CUDA graph 捕获交错 ⇒ 捕获被污染 ⇒ replay 时
-        `cuGraphLaunch` **SIGSEGV**:实测 2026-10-09 17:35,两个 rank 同构栈
+      * **warmup + CUDA graph 捕获期必须【挡住】** ✗ —— 否则侧流 GPU 预填会与图捕获交错
+        ⇒ 捕获被污染 ⇒ replay 时 `cuGraphLaunch` **SIGSEGV**:
+        实测 2026-10-09 17:35,两个 rank 同构栈
         `at::cuda::CUDAGraph::replay → cudaGraphLaunch → cuGraphLaunch`,服务整体下线 ✗
+      * ⚠️ `torch.cuda.is_current_stream_capturing()` **不够** —— 它只在捕获调用之内为真,
+        挡不住 warmup 里"捕获前后"的那些 forward ✗
     """
-    return bool(_IN_PROFILE_RUN)
+    return bool(_IN_WARMUP[0])
 
 
 def install_profile_guard() -> list[str]:
@@ -834,9 +841,13 @@ def install_profile_guard() -> list[str]:
     if orig_warm is not None and not getattr(orig_warm, "_xtu_shim", False):
         @functools.wraps(orig_warm)
         def compile_or_warm_up_model(self, *a, **kw):
+            # ⭐ 2026-10-09:本窗口 = **warmup + CUDA graph 捕获** ⇒ 期间挡住 GPU 预填 ✗
+            #   (实测:侧流预填与捕获交错 ⇒ replay 时 `cuGraphLaunch` SIGSEGV)✓
+            _IN_WARMUP[0] = True
             try:
                 return orig_warm(self, *a, **kw)
             finally:
+                _IN_WARMUP[0] = False
                 if _IN_STARTUP[0]:
                     _IN_STARTUP[0] = False
                     print("[vllm-xtu-moe] worker startup finished (KV sized + graphs "

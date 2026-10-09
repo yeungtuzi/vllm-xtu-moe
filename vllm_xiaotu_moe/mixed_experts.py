@@ -1549,25 +1549,21 @@ class _XiaotuExpertsMixin:
         if _gp_mod is not None:
             from vllm_xiaotu_moe.gpu_prefill import (
                 gpu_prefill_min_tokens,
-                in_profile_run,
-                in_vllm_profile_run,
+                in_warmup_or_capture,
             )
 
             _gp_min = gpu_prefill_min_tokens()
             _gp_on = _gp_min > 0
-            # ⭐⭐ 2026-10-09(SPEC_mbt_budget 改动②,已按实测事故**收紧**):
-            #   要放行的**只是 vLLM 的 `profile_run`**(KV 池大小就是在那里定的),
-            #   目的是让 staging 真的被分配 ⇒ 进入 vLLM 的 `total_consumed` ✓
-            #   ⛔ **warmup / CUDA graph 捕获期必须继续挡住** —— 2026-10-09 17:35 实测:
-            #   把 `in_profile_run()` 整个删掉后,侧流 GPU 预填与图捕获交错,两个 rank 在
-            #   第一个 32K 请求后**同时** `cuGraphLaunch` SIGSEGV ⇒ 服务整体下线 ✗
-            #   判据:`(不在 startup) or (正在 profile_run)`,且**任何**捕获中的流都不放行 ✓
-            _in_startup = in_profile_run()
-            _prof_only = in_vllm_profile_run()
+            # ⭐⭐ 2026-10-09(SPEC_mbt_budget 改动②,已按实测事故**两次收紧**):
+            #   ① 要放行以让 vLLM 的 profile **看到 staging**(它才据此给 KV 定容)✓
+            #   ② ⛔ 但 **warmup + CUDA graph 捕获** 窗口必须挡住 —— 2026-10-09 17:35 实测:
+            #      侧流 GPU 预填与图捕获交错 ⇒ 两 rank 同时 `cuGraphLaunch` SIGSEGV ⇒ 服务下线 ✗
+            #      (`is_current_stream_capturing()` 不够:它只在捕获调用之内为真)
+            #   ⇒ 判据 = `not in_warmup_or_capture()`:profile 期放行、warmup/捕获期挡住 ✓
             _gpu_pf = (
                 _gp_on
                 and qlen >= _gp_min
-                and ((not _in_startup) or _prof_only)
+                and not in_warmup_or_capture()
                 and not torch.cuda.is_current_stream_capturing()
             )
         # ⚠️ 释放条件是 `_gp_on`,不是 `_gpu_pf`。引擎是**惰性**建的:第一个请求
