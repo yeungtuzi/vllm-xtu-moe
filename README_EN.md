@@ -29,7 +29,7 @@
 
 ## Project highlights
 
-1. **Runs very large MoE models on a single GPU (>40 GB) with enough system RAM** (verified on DeepSeek-V4.1-Flash, GLM-5.3-Flash, MiMo-V2.6-Flash-RL and Qwen3.8-Flash-Next); other MoE models are supported too.
+1. **Runs very large MoE models on a single GPU (>40 GB) with enough system RAM** (verified on DeepSeek-V4.1-Flash, GLM-5.3-Flash, MiMo-V2.6-Flash-RL and Qwen3.8-Flash-Next); other MoE models are presumed to work.
 2. **Automatic CPU/GPU prefill split**: for long prompts (threshold configurable) the weights are streamed into VRAM with DMA double buffering, **saturating the PCIe link** (verified on 2x Tesla A100 40GB: both PCIe 4.0 x16 lanes reach the **25 GB/s** ceiling), keeping GPU-side prefill performance as high as possible.
 3. **Supports older GPUs such as SM80**, and **NVFP4 / MXFP4** quantized weights; where the hardware has no native support, the weights are **dequantized and computed on the best available path**.
 4. Supports **AVX-512 VNNI and other ISAs**, picking the best CPU compute backend automatically.
