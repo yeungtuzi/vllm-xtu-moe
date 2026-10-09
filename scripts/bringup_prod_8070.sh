@@ -66,7 +66,12 @@ VLLM_ENV=(
               #    GPU 预填触发率=0(device=cuda 0 次 ✗)⇒ 丢掉 1.41× 预填优化  ⛔ **此处已失效,见文件末尾【勘误 C1】(2026-10-08)**
               #    安全改由 ACT_RESERVE 承担(见下)
               #    原 8192(用户 2026-10-03 指示)⇒ 崩溃回归;详见 BUG_REGISTRY A19/A20/A21/A24
-  MAXSEQS=4    # ⭐ 2026-10-08 用户定案(窗口期):并发 → 4;配合 MAXLEN=524288
+  MAXSEQS=2    # ⭐⭐ 2026-10-09 用户定案:并发 4 → **2**
+  #   ⛔ 来由(2026-10-09 04:36 崩溃):4 路 sub-agent 同时打本机,每个 prompt 18 万 token 且
+  #      **前缀缓存零命中(完整预填)** ⇒ 显存爬到 34.2 GiB(上限~36)⇒ attention 里 q_padded
+  #      分配失败(`aten::new_empty`)⇒ **EngineCore 死、服务整体下线** ✗
+  #   ⭐ 选择只降并发、**不动 MBT**(保住预填速度):见 USER_QA_LEDGER #133
+  #   旧值(保留):4 —— 2026-10-08 用户定案(窗口期):并发 → 4;配合 MAXLEN=524288
                #   用户口径:「512K 天花板 + 短任务多路」;⚠️ **长请求超池会排队**
                # ⚠️ 算术(实测):池 = 1,080,480 token(2.5 GiB,2.426 KiB/tok)
                #   4 × 512K = 2,097,152 tok ⇒ **只有 ~2 路满长能真同时跑**,其余**排队**(不报错)✓
@@ -120,7 +125,7 @@ VLLM_ENV=(
   #   而剖析本来会用 dummy 分配为这块 logits 预留 512 MB(见 IRON_RULES R24 第 8 条)。
   #   ⇒ 降到 128 MB 后,同样的请求只申请 ≤128 MB,在碎片空间里就能放下 ✓
   #   (框架按此预算在 query 维分块,可优雅退化到 1 token:vllm/v1/attention/backends/mla/indexer.py:1285-1318)
-  EXTRA_ENV="XIAOTU_GP_ACT_RESERVE_GIB=1.5 VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128"   # ⛔ 2026-10-08 **回退**:3.0 被 A29 实测否决(GPU 预填 device=cuda **0** 次);2.0 亦"可能完全不触发"⇒ **只有 1.5 下实测 ACTIVE(346 次)** ⇒ 不动 ✓
+  EXTRA_ENV="XIAOTU_GP_ACT_RESERVE_GIB=1.5 VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128 XIAOTU_GPF_STAGE_TILE_E=96"   # ⛔ 2026-10-08 **回退**:3.0 被 A29 实测否决(GPU 预填 device=cuda **0** 次);2.0 亦"可能完全不触发"⇒ **只有 1.5 下实测 ACTIVE(346 次)** ⇒ 不动 ✓
   # ⭐ 【勘误 C3】(2026-10-08)`ACT_RESERVE` **保持 1.5** 的回退理由仍然成立 ✓
   #   (A29 实测:3.0 ⇒ GPU 预填 `device=cuda` **0 次**;2.0 亦'可能完全不触发')✓
   #   ⚠️ 但**不要**据此以为 GPU 预填没在跑 —— 见下面的 C4 ✓

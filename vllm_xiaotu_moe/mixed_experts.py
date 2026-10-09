@@ -1715,6 +1715,19 @@ class _XiaotuExpertsMixin:
                 _gpu_pf = False
             _km = None
             _pf_reason = "engine shards"
+            # ⭐⭐ 【微 ping/pong】tile 模式(用户 2026-10-09:实现微 ping/pong,省显存)
+            #   默认关 ⇒ `_gp_tiled` 恒 False ⇒ 下面所有分支与改动前**逐字等价** ✓
+            #   为什么分叉点必须在这里:整层装配会分配**进程级持久**的整层槽(§601:永不释放)
+            #   ⇒ 若"先装配、再改算 tile",显存一字节都省不下来 ✗
+            _tiled_done = False
+            _tile_e = 0
+            try:
+                from vllm_xiaotu_moe.gpu_prefill import staging_tile_experts as _ste
+                _tile_e = int(_ste(_E))
+            except Exception:  # noqa: BLE001
+                _tile_e = 0
+            _gp_tiled = (bool(_gpu_pf) and engine is not None
+                         and 0 < _tile_e < int(_E))
             if _gpu_pf and _is_fp8:
                 # ---- FP8: 自己装配 + 自己算(持久命名缓冲,不走 slot) ----------
                 # `group_k` 对 FP8 无意义(块固定 128x128),而装配目标用的是模块内
@@ -1822,6 +1835,32 @@ class _XiaotuExpertsMixin:
                           f"qlen={qlen} asm={(time.perf_counter() - _t0) * 1e3:.1f}ms "
                           f"free={torch.cuda.mem_get_info(_dev)[0] / 2**30:.2f}GiB",
                           flush=True)
+            elif _gp_tiled:
+                # ---- 【微 ping/pong】层内 tile 流水 -----------------------------------
+                # 与下面 `elif _gpu_pf:` 的区别:那条先把**一整层**装配进进程级持久的
+                # 整层槽(2 槽 = 6.72 GiB/rank,生产 preflight 7.56);这条把装配与计算
+                # 都下沉到 `tile_e` 个专家一块,环槽 ∝ tile_e/E
+                # ⇒ 驻留降到 ~1.89 GiB/rank(tile=96/384)✓
+                # 数值上等价:`_moe_tile_launch` 复用同一批内核,`out` 靠 atomic_add 累加 ✓
+                _t_split_t = os.environ.get("XIAOTU_GP_SPLIT") == "1"
+                _tt0 = time.perf_counter() if _t_split_t else 0.0
+                out = _gp_mod.gpu_moe_layer_from_engine_tiled(
+                    engine, h_bf16, ids_i32, wts_f32,
+                    hidden_size, _I, _E,
+                    K=int(self.moe_config.experts_per_token),
+                    device=_dev, group_k=int(self._group_k), nslots=2,
+                )
+                if out is None:
+                    # 引擎没有分片等 ⇒ **不**标完成,让下面 `elif _gpu_pf:` 的守卫放行,
+                    # 自然回退到源张量路径(与改动前的回退行为一致 ✓)
+                    _tiled_done = False
+                else:
+                    _tiled_done = True
+                    if _t_split_t:
+                        torch.cuda.synchronize(_dev)
+                        print(f"[gp-tile] layer={getattr(layer,'layer_name','?')} "
+                              f"tile_e={_tile_e} ms={(time.perf_counter()-_tt0)*1e3:.1f}",
+                              flush=True)
             elif _gpu_pf:
                 try:
                     import time as _time
@@ -2042,8 +2081,10 @@ class _XiaotuExpertsMixin:
                     torch.cuda.synchronize(_dev)
                     print(f"[gp-fp8] layer={getattr(layer, 'layer_name', '?')} "
                           f"kernels={(time.perf_counter() - _tk) * 1e3:.1f}ms", flush=True)
-            elif _km is not None:
+            elif _km is not None and not _tiled_done:
                 # 槽来自 `slot_for_shapes`(环形复用);这里只补 ready 事件。
+                # ⚠️ `not _tiled_done`:tile 分支已经算完(且用的是层内环,没有 `_slot`)
+                #    ⇒ 不能再走这条,否则会**二次计算**并把 `out` 重复累加 ✗
                 _slot.ready = torch.cuda.Event()
                 _slot.ready.record(torch.cuda.current_stream(_dev))
                 _t1 = _time.perf_counter() if _t_split else 0.0
@@ -2066,8 +2107,9 @@ class _XiaotuExpertsMixin:
                     print(f"[gp-split] layer={getattr(layer,'layer_name','?')} "
                           f"kernels={(_time.perf_counter()-_t1)*1e3:.1f}ms "
                           f"alloc_after_gemm={_al:.1f}MiB", flush=True)
-            elif _gpu_pf:
+            elif _gpu_pf and not _tiled_done:
                 # 退回源张量(需要源没被释放——`_gp_on` 已保证这一点)。
+                # ⚠️ `not _tiled_done`:tile 分支已产出 `out` ⇒ 这里再跑会**覆盖**它 ✗
                 self._prepare_weights(layer)
                 w13h = getattr(self, "_engine_w13", None)
                 if w13h is None:

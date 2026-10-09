@@ -30,16 +30,13 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.2.6** (2026-10-06) — **bootstrapped development: the whole session ran on the engine it was building, and FP4 expert weights gained an INT8 activation compute path**:
-> **MXFP4 expert weights now have an INT8 activation path** (the fp4 code set `{0, ±1…±12}` fits int8 exactly,
-> so the **weight side is free**; the entire numerical cost comes from quantising the activations) —
-> kernel level **24.9 -> 15.1-15.7 ms/layer (1.54-1.62x)**, `max_abs ≈ 3.163e-03`;
-> end to end (qfn, MXFP4-FP8): GSM8K 200 questions **193/200 on both arms**, 194/200 per-question agreement
-> (net change 0), 256K four-pin **4/4 with `finish_reason=stop` on both arms**, Vision 23 agrees 18/23;
-> also fixed the **fallback-path regression** (was 16-22% slower -> **+1.49% instructions**),
-> brought up **MTP on qfn** (**2.44x** decode) and set the qfn service default thread count to
-> **120 (= 5 cores/CCD)**. The path is **off by default**; enable with `XIAOTU_MOE_INT8=1`.
-> Release notes: [`RELEASE_NOTES_v0.2.6.md`](RELEASE_NOTES_v0.2.6.md)
+> **📌 Current release: v0.2.7** (2026-10-09) — **Optimized engine: CPU→GPU DMA buffers cut, 11 GB of VRAM saved in total, no performance loss**:
+> ⭐ **micro ping/pong** (`XIAOTU_GPF_STAGE_TILE_E=96`): GPU-prefill **staging 7.56 → 1.89 GiB/rank** (**5.67 GiB/rank saved**), and
+> **long-prompt TTFT −16.8%** (same-session interleaved A/B, 3 rounds, **0.4%** dispersion on both arms, **byte-identical output**).
+> Scope: official quantization of this model · `TP=2` · `MBT=8192` · `MAXSEQS=2` · `MAXLEN=524288` · ~32K-char prompt · **prefill phase only** (short requests use CPU prefill and are unaffected).
+> ⚠️ **No decode improvement is claimed** — the 2026-10-08 "decode +2.5~8%" figure was corrected and **retracted** on 2026-10-09. ⚠️ **Long-run stability (hours) not verified.**
+> Release notes: [`RELEASE_NOTES_v0.2.7.md`](RELEASE_NOTES_v0.2.7.md)
+> Work report: [`docs/WORK_REPORT_2026-10-09.md`](docs/WORK_REPORT_2026-10-09.md)
 
 ---
 
