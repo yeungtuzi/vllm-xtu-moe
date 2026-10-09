@@ -29,32 +29,12 @@
 
 ## Project highlights
 
-1. Any MoE model. Not tied to one architecture generation. DeepSeek-V4 / V4.1 work
-   end to end; GLM-5.3-Flash runs end to end too with an FP8 GPU prefill path; MiMo-V2.5
-   runs end to end on a single card.
-   **MiMo-V2.6-Flash-RL also runs on A100/SM80**: the skeleton, a 1M context and real-weight
-   long-context generation have all been measured (multimodal input and throughput pending).
-   It takes the same **MXFP4** engine path as V4.1 and is 161 GiB -- see `docs/MODEL_GUIDES.md`
-   section 3b and `docs/EXPERIMENTS.md` B92-B100.
-2. Any x86 ISA. `scalar → AVX2 → AVX-512 (base/VNNI/BF16/VBMI)`, selected at import
-   time from `/proc/cpuinfo`.
-3. A fixed VRAM priority order: `KV pool → GPU prefill staging → speculative draft → activation workspace (∝ MBT)`.
-   No feature may push that order back.
-   > Revised 2026-09-20: (a) expert-layer residency is dropped — it measured poorly
-   > (3.36 GiB per layer, and the gain does not justify the squeeze it puts on 32K prefill, so
-   > the user retired it from the priority list); (b) the activation workspace is added — it
-   > scales with the chunk (i.e. MBT) and was the real cause of two consecutive long-prompt OOMs,
-   > yet it had never been listed.
-4. One copy of the weights even across the multiple NUMA nodes of a single server:
-   each NUMA node only reads and writes its local memory, maximising performance while
-   saving memory.
-5. **Bootstrapped development.** The 2026-10-06 session was developed and tested entirely inside the
-   local "self-service" environment: the agent acted as the developer while the engine under
-   development **was its own inference backend**. Every step, regression and A/B measurement was
-   served by the very engine being changed -- which also exercised its stability under real live load
-   (that service ran **16+ hours without a fault** during the session).
+1. **Runs very large MoE models on a single GPU (>40 GB) with enough system RAM** (verified on DeepSeek-V4.1-Flash, GLM-5.3-Flash, MiMo-V2.6-Flash-RL and Qwen3.8-Flash-Next); other MoE models are supported too.
+2. **Automatic CPU/GPU prefill split**: for long prompts (threshold configurable) the weights are streamed into VRAM with DMA double buffering, **saturating the PCIe link** (verified on 2x Tesla A100 40GB: both PCIe 4.0 x16 lanes reach the **25 GB/s** ceiling), keeping GPU-side prefill performance as high as possible.
+3. **Supports older GPUs such as SM80**, and **NVFP4 / MXFP4** quantized weights; where the hardware has no native support, the weights are **dequantized and computed on the best available path**.
+4. Supports **AVX-512 VNNI and other ISAs**, picking the best CPU compute backend automatically.
+5. **Hardware-aware NUMA slicing**: the process is spread evenly across cores according to the NUMA topology, and the MoE weights are sharded to match, so **every node's compute only touches local memory** (no cross-socket traffic) while **total memory stays at a single copy of the weights**.
 
----
 ## Measurement host
 
 Every performance number below was taken on this machine:
