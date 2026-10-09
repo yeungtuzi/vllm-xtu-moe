@@ -28,7 +28,7 @@ PY="$ENV/bin/python"
 CKPT="${CKPT:-$(ls -d /home/user/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/*/ 2>/dev/null | head -1)}"
 
 TAG="${TAG:-qwen38_$(date +%m%d_%H%M%S)}"
-PORT="${PORT:-8140}"        # ⚠️ 不能是 8070(生产)/8080(LMCache HTTP)/5555
+PORT="${PORT:-8140}"        # ⚠️ 不能是 8070(生产)
 GPUS="${GPUS:-2}"           # 【纪律】调试只用 GPU2
 TP="${TP:-1}"               # 【纪律】TP=1
 MAXLEN="${MAXLEN:-8192}"    # 【纪律】上下文尽量短

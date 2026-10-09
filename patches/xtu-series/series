@@ -11,5 +11,4 @@
 0011-feat-MiMo-V2.5-SM80-build-all-3-MTP-depth-layer.patch
 0012-sparse-MLA-prefill-2-D-BLOCK_H-tile-2.89x-on-th.patch
 0013-Revert-feat-MiMo-V2.5-SM80-build-all-3-MTP-dept.patch
-0014-feat-DSv4.1-transfer-KV-through-the-connector-f.patch
 0015-feat-GLM-5.3-fp8_ds_mla-KV-cache-on-the-SM8x-sp.patch

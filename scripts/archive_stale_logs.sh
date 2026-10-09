@@ -19,7 +19,7 @@ cd "$L" || exit 0
 [ -d archive ] || mkdir -p archive
 
 # ---- 【R32】显式服务名单:即使 ppid=1 / 无日志更新,这些**服务**也绝不归档 ----
-SERVICES_KEEP=" prometheus grafana node_exporter coremap coremap_png xtu_exporter lmcache_server "
+SERVICES_KEEP=" prometheus grafana node_exporter coremap coremap_png xtu_exporter "
 # ---- 活着的一律保留(含其日志)----
 KEEP=" _launch_audit.log "
 for f in *.pid; do

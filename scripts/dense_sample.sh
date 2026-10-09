@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # 【2026-10-05】密集采样 —— 用户触发真实负载时同步抓现场(1 秒级)
 #
-# 为什么需要它:看门狗 30 秒采样 ✗ 会漏掉 prefill 决定性序列;而 LMCache 日志**每次启动被覆盖** ✗
+# 为什么需要它:看门狗 30 秒采样 ✗ 会漏掉 prefill 决定性序列
 # ⇒ 必须在【故障发生的那一刻】把这几样都记下来 ✓
 #   ① 引擎进度心跳 [xtu-pf-progress](带 device/layer/qlen)⇒ 卡死时看**最后一条停在哪一层** ✓✓
 #   ② 指标 running/waiting/tokens ⇒ 是否推进 ✓
 #   ③ GPU 利用率/功耗 + 引擎进程 CPU 核数 ⇒ "谁在干活" ✓
-#   ④ LMCache 的 store/retrieve/错误行 ✓
-#   ⑤ 一旦命中铁证(running=0 且 waiting=0 且 GPU>50% 且功耗>150W)⇒ 立即调 diagnose_hang.sh 全量留档 ✓
+#   ④ 一旦命中铁证(running=0 且 waiting=0 且 GPU>50% 且功耗>150W)⇒ 立即调 diagnose_hang.sh 全量留档 ✓
 #
 # 用法: INTERVAL=1 DURATION=2400 bash scripts/dense_sample.sh      # 1 秒一次,最多 40 分钟
 #       bash scripts/proc.sh spawn dense_sample env INTERVAL=1 DURATION=2400 bash scripts/dense_sample.sh
@@ -16,7 +15,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; L="$HERE/../dev-docs/repor
 INTERVAL="${INTERVAL:-1}"; DURATION="${DURATION:-2400}"
 TS=$(date +%Y%m%d-%H%M%S); OUT="$L/dense_$TS"; mkdir -p "$OUT"
 CSV="$OUT/samples.csv"; PFLOG="$OUT/pf_progress.txt"
-echo "t,epoch,running,waiting,prompt_tok,gen_tok,gpu_max,power_max,cpu_cores,verdict,kv_usage_pct,avail_gib,lmc_stored" >"$CSV"
+echo "t,epoch,running,waiting,prompt_tok,gen_tok,gpu_max,power_max,cpu_cores,verdict,kv_usage_pct,avail_gib" >"$CSV"
 SLOG=$(ls -t "$L"/v41_8070.*.log 2>/dev/null | head -1)
 echo "=== dense sample start $TS  interval=${INTERVAL}s duration=${DURATION}s" | tee -a "$OUT/run.log"
 echo "    服务日志: $(basename "${SLOG:-无}")" | tee -a "$OUT/run.log"
@@ -57,8 +56,7 @@ while [ "$(date +%s)" -lt "$end" ]; do
   fi
   KV=$(echo "$M" | grep -E "^vllm:gpu_cache_usage_perc" | sed 's/.*} //' | head -1)
   AV=$(awk '/^MemAvailable:/{printf "%.0f",$2/1048576}' /proc/meminfo)
-  LS=$(grep -ac "Stored" "$L/lmcache_server.log" 2>/dev/null || echo 0)
-  echo "$(date +%H:%M:%S),$NOW,$R,$W,${P:-},${G:-},${U:-0},${PW:-0},${CORES:-0},$V,${KV:-},${AV:-},${LS:-}" >>"$CSV"
+  echo "$(date +%H:%M:%S),$NOW,$R,$W,${P:-},${G:-},${U:-0},${PW:-0},${CORES:-0},$V,${KV:-},${AV:-}" >>"$CSV"
   # ★ 铁证 ⇒ 立刻全量留档
   if [ "${Rn:-0}" -eq 0 ] && [ "${Wn:-0}" -eq 0 ] && [ "${U:-0}" -gt 50 ] && [ "${PW:-0}" -gt 150 ]; then
     echo "★★★ $(date +%H:%M:%S) 铁证:零请求但 GPU ${U}%/${PW}W ⇒ 留档" | tee -a "$OUT/run.log"

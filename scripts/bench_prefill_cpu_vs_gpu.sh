@@ -4,7 +4,7 @@
 # 设计(为什么这样写):
 #   * 每个 (臂, MBT) **独立重启服务** —— 不靠运行时切阈值,因为阈值切到 0 会让引擎
 #     释放源权重,再切回来就没有可流式的源 ⇒ 会给"CPU 臂"引入"源权重双份常驻"的混淆。
-#   * PREFIX_CACHE=0 + LMCACHE=0 + UNIQUE=1 —— 否则量到的是缓存命中,不是真预填充
+#   * PREFIX_CACHE=0 + UNIQUE=1 —— 否则量到的是缓存命中,不是真预填充
 #     (probe_ttft.py 头部的 §591 尺子教训)。
 #   * 每个配置先跑一遍**丢弃的 warmup pass**,再跑测量 pass ⇒ 报告的才是 warmup 状态。
 #   * TP=2 一律 GPU1,2(IRON_RULES R19:GPU0 只有 PCIe x8)。
@@ -77,7 +77,7 @@ run_one(){  # $1=mbt $2=arm $3=threshold
   local rc
   log "START arm=$arm mbt=$mbt thr=$thr tag=$tag"
   bash scripts/proc.sh spawn "$tag" env \
-    LMCACHE=0 MAXLEN="$MAXLEN" MBT="$mbt" MAXSEQS=1 GPUS="$GPUS" TP="$TP" GPU_UTIL="$GPU_UTIL" \
+    MAXLEN="$MAXLEN" MBT="$mbt" MAXSEQS=1 GPUS="$GPUS" TP="$TP" GPU_UTIL="$GPU_UTIL" \
     COMPILE=1 EAGER=0 SPEC=0 KV_DTYPE=fp8_ds_mla KV_CACHE_BYTES="$KVB" \
     PREFIX_CACHE=0 WARMUP=0 LOAD=auto PORT="$PORT" TAG="$tag" \
     VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$thr" XIAOTU_MOE_THREADS="$THREADS" \

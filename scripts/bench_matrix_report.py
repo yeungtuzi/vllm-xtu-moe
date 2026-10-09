@@ -56,7 +56,7 @@ def main() -> int:
     A("| 模型 | **ds41f** = DeepSeek-V4.1-Flash(官方量化:FP8 稠密 + **MXFP4** 专家)✓ |")
     A("| 服务 | 生产 **8070** · 受审脚本 `scripts/bringup_prod_8070.sh` · md5 `" + md5 + "` |")
     A("| 配置 | `TP=2`(GPU1+GPU2)· `MAXLEN=524288` · **`MBT=8192`** · `MAXSEQS=4` · "
-      "`KV_CACHE_BYTES=2684354560` · `GPU_UTIL=0.90` · `SPEC=1`(DSpark k=5)· `LMCACHE=0` |")
+      "`KV_CACHE_BYTES=2684354560` · `GPU_UTIL=0.90` · `SPEC=1`(DSpark k=5) |")
     A("| 硬件 | " + gpu + " |")
     A("| 宿主 | " + mem + " GiB total |")
     A("| 项目数 | **6** = `c ∈ {1,2,4}` × `L ∈ {128, 16384}` |")

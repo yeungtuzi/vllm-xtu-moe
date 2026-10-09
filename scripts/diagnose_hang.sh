@@ -54,10 +54,9 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,nohead
   | sed 's/^/    /' | tee -a "$OUT/compute_apps.txt" | sed 's/^/  /'
 log "    (上面若出现非 8070 那 4 个 pid 的进程 ⇒ 就是【第二个实例在抢资源】✗)"
 PROD=$(tr -dc '0-9' < "$L/v41_8070.pid" 2>/dev/null)
-LMC=$(tr -dc '0-9' < "$L/lmcache_server.pid" 2>/dev/null)
-# 沿 PPid 向上追溯,判断某 pid 是否属于【生产那棵树】或【LMCache】(两者都合法用 GPU ✓)
+# 沿 PPid 向上追溯,判断某 pid 是否属于【生产那棵树】(合法用 GPU ✓)
 in_tree(){ local x="$1" hop=0; while [ -n "$x" ] && [ "$x" != "0" ] && [ "$x" != "1" ] && [ $hop -lt 12 ]; do
-    [ "$x" = "$PROD" ] && return 0; [ "$x" = "$LMC" ] && return 0
+    [ "$x" = "$PROD" ] && return 0
     x=$(grep -m1 '^PPid:' /proc/$x/status 2>/dev/null | tr -dc '0-9'); hop=$((hop+1)); done; return 1; }
 nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ' | sort -u | while read ap; do
   [ -z "$ap" ] && continue
@@ -74,19 +73,6 @@ log "    $(basename "${S:-无}")  mtime=$(stat -c %y "$S" 2>/dev/null | cut -c1-
   | tail -12 | sed 's/^/    /' | tee -a "$OUT/log_tail.txt" >/dev/null
 
 log ""
-log "--- 5b) ⭐ LMCache 现场(它的日志【每次启动被覆盖】⇒ 必须当场抓,否则证据永久丢失 ✗)"
-LML="$L/lmcache_server.log"
-if [ -f "$LML" ]; then
-  log "    大小=$(du -h "$LML" | cut -f1) 最后写入=$(stat -c %y "$LML" | cut -c1-19)"
-  log "    最近动作(去 ANSI):"
-  grep -a "Stored\|Retrieved\|ERROR\|timeout" "$LML" 2>/dev/null | tail -8 \
-    | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-150 | sed 's/^/      /' | tee -a "$OUT/lmcache.txt" >/dev/null
-  log "    Stored 频次分布(多份=同一块反复搬运 ⇒ 传输层可能在重试 ✗):"
-  grep -aoE "Stored [0-9]+ tokens" "$LML" 2>/dev/null | sort | uniq -c | sort -rn | head -5 \
-    | sed 's/^/      /' | tee -a "$OUT/lmcache.txt" >/dev/null
-else
-  log "    ✗ 找不到 $LML"
-fi
 log ""
 log "--- 6) Python 栈(若装了 py-spy 就能直接看到卡在哪一行)---"
 if command -v py-spy >/dev/null 2>&1; then

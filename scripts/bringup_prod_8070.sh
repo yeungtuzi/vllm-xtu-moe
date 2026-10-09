@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ⭐ 生产 8070 固化启动脚本(唯一真源 ✓;用户口径 2026-09-30)
 #
-# 口径:DeepSeek-V4.1-Flash · **1M 上下文** · GPU 预填 on · dspark k=5 on · LMCache on · 监控栈 on
+# 口径:DeepSeek-V4.1-Flash · **1M 上下文** · GPU 预填 on · dspark k=5 on · 监控栈 on
 #
 # 【2026-10-03 变更(用户指示)】MAXLEN 768K → **1M**;MBT 4096 → **8192**。
 #   为什么现在能开 1M(此前被护栏拒绝):
@@ -22,7 +22,6 @@
 #    ⇒ 本脚本只用于【机器重启后恢复】;日常调试请用 GPU2 + TP=1,不要动 8070 ✓
 #
 # 关键词(踩过的坑,别再改错):
-#   * LMCache 是口径的一部分 ✗ 不能省(用户明令)⇒ 必须先起 LMCache 服务端(5555),再起 vLLM ✓
 #   * MAXLEN = **1048576(1M)** ✓ —— 护栏已改成按 **KV 池预算**判定(见 serve_v41.sh);
 #     1M + GPU 预填在 KV ≤ 3 GiB 时成立(实测 KV 2.5 GiB ⇒ 峰值 93.8% ✅)
 #   * KV_CACHE_BYTES=2684354560(2.5 GiB):1M 实测只需 ~2.2 GiB;给到 5.3 GiB 会顶到 98.4% ✗
@@ -46,9 +45,6 @@ WITH_MONITORING="${WITH_MONITORING:-1}"
 # ⭐ 本次实例计划用的 GPU(与 VLLM_ENV 里的 GPUS 同源,下面有断言强制一致)
 GPUS_PLAN=1,2
 VLLM_ENV=(
-  LMCACHE="${LMCACHE:-0}"   # ⭐ 2026-10-05 目标①:默认关闭 LMCache 连接器
-  #   依据:SPEC=0 两次大请求崩溃栈均为 LMCache(retrieve 失败 ⇒ invalid_block_ids ⇒ scheduler 抛)✗
-  #   ⇒ 先验证"无 LMCache 时 long prefill 是否稳定" ✓   # 【2026-10-05 修】原来硬编码 ⇒ 覆盖外部 env,令 LMCACHE=0 的 A/B 从未生效 ✗
   MM_IMAGES="${MM_IMAGES:-4}"   # 【2026-10-05】用户被 400 挡住(历史里的图被数成超限)⇒ 提到 4 解阻塞;代价:多图一起过编码器 ⇒ 首 token 慢
   MAXLEN=524288
   MBT=8192   # ⭐⭐ 2026-10-08 【已执行】6144 → 8192:端到端 **−9.9%**(交错 A/B × 3 轮,离散 **0.3%**)✓(台账 B376);原注见下方 C2 勘误
@@ -91,11 +87,9 @@ VLLM_ENV=(
   EAGER=0
   SPEC=1   # ⭐ 2026-10-05 用户指示:生产【开启】投机解码(DSpark k=5)
             #   理由:投机收益太大(实测 mean acceptance ≈3.59 ⇒ decode 约 2–3×)
-            #   ⭐ 保留 LMCACHE=0(已确认它是 long prefill 崩溃的元凶 ✓,见 docs/KNOWN_ISSUES_LMCACHE.md)
             #   ⇒ 本配置用于明天验证【输出退化】是否仍出现
             #   若本臂 long prefill 稳定 ⇒ 按目标③把此配置留在生产供明天测退化
-            #   崩溃栈:LMCache retrieve 失败 ⇒ invalid_block_ids ⇒ scheduler 抛 ⇒ EngineCore 死(A34)
-            #   ⇒ 暂回 SPEC=1(已知可用);SPEC=0 需先解决 LMCache 崩才能用于退化验证
+            #   ⇒ 暂回 SPEC=1(已知可用)
             #   目的①:减每步激活(不再被 draft token 放大)⇒ 放开显存闸门
             #   目的②:⭐ 验证模型退化是否由投机解码引起(sample #3 的对照臂)
             #   ⚠️ 代价:decode 吞吐下降(acceptance 均值 3.59 ⇒ 预期 decode 慢 ~2x)
@@ -114,13 +108,15 @@ VLLM_ENV=(
   #   机理:胜负由 **chunk = min(prompt, MBT)** 决定,不是 prompt 总长 ✓
   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="${GPU_PREFILL_MIN_TOKENS:-2560}"
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+  #   ⛔ 2026-10-09:全部 LMCache 接线已删除 ⇒ 本条 `expandable_segments:False` 原有的
+  #      "LMCache 要求" 约束已消失。⚠️ 是否改回 True 属【独立决策】(见事故报告),本次不动 ✓
   # 【2026-10-03 事故修复】索引器 logits 预算 512 → 128 MB。
   #   事故:长 prompt 时 `sparse_attn_indexer` 的 `fp8_fp4_mqa_logits` 回退会分配
   #   `[q, kv]` 的 fp32 logits,分块器把 m×n 填到 `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`
   #   (默认 512 MB)⇒ 实测崩溃那次请求 num_computed_tokens=11904,
   #   max_q = 512MB/4 // 11904 = 11274 ⇒ 11274×11904 = 134.2M 元素 = **恰好 512 MB**,
   #   而当时只剩 421.94 MiB 空闲(且 PyTorch 有 2.27 GiB reserved-but-unallocated 的碎片,
-  #   因 LMCache 要求 expandable_segments:False 无法回收)⇒ OOM ⇒ EngineCore 死。
+  #   而 expandable_segments:False 令其无法回收)⇒ OOM ⇒ EngineCore 死。
   #   为什么以前没预留:显式传 KV_CACHE_BYTES 会让 vLLM **跳过显存剖析**,
   #   而剖析本来会用 dummy 分配为这块 logits 预留 512 MB(见 IRON_RULES R24 第 8 条)。
   #   ⇒ 降到 128 MB 后,同样的请求只申请 ≤128 MB,在碎片空间里就能放下 ✓
@@ -144,9 +140,6 @@ VLLM_ENV=(
   TAG=v41_8070
   SERVED=DeepSeek-V4.1-Flash
 )
-LMCACHE_ENV=(CHUNK_SIZE=2176 TRANSFER_MODE=lmcache_driven ENABLE_MODULES= L1_GB=64 L2_GB=100)
-  # 【2026-10-05】L1 100→64 GiB:各 node 仅剩 5.9–20.1 GiB 空闲 ⇒ 100 GiB 即使 interleave 也偏紧;
-  # 64 GiB ⇒ 每节点 8 GiB ✓ 宽裕;保留 interleave(用户:lmcache 性能要求不高,不必锁 local ✓)
 MONITORING_ROOT=/home/user/lvllm/monitoring
 
 # ⭐ 自检:GPUS_PLAN 必须等于 VLLM_ENV 里的 GPUS —— 防止"同一事实两处表示" ✗
@@ -164,8 +157,8 @@ fi
 #   ⭐ 证据读不到(ss 失败)一律【当作在跑】⇒ fail-closed ✓
 # ⭐⭐ 2026-10-07 独立审计 F1:原来的二元 port_up 把"ss 读不到"当成"在跑" ✗
 #   对【安全门】(非 8070 + 生产在跑 ⇒ 拒绝)方向正确,但同一函数被 12 个调用点复用 ⇒
-#   在【启动决策】处方向相反:会**静默跳过**启动监控栈/LMCache/coremap,
-#   而 --status/⑤汇总还会**反报 RUNNING** ✗
+#   在【启动决策】处方向相反:会**静默跳过**启动监控栈/coremap,
+#   而 --status/④汇总还会**反报 RUNNING** ✗
 #   ⇒ 改为三态:UP / DOWN / UNKNOWN(= 证据读不到)✓
 port_state() {   # 结果写入 PORT_STATE;rc:0=UP 1=DOWN 2=UNKNOWN
   pi_port_listeners "$1"
@@ -220,8 +213,6 @@ recycle_helper() {   # <name> <cmd...>
 if [ "${1:-}" = "--status" ]; then
   say "生产状态"
   printf '  %-24s %s\n' "8070 vLLM" "$(port_label 8070)"
-  printf '  %-24s %s\n' "5555 LMCache MP" "$(port_label 5555)"
-  printf '  %-24s %s\n' "8080 LMCache HTTP" "$(port_label 8080)"
   for p in 9090 3000 9100 8787; do printf '  %-24s %s\n' "监控 $p" "$(port_label $p)"; done
   port_state 8070; [ "$PORT_STATE" != "UNKNOWN" ] || echo "  ⚠️ 8070 端口状态无法判定(ss 失败)⇒ 上面的 RUNNING/DOWN 不可信" >&2
   echo "  真服务 PID 文件: $(cat "$LOGDIR/vllm_prod_8070.pid" 2>/dev/null || echo '无')"
@@ -230,8 +221,8 @@ if [ "${1:-}" = "--status" ]; then
 fi
 
 # ⭐ 同机多实例硬门(AGENTS「同机多实例纪律」)—— 必须放在【任何 spawn 之前】✓
-#   来由(2026-10-07 自查):原先它排在 ①LMCache 之后 ⇒ 用 PORT=8071 起第二个实例时,
-#   会先把 LMCache 服务端拉起来、再拒绝 ⇒ "拒绝了却已经动了东西" ✗ ⇒ 现在提到最前 ✓
+#   来由(2026-10-07 自查):原先它排在其它 spawn 步骤之后 ⇒ 用 PORT=8071 起第二个实例时,
+#   会先动了东西、再拒绝 ⇒ "拒绝了却已经动了东西" ✗ ⇒ 现在提到最前 ✓
 # ⭐ 安全门:生产"确定在跑"或"无法判定"都拒绝(fail-closed)✓
 port_state 8070; _prod_st=$?
 if [ "$PORT" != "8070" ] && { [ "$_prod_st" -eq 0 ] || [ "$PORT_STATE" = "UNKNOWN" ]; }; then
@@ -240,24 +231,8 @@ if [ "$PORT" != "8070" ] && { [ "$_prod_st" -eq 0 ] || [ "$PORT_STATE" = "UNKNOW
   exit 3
 fi
 
-say "① LMCache 服务端"
-# ⭐ 数组元素【不是】shell 变量 ⇒ 必须先取出真实变量(否则 set -u 会直接退出 ✗)
-_LMCACHE_ON="${LMCACHE:-0}"
-if [ "$_LMCACHE_ON" = "1" ]; then
-  port_maybe_start 5555; _lm=$?
-  if [ "$_lm" = "2" ]; then echo "  ⛔ :5555 端口状态无法判定(ss 失败)⇒ 中止 ✗" >&2; exit 1; fi
-  if [ "$_lm" = "1" ]; then
-    echo "  已在跑 ⇒ 跳过 ✓"
-  else
-    spawn_or_die lmcache_server env "${LMCACHE_ENV[@]}" bash scripts/serve_lmcache.sh
-    wait_port 5555 24 && echo "  ✅ 5555 就绪 ✓" || { echo "  ✗ LMCache 未起来"; exit 1; }
-  fi
-else
-  echo "  LMCACHE=0 ⇒ 不启动 lmcache_server(端口 5555/8080 预期 DOWN ✓);也不等待它 ✓"
-fi
-
-say "② vLLM 生产(LMCache + 512K + GPU 预填 + dspark ✓)"
-# (同机多实例硬门已提到 ① 之前 —— 见上面)✓
+say "① vLLM 生产(512K + GPU 预填 + dspark ✓)"
+# (同机多实例硬门已在最前 —— 见上面)✓
 port_maybe_start "$PORT"; _vp=$?
 if [ "$_vp" = "2" ]; then echo "  ⛔ :$PORT 端口状态无法判定(ss 失败)⇒ 中止(不静默跳过启动)✗" >&2; exit 1; fi
 if [ "$_vp" = "1" ]; then
@@ -284,7 +259,7 @@ else
   echo "  ✅ 8070 就绪 ✓"
 fi
 
-say "③ 认领【真】PID + 记日志(按用户定的策略 ✓)"
+say "② 认领【真】PID + 记日志(按用户定的策略 ✓)"
 # ⭐ 审计修:认领名不得在非 8070 端口时仍写成生产名(否则用调试实例覆盖生产 PID 文件)✗
 ADOPT_NAME="$([ "$PORT" = "8070" ] && echo vllm_prod_8070 || echo "probe_${PORT}")"
 # ⭐ 审计修:原代码用 `ss | grep ":$PORT " … | head -1` 且**只看"有人听"**就 adopt
@@ -321,7 +296,7 @@ fi
 } >> "$LOGDIR/$ADOPT_NAME.log"
 echo "  ✅ 真 PID=$APIP(PGID=$PG)已写入 $ADOPT_NAME.pid ✓;真服务日志=$LOGDIR/v41_8070.log ✓"
 
-say "④ 监控栈"
+say "③ 监控栈"
 if [ "$WITH_MONITORING" = "1" ]; then
   M="$MONITORING_ROOT"
   port_maybe_start 9090; case $? in 0) : ;; 1) : ;; *) echo "  ⛔ :9090 端口状态无法判定(ss 失败)⇒ 拒绝静默跳过,中止 ✗" >&2; exit 1 ;; esac
@@ -360,8 +335,8 @@ else
   echo "  跳过(WITH_MONITORING=0)✓"
 fi
 
-say "⑤ 汇总"
-for p in 8070 5555 8080 9090 3000 9100 8787; do
+say "④ 汇总"
+for p in 8070 9090 3000 9100 8787; do
   printf '  %-5s %s\n' "$p" "$(port_label "$p")"
 done
 echo "  看板: http://127.0.0.1:3000/d/dsh-overview"

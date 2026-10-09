@@ -140,7 +140,7 @@ def start(mbt: int, name: str) -> None:
     env = dict(
         PORT=str(PORT), TAG=name, GPUS="1,2", TP="2", MAXLEN="524288", MBT=str(mbt),
         MAXSEQS="2", KV_DTYPE="fp8_ds_mla", KV_CACHE_BYTES="2684354560", GPU_UTIL="0.90",
-        COMPILE="1", EAGER="0", SPEC="1", LMCACHE="0", MM_IMAGES="4", WARMUP="1",
+        COMPILE="1", EAGER="0", SPEC="1", MM_IMAGES="4", WARMUP="1",
         VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="2560",
         PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False",
         SERVED="DeepSeek-V4.1-Flash",

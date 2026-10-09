@@ -99,11 +99,11 @@ TP="${TP:-2}"
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║ ★ 最佳性能配置(2026-10-03 重定为 **1M + MBT=8192**;用户指示,勿凭记忆 ✗)   ║
 # ╠══════════════════════════════════════════════════════════════════════════════╣
-# ║ 口径:1M 上下文 + GPU 预填 + dspark(k=5)+ FULL_DECODE_ONLY + LMCache         ║
+# ║ 口径:1M 上下文 + GPU 预填 + dspark(k=5)+ FULL_DECODE_ONLY                  ║
 # ║   MAXLEN=1048576  MBT=8192  MAXSEQS=1  GPUS=1,2  TP=2  GPU_UTIL=0.90        ║
 # ║   EAGER=0  COMPILE=1  SPEC=1  KV_DTYPE=fp8_ds_mla                          ║
 # ║   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384  XIAOTU_GP_ACT_RESERVE_GIB=1.5     ║
-# ║   KV_CACHE_BYTES=2684354560(2.5 GiB)  LMCACHE=1                            ║
+# ║   KV_CACHE_BYTES=2684354560(2.5 GiB)                                       ║
 # ║   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False                         ║
 # ║                                                                            ║
 # ║ 实测(2026-10-03,TP=2/GPU1,2/dspark/KV 2.5 GiB):                            ║
@@ -132,7 +132,7 @@ fi
 #   原为 MBT=4096 是为了给 1M 的 KV 腾地方;现在 CED 让 KV 只占 ~2.2 GiB,
 #   且 MBT=8192 的 GPU 预填 chunk 更饱满(实测 988 tok/s vs MBT=4096 的 ~648)。
 # 生产调用示例(单行即可):
-#   GPUS=1,2 TP=2 MAXLEN=1048576 MBT=8192 KV_CACHE_BYTES=2684354560 LMCACHE=1 bash scripts/bringup_prod_8070.sh
+#   GPUS=1,2 TP=2 MAXLEN=1048576 MBT=8192 KV_CACHE_BYTES=2684354560  bash scripts/bringup_prod_8070.sh
 # ⚠️ 【2026-10-03 用户明令】TP=2 一律 GPU1+GPU2;GPU0 只有 x8 ⇒ 只做单卡调试(IRON_RULES R19)。
 # (本脚本默认 MAXLEN=2048 是**冒烟**口径,别拿默认值当生产。)
 MBT="${MBT:-4096}"
@@ -160,18 +160,6 @@ HF_OVERRIDES="${HF_OVERRIDES:-}"
 # 且拿不到 reasoning_content ⇒ DSH 的"思考强度"选项会消失。置空可关。
 # KV 显存类型:`fp8_ds_mla` 可让同容量显存减半(V4-Flash 生产口径)⇒ 给 GPU 预填腾出余量;
 # 缺省 auto = 不传该参数(保持模型默认)。⚠️ 1M + GPU 预填必须留够余量,否则 prefill 的 MLA logits 缓冲会 OOM。
-# 【LMCache】LMCACHE=1 时启用外部 KV 缓存(需先跑 scripts/serve_lmcache.sh)。
-# L1=CPU 内存、L2=SSD ⇒ **服务重启后 prefix cache 仍在**(见 EXPERIMENTS B164)。
-LMCACHE="${LMCACHE:-0}"
-if [ "$LMCACHE" = "1" ]; then
-if [ "${LMCACHE_XFER:-false}" = "true" ]; then
-  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555},\"lmcache.mp.transfer_intermediate_tensors\":true}"
-else
-  KV_TRANSFER_JSON="{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"127.0.0.1\",\"lmcache.mp.port\":5555}}"
-fi
-else
-  KV_TRANSFER_JSON=""
-fi
 TOOL_PARSER="${TOOL_PARSER:-deepseek_v41}"
 REASONING_PARSER="${REASONING_PARSER:-deepseek_v3}"   # ⚠️ 与第 25 行注释("默认 deepseek_v41")不一致 ✗;
 #    启动日志会出现 "Auto-initialization of reasoning token IDs failed" 警告 ✓
@@ -450,8 +438,6 @@ fi
     $( [ -n "$REASONING_PARSER" ] && printf -- '--reasoning-parser %s' "$REASONING_PARSER" ) \
     $( [ -n "$DEFAULT_CHAT_KWARGS" ] && printf -- '--default-chat-template-kwargs %s' "${DEFAULT_CHAT_KWARGS// /}" ) \
     $( [ "$KV_DTYPE" != "auto" ] && printf -- '--kv-cache-dtype %s' "$KV_DTYPE" ) \
-    $( [ "$LMCACHE" = "1" ] && echo --enable-prefix-caching ) \
-    $( [ -n "$KV_TRANSFER_JSON" ] && printf -- '--kv-transfer-config %s' "$KV_TRANSFER_JSON" ) \
     $( [ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && echo --enable-prompt-tokens-details ) \
     $( [ "${EAGER:-1}" = "1" ] && echo --enforce-eager )  \
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \

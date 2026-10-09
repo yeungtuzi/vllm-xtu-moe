@@ -27,7 +27,7 @@ STUB=$(mktemp)
   # ⭐ 动态 horizon:VLLM_ENV=( … ) 的闭合行(取不到时退回 130,并打印告警)
   END=$(awk '/^VLLM_ENV=\(/ {f=1} f && /^\)[[:space:]]*$/ {print NR; exit}' "$B")
   if [ -z "$END" ]; then echo "⚠️ 取不到 VLLM_ENV 闭合行,退回 1,130" >&2; END=130; fi
-  sed -n "1,${END}p" "$B" | sed 's#bash scripts/proc.sh spawn lmcache_server#: #'
+  sed -n "1,${END}p" "$B"
 } > "$STUB"
 if bash "$STUB" >/tmp/_pf_out 2>/tmp/_pf_err; then
   note "② 干跑到数组闭合(set -u 未定义变量)" "✅"
@@ -41,11 +41,9 @@ rm -f "$STUB"
 # ③ 关键参数抽查(必须都能取到值且合法 ✓)
 check(){ v=$(grep -oE "^[[:space:]]*$1=[^ #]+" "$B" | head -1 | cut -d= -f2 | tr -d '"'); \
   if [ -n "$v" ]; then note "③ $1" "✅ $v"; else note "③ $1" "❌ 取不到值"; fail=1; fi; }
-check LMCACHE; check MAXLEN; check MBT; check SPEC; check TP
+check MAXLEN; check MBT; check SPEC; check TP
 v=$(grep -oE 'XIAOTU_GP_ACT_RESERVE_GIB=[0-9.]+' "$B" | head -1 | cut -d= -f2)
 if [ -n "$v" ]; then note "③ ACT_RESERVE" "✅ $v"; else note "③ ACT_RESERVE" "❌"; fail=1; fi
-# ④ LMCache 分支一致性:LMCACHE 必须来自【真实变量或默认值】,不能裸用数组项 ✗
-if grep -qE '\[ "\$LMCACHE" = "1" \]' "$B"; then note "④ LMCACHE 分支用裸变量" "❌(数组项不是变量)"; fail=1; else note "④ LMCache 分支" "✅"; fi
 
 echo
 if [ "$fail" -eq 0 ]; then echo "  ✅ 前置检查通过 ⇒ 可以重启生产 ✓"; exit 0; else echo "  ❌ 前置检查未通过 ⇒ 【禁止重启生产】✗"; exit 1; fi

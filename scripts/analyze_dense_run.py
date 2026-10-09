@@ -76,11 +76,9 @@ out.append("")
 out.append("## 4. 状态量趋势(哪个先异常)")
 av = [fnum(r.get("avail_gib"), -1) for r in rows]; av = [x for x in av if x > 0]
 kv = [fnum(r.get("kv_usage_pct"), -1) for r in rows]; kv = [x for x in kv if x >= 0]
-ls = [fnum(r.get("lmc_stored"), -1) for r in rows]; ls = [x for x in ls if x >= 0]
 gu = max([fnum(r.get("gpu_max")) for r in rows] or [0]); gp = max([fnum(r.get("power_max")) for r in rows] or [0])
 out.append("- **MemAvailable 最低**: %s GiB" % ("%.0f" % min(av) if av else "n/a"))
 out.append("- **KV 池使用率峰值**: %s%%" % ("%.1f" % max(kv) if kv else "n/a(本轮未采到)"))
-out.append("- **LMCache 已存块数**(末值): %s" % ("%.0f" % ls[-1] if ls else "n/a"))
 out.append("- **GPU 峰值**: %.0f%% / **功耗峰值**: %.0fW" % (gu, gp))
 out.append("")
 # 5 心跳细节
