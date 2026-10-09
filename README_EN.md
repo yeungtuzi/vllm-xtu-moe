@@ -11,14 +11,6 @@
 >
 > In other words: even when the **expert weights do not fit in VRAM**, a large MoE model
 > still runs — while **changing mainline vLLM as little as possible**.
->
-> **Focus**
->
-> * very large MoE models such as **DeepSeek / GLM / MiMo**
-> * **CPU + GPU hybrid inference** · **low VRAM footprint**
-> * **high-performance long-context inference**
-> * **mainline-vLLM compatible, no fork required**
-> * aimed at **large-model deployment and engineering optimisation**
 
 [中文](README.md) · English (default)
 
