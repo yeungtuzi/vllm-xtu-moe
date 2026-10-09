@@ -409,7 +409,14 @@ def emit_env(p: dict) -> str:
     _kv_bytes = max(int(p.get("kv_gib", 0.0) * _slack * (1 << 30)), _kv_floor)
     if _kv_bytes > _kv_avail:
         _kv_bytes = _kv_avail
-    lines.append(f"XIAOTU_KV_CACHE_BYTES={_kv_bytes}")
+    # ⭐⭐ 2026-10-09(SPEC_mbt_budget 改动①):**不再下发** `XIAOTU_KV_CACHE_BYTES` ✓
+    #   为什么:显式传 KV 会让 vLLM **跳过显存剖析** ⇒ 它的账本里没有 staging/激活峰,
+    #   于是"够不够"只能在运行中崩给我们看 ✗(见 docs/STRATA_ANALYSIS.md R2 / BUG_REGISTRY A9)。
+    #   ⇒ 现在 KV 池大小**交给 vLLM 自己的 profile**(改动②已让 profile 看到真实 staging ✓)。
+    #   ⚠️ 这里保留的只是一个【离线核算值】,写成注释 ⇒ 不会被 serve 脚本当参数消费 ✓
+    lines.append(
+        f"# [离线核算·不再下发] 按 maxlen 需要的 KV ≈ {_kv_bytes / 2**30:.2f} GiB"
+        f"(其可用上限 {_kv_avail / 2**30:.2f} GiB);实际池大小由 vLLM profile 决定 ✓")
     return "\n".join(lines)
 
 

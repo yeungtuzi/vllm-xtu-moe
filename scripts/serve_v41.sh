@@ -102,7 +102,7 @@ TP="${TP:-2}"
 # ║ 口径:1M 上下文 + GPU 预填 + dspark(k=5)+ FULL_DECODE_ONLY                  ║
 # ║   MAXLEN=1048576  MBT=8192  MAXSEQS=1  GPUS=1,2  TP=2  GPU_UTIL=0.90        ║
 # ║   EAGER=0  COMPILE=1  SPEC=1  KV_DTYPE=fp8_ds_mla                          ║
-# ║   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384  XIAOTU_GP_ACT_RESERVE_GIB=1.5     ║
+# ║   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384  (ACT_RESERVE 已于 2026-10-09 删除)  ║
 # ║   KV_CACHE_BYTES=2684354560(2.5 GiB)                                       ║
 # ║   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False                         ║
 # ║                                                                            ║
@@ -118,16 +118,11 @@ TP="${TP:-2}"
 # ║ ⚠️ fp8/fp4 indexer 与显存**无关**(那是每层仅 1 块的环形暂存,可忽略)✗        ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 MAXLEN="${MAXLEN:-786432}"
-# ── 护栏:**按 KV 池预算**判定(2026-10-03 改;原按 maxlen 判,已不成立)──────────
-# 实测:1M 只需 KV ~2.2 GiB ⇒ KV 2.5 GiB 时峰值 93.8% ✅;给到 5.3 GiB 就顶到 98.4% ⚠️。
-# 所以真正的危险组合是"1M + GPU 预填 + KV 池给太大",不是 1M 本身。
-if [ "${MAXLEN}" -gt 786432 ] && [ "${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-0}" != "0" ] \
-   && [ "${KV_CACHE_BYTES:-0}" -gt 3221225472 ]; then
-  echo "[serve_v41] ⛔ 拒绝启动:MAXLEN=${MAXLEN} > 786432 + GPU 预填 + KV_CACHE_BYTES=${KV_CACHE_BYTES:-未设} > 3 GiB ✗" >&2
-  echo "[serve_v41]    实测:1M 只需 KV ~2.2 GiB;给 2.5 GiB 时峰值 93.8% ✅、给 5.3 GiB 时 98.4% ⚠️。" >&2
-  echo "[serve_v41]    请显式设 KV_CACHE_BYTES=2684354560(2.5 GiB)。确有需要请设 VLLM_SERVE_ALLOW_RISKY_1M=1。" >&2
-  [ "${VLLM_SERVE_ALLOW_RISKY_1M:-0}" != "1" ] && exit 2
-fi
+# ⛔ 2026-10-09(SPEC_mbt_budget 改动①):原来这里的「1M + GPU 预填 + KV>3 GiB ⇒ 拒绝启动」
+#   护栏**已删除** —— 它的前提是"KV 池由我们显式指定";现在 KV 交给 vLLM 自己的 profile
+#   (改动② 已让 profile 看到真实 staging),由 vLLM 按真实占用定容;
+#   分配不下就由 vLLM **启动即失败**(阶段 A = KV 是前置条件)✓
+#   历史来由保留供追溯:`BUG_REGISTRY` A9 / A19(1M 不手传 KV 就起不来)。
 # 【2026-10-03 用户定的生产口径】**MBT=8192**(原 4096)。
 #   原为 MBT=4096 是为了给 1M 的 KV 腾地方;现在 CED 让 KV 只占 ~2.2 GiB,
 #   且 MBT=8192 的 GPU 预填 chunk 更饱满(实测 988 tok/s vs MBT=4096 的 ~648)。
@@ -295,7 +290,6 @@ if [ "$VRAM_POLICY" = "1" ]; then
     POLICY_GP_MIN="$(printf '%s\n' "$_PLAN" | sed -n 's/^VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=//p')"
     POLICY_RESIDENT="$(printf '%s\n' "$_PLAN" | sed -n 's/^XIAOTU_GPU_RESIDENT_LAYERS=//p')"
     POLICY_DRAFT="$(printf '%s\n' "$_PLAN" | sed -n 's/^XIAOTU_MOE_RESIDENT_DRAFT=//p')"
-    POLICY_KV_BYTES="$(printf '%s\n' "$_PLAN" | sed -n 's/^XIAOTU_KV_CACHE_BYTES=//p')"
     echo "[v41] R-VRAM 规划(maxlen=$MAXLEN):gpu_prefill_min=${POLICY_GP_MIN:-?} resident='${POLICY_RESIDENT:-}' draft_on_gpu=${POLICY_DRAFT:-?}"
   fi
 fi
@@ -432,7 +426,7 @@ fi
     $( [ "${LPT:-0}" -gt 0 ] 2>/dev/null && echo --long-prefill-token-threshold "$LPT" ) \
     $( [ "${LPT_ADAPTIVE:-0}" = "1" ] && echo --long-prefill-token-threshold-adaptive ) \
     --gpu-memory-utilization "$GPU_UTIL" \
-    $( [ -n "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-6442450944}}" ] && printf -- '--kv-cache-memory %s' "${KV_CACHE_BYTES:-${POLICY_KV_BYTES:-}}" ) \
+    $( [ -n "${KV_CACHE_BYTES:-}" ] && printf -- '--kv-cache-memory %s' "$KV_CACHE_BYTES" ) \
     $( [ -n "$HF_OVERRIDES" ] && printf -- '--hf-overrides %s' "${HF_OVERRIDES// /}" ) \
     $( [ -n "$TOOL_PARSER" ] && printf -- '--enable-auto-tool-choice --tool-call-parser %s' "$TOOL_PARSER" ) \
     $( [ -n "$REASONING_PARSER" ] && printf -- '--reasoning-parser %s' "$REASONING_PARSER" ) \

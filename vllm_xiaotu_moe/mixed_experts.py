@@ -33,6 +33,7 @@ DS-V4(sqrtsoftplus)都会选错专家。
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import torch
@@ -180,9 +181,9 @@ def _host_mib() -> dict:
 
 _LAYER_IDX_RE = __import__("re").compile(r"layers\.(\d+)\.")
 
-# 【§597】设备级 GPU 预填充判定(第一个模块的决定即为全局,防混合模式)
-_GPF_OK: dict = {}
-# 【§601】判定时的数字(staging / 要求空闲 / 实际空闲),用于把预检结果打进 ACTIVE 日志:
+# ⛔ 2026-10-09:原 `_GPF_OK`(设备级 GPU/CPU 判定门)已删除 —— 用户要求"把需求报告给 vLLM,
+#   让它自己的启动分配决定成败,不做优雅回退"(QA #151/#152)⇒ 不再有"我们判 GPU/CPU"这一步 ✓
+# 【§601】首次 GPU 预填时的数字(staging / 要求空闲 / 实际空闲),**仅用于日志报告**:
 # "GPU prefill ACTIVE" 只说结论,事故复盘时最需要的恰好是它距离阈值有多远。
 _GPF_INFO: dict = {}
 _RELEASE_MISSES = 0   # 见 _release_source_weights:静默失败的可观测性
@@ -1546,21 +1547,21 @@ class _XiaotuExpertsMixin:
         _gp_mod = None if _resident else _gpu_prefill_mod(
             getattr(self, "_engine_attr", ""))
         if _gp_mod is not None:
-            from vllm_xiaotu_moe.gpu_prefill import (
-                gpu_prefill_min_tokens,
-                in_profile_run,
-            )
+            from vllm_xiaotu_moe.gpu_prefill import gpu_prefill_min_tokens
 
             _gp_min = gpu_prefill_min_tokens()
             _gp_on = _gp_min > 0
-            # ⚠️ profile run 期间**必须**留在 CPU:vLLM 用那次 forward 的峰值显存
-            # 给 KV cache 定容,而流式 staging 有 ~14 GiB(V4.1@TP=1);不挡住就会
-            # 得到 `Available KV cache memory: -1.57 GiB` ⇒ **服务起不来**
-            # (实测,NOTES §460)。挡住之后 KV 按 CPU 路径定容(正常),运行时再预检。
+            # ⭐⭐ 2026-10-09(SPEC_mbt_budget 改动②):**不再用 `in_profile_run()` 挡住 GPU 预填**
+            # —— 必须让 vLLM 的 profile **看到 staging 的真实占用**,否则它的账本里根本没有
+            # staging,我们只能靠"跑一阵才崩"才发现不够(见 docs/STRATA_ANALYSIS.md R2)✓
+            #   * profile 期 staging 真的分配 ⇒ 进 vLLM 的 `total_consumed`
+            #     ⇒ `non_kv_cache_memory` 抬升 ⇒ KV 池按"剩下的"定容 = **vLLM 统一管理** ✓✓
+            #   * ⛔ 我们**不再**用预检结果决定 GPU/CPU(那个门已删,见下方 `_GPF_INFO` 处):
+            #     装不下就让它抛 ⇒ 由 vLLM 自己失败并结束;降档是**用户看日志后**的选择 ✓
+            #   * ⚠️ **图捕获期仍然一律挡住**(侧流分配会破坏捕获),这条不动 ✓
             _gpu_pf = (
                 _gp_on
                 and qlen >= _gp_min
-                and not in_profile_run()
                 and not torch.cuda.is_current_stream_capturing()
             )
         # ⚠️ 释放条件是 `_gp_on`,不是 `_gpu_pf`。引擎是**惰性**建的:第一个请求
@@ -1663,7 +1664,7 @@ class _XiaotuExpertsMixin:
                 "MOE_MXFP4", "MOE_WNA16") else 1
             _E, _I = int(_shp[0]), _pack * int(_shp[2])
             _dev = h_bf16.device
-            # 运行时预检:腾不出 staging 就**优雅放弃**(慢但能跑),并给用户选择。
+            # 需求**如实报告**用(只算数、只打印;⛔ 不再用它做 GPU/CPU 取舍 —— 见下)
             from vllm_xiaotu_moe.gpu_prefill import fits_device
 
             try:
@@ -1677,42 +1678,26 @@ class _XiaotuExpertsMixin:
                 # the preflight cannot pass and then OOM into a sticky CPU
                 # fallback (which would be slower than never enabling it).
                 _need += 2 * (_E * hidden_size * 2 * _I + _E * _I * hidden_size)
-            # 判定**每个模块只做一次**:预检看的是瞬时空闲显存,逐次判定会让同一层
-            # 在 GPU/CPU 之间来回跳(实测一次 forward 内 24 层走分片、16 层退回源张量,
-            # 另一半 forward 全部 SKIPPED,NOTES §464),行为不可复现。
-            # 【§597】**判定必须进程级**(不是"每个模块一次")。原先用 self._gpu_pf_ok 是
-            # **每层模块各判一次**,于是出现最坏的形态:前 8 层 free 够 ⇒ 走 GPU,
-            # 第 9 层起 free 掉到阈值下 ⇒ 逐层退回 CPU ⇒ **一次 forward 里 GPU/CPU 混合**,
-            # 实测 13.8K prompt 要 76.5 s(纯 CPU 只要 ~54 s、纯 GPU 应 ~13 s)。
-            # 现在第一个做出判定的模块把结论钉在**设备级**,后续所有层沿用。
-            _ok = _GPF_OK.get(_dev.index if hasattr(_dev, "index") else None)
-            if _ok is None:
-                _ok, _free = fits_device(_need, _dev)
-                _GPF_OK[_dev.index if hasattr(_dev, "index") else None] = bool(_ok)
-                _GPF_INFO[_dev.index if hasattr(_dev, "index") else None] = (
-                    int(_need), int(_free))
-                if not _ok:
-                    from vllm_xiaotu_moe.gpu_prefill import (
-                        activation_reserve_bytes, required_bytes)
-                    print(
-                        f"[vllm-xtu-moe] GPU prefill DISABLED for this process -> staying "
-                        f"on CPU (slower but correct).\n"
-                        f"    per-layer staging ~{_need / 2**30:.1f} GiB; preflight wants "
-                        f"~{required_bytes(_need) / 2**30:.1f} GiB free VRAM "
-                        f"(staging x1.10 + {activation_reserve_bytes() / 2**30:.1f} GiB "
-                        f"activation reserve), only {_free / 2**30:.1f} GiB is free.\n"
-                        f"    The reserve protects vLLM's own activation peak: the staging "
-                        f"buffers are process-persistent, so spending that peak makes a "
-                        f"long prefill OOM *after* a passing preflight (NOTES §601).\n"
-                        f"    Options: a lower --gpu-memory-utilization "
-                        f"(scripts/serve_glm53_mainline.sh defaults to 0.85 for this), "
-                        f"XIAOTU_GP_ACT_RESERVE_GIB=<smaller> to trade safety for reach, "
-                        f"or a larger-VRAM GPU.\n"
-                        f"    VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0 silences this.",
-                        flush=True,
-                    )
-            if not _ok:
-                _gpu_pf = False
+            # ⭐⭐ 2026-10-09(用户纠正实现方式):**删除自建预检门** ——
+            #   用户原话:"把需求都报告给 vllm,它启动的时候自然会去尝试分配 kv-cache、
+            #   加载权重、做 cuda-graph 等,失败了就会自动结束"。
+            #   ⇒ 这里**只算数、只报告**(存 `_GPF_INFO` 供下面 ACTIVE 日志打印),
+            #     **不再用预检结果做 GPU/CPU 取舍**,也不再"腾不出就优雅退回 CPU" ✓
+            #   ⇒ 需求"报告给 vLLM"的方式:① 不传 `KV_CACHE_BYTES`(改动①);
+            #     ② 去掉 profile 期挡板(改动②)⇒ staging 在 profile 期真的被分配,
+            #     自然进入 vLLM 的 `total_consumed`/`non_kv_cache_memory` ⇒ 由它给 KV 定容 ✓
+            #   ⇒ 装不下时不在这里判:由 vLLM 自己的分配失败(权重/KV/NCCL/图)自然结束 ✓
+            _di = _dev.index if hasattr(_dev, "index") else None
+            if _GPF_INFO.get(_di) is None:
+                _rep_ok, _free = fits_device(_need, _dev)
+                _GPF_INFO[_di] = (int(_need), int(_free))
+                print(
+                    f"[vllm-xtu-moe] GPU 预填需求(如实报告,不做取舍):"
+                    f" per-layer staging ~{_need / 2**30:.2f} GiB;"
+                    f" 首次 GPU 预填时 free = {_free / 2**30:.2f} GiB"
+                    f" ({'余量充足' if _rep_ok else '⚠️ 偏紧 —— 不降级,装不下由分配失败终止'})",
+                    flush=True,
+                )
             _km = None
             _pf_reason = "engine shards"
             # ⭐⭐ 【微 ping/pong】tile 模式(用户 2026-10-09:实现微 ping/pong,省显存)
@@ -2003,22 +1988,18 @@ class _XiaotuExpertsMixin:
                     if _km is None:
                         _pf_reason = "checkpoint source (engine has no shards)"
                 except torch.OutOfMemoryError:
-                    # 预检与真实分配之间可能被别的分配抢走 -> 同样优雅退回 CPU,
-                    # 并且**粘住**这个否定结论,避免每次 forward 反复试错。
-                    torch.cuda.empty_cache()
-                    _gpu_pf = False
-                    _km = None
-                    _di = _dev.index if hasattr(_dev, "index") else None
-                    if _GPF_OK.get(_di) is not False:
-                        _GPF_OK[_di] = False
-                        print(
-                            "[vllm-xtu-moe] GPU prefill OOM while staging a layer -> "
-                            "falling back to CPU prefill for this layer and disabling "
-                            "GPU prefill from here on (slower but correct). Consider "
-                            "TP=2 (+ XIAOTU_MOE_RANK_SPLIT=0), a larger-VRAM GPU, or a "
-                            "lower --gpu-memory-utilization.",
-                            flush=True,
-                        )
+                    # ⭐⭐ 2026-10-09(用户纠正实现方式):**不做优雅回退** ——
+                    #   用户原话:"把需求都报告给 vllm … 失败了就会自动结束"。
+                    #   ⇒ 不再 `empty_cache()` + 粘滞降级为 CPU 预填,而是**原样抛出**:
+                    #     · 启动期(profile)⇒ vLLM 启动失败并结束 ✓
+                    #     · 运行期 ⇒ 服务不再"静默变慢",故障暴露给用户 ✓
+                    print(
+                        "[vllm-xtu-moe] ⛔ GPU 预填 staging 分配 OOM ⇒ 不降级,直接上抛"
+                        "(由 vLLM 判定启动/服务失败);请调 MBT / GPU_UTIL / "
+                        "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0 后重启 ✗",
+                        file=sys.stderr, flush=True,
+                    )
+                    raise
             if _is_fp8 and _km is not None:
                 # FP8:已经在上面的分支里装配好了,直接算(输出 fp32,调用方转 dtype)。
                 _limit = float(getattr(self, "swiglu_limit", 0.0) or 0.0)

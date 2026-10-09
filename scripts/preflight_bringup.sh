@@ -42,8 +42,9 @@ rm -f "$STUB"
 check(){ v=$(grep -oE "^[[:space:]]*$1=[^ #]+" "$B" | head -1 | cut -d= -f2 | tr -d '"'); \
   if [ -n "$v" ]; then note "③ $1" "✅ $v"; else note "③ $1" "❌ 取不到值"; fail=1; fi; }
 check MAXLEN; check MBT; check SPEC; check TP
-v=$(grep -oE 'XIAOTU_GP_ACT_RESERVE_GIB=[0-9.]+' "$B" | head -1 | cut -d= -f2)
-if [ -n "$v" ]; then note "③ ACT_RESERVE" "✅ $v"; else note "③ ACT_RESERVE" "❌"; fail=1; fi
+# ⭐ 2026-10-09:原 ③ `XIAOTU_GP_ACT_RESERVE_GIB` 检查已删 —— 该旋钮及其唯一消费者
+#   (我们自建的预检门)都已移除(QA #151/#152)⇒ 改查**用户的正式旋钮** ✓
+check VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS
 
 echo
 if [ "$fail" -eq 0 ]; then echo "  ✅ 前置检查通过 ⇒ 可以重启生产 ✓"; exit 0; else echo "  ❌ 前置检查未通过 ⇒ 【禁止重启生产】✗"; exit 1; fi

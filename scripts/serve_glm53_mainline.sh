@@ -109,7 +109,9 @@ GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-1500}"
 # 换来稳定(见 docs/KNOWN_LIMITATIONS.md)。
 GP_PREFILL="${GP_PREFILL:-1}"
 if [ "$GP_PREFILL" = "0" ]; then
-  export XIAOTU_GP_ACT_RESERVE_GIB=99
+  # ⭐ 2026-10-09:原来靠 `XIAOTU_GP_ACT_RESERVE_GIB=99` 让**我们的预检**不通过,从而间接
+  #   关掉 GPU 预填 ✗ —— 那个自建预检门已删除(QA #152)⇒ 改用**用户的正式旋钮** ✓
+  export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0
 fi
 # 工具调用 + 思考解析。不加这两项时:
 #   * 客户端带 tools + tool_choice="auto" 会被 vLLM 直接 400:

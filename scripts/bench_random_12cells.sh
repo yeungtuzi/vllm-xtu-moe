@@ -291,7 +291,7 @@ run_mimo() {
   rm -f "$LOGD/$tag.pid"        # 见 run_glm 里的说明:陈旧 pidfile 会误判早退
   setsid env CUDA_VISIBLE_DEVICES=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     PYTHONPATH="$XTU_TREE" VLLM_EXPERTS_LOAD_DEVICE=cpu XIAOTU_MOE_THREADS=60 \
-    XIAOTU_SPEC_DECODE=1 VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1500 XIAOTU_GP_ACT_RESERVE_GIB=3.0 \
+    XIAOTU_SPEC_DECODE=1 VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=1500 \
     "$PY" -m vllm.entrypoints.openai.api_server --model "$CKPT_M" --served-model-name MiMo-V2.5 \
     --host 127.0.0.1 --port "$port" --tensor-parallel-size 1 --dtype bfloat16 \
     --kv-cache-dtype bfloat16 --max-model-len "$MAXLEN_M" --max-num-batched-tokens 16384 \

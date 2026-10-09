@@ -22,11 +22,12 @@
 #    ⇒ 本脚本只用于【机器重启后恢复】;日常调试请用 GPU2 + TP=1,不要动 8070 ✓
 #
 # 关键词(踩过的坑,别再改错):
-#   * MAXLEN = **1048576(1M)** ✓ —— 护栏已改成按 **KV 池预算**判定(见 serve_v41.sh);
-#     1M + GPU 预填在 KV ≤ 3 GiB 时成立(实测 KV 2.5 GiB ⇒ 峰值 93.8% ✅)
-#   * KV_CACHE_BYTES=2684354560(2.5 GiB):1M 实测只需 ~2.2 GiB;给到 5.3 GiB 会顶到 98.4% ✗
+#   * MAXLEN = **1048576(1M)** ✓
+#   * ⛔ 2026-10-09 起**不再传 `KV_CACHE_BYTES`**(原 2.5 GiB):KV 池由 vLLM 自己的 profile
+#     定容(SPEC_mbt_budget 改动①+②)⇒ 原"按 KV 池预算"的启动护栏已删除(见 serve_v41.sh)✓
 #   * PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False 必须带 ✓
-#   * EXTRA_ENV 里的变量名是 XIAOTU_GP_ACT_RESERVE_GIB(不是 RESERVED ✗)
+#   * EXTRA_ENV 现在只放 VLLM_SPARSE_INDEXER_MAX_LOGITS_MB 与 XIAOTU_GPF_STAGE_TILE_E ✓
+#     (原 `XIAOTU_GP_ACT_RESERVE_GIB` 及其自建预检门已于 2026-10-09 删除,见 QA #151/#152)
 #   * proc.sh 的 PID 文件记的会是【包装脚本】✗(serve_v41.sh 内部 nohup 起真服务)
 #     ⇒ 必须用【端口派生 PID】adopt 真服务 PID ✓,并把真服务日志路径写进日志头 ✓
 set -uo pipefail
@@ -94,12 +95,12 @@ VLLM_ENV=(
             #   目的②:⭐ 验证模型退化是否由投机解码引起(sample #3 的对照臂)
             #   ⚠️ 代价:decode 吞吐下降(acceptance 均值 3.59 ⇒ 预期 decode 慢 ~2x)
   KV_DTYPE=fp8_ds_mla
-  KV_CACHE_BYTES=2684354560   # ⚠️ 2026-10-05:1.5 GiB 导致 EngineCore 初始化失败 ✗ ⇒ 回退已知可用值 ✓(见 A19)
-  # ⭐ 2026-10-05 三方审核定案:原 2.5 GiB ⇒ 可用显存只剩 ~0.14-0.42 GiB
-  #   ⇒ 512 MiB 的 per-forward q_out(MBT=8192 ⇒ 8188x64KiB)分配失败 ⇒ EngineDeadError
-  #   ⇒ 降到 1.5 GiB 永久多出 ~1 GiB 余量 ⇒ 确定性 >=512 MiB ✓
-  #   ⇒ 代价:KV 池 119 万 → ~71 万 token(agent 实际只需 ~31 万 ✓)
-  #   ⇒ 依据:BUG_REGISTRY A17/A18 + EXPERIMENTS B25 + CHANGELOG 2026-09-21
+  # ⛔ 2026-10-09(SPEC_mbt_budget 改动①):**不再传 `KV_CACHE_BYTES`** —— KV 池大小交给
+  #   vLLM 自己的 profile(改动② 已让 profile 看到真实 staging),由它按真实占用定容;
+  #   分配不下 ⇒ vLLM **启动即失败**(阶段 A:KV 是前置条件)✓
+  #   历史:曾固定 2.5 GiB(1.5 GiB 会让 EngineCore 起不来,见 A19),而该值使可用显存
+  #   只剩 ~0.14–0.42 GiB ⇒ 512 MiB 的 per-forward q_out 分配失败 ⇒ EngineDeadError
+  #   (A17/A18 + B25)。这正是"我们替 vLLM 编 KV 数"的代价 ⇒ 连同这条 hack 一起去掉 ✓
   # 【2026-10-05 改】原 384 是 **ds-v4-flash** 时代的甜点 ✗(该模型已退役)⇒ 归档 ✓
   # 现依据【本仓实测】`dev-docs/PREFILL_CPU_VS_GPU_2026-10-03.md` §3:
   #   TP=1 交叉点 ≈ **5700** token/层;TP=2 每 rank 的 DMA 减半 ⇒ 交叉点 **~2500–2900** ✓
@@ -121,10 +122,11 @@ VLLM_ENV=(
   #   而剖析本来会用 dummy 分配为这块 logits 预留 512 MB(见 IRON_RULES R24 第 8 条)。
   #   ⇒ 降到 128 MB 后,同样的请求只申请 ≤128 MB,在碎片空间里就能放下 ✓
   #   (框架按此预算在 query 维分块,可优雅退化到 1 token:vllm/v1/attention/backends/mla/indexer.py:1285-1318)
-  EXTRA_ENV="XIAOTU_GP_ACT_RESERVE_GIB=1.5 VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128 XIAOTU_GPF_STAGE_TILE_E=96"   # ⛔ 2026-10-08 **回退**:3.0 被 A29 实测否决(GPU 预填 device=cuda **0** 次);2.0 亦"可能完全不触发"⇒ **只有 1.5 下实测 ACTIVE(346 次)** ⇒ 不动 ✓
-  # ⭐ 【勘误 C3】(2026-10-08)`ACT_RESERVE` **保持 1.5** 的回退理由仍然成立 ✓
-  #   (A29 实测:3.0 ⇒ GPU 预填 `device=cuda` **0 次**;2.0 亦'可能完全不触发')✓
-  #   ⚠️ 但**不要**据此以为 GPU 预填没在跑 —— 见下面的 C4 ✓
+  # ⛔ 2026-10-09:**`XIAOTU_GP_ACT_RESERVE_GIB` 已从本行删除** —— 它唯一的消费者是
+  #   "我们自建的预检门",而那个门已按用户要求删除(需求如实报告给 vLLM,由 vLLM 自己的
+  #   启动分配决定成败;QA #151/#152)⇒ 留着它只会让人以为还有一道闸门 ✗
+  #   ⭐ 留白现在由 **vLLM 自己**在 profile 里测出来(`transient_peak_headroom`)✓
+  EXTRA_ENV="VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128 XIAOTU_GPF_STAGE_TILE_E=96"
 
   # ⭐ 2026-10-05 定案(A28):ACT_RESERVE 原为 1.5 GiB,而代码默认 3.0 GiB(gpu_prefill.py:886)✗
   #   ⇒ 预检过松 ⇒ 显存极紧时仍放行 GPU 预填 ⇒ 随后的几百 MiB 分配失败 ⇒ EngineCore 死 ✗
