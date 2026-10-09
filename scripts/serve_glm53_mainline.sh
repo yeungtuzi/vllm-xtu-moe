@@ -94,13 +94,16 @@ SPEC_K="${SPEC_K:-0}"
 SPEC_MODEL="${SPEC_MODEL:-$CKPT}"
 # EAGER=1 ⇒ --enforce-eager。MTP 的 draft 图捕获若在插件路径下有问题,退这一档。
 EAGER="${EAGER:-0}"
-# GPU-prefill threshold. The plugin's own default is 4096, which is *above*
-# GLM-5.3's prefill chunk size: the KDA (mamba-like) state is only written at
-# `block_size = 2176` boundaries, so the scheduler trims every chunk to a
-# multiple of 2176 no matter how large --max-num-batched-tokens is. With the
-# side-stream assembly overlap the measured break-even is ~1300 tokens/chunk
-# (1580 tokens: CPU 10.9 s vs GPU 10.2 s; 2176 tokens: 1.2x; ~4.1k: 1.26x), so
-# 1500 is the right default here. Lower it further only if you measure it.
+# GPU-prefill threshold ⚠️ 【2026-10-09 更正(R38 复审指出事实错误)】插件的真实默认值是
+# **0 = 关闭**(见 `vllm_xiaotu_moe/gpu_prefill.py` 的 `gpu_prefill_min_tokens()`);
+# 旧注释里写的 **4096** 其实是**另一个旋钮** `XIAOTU_GPU_PREFILL_SWITCH_TOKENS`
+# (见 `vllm_xiaotu_moe/vram_policy.py`),两者曾被混为一谈 ✗。
+# 本脚本**总是显式**给 `GPU_PREFILL_MIN`(默认 1500),所以这个默认值对本脚本无影响 ✓。
+# 为什么取 1500:GLM-5.3 的 KDA(mamba-like)状态只在 `block_size = 2176` 边界写入 ⇒
+# scheduler 会把每个 chunk 裁到 2176 的倍数(与 --max-num-batched-tokens 无关);
+# 而实测(side-stream 装配重叠下)break-even 约 1300 tok/chunk
+# (1580 tok: CPU 10.9 s vs GPU 10.2 s;2176 tok: 1.2x;~4.1k: 1.26x)⇒ 1500 是本机甜点。
+# 只有实测过才往下调。
 GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-1500}"
 # GPU_PREFILL=0 彻底关掉 GPU 流式预填充(走 CPU 引擎)。
 # 为什么需要这个开关(2026-09-20 实测):staging 是**进程级持久**的 ~7.59 GiB/rank,
@@ -111,6 +114,10 @@ GP_PREFILL="${GP_PREFILL:-1}"
 if [ "$GP_PREFILL" = "0" ]; then
   # ⭐ 2026-10-09:原来靠 `XIAOTU_GP_ACT_RESERVE_GIB=99` 让**我们的预检**不通过,从而间接
   #   关掉 GPU 预填 ✗ —— 那个自建预检门已删除(QA #152)⇒ 改用**用户的正式旋钮** ✓
+  # ⚠️ 必须改 `GPU_PREFILL_MIN`(不能只 export):本脚本 :193 会把该值写进**权威 env 文件**、
+  #   :251 又直接放进子进程 env,而 env 桥对显式文件是"文件覆盖 os.environ" ⇒ 只 export 会被覆盖 ✗
+  #   (2026-10-09 独立审计 **MF-1** 查出;DRYRUN 实测确认)
+  GPU_PREFILL_MIN=0
   export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=0
 fi
 # 工具调用 + 思考解析。不加这两项时:

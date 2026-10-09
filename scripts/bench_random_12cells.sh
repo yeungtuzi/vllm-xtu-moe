@@ -307,13 +307,17 @@ run_mimo() {
 run_v41() {
   local tag=v41_rnd port=8077 cap
   cap=$(resolve_kv_cap V4.1 $RULER_V41 $MAXLEN_V $MAXSEQS "$LONG" $FLOOR_V41) || return 1
+  # ⛔ 2026-10-09(R38 三审指出):serve_v41.sh 的 `--kv-cache-memory` 传参点已删除 ⇒
+  #   `cap` **到不了引擎**:resolve_kv_cap 的"够不够"断言从此**空转**(断言过 ≠ 引擎真拿到);
+  #   实际 KV 池改由 vLLM 按 GPU_UTIL=0.85 的 profile 决定 ⇒ **本臂口径已变**,不可与历史比 ✗
+  echo "[cfg] V4.1: KV 封顶已失效(serve_v41 不再支持)⇒ cap=$cap 仅作记录;KV 池由 vLLM profile 决定 ✗" >&2
   [ "${DRY_RUN:-0}" = 1 ] && return 0
   freegpu || return 1     # ⭐ 2026-10-07 审计修:清场失败 ⇒ 中止本阶段(见 run_glm 说明)
   _assert_port_no_foreign_owner "$port" "$LOGD/$tag.pid" "$tag" || return 1   # blocker B-3
   rm -f "$LOGD/$tag.pid"        # 见 run_glm 里的说明:陈旧 pidfile 会误判早退
   setsid env PYTHONPATH="$XTU_TREE" TAG="$tag" PORT="$port" GPUS=0,1 TP=2 \
     MAXLEN=$MAXLEN_V MAXSEQS=$MAXSEQS MBT=16384 GPU_UTIL=0.85 \
-    SPEC=1 LOAD=auto PREFIX_CACHE=1 KV_CACHE_BYTES="$cap" \
+    SPEC=1 LOAD=auto PREFIX_CACHE=1 \
     bash scripts/serve_v41.sh > "$(srv_log $tag).wrapper" 2>&1 &
   wait_ready "$port" "$LOGD/$tag.pid" "$(srv_log $tag)" 5400 || return 1
   # DSV4.1 快照没有 chat_template ⇒ 必须走 /v1/completions 并跳过模板

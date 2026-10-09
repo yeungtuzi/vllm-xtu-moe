@@ -1793,8 +1793,13 @@ class _XiaotuExpertsMixin:
                                 engine, _dev, hidden_size, _I, _E, int(self._group_k),
                                 dst=_dst)
                         except torch.OutOfMemoryError:
-                            torch.cuda.empty_cache()
-                            _km = None
+                            # ⭐ 2026-10-09(MF-2,独立审计查出):FP8 分支同样**不做优雅回退** ——
+                            #   原实现在这里 `empty_cache()` + `_km = None`,会被下面
+                            #   `if _km is None:` 误标成 "engine has no shards (fp8)" 并静默降级为
+                            #   CPU 预填 ✗ ⇒ 改为**原样上抛**,由 vLLM 判定启动/服务失败 ✓
+                            print("[vllm-xtu-moe] ⛔ FP8 GPU 预填 staging 分配 OOM ⇒ "
+                                  "不降级,直接上抛 ✗", file=sys.stderr, flush=True)
+                            raise
                     if _km is not None:
                         _ev_ready = torch.cuda.Event()
                         _ev_ready.record(_side)
@@ -1805,11 +1810,14 @@ class _XiaotuExpertsMixin:
                             engine, _dev, hidden_size, _I, _E, int(self._group_k)
                         )
                     except torch.OutOfMemoryError:
-                        torch.cuda.empty_cache()
-                        _km = None
+                        # ⭐ 2026-10-09(MF-2):同上,不做优雅回退,原样上抛 ✓
+                        print("[vllm-xtu-moe] ⛔ FP8 GPU 预填 staging 分配 OOM(同步路径)⇒ "
+                              "不降级,直接上抛 ✗", file=sys.stderr, flush=True)
+                        raise
                 if _km is None:
                     # 引擎没有分片(如 NOSHARD)⇒ 优雅退回 CPU(FP8 没有源张量兜底:
                     # 源张量此时可能已被释放,而分片是唯一保证在的副本)。
+                    # ⚠️ 注意:**只有**"真的没有分片"才走这里;OOM 已在上面的 except 里上抛 ✓
                     _gpu_pf = False
                     _pf_reason = "engine has no shards (fp8)"
                 elif _t_split:

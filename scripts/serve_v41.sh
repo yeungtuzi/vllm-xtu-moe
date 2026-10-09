@@ -103,7 +103,7 @@ TP="${TP:-2}"
 # ║   MAXLEN=1048576  MBT=8192  MAXSEQS=1  GPUS=1,2  TP=2  GPU_UTIL=0.90        ║
 # ║   EAGER=0  COMPILE=1  SPEC=1  KV_DTYPE=fp8_ds_mla                          ║
 # ║   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384  (ACT_RESERVE 已于 2026-10-09 删除)  ║
-# ║   KV_CACHE_BYTES=2684354560(2.5 GiB)                                       ║
+# ║   KV 池大小**交给 vLLM profile**(⛔ 不再传 KV_CACHE_BYTES;见下方改动说明)  ║
 # ║   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False                         ║
 # ║                                                                            ║
 # ║ 实测(2026-10-03,TP=2/GPU1,2/dspark/KV 2.5 GiB):                            ║
@@ -118,6 +118,16 @@ TP="${TP:-2}"
 # ║ ⚠️ fp8/fp4 indexer 与显存**无关**(那是每层仅 1 块的环形暂存,可忽略)✗        ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 MAXLEN="${MAXLEN:-786432}"
+# ⛔⛔ 2026-10-09:本脚本**不再支持**指定 KV 池大小 ✓
+#   `--kv-cache-memory` 的传参点已**整条删除**(R38 复审 **MF-3**:原先只把默认值改成 env-only,
+#   仍会被 `KV_CACHE_BYTES=…` 重新打开旁路)⇒ KV 池由 vLLM 的 profile 决定,它会算上插件
+#   如实暴露的 staging(SPEC_mbt_budget 改动①+②)✓
+#   ⚠️ 本仓历史文档/基准脚本里那些 `KV_CACHE_BYTES=…` 从此**是惰性的**(不再生效)——
+#     这里显式告警,避免"以为封顶了、其实没封"的静默误解 ✗
+if [ -n "${KV_CACHE_BYTES:-}" ]; then
+  echo "[serve_v41] ⚠️ 忽略 KV_CACHE_BYTES=${KV_CACHE_BYTES}:2026-10-09 起 KV 池交给 vLLM profile," \
+       "本脚本不再传 --kv-cache-memory(要腾显存请改 --gpu-memory-utilization 或 MAXLEN)✗" >&2
+fi
 # ⛔ 2026-10-09(SPEC_mbt_budget 改动①):原来这里的「1M + GPU 预填 + KV>3 GiB ⇒ 拒绝启动」
 #   护栏**已删除** —— 它的前提是"KV 池由我们显式指定";现在 KV 交给 vLLM 自己的 profile
 #   (改动② 已让 profile 看到真实 staging),由 vLLM 按真实占用定容;
@@ -127,7 +137,7 @@ MAXLEN="${MAXLEN:-786432}"
 #   原为 MBT=4096 是为了给 1M 的 KV 腾地方;现在 CED 让 KV 只占 ~2.2 GiB,
 #   且 MBT=8192 的 GPU 预填 chunk 更饱满(实测 988 tok/s vs MBT=4096 的 ~648)。
 # 生产调用示例(单行即可):
-#   GPUS=1,2 TP=2 MAXLEN=1048576 MBT=8192 KV_CACHE_BYTES=2684354560  bash scripts/bringup_prod_8070.sh
+#   GPUS=1,2 TP=2 MAXLEN=1048576 MBT=8192  bash scripts/bringup_prod_8070.sh
 # ⚠️ 【2026-10-03 用户明令】TP=2 一律 GPU1+GPU2;GPU0 只有 x8 ⇒ 只做单卡调试(IRON_RULES R19)。
 # (本脚本默认 MAXLEN=2048 是**冒烟**口径,别拿默认值当生产。)
 MBT="${MBT:-4096}"
@@ -148,6 +158,10 @@ LPT="${LPT:-0}"
 LPT_ADAPTIVE="${LPT_ADAPTIVE:-0}"
 LOAD="${LOAD:-auto}"           # 【本机+V4.1 默认】真实权重(dummy 只用于开发自测)
 GPU_UTIL="${GPU_UTIL:-0.90}"   # 【本机+V4.1 默认】生产值
+# ⛔ 2026-10-09(R38 三审查出,预先存在的缺陷):本脚本 :443 会读 `$KV_DTYPE`,但**从未赋默认值**
+#   ⇒ 在 `set -u` 下,不设 KV_DTYPE 的调用者会打 `unbound variable`,并**静默丢掉 `--kv-cache-dtype`** ✗
+#   (生产 `bringup_prod_8070.sh` 设了它所以无感;`scripts/ab_config.py` 等没设 ⇒ 会中招)
+KV_DTYPE="${KV_DTYPE:-auto}"
 EXTRA_ENV="${EXTRA_ENV:-}"
 HF_OVERRIDES="${HF_OVERRIDES:-}"
 # 【DSH 兼容】工具调用与推理(思考强度)解析器:vLLM 必须显式开,否则 DSH 报
@@ -426,7 +440,6 @@ fi
     $( [ "${LPT:-0}" -gt 0 ] 2>/dev/null && echo --long-prefill-token-threshold "$LPT" ) \
     $( [ "${LPT_ADAPTIVE:-0}" = "1" ] && echo --long-prefill-token-threshold-adaptive ) \
     --gpu-memory-utilization "$GPU_UTIL" \
-    $( [ -n "${KV_CACHE_BYTES:-}" ] && printf -- '--kv-cache-memory %s' "$KV_CACHE_BYTES" ) \
     $( [ -n "$HF_OVERRIDES" ] && printf -- '--hf-overrides %s' "${HF_OVERRIDES// /}" ) \
     $( [ -n "$TOOL_PARSER" ] && printf -- '--enable-auto-tool-choice --tool-call-parser %s' "$TOOL_PARSER" ) \
     $( [ -n "$REASONING_PARSER" ] && printf -- '--reasoning-parser %s' "$REASONING_PARSER" ) \
@@ -466,7 +479,8 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
   fi
   sleep 10
 done
-echo "[v41] TIMEOUT waiting for readiness; tail:"; tail -25 "$LOG"; exit 1# ╔══════════════════════════════════════════════════════════════════════════════╗
+echo "[v41] TIMEOUT waiting for readiness; tail:"; tail -25 "$LOG"; exit 1
+# ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║ 多模态(MM)默认开启,并**按省显存的安全组合**配置(2026-09-24)                  ║
 # ╠══════════════════════════════════════════════════════════════════════════════╣
 # ║ 事实(实测/源码):                                                            ║

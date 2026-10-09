@@ -527,7 +527,7 @@ bash scripts/serve_glm53_mainline.sh        # 默认 TP=2、GPU 0/1、bf16 KV
 | 开关 | 作用 | 收益(实测) | 代价 |
 |---|---|---|---|
 | (默认开启,无需开关) | 装配走 side stream,与**同层 attention** 重叠 | **1.20×**(26.6 → 22.3 s) | **0 显存** |
-| `XIAOTU_GP_ASM_PREFETCH=1`**(默认关,不推荐)** | ping/pong **跨层**预取(第二套 K-major) | 再 **1.07×**(22.6 → 21.1 s) | **+3.38 GiB/rank** ⇒ 需把 `--gpu-memory-utilization` 从 0.88 降到 **0.82**(KV 池变小,约 -285k token 容量) |
+| `XIAOTU_GP_ASM_PREFETCH=1` **(默认关,不推荐)** | ping/pong **跨层**预取(第二套 K-major) | 再 **1.07×**(22.6 → 21.1 s) | **+3.38 GiB/rank** ⇒ 需把 `--gpu-memory-utilization` 从 0.88 降到 **0.82**(KV 池变小,约 -285k token 容量) |
 
 ⚠️ **本开关默认关闭,建议保持关闭**:显存在这台机器上是比预填充时延更稀缺的资源。
 它换来的只有 1.07×,却要占 3.38 GiB/rank(= KV 容量少 ~285k token 的 GLM 上下文),
@@ -924,3 +924,16 @@ V4.1 的 KV 含 **9 个组**,其中 indexer 尾部是 vLLM 的 **`KpoolTailSpec`
 * `vllm/models/deepseek_v41/attention.py`:**补齐 KV-connector 钩子**(上游该文件 **0 处** ✗)
   —— 对**逐层**连接器必需 ✓;MP connector 不需要它 ✓
 * 启动脚本:`LMCACHE` / `LMCACHE_XFER` 旋钮 ✓;`serve_lmcache.sh` 的 `CHUNK_SIZE`/`TRANSFER_MODE`/`ENABLE_MODULES` ✓
+
+---
+
+## ⛔ 2026-10-09 勘误:**§0.1b-2** 的 `KV (--kv-cache-memory)` 一行(6 GiB 那行在本节 :39 附近)
+
+上表 v41 档位里的 **`KV (--kv-cache-memory) = 6 GiB` 已作废** ✗ —— 自 2026-10-09 起:
+
+* ⛔ **`--kv-cache-memory` 的传参点已【整条删除】**:`bringup_prod_8070.sh` 去掉 KV 环境项;`serve_v41.sh` 删掉传参行,并会对 `KV_CACHE_BYTES=` 打**忽略告警**;<br>⚠️ ⇒ **本文件其余 v41 示例里所有 `KV_CACHE_BYTES=…` 从此是惰性的**(如"换成要 GPU 预填的档"那行),照抄也**不会**重开旁路 ✓;
+* ⭐ KV 池大小由 **vLLM 自己的 `profile_run`** 决定(插件已去掉 profile 期挡板 ⇒ staging 的真实占用进入
+  vLLM 的 `total_consumed` / `non_kv_cache_memory`)⇒ 启动日志会出现真实的
+  `Available KV cache memory: …` 与 `… for peak activation, and … for CUDAGraph memory` ✓;
+* ⛔ 因此"`--gpu-memory-utilization` 在显式传 `--kv-cache-memory` 时不起作用"这条**不再适用**于 v41 生产;
+* ⚠️ 其它模型(`serve_glm53_mainline.sh` / `serve_qwen38.sh`)仍在自动/显式封顶 KV —— **尚未改造**,勿据本节外推 ✗

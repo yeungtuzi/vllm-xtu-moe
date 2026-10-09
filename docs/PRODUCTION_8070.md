@@ -263,3 +263,21 @@ curl -s --noproxy 127.0.0.1 http://127.0.0.1:8080/metrics | grep -E "lookup_(req
 
 ---
 *相关记录:`docs/EXPERIMENTS.md` B142–B214(生产配置演进)、B160(思考强度配方)、B198(LMCache chunk)、B214(DSH 配置字段)。*
+
+---
+
+## ⛔ 2026-10-09 勘误(现行状态,以本节为准)
+
+上面那张参数表是**历史快照** ✗(768K / GPU0+1 / `LMCACHE=1` / `KV_CACHE_BYTES=3 GiB` / 384 阈值 …)。现行:
+
+| 项 | 现行值 | 说明 |
+|---|---|---|
+| 上下文 | `MAXLEN=524288` | 用户 2026-10-08 定(512K) |
+| `MAXSEQS` | **2** | 用户 2026-10-09 定(4 → 2) |
+| `MBT` | **8192** | 2026-10-08 起 |
+| **KV 池** | ⛔ **不再显式指定** | 2026-10-09 起 `KV_CACHE_BYTES` 已从 `bringup_prod_8070.sh` 删除;KV 由 **vLLM 自己的 `profile_run`** 定容(插件已把 staging 如实暴露给它)✓ |
+| `LMCACHE` | ⛔ **代码全部删除** | 见提交 `chore(lmcache)`;`docs/KNOWN_ISSUES_LMCACHE.md` 仅作历史保留 |
+| `XIAOTU_GP_ACT_RESERVE_GIB` | ⛔ **已删除** | 其唯一消费者(插件自建预检门)已删除;留白改由 vLLM 实测的 `transient_peak_headroom` 承担 |
+| 启动失败语义 | **不做优雅回退** | 参数不满足 ⇒ **vLLM 启动即失败**并在日志给出账目;改 `MBT` / 关 GPU 预填是**用户的选择** |
+
+⛔ **照抄 `KV_CACHE_BYTES=<n>` 启动现在【已经无效】**:`serve_v41.sh` 会**忽略并告警**(传参行已整条删除)⇒ 不会重开旁路,但也**别指望它封顶** ✓;<br>⚠️ 真正会重开旁路的是**直接给 vLLM 传 `--kv-cache-memory`**,或走**仍封顶的脚本**(`serve_glm53_mainline.sh` / `serve_qwen38.sh`)✗

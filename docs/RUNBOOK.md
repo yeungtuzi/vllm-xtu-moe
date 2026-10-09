@@ -1256,3 +1256,16 @@ cd /tmp/vllm-up && git cherry-pick <我们的 10 个提交>   # 解那 4-5 个�
 * ⚠️ **生产树 vs editable 安装的漂移**:生产树 `vllm-up-133b71e0b` ✓,但 editable 安装指向**旧树** ✗
   ⇒ 2026-09-23 起 `serve_v41.sh` / `serve_glm53_mainline.sh` / `tune_serve.sh` 已加
   `PYTHONPATH=$XTU_TREE`(默认生产树 ✓,可用环境变量覆盖 ✓)
+
+---
+
+## ⛔ 2026-10-09 勘误:§5.8「显式给 `--kv-cache-memory` 把 KV 池封顶」这条**对 v41 生产已作废**
+
+* ⛔ `serve_v41.sh` 的 `--kv-cache-memory` **传参行已整条删除**、`bringup_prod_8070.sh` 去掉 KV 环境项 ⇒ **§5.9(`serve_v41.sh` 的示例,:998/:1013)与 §5.6(:876)那套 `KV_CACHE_BYTES=…` 从此惰性**(会被忽略并告警)✗;<br>⚠️ **§5.1b(:746-774)是 GLM 口径**(:765 标尺、:773 明说 `serve_glm53_mainline.sh` 已内建)⇒ 那里的示例**仍然有效**,不要套用本节结论 ✗;
+  `vram_policy` 也**不再下发** `XIAOTU_KV_CACHE_BYTES`(只留一行注释形式的离线核算值)。
+* ⭐ 原因:显式传 KV 会让 vLLM **跳过显存剖析**,于是它的账本里没有插件的 staging/激活峰
+  ⇒ "够不够"只能在运行中崩给我们看 ✗(见 `docs/STRATA_ANALYSIS.md` R2)。
+* ⭐ 现行:插件的 staging 在 profile 期**如实分配**、进入 vLLM 的 `total_consumed`,
+  由 vLLM 给 KV 定容;参数不满足 ⇒ **启动即失败**(不做优雅回退)。
+* ⚠️ 本文件其余章节里"必须显式传 `KV_CACHE_BYTES`"的措辞**只对 GLM / qwen38 仍适用**;⛔ 对"目标是 `serve_v41.sh` 的 bench"**已不适用**(见上一行)✗,
+  但**不适用于 v41 生产** —— 引用前先看本节 ✓

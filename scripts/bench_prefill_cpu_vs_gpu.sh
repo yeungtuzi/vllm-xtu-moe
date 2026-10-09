@@ -26,8 +26,12 @@ PORT="${PORT:-8091}"
 MAXLEN="${MAXLEN:-131072}"
 GPU_UTIL="${GPU_UTIL:-0.70}"
 # MBT=16384 时激活工作区 ∝ chunk 会 OOM(实测 aten::new_empty 失败,CPU 臂在 16k 请求上同样中招)
-# ⇒ 可用 KVB 压缩 KV 池、用 GPU_UTIL 腾出激活空间来跑那一档。
-KVB="${KVB:-3221225472}"
+# ⇒ 原来可用 KVB 压缩 KV 池、用 GPU_UTIL 腾出激活空间来跑那一档。
+# ⛔ 2026-10-09:**KVB 已失效** —— `serve_v41.sh` 的 `--kv-cache-memory` 传参点已整条删除
+#   (KV 池交给 vLLM 的 profile;R38 复审 MF-3)⇒ 本脚本**不再把 KVB 传下去**;
+#   要跑 MBT=16384 档请改用 `GPU_UTIL` / `MAXLEN` 手段,否则该档会 OOM ✗
+KVB="${KVB:-}"
+[ -n "$KVB" ] && echo "[bench_prefill] ⚠️ 忽略 KVB=$KVB:serve_v41 自 2026-10-09 起不再支持 KV 封顶 ✗" >&2
 GPUS="${GPUS:-1,2}"
 TP="${TP:-2}"
 # ⚠️【2026-10-03 用户提醒】serve_v41.sh 的线程默认是 **60**,那是 **decode 口径**
@@ -78,7 +82,7 @@ run_one(){  # $1=mbt $2=arm $3=threshold
   log "START arm=$arm mbt=$mbt thr=$thr tag=$tag"
   bash scripts/proc.sh spawn "$tag" env \
     MAXLEN="$MAXLEN" MBT="$mbt" MAXSEQS=1 GPUS="$GPUS" TP="$TP" GPU_UTIL="$GPU_UTIL" \
-    COMPILE=1 EAGER=0 SPEC=0 KV_DTYPE=fp8_ds_mla KV_CACHE_BYTES="$KVB" \
+    COMPILE=1 EAGER=0 SPEC=0 KV_DTYPE=fp8_ds_mla \
     PREFIX_CACHE=0 WARMUP=0 LOAD=auto PORT="$PORT" TAG="$tag" \
     VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$thr" XIAOTU_MOE_THREADS="$THREADS" \
     bash scripts/serve_v41.sh >/dev/null
