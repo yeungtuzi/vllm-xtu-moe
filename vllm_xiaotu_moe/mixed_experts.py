@@ -186,6 +186,29 @@ _LAYER_IDX_RE = __import__("re").compile(r"layers\.(\d+)\.")
 # 【§601】首次 GPU 预填时的数字(staging / 要求空闲 / 实际空闲),**仅用于日志报告**:
 # "GPU prefill ACTIVE" 只说结论,事故复盘时最需要的恰好是它距离阈值有多远。
 _GPF_INFO: dict = {}
+
+
+def layer_staging_need_bytes(gp_mod, engine, E: int, H: int, I: int, group_k: int) -> int:
+    """⭐ 单层 GPU 预填 staging 的**峰值显存需求** —— 【唯一真源】✓
+
+    为什么必须唯一(§600/§601 两次"预检说够、实际 OOM"事故的直接教训):
+      ① `apply()` 里的运行时预检/日志报告
+      ② ⭐ **profile 期的 eager 占位**(SPEC_mbt_budget 改动② 的正解,见 `gpu_prefill`)
+      两处必须用**同一个数**,否则"账实不符"会以最坏的方式暴露(跑一阵才崩)✗
+    ⚠️ 这是**单层峰值**(不是所有层之和):GPU 预填逐层流式,峰值只有一层 ✓
+    ⚠️ `gp_mod` 必须显式传:FP8 走 `gpu_prefill_fp8`,其 staging 公式与 MXFP4 不同 ✓
+    """
+    try:
+        ns = int(engine.shard_geometry()["ns"]) or 2
+    except Exception:  # noqa: BLE001
+        ns = 2
+    need = int(gp_mod.staging_bytes(int(E), int(H), int(I), int(group_k), ns))
+    if gp_prefetch_enabled():
+        # The ping/pong prefetch holds a second K-major set; charge it too.
+        need += 2 * (int(E) * int(H) * 2 * int(I) + int(E) * int(I) * int(H))
+    return need
+
+
 _RELEASE_MISSES = 0   # 见 _release_source_weights:静默失败的可观测性
 _RELEASE_FILE = "/tmp/xiaotu_release_source"
 
@@ -1247,6 +1270,29 @@ class _XiaotuExpertsMixin:
             _GP_LAYERS[_li] = self
         return self._xiaotu_engine
 
+    def staging_need_bytes(self) -> int:
+        """⭐ 本层 GPU 预填 staging 的峰值需求(字节;0 = 本层不适用)✓
+
+        给 `gpu_prefill` 用:它在 **vLLM `profile_run` 之前**按这个数做 **eager 占位分配**,
+        从而让 staging 进 vLLM 的 `total_consumed`(KV 池按"剩下的"定容),
+        ⛔ 而不是让 GPU 预填在 profile 期**实跑**(那会污染 CUDA graph 捕获 ⇒ SIGSEGV,实测两次)✗
+        """
+        if getattr(self, "_gpu_resident", False):
+            return 0                      # 常驻层不流式 ⇒ 无 staging
+        eng = getattr(self, "_xiaotu_engine", None)
+        if eng is None:
+            return 0
+        _E = getattr(self, "_E_eng", None)
+        _H = getattr(self, "_H_eng", None)
+        _I = getattr(self, "_I_eng", None)
+        if _E is None or _H is None or _I is None:
+            return 0
+        gp = _gpu_prefill_mod(getattr(self, "_engine_attr", ""))
+        if gp is None:
+            return 0
+        return layer_staging_need_bytes(
+            gp, eng, int(_E), int(_H), int(_I), int(getattr(self, "_group_k", 32) or 32))
+
     # ---- optional in-process self-verification -------------------------
     def _verify_once(self, layer, hidden_states, topk_ids, topk_weights, out):
         """对比引擎输出与 torch 参考(同一批已加载权重),定位数值差异。
@@ -1669,17 +1715,10 @@ class _XiaotuExpertsMixin:
             # 需求**如实报告**用(只算数、只打印;⛔ 不再用它做 GPU/CPU 取舍 —— 见下)
             from vllm_xiaotu_moe.gpu_prefill import fits_device
 
-            try:
-                _ns = int(engine.shard_geometry()["ns"]) or 2
-            except Exception:  # noqa: BLE001
-                _ns = 2
             _is_fp8 = getattr(self, "_engine_attr", "") == "MOE_FP8"
-            _need = _gp_mod.staging_bytes(_E, hidden_size, _I, int(self._group_k), _ns)
-            if gp_prefetch_enabled():
-                # The ping/pong prefetch holds a second K-major set; charge it so
-                # the preflight cannot pass and then OOM into a sticky CPU
-                # fallback (which would be slower than never enabling it).
-                _need += 2 * (_E * hidden_size * 2 * _I + _E * _I * hidden_size)
+            # ⭐ 与 profile 期的 eager 占位共用**同一个函数**(唯一真源)✓
+            _need = layer_staging_need_bytes(
+                _gp_mod, engine, _E, hidden_size, _I, int(self._group_k))
             # ⭐⭐ 2026-10-09(用户纠正实现方式):**删除自建预检门** ——
             #   用户原话:"把需求都报告给 vllm,它启动的时候自然会去尝试分配 kv-cache、
             #   加载权重、做 cuda-graph 等,失败了就会自动结束"。

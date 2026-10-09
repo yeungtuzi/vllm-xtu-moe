@@ -776,6 +776,70 @@ def in_warmup_or_capture() -> bool:
     return bool(_IN_WARMUP[0])
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ⭐⭐ 2026-10-09(SPEC_mbt_budget 改动② 的**正解**):让 staging **进 vLLM 的账本**,
+#    但**不让 GPU 预填在 profile 期实跑** ✓
+#
+# 实测教训(见 dev-docs/report/tuning/vllm_vram_experiment_2026-10-09.md §7/§11):
+#   * 让预填在 `profile_run` 期**实跑**(无论 warmup 是否挡住)⇒ **两次**都在首个长请求后
+#     `cuGraphLaunch` SIGSEGV(CUDA graph 捕获被侧流活动污染)✗
+#   * 而**只占位、不跑内核**:同一次 profile 里,「已消耗显存」照样 +1.9 GiB
+#     ⇒ vLLM 的 `total_consumed`/`non_kv_cache_memory` 记上它 ⇒ KV 池按"剩下的"定容 ✓
+#   * 占位在 profile 结束**立刻释放** ⇒ 那块显存留给随后分配的 KV,预算分毫不差 ✓
+# ══════════════════════════════════════════════════════════════════════════════
+_PROF_RESERVE: list = []
+
+
+def reserve_staging_for_profile(need_bytes: int, device=None) -> bool:
+    """占位分配 `need_bytes`(单层 staging 峰值),**不跑任何内核** ✓ 返回是否成功。"""
+    if int(need_bytes) <= 0:
+        return False
+    if device is None:
+        try:
+            device = torch.device("cuda", torch.cuda.current_device())
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        t = torch.empty(int(need_bytes), dtype=torch.uint8, device=device)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vllm-xtu-moe] ⚠️ profile 期 staging 占位分配失败"
+              f"({int(need_bytes) / 2**30:.2f} GiB):{type(exc).__name__}: {exc}"
+              f" —— 照常继续(只是本次 KV 会按'没有 staging'定容)", flush=True)
+        return False
+    _PROF_RESERVE.append(t)
+    print(f"[vllm-xtu-moe] ⭐ profile 期 staging 占位 {int(need_bytes) / 2**30:.2f} GiB"
+          f"(计入 vLLM 的 total_consumed ⇒ KV 按剩下的定容;不跑任何预填内核)✓", flush=True)
+    return True
+
+
+def release_staging_reserve() -> None:
+    """profile 结束立刻释放占位 ⇒ 那块显存留给随后分配的 KV / 真正的 staging ✓"""
+    if _PROF_RESERVE:
+        _PROF_RESERVE.clear()
+        print("[vllm-xtu-moe] profile 结束 ⇒ 释放 staging 占位(留给 KV)✓", flush=True)
+
+
+def _reserve_staging_from_model(runner) -> None:
+    """从 runner 的模型里取各 MoE 层的 staging 需求,**取最大值**(单层峰值,不是求和)✓"""
+    model = getattr(runner, "model", None)
+    if model is None:
+        return
+    need = 0
+    try:
+        for m in model.modules():
+            f = getattr(m, "staging_need_bytes", None)
+            if not callable(f):
+                continue
+            try:
+                need = max(need, int(f()))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        return
+    if need > 0:
+        reserve_staging_for_profile(need)
+
+
 def install_profile_guard() -> list[str]:
     """Make ``GPUModelRunner.profile_run`` visible to us as a flag."""
     global _IN_PROFILE_RUN
@@ -794,9 +858,12 @@ def install_profile_guard() -> list[str]:
         global _IN_PROFILE_RUN
         _IN_PROFILE_RUN = True
         try:
+            # ⭐⭐ 2026-10-09:先占位(让 vLLM 记账),再跑 profile —— **不跑预填内核** ✓
+            _reserve_staging_from_model(self)
             return orig(self, *a, **kw)
         finally:
             _IN_PROFILE_RUN = False
+            release_staging_reserve()
 
     profile_run._xtu_shim = True  # type: ignore[attr-defined]
     GPUModelRunner.profile_run = profile_run
