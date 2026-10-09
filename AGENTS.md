@@ -199,7 +199,7 @@ grep -n "^## " dev-docs/USER_QA_LEDGER.md                # 错题本目录
    ⚠️ **来由**:2026-10-07 **一天内四次**事故,**根因全是"按模式找进程"**:① `pkill -f run_matrix.sh` 命中自己的命令行 ⇒ 自杀;
    ② `proc.sh stop dsv41_prod` 只停了包装脚本(真服务还在)⇒ 又起了一个实例;
    ③ **runner 名 = 被管实例名** ⇒ 脚本第一行 `stop <自己>` ⇒ 自杀;
-   ④ ⭐ `ps | grep vllm.entrypoints` 把**【生产】当成"孤儿"杀了** ✗✗
+   ④ ⭐ `ps | grep vllm.entrypoints` 把 **【生产】当成"孤儿"杀了** ✗✗
    ⭐ **推论**:①**runner 名必须 ≠ 被管实例名** ✓;②**归属只能用 PID文件 / 端口 / `CUDA_VISIBLE_DEVICES` 判定**,
    **绝不能用进程名** ✗(生产的判据是 `CUDA_VISIBLE_DEVICES=1,2` 或 PID 文件 `dsv41_prod` ✓)
 0.5 ⭐⭐ **【脚本复审门 · 2026-10-07 用户明令】**:凡**我新写或修改的、涉及【启动/杀进程】的脚本**,
