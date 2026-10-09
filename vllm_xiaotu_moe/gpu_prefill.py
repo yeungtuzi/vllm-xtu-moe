@@ -841,33 +841,51 @@ def _reserve_staging_from_model(runner) -> None:
 
 
 def install_profile_guard() -> list[str]:
-    """Make ``GPUModelRunner.profile_run`` visible to us as a flag."""
+    """把 `profile_run` 暴露给我们(用来① 设 `_IN_PROFILE_RUN` ② **profile 期占位 staging**)✓
+
+    ⭐⭐ 2026-10-09 修(R38 复审后实测发现的真 bug):本构建的 worker 用的是 **V2** runner
+    (`vllm/v1/worker/gpu_worker.py:551` → `vllm.v1.worker.gpu.model_runner.GPUModelRunner`),
+    而本函数原先**只打 V1**(`vllm.v1.worker.gpu_model_runner.GPUModelRunner`)⇒
+    **shim 一直是死的**:`_IN_PROFILE_RUN` 从不为真、占位也从未发生 ✗
+    ⇒ 现在**两个模块都打**(各自 `_xtu_shim` 幂等)✓
+    """
     global _IN_PROFILE_RUN
-    try:
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except Exception:  # noqa: BLE001
-        return []
-    orig = getattr(GPUModelRunner, "profile_run", None)
-    if orig is None or getattr(orig, "_xtu_shim", False):
-        return []
-
     import functools
+    import importlib
 
-    @functools.wraps(orig)
-    def profile_run(self, *a, **kw):
-        global _IN_PROFILE_RUN
-        _IN_PROFILE_RUN = True
+    applied: list[str] = []
+    for mod_name in ("vllm.v1.worker.gpu_model_runner",     # V1(旧)
+                     "vllm.v1.worker.gpu.model_runner"):    # ⭐ V2(本构建实际在用)
         try:
-            # ⭐⭐ 2026-10-09:先占位(让 vLLM 记账),再跑 profile —— **不跑预填内核** ✓
-            _reserve_staging_from_model(self)
-            return orig(self, *a, **kw)
-        finally:
-            _IN_PROFILE_RUN = False
-            release_staging_reserve()
+            _m = importlib.import_module(mod_name)
+        except Exception:  # noqa: BLE001
+            continue
+        _cls = getattr(_m, "GPUModelRunner", None)
+        if _cls is None:
+            continue
+        orig = getattr(_cls, "profile_run", None)
+        if orig is None or getattr(orig, "_xtu_shim", False):
+            continue
 
-    profile_run._xtu_shim = True  # type: ignore[attr-defined]
-    GPUModelRunner.profile_run = profile_run
-    applied = ["GPUModelRunner.profile_run"]
+        def _make(orig_fn):
+            @functools.wraps(orig_fn)
+            def profile_run(self, *a, **kw):
+                global _IN_PROFILE_RUN
+                _IN_PROFILE_RUN = True
+                try:
+                    # ⭐⭐ 先占位(让 vLLM 记账),再跑 profile —— **不跑预填内核** ✓
+                    _reserve_staging_from_model(self)
+                    return orig_fn(self, *a, **kw)
+                finally:
+                    _IN_PROFILE_RUN = False
+                    release_staging_reserve()
+            profile_run._xtu_shim = True  # type: ignore[attr-defined]
+            return profile_run
+
+        _cls.profile_run = _make(orig)
+        applied.append(f"{mod_name.rsplit('.', 1)[-1]}.GPUModelRunner.profile_run")
+    if not applied:
+        return []
 
     # 关键的一半:KV cache 定容完成 = startup 结束。
     try:
