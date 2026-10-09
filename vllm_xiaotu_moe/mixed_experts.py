@@ -1547,23 +1547,23 @@ class _XiaotuExpertsMixin:
         _gp_mod = None if _resident else _gpu_prefill_mod(
             getattr(self, "_engine_attr", ""))
         if _gp_mod is not None:
-            from vllm_xiaotu_moe.gpu_prefill import (
-                gpu_prefill_min_tokens,
-                in_warmup_or_capture,
-            )
+            from vllm_xiaotu_moe.gpu_prefill import gpu_prefill_min_tokens, in_profile_run
 
             _gp_min = gpu_prefill_min_tokens()
             _gp_on = _gp_min > 0
-            # ⭐⭐ 2026-10-09(SPEC_mbt_budget 改动②,已按实测事故**两次收紧**):
-            #   ① 要放行以让 vLLM 的 profile **看到 staging**(它才据此给 KV 定容)✓
-            #   ② ⛔ 但 **warmup + CUDA graph 捕获** 窗口必须挡住 —— 2026-10-09 17:35 实测:
-            #      侧流 GPU 预填与图捕获交错 ⇒ 两 rank 同时 `cuGraphLaunch` SIGSEGV ⇒ 服务下线 ✗
-            #      (`is_current_stream_capturing()` 不够:它只在捕获调用之内为真)
-            #   ⇒ 判据 = `not in_warmup_or_capture()`:profile 期放行、warmup/捕获期挡住 ✓
+            # ⛔⛔ 2026-10-09 实测定案(三版对照,见 dev-docs/report/tuning/vllm_vram_experiment_2026-10-09.md §10–§11):
+            #   ⭐ **只要 GPU 预填在 `profile_run` 期跑过(staging 被分配),第一个长请求之后
+            #   两个 rank 必定 `cuGraphLaunch` SIGSEGV** —— 与 warmup/捕获期是否挡住**无关** ✗
+            #   * profile 放行 ⇒ consumed 26.34 GiB / KV 8.73 GiB ⇒ **32K 首发即段错误**(复现两次)
+            #   * profile 挡住 ⇒ consumed 24.21 GiB / KV 10.86 GiB ⇒ **12/12 回放全活** ✓
+            #   ⇒ 本版**回到旧行为**:整个 startup(profile + warmup + 捕获)都不放行 ✓
+            #   ⚠️ 代价:staging **不在 vLLM 的账本里**(它按"只有权重/图/激活"给 KV 定容 ⇒ 池偏大约 2 GiB)。
+            #      要真正兑现"staging 进账本",下一步应走 **"在 profile 之前就把常驻缓冲显式分配好、
+            #      但不在 profile 期跑预填内核"**(eager 分配),而不是让预填在 profile 期跑起来 ✗
             _gpu_pf = (
                 _gp_on
                 and qlen >= _gp_min
-                and not in_warmup_or_capture()
+                and not in_profile_run()
                 and not torch.cuda.is_current_stream_capturing()
             )
         # ⚠️ 释放条件是 `_gp_on`,不是 `_gpu_pf`。引擎是**惰性**建的:第一个请求
