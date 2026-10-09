@@ -820,26 +820,41 @@ def release_staging_reserve() -> None:
 
 
 def _reserve_staging_from_model(runner) -> None:
-    """从 runner 的模型里取各 MoE 层的 staging 需求,**取最大值**(单层峰值,不是求和)✓"""
-    model = getattr(runner, "model", None)
-    if model is None:
-        print("[vllm-xtu-moe/dbg] profile 期占位:runner 没有 .model ⇒ 跳过", flush=True)
-        return
+    """取各 MoE 层的 staging 需求,**取最大值**(单层峰值,不是求和)✓
+
+    ⭐⭐ 2026-10-09 实测修正:`runner.model.modules()` **扫不到**我们的 MoE 模块
+    (V2 runner 的 `.model` 不是那棵树 ⇒ 实测"扫到 0 个")✗
+    ⇒ 改为走**插件自己的层注册表** `mixed_experts._GP_LAYERS`(引擎构建时填的),
+       它与 vLLM 的模型树无关 ✓;模型树只作兜底 ✓
+    """
     need = 0
     _asked = 0
+    cands = []
     try:
-        for m in model.modules():
-            f = getattr(m, "staging_need_bytes", None)
-            if not callable(f):
-                continue
-            _asked += 1
-            try:
-                need = max(need, int(f()))
-            except Exception:  # noqa: BLE001
-                continue
+        from vllm_xiaotu_moe import mixed_experts as _mx
+        cands.extend(list(getattr(_mx, "_GP_LAYERS", {}).values()))
     except Exception:  # noqa: BLE001
-        return
-    print(f"[vllm-xtu-moe/dbg] profile 期占位:扫到 {_asked} 个可问 staging 的模块,"
+        pass
+    model = getattr(runner, "model", None)
+    if model is not None:
+        try:
+            cands.extend(list(model.modules()))
+        except Exception:  # noqa: BLE001
+            pass
+    seen = set()
+    for m in cands:
+        if id(m) in seen:
+            continue
+        seen.add(id(m))
+        f = getattr(m, "staging_need_bytes", None)
+        if not callable(f):
+            continue
+        _asked += 1
+        try:
+            need = max(need, int(f()))
+        except Exception:  # noqa: BLE001
+            continue
+    print(f"[vllm-xtu-moe] profile 期占位:扫到 {_asked} 个可问 staging 的模块,"
           f" max need = {need / 2**30:.2f} GiB", flush=True)
     if need > 0:
         reserve_staging_for_profile(need)
