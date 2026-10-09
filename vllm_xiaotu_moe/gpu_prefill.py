@@ -823,19 +823,24 @@ def _reserve_staging_from_model(runner) -> None:
     """从 runner 的模型里取各 MoE 层的 staging 需求,**取最大值**(单层峰值,不是求和)✓"""
     model = getattr(runner, "model", None)
     if model is None:
+        print("[vllm-xtu-moe/dbg] profile 期占位:runner 没有 .model ⇒ 跳过", flush=True)
         return
     need = 0
+    _asked = 0
     try:
         for m in model.modules():
             f = getattr(m, "staging_need_bytes", None)
             if not callable(f):
                 continue
+            _asked += 1
             try:
                 need = max(need, int(f()))
             except Exception:  # noqa: BLE001
                 continue
     except Exception:  # noqa: BLE001
         return
+    print(f"[vllm-xtu-moe/dbg] profile 期占位:扫到 {_asked} 个可问 staging 的模块,"
+          f" max need = {need / 2**30:.2f} GiB", flush=True)
     if need > 0:
         reserve_staging_for_profile(need)
 
