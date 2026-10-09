@@ -80,19 +80,19 @@ GLM / DeepSeek-V4.1 未开投机解码（random 数据集对投机是最坏情�
 ## 快速开始
 
 ```bash
-# 1) 主线 vLLM(本插件是插件,不需要 fork)
-pip install vllm==2.5.0
+# 1) 主线 vLLM(本插件是插件,不需要 fork;已验证的版本与提交见 docs/INSTALL_MAINLINE.md)
+pip install vllm
 
 # 2) 本插件(发行名 vllm-xtu-moe,**不发 PyPI**;二选一)
-# (a) 从 GitHub Release 附件装:wheel 里已含 6 个 ISA 变体,无需本地编译器
-pip install ./vllm_xtu_moe-0.2.3-cp312-cp312-manylinux_2_34_x86_64.whl
+# (a) 从 GitHub Release 附件装:wheel 里已含 7 个 ISA 变体,无需本地编译器
+pip install ./vllm_xtu_moe-0.2.7-cp312-cp312-manylinux_2_34_x86_64.whl
 # (b) 源码安装(需要本地编译器):
 # CXX=g++-16 PYTHON=$(which python) bash scripts/build_engine_variants.sh && pip install -e .
 
 # 3) 跑一个专家权重放不进显存的 MoE 模型
 VLLM_EXPERTS_LOAD_DEVICE=cpu \
 vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
-  --max-model-len 65536 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.95
+  --max-model-len 65536 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90
 ```
 
 逐模型配方、显存核算、自检与排错 → **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)**、
@@ -104,7 +104,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 
 | 版本 | 主题 |
 |---|---|
-| ~~v0.2.7~~ | **未发布**(2026-10-08)—— 当天无新性能能力;`MBT 6144→8192` 属已知配置收益 ⇒ 决定不发 |
+| **v0.2.7**（2026-10-09） | **优化引擎：削减 CPU→GPU DMA 缓冲区** —— 预填期的权重驻留量由 **2 × 整层** 改为 **N × 子层块环**：**7.56 → 1.89 GiB/rank**（TP=2 共省 **11 GB**），性能无损失；开关 `XIAOTU_GPF_STAGE_TILE_E`（`0` = 旧行为，可即时回滚）—— 详见[发行说明](RELEASE_NOTES_v0.2.7.md) |
 | **v0.2.6** | **自举开发：INT8 激活 × FP4 专家权重 的计算路径** —— 为 **MXFP4** 专家权重增加 **INT8 激活**路径（fp4 码值全含于 int8 ⇒ **权重侧零代价**）：内核级 **24.9 → 15.1–15.7 ms/层（1.54–1.62×）**；端到端（qfn·MXFP4-FP8）GSM8K **两臂 193/200**、逐题一致 194/200（净 0）、256K 四针两臂 4/4 + `stop`、Vision 23 逐项一致 18/23；修复**回退路径回归**（慢 16–22% ⇒ +1.49% 指令）；打通 **qfn 的 MTP**（**2.44×**）；qfn 默认线程数 **120（5 核/CCD）**；路径默认关（`XIAOTU_MOE_INT8=1`）|
 | **v0.2.5** | **优化 GPU prefill 内存机制** —— **为 GPU 算子增加对 NUMA 切片权重的处理路径,节省了一层权重空间**(对 DeepSeek-V4.1-Flash **节约 6.33 GiB**;2 个 GPU 时**每卡节约 3.16 GiB**):单层 staging 10.73→**7.56 GiB/rank**、离线同层 364.91→**341.31 ms**、数值逐字节相同;**支持 1M 上下文 + GPU 预填充**(CED 让每 token KV 5437→2106 B,1M 只需 KV ~2.2 GiB);**Engram pinned 浪费修复**(宿主内存 **−75 GiB**);rebase 到上游后 **CED 恢复生效**(16k prefill 527.8→**982.4** tok/s);**TP=2 一律用 GPU1+GPU2**(GPU0 只有 x8);服务日志按 **PID** 命名 |
 | **v0.2.4** | **支持 MiMo-V2.6-Flash-RL + 性能优化** —— 新模型接入（MXFP4/TP=2/1M/多模态/MTP k=1，**层内数值门禁 94/94 层通过**、312K 针测试命中、多模态真图通过）；**GPU 预填充「0=关闭」陷阱修复**（长 prefill 313→**811** tok/s）；**`--max-num-seqs` 默认统一为 4**（短 C=2 prefill 236→**367**）；**decode 口径改为 median ITL**（真实争用 1.13–1.77×）；修好 MXFP4 上的层内数值门禁 |

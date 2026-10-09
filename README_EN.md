@@ -89,19 +89,19 @@ with long context for VRAM).
 ## Quick start
 
 ```bash
-# 1) upstream vLLM (this project is a plugin, no fork needed)
-pip install vllm==2.5.0
+# 1) upstream vLLM (this project is a plugin, no fork needed; verified versions and commits: docs/INSTALL_MAINLINE.md)
+pip install vllm
 
 # 2) this plugin (distribution name vllm-xtu-moe, NOT on PyPI) -- pick one
-# (a) install the wheel attached to the GitHub Release (all 6 ISA variants included):
-pip install ./vllm_xtu_moe-0.2.3-cp312-cp312-manylinux_2_34_x86_64.whl
+# (a) install the wheel attached to the GitHub Release (all 7 ISA variants included):
+pip install ./vllm_xtu_moe-0.2.7-cp312-cp312-manylinux_2_34_x86_64.whl
 # (b) or install from source (needs a local compiler):
 # CXX=g++-16 PYTHON=$(which python) bash scripts/build_engine_variants.sh && pip install -e .
 
 # 3) serve a MoE model whose experts do not fit in VRAM
 VLLM_EXPERTS_LOAD_DEVICE=cpu \
 vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
-  --max-model-len 65536 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.95
+  --max-model-len 65536 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90
 ```
 
 Per-model recipes, memory budgeting, self-checks and troubleshooting →
@@ -113,6 +113,7 @@ Per-model recipes, memory budgeting, self-checks and troubleshooting →
 
 | Version | Theme |
 |---|---|
+| **v0.2.7** (2026-10-09) | **Engine optimisation: CPU→GPU DMA buffers cut** — per-prefill weight residency goes from **2 × whole layer** to an **N × sub-layer block ring**: **7.56 → 1.89 GiB/rank** (**11 GB** saved in total at TP=2), no performance loss; switch `XIAOTU_GPF_STAGE_TILE_E` (`0` = old behaviour, instantly revertible) — see [release notes](RELEASE_NOTES_v0.2.7.md) |
 | **v0.2.6** | **Bootstrapped development: INT8 activation x FP4 expert weights** — MXFP4 experts gain an **INT8 activation** path (the fp4 code set fits int8 exactly, so the **weight side is free**): kernel level **24.9 -> 15.1-15.7 ms/layer (1.54-1.62x)**; end to end (qfn, MXFP4-FP8) GSM8K **193/200 on both arms**, 194/200 per-question (net 0), 256K four-pin 4/4 + `stop` on both arms, Vision 23 agrees 18/23; **fallback-path regression fixed** (16-22% slower -> +1.49% instructions); **MTP on qfn (2.44x)**; qfn default threads **120 (5 cores/CCD)**; path off by default (`XIAOTU_MOE_INT8=1`) |
 | **v0.2.5** | **GPU prefill memory rework** — the GPU operator consumes NUMA-sharded experts directly, dropping one layer of weight staging (**6.33 GiB saved for DeepSeek-V4.1-Flash, 3.16 GiB per card at TP=2**; per-layer staging 10.73 → **7.56 GiB/rank**; byte-identical results); **1M context + GPU prefill** (CED: KV 5437 → 2106 B/token, so 1M needs ~2.2 GiB); **Engram pinned over-allocation fixed (−75 GiB host)**; rebasing onto upstream restores **CED** (16k prefill 527.8 → **982.4** tok/s); **TP=2 uses GPU1+GPU2**; service logs named by PID |
 | **v0.2.4** | **MiMo-V2.6-Flash-RL support + performance work** — MXFP4 experts over V4.1's engine path (TP=2 / 1M context / multimodal / MTP k=1 all measured); the **GPU prefill "zero means off" trap fixed** (long prefill 313 → **811** tok/s); **`--max-num-seqs` now defaults to 4**; decode metric switched to median ITL |
