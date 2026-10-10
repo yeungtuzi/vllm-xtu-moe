@@ -86,8 +86,8 @@ Every performance number below was taken on this machine:
 | | short | 128 | 2 | **269.8** | **49.5** |
 | | short | 128 | 4 | **276.2** | **57.0** |
 | | long | 16,384 | 1 | **1011.0** | **41.0** |
-| | long | 16,384 | 2 | **1010.1** | **20.2** |
-| | long | 16,384 | 4 | **1005.0** | **10.9** |
+| | long | 16,384 | 2 | **1010.1** | pending |
+| | long | 16,384 | 4 | **1005.0** | pending |
 
 GLM-5.3-Flash and the DeepSeek CED rows run without speculative decoding. **DSpark k=5** (the v0.2.7
 DeepSeek production config) is substantially faster on decode — see the v0.2.7 release notes for the
