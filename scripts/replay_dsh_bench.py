@@ -68,17 +68,20 @@ def snap(metrics_url: str) -> dict:
 
 
 def one(url, model, prompt, max_tokens, sink, tag):
-    # ⭐⭐ 2026-10-09 修(用户指出我的 A/B 口径错误后查出的测量缺陷):
-    #   `ignore_eos=True` 在**投机解码路径**下**不足以**保证跑满 —— 实测 SPEC=1 的各臂都在
-    #   ~280 token/请求 处提前结束(dspark k=5:289、k=1:745),而 SPEC=0 跑满 1024 ✗
-    #   ⇒ 两臂**生成长度不同** ⇒ 墙钟吞吐里混进了"投机路径的启动成本",A/B 不可比 ✗
-    #   ⇒ 这里补 `min_tokens = max_tokens`:强制**两臂都跑满**,长度对齐后才可减出因果 ✓
-    #   (vLLM 的 /v1/completions 支持 `min_tokens`,在达到该数前屏蔽 EOS ✓)
+    # ⭐⭐ 2026-10-09 修(用户指出我的 A/B 口径错误后查出**两个**测量缺陷):
+    #  ① `ignore_eos=True` 在投机路径下**不足以**保证跑满 ⇒ 补 `min_tokens = max_tokens` ✓
+    #  ② ⭐⭐ **最致命的一条**:原先用"收到的 SSE chunk 数"当 token 数 —— 而**投机解码下一次 flush
+    #     会带 ~A 个 token**(实测 196 chunk × ~5.2 ≈ 1024 token)⇒ 投机的"token 数"被**低估 ~A 倍**,
+    #     于是我把"chunk/s"和"token/s"直接比,得出"投机慢 3.8×"的**错误结论** ✗✗
+    #     ⇒ 现在改为**读服务端 `usage.completion_tokens`**(stream_options.include_usage)✓
+    #     并把 token 数写回 `n`,让所有上层统计口径统一 ✓
     body = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
             "min_tokens": max_tokens,
-            "temperature": 0.0, "ignore_eos": True, "stream": True}
+            "temperature": 0.0, "ignore_eos": True, "stream": True,
+            "stream_options": {"include_usage": True}}
     t0 = time.time()
     marks, first, texts = [], None, []
+    ntok = None          # ⭐ 服务端口径的真实生成 token 数(优先于 chunk 数)✓
     try:
         with requests.post(url, json=body, stream=True, timeout=1800) as r:
             r.raise_for_status()
@@ -99,11 +102,17 @@ def one(url, model, prompt, max_tokens, sink, tag):
                         first = now - t0
                     marks.append(now - t0)
                     texts.append(ch)   # ⭐ 保存输出:供"同一批输出的 ngram 复制率"比对
+                _u = d.get("usage") or {}
+                if _u.get("completion_tokens"):
+                    ntok = int(_u["completion_tokens"])   # ⭐ 真实 token 数 ✓
 
     except Exception as e:  # noqa: BLE001
         sink[tag] = {"error": repr(e)}
         return
-    sink[tag] = {"ttft": first, "marks": marks, "n": len(marks), "text": "".join(texts)}
+    sink[tag] = {"ttft": first, "marks": marks, "text": "".join(texts),
+                 # ⭐ 优先用服务端 usage 的真实 token 数;拿不到才退回 chunk 数(并标注)✓
+                 "n": int(ntok) if ntok else len(marks),
+                 "n_src": "usage" if ntok else "chunks"}
 
 
 def main():
@@ -146,10 +155,11 @@ def main():
     m1 = snap(murl)
 
     ok = [v for v in sink.values() if v.get("marks")]
-    itls, ttfts, ntok = [], [], 0
+    itls, ttfts, ntok, nchunks = [], [], 0, 0
     for v in ok:
         m = v["marks"]
-        ntok += len(m)
+        ntok += int(v.get("n") or 0)        # ⭐ 服务端 usage 的真实 token 数 ✓
+        nchunks += len(m)                   # chunk 数(诊断用:投机下 ≠ token 数)
         if v.get("ttft"):
             ttfts.append(v["ttft"])
         itls += [(m[j] - m[j - 1]) * 1000.0 for j in range(1, len(m))]
@@ -161,7 +171,13 @@ def main():
     emitted = d.get("vllm:num_emitted_tokens_total", 0)
 
     print(f"完成 {len(ok)}/{len(recs)} 条 · 墙钟 {wall:.1f}s")
-    print(f"  生成 token {ntok} · 输出吞吐 {ntok/wall:.2f} tok/s")
+    print(f"  生成 token {ntok}(服务端 usage) · 输出吞吐 {ntok/wall:.2f} tok/s")
+    if ntok and nchunks:
+        _tt = statistics.median(ttfts) if ttfts else 0.0
+        _dec = max(0.1, wall - _tt)
+        print(f"  ⭐ 解码段速率 {ntok/_dec:.2f} tok/s(排除 TTFT {_tt:.2f}s;"
+              f" {ntok} token / {nchunks} chunk ⇒ 每 chunk **{ntok/max(1,nchunks):.2f} token**"
+              f" —— 非投机应≈1.00,投机应≈接受长度)✓")
     if ttfts:
         print(f"  TTFT  中位 {statistics.median(ttfts):.2f}s  (mean {statistics.mean(ttfts):.2f}s)")
     if itls:
