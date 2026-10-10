@@ -68,7 +68,14 @@ def snap(metrics_url: str) -> dict:
 
 
 def one(url, model, prompt, max_tokens, sink, tag):
+    # ⭐⭐ 2026-10-09 修(用户指出我的 A/B 口径错误后查出的测量缺陷):
+    #   `ignore_eos=True` 在**投机解码路径**下**不足以**保证跑满 —— 实测 SPEC=1 的各臂都在
+    #   ~280 token/请求 处提前结束(dspark k=5:289、k=1:745),而 SPEC=0 跑满 1024 ✗
+    #   ⇒ 两臂**生成长度不同** ⇒ 墙钟吞吐里混进了"投机路径的启动成本",A/B 不可比 ✗
+    #   ⇒ 这里补 `min_tokens = max_tokens`:强制**两臂都跑满**,长度对齐后才可减出因果 ✓
+    #   (vLLM 的 /v1/completions 支持 `min_tokens`,在达到该数前屏蔽 EOS ✓)
     body = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
+            "min_tokens": max_tokens,
             "temperature": 0.0, "ignore_eos": True, "stream": True}
     t0 = time.time()
     marks, first, texts = [], None, []
