@@ -82,9 +82,16 @@ Every performance number below was taken on this machine:
 | | short | 128 | 2 | **350.4** | **28.0** |
 | | long | 16,384 | 1 | **903.9** | **19.3** |
 | | long | 16,384 | 2 | **1204.2** | **15.4** |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.90 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** (v0.2.7 production config) | short | 128 | 1 | **261.1** | **37.9** |
+| | short | 128 | 2 | **269.8** | **49.5** |
+| | short | 128 | 4 | **276.2** | **57.0** |
+| | long | 16,384 | 1 | **1011.0** | **41.0** |
+| | long | 16,384 | 2 | **1010.1** | **20.2** |
+| | long | 16,384 | 4 | **1005.0** | **10.9** |
 
-Neither model uses speculative decoding (random tokens are its worst case, and the draft layer competes
-with long context for VRAM).
+GLM-5.3-Flash and the DeepSeek CED rows run without speculative decoding. **DSpark k=5** (the v0.2.7
+DeepSeek production config) is substantially faster on decode — see the v0.2.7 release notes for the
+2026-10-10 erratum on that decode column.
 
 ## Quick start
 
